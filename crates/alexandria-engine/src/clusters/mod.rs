@@ -1,3 +1,5 @@
+pub mod maintenance;
+
 use crate::search::cosine_similarity;
 
 #[derive(Debug, Clone)]
