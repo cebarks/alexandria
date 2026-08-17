@@ -61,4 +61,53 @@ impl<'a> MemoryRepo<'a> {
             .check()?;
         Ok(())
     }
+
+    /// Update a fact's content and/or tags. Returns the updated fact.
+    pub async fn update_fact(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        tags: Option<&[String]>,
+        confidence: Option<f64>,
+        embedding: Option<&[f32]>,
+    ) -> Result<Option<Fact>> {
+        let mut parts = Vec::new();
+        if content.is_some() {
+            parts.push("content = $content");
+        }
+        if tags.is_some() {
+            parts.push("tags = $tags");
+        }
+        if confidence.is_some() {
+            parts.push("confidence = $confidence");
+        }
+        if embedding.is_some() {
+            parts.push("embedding = $embedding");
+        }
+
+        if parts.is_empty() {
+            return self.get_fact(id).await;
+        }
+
+        let set_clause = parts.join(", ");
+        let query = format!("UPDATE type::record($id) SET {set_clause}");
+
+        let mut q = self.db.query(&query).bind(("id", id.to_string()));
+        if let Some(c) = content {
+            q = q.bind(("content", c.to_string()));
+        }
+        if let Some(t) = tags {
+            q = q.bind(("tags", t.to_vec()));
+        }
+        if let Some(conf) = confidence {
+            q = q.bind(("confidence", conf));
+        }
+        if let Some(emb) = embedding {
+            q = q.bind(("embedding", emb.to_vec()));
+        }
+
+        let mut response = q.await?;
+        let updated: Option<Fact> = response.take(0)?;
+        Ok(updated)
+    }
 }

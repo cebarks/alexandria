@@ -140,3 +140,58 @@ async fn test_recall_broad_and_focused() {
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["mode"], "broad");
 }
+
+#[tokio::test]
+async fn test_update_memory_content() {
+    let (server, _db) = setup().await;
+
+    // Store a memory
+    let params = alexandria_mcp::tools::StoreMemoryParams {
+        content: "Rust is version 1.75".to_string(),
+        tags: Some(vec!["rust".to_string()]),
+    };
+    let id = server.do_store_memory(params).await.unwrap();
+
+    // Update content
+    let update_params = alexandria_mcp::tools::UpdateMemoryParams {
+        id: id.clone(),
+        content: Some("Rust is version 1.88".to_string()),
+        tags: None,
+        confidence: None,
+    };
+    let result = server.do_update_memory(update_params).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["content_changed"], true);
+
+    // Verify the content was updated
+    let repo = MemoryRepo::new(_db.inner());
+    let fact = repo.get_fact(&id).await.unwrap().unwrap();
+    assert_eq!(fact.content, "Rust is version 1.88");
+}
+
+#[tokio::test]
+async fn test_update_memory_tags_only() {
+    let (server, _db) = setup().await;
+
+    let params = alexandria_mcp::tools::StoreMemoryParams {
+        content: "SurrealDB is a database".to_string(),
+        tags: Some(vec!["db".to_string()]),
+    };
+    let id = server.do_store_memory(params).await.unwrap();
+
+    // Update tags only — should not trigger re-embedding
+    let update_params = alexandria_mcp::tools::UpdateMemoryParams {
+        id: id.clone(),
+        content: None,
+        tags: Some(vec!["database".to_string(), "surrealdb".to_string()]),
+        confidence: None,
+    };
+    let result = server.do_update_memory(update_params).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["content_changed"], false);
+
+    let repo = MemoryRepo::new(_db.inner());
+    let fact = repo.get_fact(&id).await.unwrap().unwrap();
+    assert_eq!(fact.tags, vec!["database", "surrealdb"]);
+}
