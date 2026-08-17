@@ -71,7 +71,6 @@ fn default_data_dir() -> PathBuf {
         .join("data")
 }
 
-
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
@@ -167,7 +166,10 @@ mod tests {
     #[test]
     fn test_defaults() {
         let config = Config::default();
-        assert_eq!(config.embedding.model, "sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(
+            config.embedding.model,
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
         assert_eq!(config.embedding.device, "cpu");
         assert_eq!(config.cluster.join_threshold, 0.75);
         assert_eq!(config.activation.propagation_factor, 0.3);
@@ -191,7 +193,10 @@ mod tests {
             cohesion_floor = 0.5
         "#;
         let config = Config::from_toml(toml).unwrap();
-        assert_eq!(config.database.data_dir, PathBuf::from("/tmp/alexandria-test"));
+        assert_eq!(
+            config.database.data_dir,
+            PathBuf::from("/tmp/alexandria-test")
+        );
         assert_eq!(config.embedding.model, "custom-model");
         assert_eq!(config.embedding.device, "cuda");
         assert_eq!(config.cluster.join_threshold, 0.8);
