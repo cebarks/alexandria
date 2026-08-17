@@ -207,7 +207,10 @@ pub async fn count(
 
 Note: verify `CONTAINS` and `string::lowercase` are valid SurrealDB 3.2 functions before trusting this —
 run the test and adjust query syntax if SurrealDB rejects it (check error message; 3.2 sometimes wants
-different function names — see CLAUDE.md gotchas).
+different function names — see CLAUDE.md gotchas). If `CONTAINS` on strings is rejected or behaves as an
+array-membership operator instead of substring match, fall back to the design doc's originally suggested
+`content ~ $search` fuzzy-match operator, or `string::contains(content, $search)` — try both empirically
+and pick whichever SurrealDB 3.2 actually accepts before moving on to Task 2.
 
 **Step 4: Run test to verify it passes**
 
@@ -245,10 +248,10 @@ async fn test_cluster_for_fact() {
     let cluster_id = cluster_repo.create(Some("test cluster"), &[0.1, 0.2]).await.unwrap();
     cluster_repo.add_member(&cluster_id, &fact_id).await.unwrap();
 
-    let found = repo.cluster_for_fact(&fact_id).await.unwrap();
-    assert!(found.is_some());
-    let found = found.unwrap();
-    assert_eq!(found.label.as_deref(), Some("test cluster"));
+    let cluster_found = repo.cluster_for_fact(&fact_id).await.unwrap();
+    assert!(cluster_found.is_some());
+    let cluster_found = cluster_found.unwrap();
+    assert_eq!(cluster_found.label.as_deref(), Some("test cluster"));
 
     // Fact with no cluster returns None
     let orphan_id = repo.create_fact("orphan content", 0.5, &[0.9, 0.9], &[]).await.unwrap();
@@ -355,10 +358,13 @@ pub async fn list_with_counts(&self) -> Result<Vec<(Cluster, usize)>> {
 
     let mut result = Vec::with_capacity(clusters.len());
     for cluster in clusters {
+        // Use the closure form (matches existing repo convention, e.g. create()/create_fact()),
+        // not a bare `ToSql::to_sql` method reference — keeps id formatting consistent with the
+        // rest of the codebase's `table:key` string usage.
         let id = cluster
             .id
             .as_ref()
-            .map(surrealdb::types::ToSql::to_sql)
+            .map(|r| r.to_sql())
             .unwrap_or_default();
         let count = self.get_members(&id).await.map(|m| m.len()).unwrap_or(0);
         result.push((cluster, count));
@@ -649,6 +655,7 @@ mod tests {
             Ok(texts.iter().map(|_| vec![0.1, 0.2]).collect())
         }
         fn dimensions(&self) -> usize { 2 }
+        fn model_id(&self) -> &str { "stub" }
     }
 
     async fn test_server() -> AlexandriaServer {
@@ -674,9 +681,9 @@ mod tests {
 }
 ```
 
-Check `EmbeddingProvider`'s exact trait signature in `crates/alexandria-pipeline/src/embedding/provider.rs`
-before writing the stub — match it exactly (method names/async-trait usage may differ from the guess
-above). Read that file first.
+`EmbeddingProvider` (confirmed at `crates/alexandria-pipeline/src/embedding/provider.rs`) has **three**
+required methods: `embed`, `dimensions`, and `model_id(&self) -> &str`. The stub above includes all three
+— do not drop `model_id` or the impl won't compile.
 
 **Step 2: Add `router()` to `debug/mod.rs`**
 
@@ -875,14 +882,12 @@ async fn test_memory_detail_shows_content_and_heat() {
 
 #[tokio::test]
 async fn test_memory_detail_404_for_missing_id() {
-    let server = super::test_support::test_support::test_server().await; // fix path if refactored differently
+    let server = super::test_support::test_server().await;
     let app = crate::debug::router(server);
     let response = app.oneshot(Request::builder().uri("/debug/memories/fact%3Anonexistent").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(response.status(), 404);
 }
 ```
-
-(Fix the duplicate `test_support::test_support` typo when writing — call `super::test_support::test_server()`.)
 
 Note: `RecordId` string form is `table:key`; the `:` needs URL-encoding as `%3A` in the request path since
 axum path params don't accept raw `:`. Confirm by running the test — if axum's path extractor already
@@ -1013,7 +1018,9 @@ ids and one edge.
   method) to build `{ "nodes": [...], "edges": [...] }` in vis-network's expected shape
   (`{id, label}` nodes / `{from, to, label}` edges).
 - `page(State, Path<id>) -> Html<String>`: static HTML with a `<div id="graph">` canvas, inline `<script>`
-  loading vis-network from CDN (`https://unpkg.com/vis-network/standalone/umd/vis-network.min.js`), fetching
+  loading vis-network from CDN pinned to a specific version
+(`https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js` — check unpkg for the current
+latest stable release tag and pin to it explicitly, do not use an unversioned URL), fetching
   `/debug/api/graph/{id}` and rendering it. Keep the fetch/render script small and inline (no separate JS
   file needed).
 
@@ -1037,15 +1044,19 @@ git commit -m "feat(debug): add graph visualization route"
 `mode=retrieve&query=test&limit=5`, assert 200 and that the response HTML fragment renders (even if empty
 results, since the stub DB has no facts) without erroring. Add a second test that first stores a fact via
 `AlexandriaServer::do_store_memory`, then POSTs the same query and asserts the fact's content appears in
-the results fragment.
+the results fragment. Add a third test with `mode=recall&query=test` (no `limit`) confirming recall mode
+works without a limit field.
 
 **Step 2: Implement**
 
 - `form(State) -> Html<String>`: renders a form with `mode` select (`retrieve`/`recall`), `query` text
-  input, `limit` number input, an htmx `hx-post="/debug/query/run" hx-target="#query-results"`.
-- `run(State, Form<QueryForm>) -> Html<String>`: dispatches to `server.do_retrieve_memories(...)` or
-  `server.do_recall(...)` (both already exist on `AlexandriaServer` — reuse them directly rather than
-  reimplementing ranking) and renders the JSON result as an HTML table/list fragment (escaped).
+  input, and a `limit` number input that only applies to `retrieve` mode (note in the UI that it's ignored
+  for recall), an htmx `hx-post="/debug/query/run" hx-target="#query-results"`.
+- `run(State, Form<QueryForm>) -> Html<String>`: dispatches to `server.do_retrieve_memories(...)` (which
+  takes `RetrieveMemoriesParams { query, limit }`) or `server.do_recall(...)` (which takes
+  `RecallParams { query, scope_handle }` — **no `limit` field**; do not pass one). Reuse both methods
+  directly rather than reimplementing ranking, and render the JSON result as an HTML table/list fragment
+  (escaped).
 
 **Step 3: Register routes**, run tests, commit.
 
@@ -1076,6 +1087,13 @@ absolute paths like `/debug`, `.merge()` is correct; if it expects to be nested 
 `.nest("/debug", debug_router)` and change route paths in Task 6-11 to be relative, e.g. `""` and `"/memories"`.
 **Pick one convention up front in Task 6 and use it consistently** — recommend absolute paths + `.merge()`
 since it matches the design doc's literal route table.)
+
+**Ordering pitfall — read before editing:** in the existing `serve_http`, `server` is moved into the MCP
+`StreamableHttpService::new(move || Ok(server.clone()), ...)` closure. `alexandria_mcp::debug::router(server.clone())`
+MUST be called and stored in a local (e.g. `debug_router`) **before** that `StreamableHttpService::new(...)`
+call, the same way `maintenance_db = server.db.clone()` is already cloned out earlier in the function.
+Calling `server.clone()` after the `StreamableHttpService::new` line will fail to compile because `server`
+was already moved.
 
 **Step 2:** Log the debug URL alongside the existing MCP log line:
 
