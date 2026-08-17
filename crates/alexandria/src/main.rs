@@ -11,29 +11,35 @@ use rmcp::{ServiceExt, transport::stdio};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    tracing::info!("Alexandria v0.1 starting...");
+    tracing::info!("Alexandria v0.2 starting...");
 
-    let config = Config::default();
+    // 1. Load configuration
+    let config = Config::load()?;
+    tracing::info!("Config loaded: data_dir={}, model={}, device={}",
+        config.database.data_dir.display(),
+        config.embedding.model,
+        config.embedding.device,
+    );
 
-    // 1. Connect to embedded SurrealDB
+    // 2. Connect to SurrealDB
     let db = Database::connect_embedded().await?;
     schema::bootstrap(db.inner()).await?;
 
-    // 2. Initialize embedding provider
-    tracing::info!("Loading embedding model: {}", config.embedding_model);
+    // 3. Initialize embedding provider
+    tracing::info!("Loading embedding model: {}", config.embedding.model);
     let embedding =
-        CandleProvider::new(&config.embedding_model, &config.embedding_device).await?;
+        CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
     tracing::info!("Embedding model loaded ({} dimensions)", embedding.dimensions());
 
-    // 3. Create MCP server
+    // 4. Create MCP server
     let server = AlexandriaServer::new(
         Arc::new(db),
         Arc::new(embedding),
-        config.cluster_join_threshold,
-        config.heat_spacing_halflife,
+        config.cluster.join_threshold,
+        config.heat.spacing_halflife_secs,
     );
 
-    // 4. Serve over stdio
+    // 5. Serve over stdio
     tracing::info!("Alexandria ready, serving over stdio");
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
