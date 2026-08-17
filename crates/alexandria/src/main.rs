@@ -6,7 +6,7 @@ use alexandria_mcp::AlexandriaServer;
 use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
 use alexandria_storage::{Database, schema, system_config};
 use config::Config;
-use rmcp::{ServiceExt, transport::stdio};
+use rmcp::ServiceExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -15,10 +15,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 1. Load configuration
     let config = Config::load()?;
-    tracing::info!("Config loaded: data_dir={}, model={}, device={}",
+    tracing::info!(
+        "Config: transport={}, data_dir={}, model={}",
+        config.server.transport,
         config.database.data_dir.display(),
         config.embedding.model,
-        config.embedding.device,
     );
 
     // 2. Connect to SurrealDB (persistent or in-memory based on config)
@@ -41,10 +42,58 @@ async fn main() -> anyhow::Result<()> {
         config.heat.spacing_halflife_secs,
     );
 
-    // 5. Serve over stdio
-    tracing::info!("Alexandria ready, serving over stdio");
-    let service = server.serve(stdio()).await?;
-    service.waiting().await?;
+    // 5. Serve based on transport config
+    match config.server.transport.as_str() {
+        "stdio" => {
+            tracing::info!("Alexandria ready, serving over stdio");
+            let service = server.serve(rmcp::transport::stdio()).await?;
+            service.waiting().await?;
+        }
+        "http" => {
+            serve_http(server, &config).await?;
+        }
+        other => {
+            anyhow::bail!("Unknown transport: {other}. Use 'stdio' or 'http'.");
+        }
+    }
+
+    Ok(())
+}
+
+async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result<()> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        session::local::LocalSessionManager,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let cancel = CancellationToken::new();
+    let http_config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(Some(std::time::Duration::from_secs(15)))
+        .with_cancellation_token(cancel.clone())
+        .disable_allowed_hosts()
+        .disable_allowed_origins();
+
+    let service: StreamableHttpService<AlexandriaServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(server.clone()),
+            Default::default(),
+            http_config,
+        );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let bind_addr = format!("{}:{}", config.server.host, config.server.port);
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+
+    tracing::info!("Alexandria ready, serving HTTP on http://{bind_addr}/mcp");
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Shutting down...");
+            cancel.cancel();
+        })
+        .await?;
 
     Ok(())
 }

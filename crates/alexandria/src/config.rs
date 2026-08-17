@@ -13,11 +13,33 @@ use serde::Deserialize;
 #[serde(default)]
 #[derive(Default)]
 pub struct Config {
+    pub server: ServerConfig,
     pub database: DatabaseConfig,
     pub embedding: EmbeddingConfig,
     pub heat: HeatConfig,
     pub activation: ActivationConfig,
     pub cluster: ClusterConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// Transport: "stdio" or "http". Default: stdio.
+    pub transport: String,
+    /// HTTP port when transport = "http". Default: 3000.
+    pub port: u16,
+    /// HTTP bind address. Default: 127.0.0.1.
+    pub host: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            transport: "stdio".to_string(),
+            port: 3000,
+            host: "127.0.0.1".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
