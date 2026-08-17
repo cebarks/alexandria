@@ -1,1 +1,1 @@
-// Alexandria Pipeline — enrichment stages, embedding providers
+pub mod embedding;

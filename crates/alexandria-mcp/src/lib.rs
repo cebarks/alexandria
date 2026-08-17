@@ -1,1 +1,4 @@
-// Alexandria MCP — tool definitions and request handlers
+pub mod server;
+pub mod tools;
+
+pub use server::AlexandriaServer;
