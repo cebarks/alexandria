@@ -24,6 +24,9 @@ Alexandria is a multi-user agent memory MCP server written in Rust, backed by Su
 | Document import | Direct-to-fact with chunk/whole modes |
 | Deletes | Soft-delete only via MCP |
 | MCP tools | store, retrieve, recall, update, delete, import_document |
+| Cluster matching | Hybrid: centroid filter → member verification |
+| Cluster splitting | Graph-weighted hierarchical agglomerative |
+| Scope handles | Stateless signed tokens encoding cluster path |
 
 ---
 
@@ -145,6 +148,174 @@ DEFINE TABLE contains_cluster SCHEMAFULL TYPE RELATION IN cluster OUT cluster;
 
 -- Membership: clusters contain memories
 DEFINE TABLE contains_memory SCHEMAFULL TYPE RELATION IN cluster OUT fact | consolidated;
+```
+
+---
+
+## Recall Algorithm
+
+The `recall` tool implements progressive scoping-in — multi-turn narrowing that mirrors human memory retrieval.
+
+### Cluster Matching: Hybrid Centroid → Member Verification
+
+Two-phase matching balances speed and accuracy:
+
+1. **Centroid filter (fast):** Embed the query, compare against all cluster centroids at the target level. Take top ~10 candidates by cosine similarity.
+2. **Member verification (precise):** Within each candidate cluster, find the 3–5 best-matching individual memories by vector search. Rank clusters by `best_member_similarity × cluster_heat`.
+
+This avoids the "mushy centroid" problem — where a cluster's average embedding doesn't match any specific query well — while keeping the search space manageable.
+
+### First Call: Broad Recall (no scope_handle)
+
+```text
+Agent calls: recall("something about auth tokens")
+
+1. Embed the query → query_vec
+2. Centroid filter: top ~10 clusters by cosine similarity
+3. Member verification: best 3-5 memories per candidate cluster
+4. Rank clusters by: best_member_similarity × cluster_heat
+5. Return top clusters with:
+   - label ("Authentication & OAuth")
+   - heat score
+   - 2-3 representative memories (best-matching ones)
+   - scope_handle: signed token encoding { cluster_id, depth: 0 }
+   - sub-cluster previews if they exist (labels + heat)
+```
+
+### Subsequent Calls: Narrowing (with scope_handle)
+
+```text
+Agent calls: recall("refresh token expiry", scope_handle: "...")
+
+1. Decode handle → { cluster_id: cluster:auth, depth: 0 }
+2. Search WITHIN cluster:auth only:
+   - If sub-clusters exist: repeat centroid filter → member
+     verify flow against sub-clusters of cluster:auth
+   - If no sub-clusters (leaf): vector search against individual
+     memories within this cluster
+3. Return:
+   - Sub-clusters with previews + new scope_handles (depth: 1), OR
+   - Individual memories ranked by similarity × heat
+   - Each memory includes its lineage chain for drill-down
+```
+
+Each subsequent call goes deeper. Eventually you hit leaf clusters and get individual memories.
+
+### Scope Handle Structure
+
+Scope handles are **stateless** — signed, base64-encoded tokens. The server holds no session state.
+
+```rust
+struct ScopeHandle {
+    cluster_id: Thing,         // which cluster we're scoped into
+    depth: u32,                // how many levels deep
+    query_embedding: Vec<f32>, // original query for continuity
+    issued_at: u64,            // timestamp for optional expiry
+}
+```
+
+The `query_embedding` is carried forward so subsequent calls can blend the original context with the new query — the agent's recall builds on itself rather than starting fresh each pass.
+
+---
+
+## Cluster Lifecycle
+
+Clusters are living structures — they form, split, merge, and re-label as the memory space evolves. All lifecycle operations are **background maintenance** and never block MCP requests.
+
+### Formation
+
+When a new fact arrives with an embedding:
+
+```text
+New fact embedded
+       │
+       ▼
+  Compare against all cluster centroids
+  at the deepest applicable level
+       │
+       ├── Similarity > JOIN_THRESHOLD (e.g. 0.75)
+       │   → Add to best-matching cluster
+       │   → Recompute centroid (running average)
+       │   → Create contains_memory edge
+       │
+       └── No cluster above threshold
+           → Create new single-member cluster
+           → Centroid = the fact's embedding
+           → Label auto-generated (LLM summarizes content)
+```
+
+Centroid update is O(1) — no need to re-embed all members:
+
+```rust
+// O(1) centroid update
+new_centroid = (old_centroid * member_count + new_embedding) / (member_count + 1)
+```
+
+### Splitting
+
+Triggered by **cohesion monitoring**: when the average similarity of members to the centroid drops below a threshold, the cluster is too diffuse and should split.
+
+**Method: Graph-weighted hierarchical agglomerative clustering.**
+
+Run hierarchical agglomerative clustering on member embeddings, but adjust the distance metric with graph edges:
+
+- Members with `relates_to` or `supports` edges get a **similarity bonus** (pull together)
+- Members with `contradicts` edges get a **similarity penalty** (push apart)
+
+This works gracefully across the system's maturity:
+
+- **Sparse graph (early):** Falls back to pure embedding-based clustering
+- **Dense graph (mature):** Splits along semantic relationship boundaries, producing more meaningful sub-clusters
+
+### Merging
+
+Two sibling clusters (same parent) should merge when they've converged:
+
+```text
+Periodic maintenance check:
+  For each pair of sibling clusters:
+    If centroid_similarity > MERGE_THRESHOLD (e.g. 0.9):
+      → Merge into one cluster
+      → Recompute centroid from all members
+      → Re-generate label
+      → Update contains_memory / contains_cluster edges
+      → Check cohesion of merged result (split again if too diffuse)
+```
+
+Merging only considers siblings — never across the hierarchy.
+
+### Label Generation
+
+Every cluster gets an auto-generated human-readable label. Labels are critical because:
+
+- The `recall` response shows labels to agents for scoping decisions
+- Labels make the system inspectable and debuggable
+
+Generated by sending the top 5–10 representative members to an LLM: *"Summarize what these memories have in common in 2–5 words."*
+
+Labels regenerate on split, merge, or when membership changes significantly (>30% new members since last label).
+
+### Lifecycle Summary
+
+```text
+                    ┌──────────┐
+    new fact ──────►│  Assign  │ join existing or create new
+                    └────┬─────┘
+                         │
+              ┌──────────▼──────────┐
+              │  Cohesion Monitor   │ periodic background check
+              └──┬──────────────┬───┘
+                 │              │
+          low cohesion    high similarity
+                 │         between siblings
+                 ▼              ▼
+           ┌─────────┐   ┌─────────┐
+           │  Split   │   │  Merge  │
+           └─────────┘   └─────────┘
+                 │              │
+                 └──────┬───────┘
+                        ▼
+                  Re-label affected clusters
 ```
 
 ---
@@ -452,3 +623,6 @@ SurrealDB Instance
 - **Agent-centric provenance:** Each agent instance with its own memory, tagged with user interaction provenance
 - **Cross-org federation:** Shared knowledge bases across organizations
 - **SurrealDB fallback:** Postgres migration path if SurrealDB hits production blockers
+- **Cluster thresholds:** Tuning JOIN_THRESHOLD, MERGE_THRESHOLD, and cohesion floor — likely needs to be adaptive or per-org
+- **Label staleness:** How aggressively to regenerate cluster labels as membership shifts
+- **Scope handle expiry:** Whether to enforce TTL on scope handles or let them be indefinitely valid
