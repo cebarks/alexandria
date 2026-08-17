@@ -61,4 +61,21 @@ impl<'a> HeatRepo<'a> {
             .check()?;
         Ok(())
     }
+
+    /// Add heat to a memory's heat_state (for spreading activation).
+    /// Only increases heat — does NOT touch stability or access_count.
+    pub async fn add_heat(&self, memory_id: &str, heat_delta: f64) -> Result<()> {
+        self.db
+            .query(
+                "UPDATE heat_state SET \
+                 heat = heat + $delta, \
+                 last_touched = time::now() \
+                 WHERE memory = type::record($memory_id)",
+            )
+            .bind(("memory_id", memory_id.to_string()))
+            .bind(("delta", heat_delta))
+            .await?
+            .check()?;
+        Ok(())
+    }
 }
