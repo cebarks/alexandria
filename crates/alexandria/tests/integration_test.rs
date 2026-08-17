@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use alexandria_mcp::AlexandriaServer;
-use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
+use alexandria_pipeline::embedding::CandleProvider;
 use alexandria_storage::repos::MemoryRepo;
 use alexandria_storage::{schema, Database};
 
