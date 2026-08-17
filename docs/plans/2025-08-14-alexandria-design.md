@@ -15,7 +15,8 @@ Alexandria is a multi-user agent memory MCP server written in Rust, backed by Su
 | Database | SurrealDB 3.0 (embedded SurrealKV to start) |
 | Protocol | MCP server |
 | Memory tiers | raw → fact → consolidated → graph edges |
-| Temperature | Heat float + spreading activation + hierarchical clusters |
+| Temperature | Ebbinghaus-inspired heat + stability, separate heat_state table |
+| Heat storage | Dedicated heat_state table, on-demand columnar layout for SIMD |
 | Recall model | Progressive scoping-in via cluster hierarchy + scope handles |
 | Provenance | Structured records with agent/session/model context |
 | Lineage | Full chain via SurrealDB relations across tiers |
@@ -70,8 +71,6 @@ DEFINE TABLE raw SCHEMAFULL;
 DEFINE FIELD content      ON raw TYPE string;
 DEFINE FIELD provenance   ON raw TYPE record<provenance>;
 DEFINE FIELD created_at   ON raw TYPE datetime DEFAULT time::now();
-DEFINE FIELD heat         ON raw TYPE float DEFAULT 1.0;
-DEFINE FIELD last_touched ON raw TYPE datetime DEFAULT time::now();
 DEFINE FIELD metadata     ON raw TYPE option<object>;
 
 -- Tier 1: Extracted facts — discrete claims with embeddings
@@ -82,8 +81,6 @@ DEFINE FIELD embedding    ON fact TYPE array<float>;
 DEFINE FIELD tags         ON fact TYPE array<string> DEFAULT [];
 DEFINE FIELD provenance   ON fact TYPE record<provenance>;
 DEFINE FIELD created_at   ON fact TYPE datetime DEFAULT time::now();
-DEFINE FIELD heat         ON fact TYPE float DEFAULT 1.0;
-DEFINE FIELD last_touched ON fact TYPE datetime DEFAULT time::now();
 DEFINE FIELD metadata     ON fact TYPE option<object>;
 
 -- Tier 2: Consolidated — merged/deduped facts, higher confidence
@@ -94,9 +91,18 @@ DEFINE FIELD embedding    ON consolidated TYPE array<float>;
 DEFINE FIELD tags         ON consolidated TYPE array<string> DEFAULT [];
 DEFINE FIELD provenance   ON consolidated TYPE record<provenance>;
 DEFINE FIELD created_at   ON consolidated TYPE datetime DEFAULT time::now();
-DEFINE FIELD heat         ON consolidated TYPE float DEFAULT 1.0;
-DEFINE FIELD last_touched ON consolidated TYPE datetime DEFAULT time::now();
+
+-- Heat state — separate table, linked to any memory record
+-- See "Heat & Temperature Model" section for full design
+DEFINE TABLE heat_state SCHEMAFULL;
+DEFINE FIELD memory       ON heat_state TYPE record;  -- fact | consolidated | raw
+DEFINE FIELD heat         ON heat_state TYPE float DEFAULT 1.0;
+DEFINE FIELD stability    ON heat_state TYPE float DEFAULT 1.0;
+DEFINE FIELD last_touched ON heat_state TYPE datetime DEFAULT time::now();
+DEFINE FIELD access_count ON heat_state TYPE int DEFAULT 0;
 ```
+
+Heat and temperature fields are **not stored on memory records**. They live in the dedicated `heat_state` table for performance — see the Heat & Temperature Model section for rationale.
 
 ### Provenance
 
@@ -139,9 +145,9 @@ Memories self-organize into hierarchical clusters based on embedding similarity.
 DEFINE TABLE cluster SCHEMAFULL;
 DEFINE FIELD label      ON cluster TYPE option<string>;  -- auto-generated summary label
 DEFINE FIELD centroid   ON cluster TYPE array<float>;     -- average embedding of members
-DEFINE FIELD heat       ON cluster TYPE float DEFAULT 0.0;
 DEFINE FIELD depth      ON cluster TYPE int DEFAULT 0;    -- nesting level
 DEFINE FIELD created_at ON cluster TYPE datetime DEFAULT time::now();
+-- No heat field — cluster heat is derived from members at query time
 
 -- Hierarchy: clusters contain sub-clusters
 DEFINE TABLE contains_cluster SCHEMAFULL TYPE RELATION IN cluster OUT cluster;
@@ -322,49 +328,179 @@ Labels regenerate on split, merge, or when membership changes significantly (>30
 
 ## Heat & Temperature Model
 
-Temperature is driven by a `heat` float on every memory and cluster, combined with spreading activation through graph edges. No arbitrary thresholds — temperature is relative rank within scope.
+Inspired by the Ebbinghaus forgetting curve and spaced repetition research. Two core values per memory: **heat** (current temperature, decays over time) and **stability** (durability, grows with well-spaced access).
 
-### Hierarchical Heat
+### Design Principle: Separate Storage for Performance
 
+Heat state lives in its own `heat_state` SurrealDB table, **not on memory records**. This solves three scaling problems:
+
+- **Cache locality:** Heat records are tiny and uniform — no variable-length content or embeddings interleaved. SurrealDB can scan them efficiently.
+- **SIMD-friendly computation:** At query time, heat values are fetched and loaded into a transient struct-of-arrays (contiguous `f32` arrays) for bulk computation. The compiler can auto-vectorize these loops.
+- **Write isolation:** Heat updates don't touch content records. Spreading activation writes are batched into single DB round-trips.
+
+### Heat State Schema
+
+```surql
+DEFINE TABLE heat_state SCHEMAFULL;
+DEFINE FIELD memory       ON heat_state TYPE record;  -- links to fact | consolidated | raw
+DEFINE FIELD heat         ON heat_state TYPE float DEFAULT 1.0;
+DEFINE FIELD stability    ON heat_state TYPE float DEFAULT 1.0;
+DEFINE FIELD last_touched ON heat_state TYPE datetime DEFAULT time::now();
+DEFINE FIELD access_count ON heat_state TYPE int DEFAULT 0;
 ```
-Cluster: "Authentication"          ← heat: 8.2
-├── Cluster: "OAuth"               ← heat: 6.1
-│   ├── fact: "tokens expire 7d"        heat: 4.0
-│   ├── fact: "refresh via /token"      heat: 3.2
-│   └── fact: "PKCE for public clients" heat: 1.5
-├── Cluster: "Session mgmt"        ← heat: 2.3
-│   └── ...
+
+### Ebbinghaus Decay Model
+
+Each memory decays exponentially, but the rate is governed by its stability. Higher stability = slower decay. Stability grows with well-spaced access — mimicking how human memories strengthen through spaced repetition.
+
+```rust
+fn on_access(state: &mut HeatState, now: u64, spacing_halflife: f32) {
+    let elapsed = (now - state.last_touched) as f32;
+
+    // 1. Apply decay since last touch
+    //    Higher stability → slower decay rate
+    let decay_rate = 1.0 / state.stability;
+    state.heat *= (-decay_rate * elapsed).exp();
+
+    // 2. Bump heat
+    state.heat += 1.0;
+
+    // 3. Strengthen stability — spacing-aware
+    //    spacing_factor: 0 for instant re-access, approaches 1.0 for well-spaced access
+    let spacing_factor = 1.0 - (-elapsed / spacing_halflife).exp();
+    //    count_diminish: sub-linear, first accesses matter most
+    let count_diminish = 1.0 / (1.0 + (state.access_count as f32).ln());
+    state.stability += spacing_factor * count_diminish;
+
+    state.access_count += 1;
+    state.last_touched = now;
+}
 ```
 
-- Clusters carry their own heat — a memory can be cold individually but its cluster stays warm because siblings are active.
-- "Hot" is relative rank within a scope, not an absolute number.
+**How it behaves:**
+
+| Scenario | heat | stability | behavior |
+| --- | --- | --- | --- |
+| Brand new memory | 1.0 | 1.0 | Decays fast if never touched again |
+| Burst: 10 accesses in 1 hour | ~10.0 | ~1.05 | Hot now, but stability barely moved. Fades fast once burst stops |
+| Steady: accessed weekly for 2 months | ~3.0 | ~4.5 | Moderate heat, high stability. Fades very slowly |
+| Foundational: accessed regularly over 6+ months | ~2.0 | ~8.0 | May not be "hot" right now, but nearly permanent |
+| Imported fact, never accessed after | 1.0 | 1.0 | Starts warm (import heat boost), fades like any other if unused |
+
+### Initial Heat by Source
+
+```rust
+fn initial_heat(source: &Source) -> f32 {
+    match source {
+        Source::Import       => 2.0,  // user explicitly provided — starts warm
+        Source::Conversation => 1.0,  // normal starting point
+        Source::Enrichment   => 0.5,  // system-generated, prove your value
+    }
+}
+```
+
+Stability always starts at 1.0 regardless of source.
+
+### Lazy Computation
+
+Decay is **never applied in the background.** It is computed lazily:
+
+- **On access:** The `on_access` function applies decay and writes the update.
+- **On query:** A read-only projection computes current heat without writing:
+
+```rust
+/// Read-only: what would the heat be right now? (no side effects)
+fn projected_heat(state: &HeatState, now: u64) -> f32 {
+    let elapsed = (now - state.last_touched) as f32;
+    let decay_rate = 1.0 / state.stability;
+    state.heat * (-decay_rate * elapsed).exp()
+}
+```
+
+Queries use `projected_heat` for sorting. Only actual accesses trigger writes.
+
+### On-Demand Columnar Layout for Queries
+
+When a query needs heat-based ranking, heat values are fetched from the `heat_state` table and loaded into a transient struct-of-arrays:
+
+```rust
+/// Transient columnar layout — allocated per query, dropped after
+struct HeatColumns {
+    heat: Vec<f32>,
+    stability: Vec<f32>,
+    last_touched: Vec<u64>,
+}
+
+impl HeatColumns {
+    /// SIMD-friendly: contiguous same-type arrays, same operation per element
+    fn projected_heat_bulk(&self, now: u64) -> Vec<f32> {
+        self.heat.iter()
+            .zip(&self.stability)
+            .zip(&self.last_touched)
+            .map(|((h, s), t)| {
+                let elapsed = (now - t) as f32;
+                h * (-elapsed / s).exp()
+            })
+            .collect()
+    }
+}
+```
+
+Vector search narrows candidates first (typically 30–100 records), so columnar math runs on small N. For larger bulk operations (admin dashboards, cold maintenance), the same pattern works in batches.
 
 ### Spreading Activation
 
-When a memory is accessed:
+When a memory is accessed, a fraction of the heat bump propagates along graph edges (`relates_to`, `supports`, `derived_from`), diminishing per hop. Parent clusters are warmed because cluster heat is derived from members.
 
-1. It gets a heat bump.
-2. A fraction propagates along graph edges (`relates_to`, `supports`, `derived_from`), diminishing per hop.
-3. Parent clusters absorb heat from their members.
-
-Accessing "refresh tokens expire in 7 days" warms up "PKCE for public clients" (sibling) and the "Authentication" cluster as a whole — like how recalling one detail makes related details more accessible.
+Critically: **activation adds heat but does NOT increase stability.** Only direct access strengthens durability — second-hand activation warms you up temporarily but doesn't make you more durable.
 
 ```rust
 struct ActivationConfig {
     direct_bump: f32,         // heat added to accessed memory (default 1.0)
     propagation_factor: f32,  // fraction passed per hop (default 0.3)
     max_hops: u32,            // activation radius (default 2)
-    cluster_absorb: f32,      // fraction parent cluster absorbs (default 0.5)
 }
 ```
 
-Activation writes are **batched and async** — the recall query returns immediately, activation propagates in the background so reads aren't blocked by graph walks.
+Activation writes are **batched into a single SurrealDB round-trip** per propagation event:
 
-### Open Questions
+```rust
+async fn propagate_activation(
+    db: &Surreal,
+    neighbors: &[(Thing, f32)], // (memory_id, propagated_heat)
+    now: u64,
+) {
+    // Single batched update — one DB round-trip for all neighbors
+    db.query("
+        FOR $item IN $neighbors {
+            UPDATE heat_state SET
+                heat = (heat * math::exp(-((($now - last_touched) / stability))))
+                       + $item.propagated_heat,
+                last_touched = $now
+                -- NO stability or access_count change
+            WHERE memory = $item.id
+        }
+    ").await;
+}
+```
 
-- Exact decay model (half-life vs. other curves) — needs experimentation
-- Whether decay should be lazy (computed on access) or periodic (background sweep)
-- Tuning activation parameters per org or globally
+### Cluster Heat
+
+Cluster heat is **derived from members at query time**, not stored independently. This avoids stale cluster heat values and eliminates cluster-level write amplification:
+
+```rust
+fn cluster_heat(member_heats: &[f32]) -> f32 {
+    let max = member_heats.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let avg = member_heats.iter().sum::<f32>() / member_heats.len() as f32;
+    // Max ensures a single hot memory keeps the cluster findable
+    // Average reflects overall cluster activity
+    0.6 * max + 0.4 * avg
+}
+```
+
+### No Thresholds in the API
+
+MCP tools return **raw heat scores**. There are no hot/warm/cold labels in API responses — agents sort and rank by heat as a continuous value. The admin/observability layer computes percentile-based labels for dashboards and metrics only
 
 ---
 
@@ -617,8 +753,8 @@ SurrealDB Instance
 
 ## Open Questions & Future Work
 
-- **Heat decay model:** Exact decay curve and whether lazy vs. periodic — needs experimentation
-- **Activation tuning:** Per-org or global activation parameters
+- **Activation tuning:** Per-org or global activation parameters — needs experimentation
+- **Spacing halflife tuning:** The `spacing_halflife` parameter controls how quickly spaced access strengthens stability — likely needs per-org configuration
 - **Cascade deletes:** Soft-delete cascade through lineage chain — needs careful design
 - **Agent-centric provenance:** Each agent instance with its own memory, tagged with user interaction provenance
 - **Cross-org federation:** Shared knowledge bases across organizations
@@ -626,3 +762,5 @@ SurrealDB Instance
 - **Cluster thresholds:** Tuning JOIN_THRESHOLD, MERGE_THRESHOLD, and cohesion floor — likely needs to be adaptive or per-org
 - **Label staleness:** How aggressively to regenerate cluster labels as membership shifts
 - **Scope handle expiry:** Whether to enforce TTL on scope handles or let them be indefinitely valid
+- **Cluster heat caching:** Whether to cache derived cluster heat values with a TTL to avoid recomputation on every query
+- **Heat bulk maintenance:** Strategy for periodic bulk-sweep of very old records that haven't been touched (and therefore never had decay applied lazily)
