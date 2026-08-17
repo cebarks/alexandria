@@ -1,1 +1,4 @@
-// Alexandria Storage — SurrealDB connection, models, and repositories
+mod connection;
+pub mod schema;
+
+pub use connection::Database;
