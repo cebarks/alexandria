@@ -113,6 +113,7 @@ dependencies = [
  "alexandria-storage",
  "anyhow",
  "async-trait",
+ "axum",
  "chrono",
  "rmcp",
  "schemars",
@@ -121,6 +122,7 @@ dependencies = [
  "surrealdb",
  "thiserror 2.0.20",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]
