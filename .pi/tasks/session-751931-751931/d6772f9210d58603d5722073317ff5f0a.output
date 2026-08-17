@@ -1,0 +1,12 @@
+Warning: No project session found with id 'delegate-3098a9e4d87f7f40a01034ea0e618863'; creating a new session with that id.
+Warning: No models match pattern "vertex/claude-sonnet-5:high"
+Warning: No models match pattern "vertex/claude-opus-4-8:high"
+Warning: No models match pattern "vertex/claude-opus-4-6:high"
+Warning: No models match pattern "vertex/claude-sonnet-4-6:high"
+Warning: No models match pattern "vertex/claude-opus-4-5:off"
+Warning: No models match pattern "vertex/claude-sonnet-4-5:off"
+Warning: No models match pattern "vertex/claude-sonnet-4:off"
+Warning: No models match pattern "vertex/claude-haiku-4-5:off"
+Warning: No models match pattern "vertex/gemini-2.5-pro"
+Warning: No models match pattern "vertex/gemini-3.5-flash"
+Error: Unknown provider "vertex". Use --list-models to see available providers/models.

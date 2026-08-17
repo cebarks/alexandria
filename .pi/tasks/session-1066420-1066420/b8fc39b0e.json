@@ -1,0 +1,19 @@
+{
+  "id": "b8fc39b0e",
+  "name": "release build",
+  "command": "cd /home/anten/code/alexandria && cargo build --release 2>&1",
+  "status": "killed",
+  "outputPath": ".pi/tasks/session-1066420-1066420/b8fc39b0e.output",
+  "cwd": "/home/anten/code/alexandria",
+  "startTime": 1786964697392,
+  "endTime": 1786964805153,
+  "exitCode": null,
+  "signal": "SIGTERM",
+  "pid": 640889,
+  "bytesWritten": 14450,
+  "isAgent": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600
+}

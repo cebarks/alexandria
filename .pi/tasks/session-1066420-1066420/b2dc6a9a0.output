@@ -1,0 +1,22 @@
+  Installing alexandria v0.1.0 (/home/anten/code/alexandria/crates/alexandria)
+    Updating crates.io index
+     Locking 619 packages to latest compatible versions
+      Adding base64 v0.22.1 (available: v0.23.1)
+      Adding generic-array v0.14.7 (available: v0.14.9)
+      Adding hf-hub v0.5.0 (available: v1.0.0)
+      Adding i_float v1.15.0 (available: v1.16.0)
+      Adding i_overlay v4.0.7 (available: v4.5.2)
+      Adding i_shape v1.14.0 (available: v1.18.0)
+      Adding matchit v0.8.4 (available: v0.8.6)
+      Adding pdqselect v0.1.0 (available: v0.1.1)
+      Adding tokenizers v0.22.2 (available: v0.23.1)
+   Compiling surrealdb-core v3.2.4
+   Compiling surrealdb v3.2.4
+   Compiling alexandria-storage v0.1.0 (/home/anten/code/alexandria/crates/alexandria-storage)
+   Compiling alexandria-engine v0.1.0 (/home/anten/code/alexandria/crates/alexandria-engine)
+   Compiling alexandria-pipeline v0.1.0 (/home/anten/code/alexandria/crates/alexandria-pipeline)
+   Compiling alexandria-mcp v0.1.0 (/home/anten/code/alexandria/crates/alexandria-mcp)
+   Compiling alexandria v0.1.0 (/home/anten/code/alexandria/crates/alexandria)
+    Finished `release` profile [optimized] target(s) in 1m 57s
+  Installing /home/anten/.cargo/bin/alexandria
+   Installed package `alexandria v0.1.0 (/home/anten/code/alexandria/crates/alexandria)` (executable `alexandria`)

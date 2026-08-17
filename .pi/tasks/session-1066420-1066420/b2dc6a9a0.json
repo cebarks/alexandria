@@ -1,0 +1,19 @@
+{
+  "id": "b2dc6a9a0",
+  "name": "cargo install alexandria",
+  "command": "cd /home/anten/code/alexandria && cargo install --path crates/alexandria 2>&1",
+  "status": "completed",
+  "outputPath": ".pi/tasks/session-1066420-1066420/b2dc6a9a0.output",
+  "cwd": "/home/anten/code/alexandria",
+  "startTime": 1786964808971,
+  "endTime": 1786964926667,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 662354,
+  "bytesWritten": 1358,
+  "isAgent": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600
+}
