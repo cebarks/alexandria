@@ -29,6 +29,9 @@ Alexandria is a multi-user agent memory MCP server written in Rust, backed by Su
 | Cluster splitting | Graph-weighted hierarchical agglomerative |
 | Scope handles | Stateless signed tokens encoding cluster path |
 | MCP SDK | rmcp 3.1 (official Rust MCP SDK) |
+| Embedding runtime | Candle (pure Rust), pluggable provider trait |
+| Default embedding | Local via candle, model-agnostic (user configures) |
+| Model migration | Explicit admin command, server refuses to start on mismatch |
 | Project structure | Cargo workspace, 5 crates |
 
 ---
@@ -687,6 +690,136 @@ Each stage independently retryable with exponential backoff. Failed records ente
 
 ---
 
+## Embedding Strategy
+
+Pluggable embedding providers with a local-first default using candle (pure Rust, no C++ dependencies). Model-agnostic — users configure their preferred model.
+
+### Provider Trait
+
+```rust
+#[async_trait]
+pub trait EmbeddingProvider: Send + Sync {
+    /// Embed a batch of texts, return one vector per input
+    async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+
+    /// Dimensionality of the vectors this provider produces
+    fn dimensions(&self) -> usize;
+
+    /// Model identifier for tracking which model produced an embedding
+    fn model_id(&self) -> &str;
+}
+```
+
+### Local Provider: Candle
+
+Pure Rust inference via HuggingFace's `candle` crate. Loads safetensors models, tokenization via the `tokenizers` crate.
+
+```rust
+pub struct CandleProvider {
+    model: BertModel,           // or other architecture
+    tokenizer: Tokenizer,
+    dimensions: usize,
+    model_id: String,
+    device: Device,             // Cpu, Cuda(0), Metal
+    max_batch_size: usize,
+}
+```
+
+- **Model loading:** Downloads from HuggingFace Hub on first use, cached locally (`~/.cache/alexandria/models/`)
+- **Architecture support:** Starts with BERT-family models (covers MiniLM, BGE, etc.). Other architectures added as needed.
+- **Device selection:** CPU by default. CUDA/Metal enabled via cargo feature flags (`candle-cuda`, `candle-metal`).
+- **No baked-in default model:** User configures the model in `alexandria.toml`. If unconfigured, the server refuses to start with a clear error.
+
+### API Provider: OpenAI
+
+For users who prefer hosted embeddings.
+
+```rust
+pub struct OpenAIProvider {
+    client: reqwest::Client,
+    api_key: String,
+    model: String,              // e.g. "text-embedding-3-small"
+    dimensions: usize,
+    max_batch_size: usize,      // API limit: 2048 per call
+}
+```
+
+### Dimensionality Tracking
+
+Every tenant stores its embedding model metadata:
+
+```surql
+DEFINE TABLE embedding_config SCHEMAFULL;
+DEFINE FIELD model_id    ON embedding_config TYPE string;
+DEFINE FIELD dimensions  ON embedding_config TYPE int;
+DEFINE FIELD updated_at  ON embedding_config TYPE datetime DEFAULT time::now();
+```
+
+On startup, the server checks that the configured model's dimensionality matches the tenant's stored config. If they differ, the server refuses to start.
+
+### Model Migration
+
+Model changes require an **explicit admin command**. The server will not silently degrade or mix embedding spaces.
+
+```text
+Startup check:
+  configured model ≠ stored model?
+    → ERROR: "Embedding model mismatch. Configured: X, stored: Y.
+       Run `alexandria migrate-embeddings` to re-embed all records."
+    → Server does not start.
+```
+
+The migration command:
+
+```bash
+# Re-embed everything with the new model
+alexandria migrate-embeddings --config alexandria.toml
+```
+
+1. Loads the new model
+2. Re-embeds all fact + consolidated records in batches, showing progress
+3. Recomputes all cluster centroids
+4. Updates `embedding_config` with the new model_id + dimensions
+5. Can be interrupted and resumed (tracks which records have been re-embedded)
+
+Only after migration completes successfully will the server start with the new model config.
+
+### Batching
+
+```rust
+pub struct BatchConfig {
+    max_batch_size: usize,    // max texts per embed() call
+    max_concurrent: usize,    // parallel batches (API: respect rate limits)
+    retry_on_failure: bool,   // retry individual failures within a batch
+}
+```
+
+The pipeline's embed stage groups pending facts into batches up to `max_batch_size`, sends them through the provider, and writes results back.
+
+### Crate Dependencies
+
+```toml
+# crates/alexandria-pipeline/Cargo.toml
+[dependencies]
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+tokenizers = { version = "0.22", optional = true }
+hf-hub = { version = "0.5", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+
+[features]
+default = ["local"]
+local = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
+openai = ["reqwest"]
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal"]
+```
+
+Feature-gated: `local` is default (candle, no network dependency for inference). `openai` pulls in reqwest. GPU acceleration via `cuda`/`metal` features.
+
+---
+
 ## Multi-Tenancy & Isolation
 
 SurrealDB's namespace/database hierarchy maps directly to org/user isolation.
@@ -876,9 +1009,10 @@ crates/alexandria-pipeline/src/
 ├── priority.rs          -- Priority enum, queue implementation
 └── embedding/
     ├── mod.rs
-    ├── client.rs         -- trait + implementations for embedding providers
-    ├── openai.rs         -- OpenAI embedding client
-    └── local.rs          -- local model embedding client (future)
+    ├── provider.rs       -- EmbeddingProvider trait
+    ├── candle.rs         -- local candle-based provider (default)
+    ├── openai.rs         -- OpenAI API provider (feature-gated)
+    └── migration.rs      -- re-embedding on model change
 ```
 
 ### Crate: `alexandria-mcp`
@@ -927,10 +1061,11 @@ port = 3000                  # if http
 endpoint = "memory"          # "memory" (embedded SurrealKV) | "ws://host:port"
 
 [embedding]
-provider = "openai"
-model = "text-embedding-3-small"
-api_key_env = "OPENAI_API_KEY"
-batch_size = 100
+provider = "local"                   # "local" (candle) | "openai"
+model = "sentence-transformers/all-MiniLM-L6-v2"  # any HF model or OpenAI model
+device = "cpu"                       # "cpu" | "cuda" | "metal" (local only)
+api_key_env = "OPENAI_API_KEY"       # openai only
+max_batch_size = 64
 
 [heat]
 spacing_halflife_secs = 86400   # 1 day
@@ -1024,3 +1159,5 @@ alexandria/
 - **Scope handle expiry:** Whether to enforce TTL on scope handles or let them be indefinitely valid
 - **Cluster heat caching:** Whether to cache derived cluster heat values with a TTL to avoid recomputation on every query
 - **Heat bulk maintenance:** Strategy for periodic bulk-sweep of very old records that haven't been touched (and therefore never had decay applied lazily)
+- **Additional embedding providers:** Cohere, Voyage, Jina, Ollama, or other API/local providers beyond candle + OpenAI
+- **Multi-architecture models:** Support beyond BERT-family in the candle provider (e.g. GTE, E5)
