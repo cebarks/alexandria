@@ -28,6 +28,8 @@ Alexandria is a multi-user agent memory MCP server written in Rust, backed by Su
 | Cluster matching | Hybrid: centroid filter → member verification |
 | Cluster splitting | Graph-weighted hierarchical agglomerative |
 | Scope handles | Stateless signed tokens encoding cluster path |
+| MCP SDK | rmcp 3.1 (official Rust MCP SDK) |
+| Project structure | Cargo workspace, 5 crates |
 
 ---
 
@@ -748,6 +750,264 @@ SurrealDB Instance
 - Hard delete (only path to actual data removal)
 - Cluster health monitoring
 - Per-org/user storage usage
+
+---
+
+## Project Structure
+
+Cargo workspace with 5 crates. Dependency graph has no cycles: storage is the leaf, engine builds on storage, MCP and pipeline depend on engine + storage, the binary wires everything together.
+
+### Dependency Graph
+
+```text
+alexandria (binary)
+  └── alexandria-mcp
+        ├── alexandria-engine
+        │     └── alexandria-storage
+        └── alexandria-pipeline
+              ├── alexandria-engine
+              └── alexandria-storage
+```
+
+### Workspace Dependencies
+
+```toml
+# Cargo.toml (workspace root)
+[workspace]
+resolver = "2"
+members = [
+    "crates/alexandria",
+    "crates/alexandria-engine",
+    "crates/alexandria-storage",
+    "crates/alexandria-pipeline",
+    "crates/alexandria-mcp",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+surrealdb = "3.2"
+rmcp = { version = "3.1", features = ["server"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+```
+
+### Crate: `alexandria-storage`
+
+Leaf crate. SurrealDB connection management, data models, repository pattern.
+
+```text
+crates/alexandria-storage/src/
+├── lib.rs
+├── connection.rs        -- SurrealDB connection pool, multi-tenant session cloning
+├── schema.rs            -- table definitions, migrations, schema bootstrap
+├── models/
+│   ├── mod.rs
+│   ├── memory.rs        -- RawRecord, Fact, Consolidated
+│   ├── provenance.rs    -- Provenance
+│   ├── cluster.rs       -- Cluster
+│   ├── heat.rs          -- HeatState
+│   └── relations.rs     -- edge types: ExtractedFrom, MergedFrom, RelatesTo, etc.
+├── repos/
+│   ├── mod.rs
+│   ├── memory_repo.rs   -- CRUD for raw/fact/consolidated records
+│   ├── cluster_repo.rs  -- cluster CRUD, membership, centroid queries
+│   ├── heat_repo.rs     -- heat_state batch reads/writes
+│   ├── graph_repo.rs    -- relation edge CRUD, traversal queries
+│   └── provenance_repo.rs
+└── tenant.rs            -- namespace/database scoping from auth context
+```
+
+### Crate: `alexandria-engine`
+
+Core logic. Recall algorithm, heat computation, cluster lifecycle. Pure logic — calls into storage, no direct I/O.
+
+```text
+crates/alexandria-engine/src/
+├── lib.rs
+├── recall/
+│   ├── mod.rs
+│   ├── algorithm.rs     -- multi-turn scoping-in: centroid filter → member verify
+│   ├── scope_handle.rs  -- encode/decode/sign stateless scope tokens
+│   └── ranking.rs       -- similarity × heat blending, result ordering
+├── heat/
+│   ├── mod.rs
+│   ├── decay.rs         -- Ebbinghaus decay model, projected_heat, on_access
+│   ├── activation.rs    -- spreading activation, neighbor propagation
+│   └── columns.rs       -- HeatColumns: transient struct-of-arrays for SIMD bulk compute
+├── cluster/
+│   ├── mod.rs
+│   ├── assignment.rs    -- assign new facts to clusters (join or create)
+│   ├── splitting.rs     -- cohesion monitoring, graph-weighted agglomerative split
+│   ├── merging.rs       -- sibling merge detection and execution
+│   └── labeling.rs      -- LLM-based label generation
+├── import/
+│   ├── mod.rs
+│   ├── chunking.rs      -- heading/paragraph/fixed_size strategies
+│   └── ingest.rs        -- document → fact records with provenance
+└── search/
+    ├── mod.rs
+    ├── semantic.rs       -- vector similarity search
+    ├── keyword.rs        -- keyword/full-text search
+    └── hybrid.rs         -- blended search with heat ranking
+```
+
+### Crate: `alexandria-pipeline`
+
+Background enrichment. Each stage is an independent async task.
+
+```text
+crates/alexandria-pipeline/src/
+├── lib.rs
+├── runner.rs            -- pipeline orchestrator, priority queue, task spawning
+├── stages/
+│   ├── mod.rs
+│   ├── extract.rs       -- LLM fact extraction from raw records
+│   ├── embed.rs         -- batch embedding generation
+│   ├── cluster.rs       -- cluster assignment (calls engine::cluster)
+│   ├── relate.rs        -- edge discovery: fast similarity pass + LLM verification
+│   └── consolidate.rs   -- periodic dedup/merge into consolidated records
+├── dead_letter.rs       -- failed record tracking, retry logic
+├── priority.rs          -- Priority enum, queue implementation
+└── embedding/
+    ├── mod.rs
+    ├── client.rs         -- trait + implementations for embedding providers
+    ├── openai.rs         -- OpenAI embedding client
+    └── local.rs          -- local model embedding client (future)
+```
+
+### Crate: `alexandria-mcp`
+
+MCP tool definitions and request handlers. Thin layer — validates input, calls engine, formats output.
+
+```text
+crates/alexandria-mcp/src/
+├── lib.rs
+├── server.rs            -- MCP server setup, transport config (stdio/HTTP)
+├── auth.rs              -- extract identity claims from MCP connection → ConnectionScope
+├── tools/
+│   ├── mod.rs
+│   ├── store.rs         -- store_memory handler
+│   ├── retrieve.rs      -- retrieve_memories handler
+│   ├── recall.rs        -- recall handler (scoping-in)
+│   ├── update.rs        -- update_memory handler
+│   ├── delete.rs        -- delete_memory handler (soft-delete)
+│   └── import.rs        -- import_document handler
+├── types/
+│   ├── mod.rs
+│   ├── requests.rs      -- MCP request param structs
+│   └── responses.rs     -- MCP response structs
+└── error.rs             -- MCP error mapping
+```
+
+### Crate: `alexandria` (binary)
+
+Thin entrypoint. Config loading, wiring, startup.
+
+```text
+crates/alexandria/src/
+├── main.rs              -- tokio::main, arg parsing, startup sequence
+└── config.rs            -- config file loading, env var overrides, defaults
+```
+
+### Configuration
+
+```toml
+# alexandria.toml
+[server]
+transport = "stdio"          # "stdio" | "http"
+port = 3000                  # if http
+
+[database]
+endpoint = "memory"          # "memory" (embedded SurrealKV) | "ws://host:port"
+
+[embedding]
+provider = "openai"
+model = "text-embedding-3-small"
+api_key_env = "OPENAI_API_KEY"
+batch_size = 100
+
+[heat]
+spacing_halflife_secs = 86400   # 1 day
+initial_heat_import = 2.0
+initial_heat_conversation = 1.0
+initial_heat_enrichment = 0.5
+
+[activation]
+propagation_factor = 0.3
+max_hops = 2
+
+[cluster]
+join_threshold = 0.75
+merge_threshold = 0.9
+cohesion_floor = 0.6
+
+[pipeline]
+extract_concurrency = 4
+embed_batch_size = 100
+consolidation_interval_secs = 3600
+```
+
+### Full Directory Tree
+
+```text
+alexandria/
+├── Cargo.toml                          # workspace root
+├── Cargo.lock
+├── alexandria.toml                     # runtime config
+├── crates/
+│   ├── alexandria/                     # binary
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs
+│   │       └── config.rs
+│   ├── alexandria-engine/              # core logic
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── recall/
+│   │       ├── heat/
+│   │       ├── cluster/
+│   │       ├── import/
+│   │       └── search/
+│   ├── alexandria-storage/             # SurrealDB layer
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── connection.rs
+│   │       ├── schema.rs
+│   │       ├── tenant.rs
+│   │       ├── models/
+│   │       └── repos/
+│   ├── alexandria-pipeline/            # enrichment
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── runner.rs
+│   │       ├── priority.rs
+│   │       ├── dead_letter.rs
+│   │       ├── stages/
+│   │       └── embedding/
+│   └── alexandria-mcp/                 # MCP interface
+│       ├── Cargo.toml
+│       └── src/
+│           ├── lib.rs
+│           ├── server.rs
+│           ├── auth.rs
+│           ├── error.rs
+│           └── tools/
+├── docs/
+│   └── plans/
+│       └── 2025-08-14-alexandria-design.md
+├── migrations/                         # SurrealDB schema migrations
+└── tests/                              # integration tests
+    └── integration/
+```
 
 ---
 
