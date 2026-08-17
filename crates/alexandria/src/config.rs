@@ -30,6 +30,10 @@ pub struct ServerConfig {
     pub port: u16,
     /// HTTP bind address. Default: 127.0.0.1.
     pub host: String,
+    /// Allowed origins for HTTP CORS. Empty = allow all. Default: ["*"].
+    pub allowed_origins: Vec<String>,
+    /// Allowed hosts for HTTP. Empty = allow all. Default: ["*"].
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -38,6 +42,8 @@ impl Default for ServerConfig {
             transport: "stdio".to_string(),
             port: 3000,
             host: "127.0.0.1".to_string(),
+            allowed_origins: vec!["*".to_string()],
+            allowed_hosts: vec!["*".to_string()],
         }
     }
 }

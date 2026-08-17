@@ -2,7 +2,7 @@ mod config;
 
 use std::sync::Arc;
 
-use alexandria_mcp::AlexandriaServer;
+use alexandria_mcp::{AlexandriaServer, server::record_id_to_string};
 use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
 use alexandria_storage::{Database, schema, system_config};
 use config::Config;
@@ -35,12 +35,17 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Embedding model loaded ({dims} dimensions)");
 
     // 4. Create MCP server
+    let activation_config = alexandria_engine::heat::ActivationConfig {
+        propagation_factor: config.activation.propagation_factor,
+        max_hops: config.activation.max_hops,
+    };
     let server = AlexandriaServer::new(
         Arc::new(db),
         Arc::new(embedding),
         config.cluster.join_threshold,
         config.heat.spacing_halflife_secs,
-    );
+    )
+    .with_activation_config(activation_config);
 
     // 5. Serve based on transport config
     match config.server.transport.as_str() {
@@ -68,11 +73,90 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
     use tokio_util::sync::CancellationToken;
 
     let cancel = CancellationToken::new();
-    let http_config = StreamableHttpServerConfig::default()
+    let mut http_config = StreamableHttpServerConfig::default()
         .with_sse_keep_alive(Some(std::time::Duration::from_secs(15)))
-        .with_cancellation_token(cancel.clone())
-        .disable_allowed_hosts()
-        .disable_allowed_origins();
+        .with_cancellation_token(cancel.clone());
+
+    // Configure host/origin validation from config
+    if config.server.allowed_hosts.iter().any(|h| h == "*") {
+        http_config = http_config.disable_allowed_hosts();
+    } else if !config.server.allowed_hosts.is_empty() {
+        http_config = http_config.with_allowed_hosts(config.server.allowed_hosts.clone());
+    }
+    if config.server.allowed_origins.iter().any(|o| o == "*") {
+        http_config = http_config.disable_allowed_origins();
+    } else if !config.server.allowed_origins.is_empty() {
+        http_config = http_config.with_allowed_origins(config.server.allowed_origins.clone());
+    }
+
+    // Spawn cluster maintenance background task
+    let maintenance_db = server.db.clone();
+    let cohesion_floor = config.cluster.cohesion_floor;
+    let merge_threshold = config.cluster.merge_threshold;
+    let maintenance_cancel = cancel.clone();
+    tokio::spawn(async move {
+        use alexandria_engine::clusters::maintenance::{check_cohesion, check_merge};
+        use alexandria_storage::repos::ClusterRepo;
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {},
+                _ = maintenance_cancel.cancelled() => break,
+            }
+            tracing::debug!("Running cluster maintenance...");
+            let cluster_repo = ClusterRepo::new(maintenance_db.inner());
+
+            // Load all clusters with members for cohesion check
+            let mut response = match maintenance_db.inner()
+                .query("SELECT * FROM cluster")
+                .await {
+                    Ok(r) => r,
+                    Err(e) => { tracing::warn!("Maintenance: {e}"); continue; }
+                };
+            let clusters: Vec<alexandria_storage::models::Cluster> = match response.take(0) {
+                Ok(c) => c,
+                Err(e) => { tracing::warn!("Maintenance: {e}"); continue; }
+            };
+
+            for cluster in &clusters {
+                let cid = cluster.id.as_ref()
+                    .map(record_id_to_string)
+                    .unwrap_or_default();
+                let members = match cluster_repo.get_members(&cid).await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let member_embeddings: Vec<Vec<f32>> = members.iter()
+                    .map(|f| f.embedding.clone()).collect();
+
+                let action = check_cohesion(&cid, &cluster.centroid, &member_embeddings, cohesion_floor);
+                if let alexandria_engine::clusters::maintenance::MaintenanceAction::Split { cluster_id, .. } = action {
+                    tracing::info!("Cluster {cluster_id} needs splitting (below cohesion floor)");
+                    // TODO: execute split — reassign members to two new clusters
+                }
+            }
+
+            // Check pairs for merge
+            let infos: Vec<_> = clusters.iter().map(|c| {
+                let id = c.id.as_ref().map(record_id_to_string).unwrap_or_default();
+                (id, c.centroid.clone())
+            }).collect();
+            for i in 0..infos.len() {
+                for j in (i+1)..infos.len() {
+                    let result = check_merge(
+                        &infos[i].0, &infos[i].1, 0,
+                        &infos[j].0, &infos[j].1, 0,
+                        merge_threshold,
+                    );
+                    if let alexandria_engine::clusters::maintenance::MergeCheck::Merge { keep_id, remove_id, .. } = result {
+                        tracing::info!("Clusters {keep_id} and {remove_id} should merge");
+                        // TODO: execute merge — move members, delete old cluster
+                    }
+                }
+            }
+        }
+    });
 
     let service: StreamableHttpService<AlexandriaServer, LocalSessionManager> =
         StreamableHttpService::new(

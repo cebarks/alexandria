@@ -5,7 +5,7 @@ use rmcp::{tool, tool_router};
 use surrealdb::types::{RecordId, RecordIdKey};
 
 /// Helper to convert RecordId to `table:key` string format for SurrealQL.
-fn record_id_to_string(id: &RecordId) -> String {
+pub fn record_id_to_string(id: &RecordId) -> String {
     let table = id.table.as_str();
     let key = match &id.key {
         RecordIdKey::String(s) => s.clone(),
@@ -17,6 +17,7 @@ fn record_id_to_string(id: &RecordId) -> String {
 }
 
 use alexandria_engine::clusters::{assign_to_cluster, update_centroid, ClusterInfo};
+use alexandria_engine::heat::{compute_activation_targets, ActivationConfig};
 use alexandria_engine::recall::{
     broad_recall, focused_recall, ClusterWithMembers, FactSummary, ScopeHandle,
 };
@@ -36,6 +37,7 @@ pub struct AlexandriaServer {
     pub embedding: Arc<dyn EmbeddingProvider>,
     pub cluster_join_threshold: f32,
     pub heat_spacing_halflife: f64,
+    pub activation_config: ActivationConfig,
 }
 
 impl AlexandriaServer {
@@ -50,7 +52,13 @@ impl AlexandriaServer {
             embedding,
             cluster_join_threshold,
             heat_spacing_halflife,
+            activation_config: ActivationConfig::default(),
         }
+    }
+
+    pub fn with_activation_config(mut self, config: ActivationConfig) -> Self {
+        self.activation_config = config;
+        self
     }
 }
 
@@ -165,31 +173,7 @@ impl AlexandriaServer {
             .check()?;
 
         // 5. Cluster assignment
-        let cluster_repo = ClusterRepo::new(self.db.inner());
-        let clusters = self.load_cluster_infos().await?;
-        let assignment =
-            assign_to_cluster(embedding, &clusters, self.cluster_join_threshold);
-
-        match assignment {
-            alexandria_engine::clusters::ClusterAssignment::Existing(cid) => {
-                cluster_repo.add_member(&cid, &fact_id).await?;
-                // Update centroid
-                let old = clusters.iter().find(|c| c.id == cid).unwrap();
-                let new_centroid =
-                    update_centroid(&old.centroid, embedding, old.member_count);
-                self.db
-                    .inner()
-                    .query("UPDATE type::record($id) SET centroid = $centroid")
-                    .bind(("id", cid.clone()))
-                    .bind(("centroid", new_centroid))
-                    .await?
-                    .check()?;
-            }
-            alexandria_engine::clusters::ClusterAssignment::NewCluster => {
-                let cid = cluster_repo.create(None, embedding).await?;
-                cluster_repo.add_member(&cid, &fact_id).await?;
-            }
-        }
+        self.assign_to_cluster_and_update(embedding, &fact_id).await?;
 
         Ok(fact_id)
     }
@@ -205,7 +189,8 @@ impl AlexandriaServer {
         let new_embedding = if let Some(ref new_content) = params.content {
             if new_content != &existing.content {
                 let vecs = self.embedding.embed(&[new_content.as_str()]).await?;
-                Some(vecs.into_iter().next().unwrap())
+                Some(vecs.into_iter().next()
+                    .ok_or_else(|| anyhow::anyhow!("Embedding returned empty result"))?)
             } else {
                 None
             }
@@ -213,13 +198,24 @@ impl AlexandriaServer {
             None
         };
 
-        // If content changed, create a derived_from edge to preserve lineage
+        // If content changed, store old content hash as lineage marker
         if new_embedding.is_some() {
-            // Store the old version's ID for the edge (we create it after update)
             let edge_repo = EdgeRepo::new(self.db.inner());
-            // The edge points from the updated record to itself (same ID, new version)
-            // Since we update in place, we create a lineage marker
-            edge_repo.create_edge(&params.id, &params.id, "derived_from", 1.0).await.ok();
+            // Store a snapshot of the old content as a new fact, link via derived_from
+            let old_snapshot_id = MemoryRepo::new(self.db.inner())
+                .create_fact(
+                    &existing.content,
+                    existing.confidence,
+                    &existing.embedding,
+                    &existing.tags,
+                )
+                .await?;
+            // Mark snapshot as superseded (soft-delete so it doesn't appear in search)
+            MemoryRepo::new(self.db.inner())
+                .soft_delete_fact(&old_snapshot_id)
+                .await?;
+            // Create lineage edge: current → old snapshot
+            edge_repo.create_edge(&params.id, &old_snapshot_id, "derived_from", 1.0).await.ok();
         }
 
         // Perform the update
@@ -265,10 +261,17 @@ impl AlexandriaServer {
             other => anyhow::bail!("Unknown import mode: {other}"),
         };
 
+        // Create a raw record for the full document (source for extracted_from edges)
+        let raw_id = self.create_raw_record(&params.content).await?;
+
         let repo = MemoryRepo::new(self.db.inner());
-        let cluster_repo = ClusterRepo::new(self.db.inner());
         let heat_repo = HeatRepo::new(self.db.inner());
+        let edge_repo = EdgeRepo::new(self.db.inner());
         let mut created_ids = Vec::new();
+
+        // Add batch_id to tags so chunks can be found together
+        let mut import_tags = tags;
+        import_tags.push(format!("import_batch:{batch_id}"));
 
         for chunk in &chunks {
             // Embed
@@ -276,30 +279,16 @@ impl AlexandriaServer {
             let embedding = &embeddings[0];
 
             // Create fact with import confidence
-            let fact_id = repo.create_fact(chunk, 1.0, embedding, &tags).await?;
+            let fact_id = repo.create_fact(chunk, 1.0, embedding, &import_tags).await?;
 
-            // Heat state
+            // Heat state (imports get higher initial heat)
             heat_repo.create_for_memory(&fact_id, 2.0).await?;
 
+            // Create extracted_from edge: chunk → raw document
+            edge_repo.create_edge(&fact_id, &raw_id, "extracted_from", 1.0).await.ok();
+
             // Cluster assignment
-            let clusters = self.load_cluster_infos().await?;
-            let assignment = assign_to_cluster(embedding, &clusters, self.cluster_join_threshold);
-            match assignment {
-                alexandria_engine::clusters::ClusterAssignment::Existing(cid) => {
-                    cluster_repo.add_member(&cid, &fact_id).await?;
-                    let old = clusters.iter().find(|c| c.id == cid).unwrap();
-                    let new_centroid = update_centroid(&old.centroid, embedding, old.member_count);
-                    self.db.inner()
-                        .query("UPDATE type::record($id) SET centroid = $centroid")
-                        .bind(("id", cid.clone()))
-                        .bind(("centroid", new_centroid))
-                        .await?.check()?;
-                }
-                alexandria_engine::clusters::ClusterAssignment::NewCluster => {
-                    let cid = cluster_repo.create(None, embedding).await?;
-                    cluster_repo.add_member(&cid, &fact_id).await?;
-                }
-            }
+            self.assign_to_cluster_and_update(embedding, &fact_id).await?;
 
             created_ids.push(fact_id);
         }
@@ -309,6 +298,7 @@ impl AlexandriaServer {
             "count": created_ids.len(),
             "ids": created_ids,
             "batch_id": batch_id,
+            "raw_id": raw_id,
         }).to_string())
     }
 
@@ -338,12 +328,17 @@ impl AlexandriaServer {
         let embeddings: Vec<Vec<f32>> = facts.iter().map(|f| f.embedding.clone()).collect();
         let ranked = rank_by_similarity(query_emb, &embeddings, limit);
 
-        // 4. Load heat states for ranked facts
-        let _now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // 4. Trigger spreading activation for top results
+        for (idx, _) in ranked.iter().take(3) {
+            let fact = &facts[*idx];
+            if let Some(ref id) = fact.id {
+                let fact_id_str = record_id_to_string(id);
+                // Fire-and-forget activation — don't block on it
+                let _ = self.trigger_activation(&fact_id_str, 1.0).await;
+            }
+        }
 
+        // 5. Build results
         let results: Vec<serde_json::Value> = ranked
             .iter()
             .map(|(idx, sim)| {
@@ -351,9 +346,7 @@ impl AlexandriaServer {
                 let id = fact
                     .id
                     .as_ref()
-                    .map(|r| {
-                        record_id_to_string(r)
-                    })
+                    .map(record_id_to_string)
                     .unwrap_or_default();
                 serde_json::json!({
                     "id": id,
@@ -433,6 +426,80 @@ impl AlexandriaServer {
         }
     }
 
+    // --- Internal helpers ---
+
+    /// Assign a fact to a cluster, creating a new one if needed. Updates centroids.
+    async fn assign_to_cluster_and_update(
+        &self,
+        embedding: &[f32],
+        fact_id: &str,
+    ) -> anyhow::Result<()> {
+        let cluster_repo = ClusterRepo::new(self.db.inner());
+        let clusters = self.load_cluster_infos().await?;
+        let assignment = assign_to_cluster(embedding, &clusters, self.cluster_join_threshold);
+
+        match assignment {
+            alexandria_engine::clusters::ClusterAssignment::Existing(cid) => {
+                cluster_repo.add_member(&cid, fact_id).await?;
+                if let Some(old) = clusters.iter().find(|c| c.id == cid) {
+                    let new_centroid = update_centroid(&old.centroid, embedding, old.member_count);
+                    self.db
+                        .inner()
+                        .query("UPDATE type::record($id) SET centroid = $centroid")
+                        .bind(("id", cid))
+                        .bind(("centroid", new_centroid))
+                        .await?
+                        .check()?;
+                }
+            }
+            alexandria_engine::clusters::ClusterAssignment::NewCluster => {
+                let cid = cluster_repo.create(None, embedding).await?;
+                cluster_repo.add_member(&cid, fact_id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Trigger spreading activation for a memory access.
+    async fn trigger_activation(&self, fact_id: &str, bump: f32) -> anyhow::Result<()> {
+        let edge_repo = EdgeRepo::new(self.db.inner());
+        let neighbors = edge_repo.get_neighbors(fact_id, self.activation_config.max_hops).await?;
+
+        if neighbors.is_empty() {
+            return Ok(());
+        }
+
+        let neighbor_data: Vec<(String, u32, f64)> = neighbors
+            .iter()
+            .map(|n| {
+                let id_str = record_id_to_string(&n.id);
+                (id_str, n.hop, n.strength)
+            })
+            .collect();
+
+        let targets = compute_activation_targets(&neighbor_data, bump, &self.activation_config);
+
+        // Batch-update heat for all activation targets
+        let heat_repo = HeatRepo::new(self.db.inner());
+        for target in &targets {
+            heat_repo.add_heat(&target.id, target.heat_delta as f64).await.ok();
+        }
+
+        Ok(())
+    }
+
+    /// Create a raw record for document import.
+    async fn create_raw_record(&self, content: &str) -> anyhow::Result<String> {
+        let mut response = self.db.inner()
+            .query("CREATE raw SET content = $content, deleted = false")
+            .bind(("content", content.to_string()))
+            .await?;
+        let created: Option<alexandria_storage::models::RawRecord> = response.take(0)?;
+        let raw = created.ok_or_else(|| anyhow::anyhow!("Failed to create raw record"))?;
+        let id = raw.id.ok_or_else(|| anyhow::anyhow!("Raw record has no id"))?;
+        Ok(record_id_to_string(&id))
+    }
+
     async fn load_cluster_infos(&self) -> anyhow::Result<Vec<ClusterInfo>> {
         let mut response = self
             .db
@@ -441,22 +508,25 @@ impl AlexandriaServer {
             .await?;
         let clusters: Vec<alexandria_storage::models::Cluster> = response.take(0)?;
 
-        Ok(clusters
-            .into_iter()
-            .map(|c| {
-                let id = c
-                    .id
-                    .map(|r| {
-                        record_id_to_string(&r)
-                    })
-                    .unwrap_or_default();
-                ClusterInfo {
-                    id,
-                    centroid: c.centroid,
-                    member_count: 0, // TODO: query count
-                }
-            })
-            .collect())
+        let cluster_repo = ClusterRepo::new(self.db.inner());
+        let mut infos = Vec::with_capacity(clusters.len());
+
+        for c in clusters {
+            let id = c
+                .id
+                .map(|r| record_id_to_string(&r))
+                .unwrap_or_default();
+            let member_count = cluster_repo.get_members(&id).await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            infos.push(ClusterInfo {
+                id,
+                centroid: c.centroid,
+                member_count,
+            });
+        }
+
+        Ok(infos)
     }
 
     async fn load_cluster_with_members(
@@ -471,15 +541,13 @@ impl AlexandriaServer {
             .map(|f| {
                 let id = f
                     .id
-                    .map(|r| {
-                        record_id_to_string(&r)
-                    })
+                    .map(|r| record_id_to_string(&r))
                     .unwrap_or_default();
                 FactSummary {
                     id,
                     content: f.content,
                     embedding: f.embedding,
-                    heat: 1.0, // simplified for v0.1
+                    heat: 1.0,
                 }
             })
             .collect();
@@ -487,7 +555,7 @@ impl AlexandriaServer {
         Ok(ClusterWithMembers {
             info: ClusterInfo {
                 id: cluster_id.to_string(),
-                centroid: vec![], // not needed for focused recall
+                centroid: vec![],
                 member_count: fact_summaries.len(),
             },
             members: fact_summaries,
@@ -501,7 +569,6 @@ impl AlexandriaServer {
         let mut result = Vec::with_capacity(infos.len());
         for info in infos {
             let cwm = self.load_cluster_with_members(&info.id).await?;
-            // Re-create with the proper centroid from info
             result.push(ClusterWithMembers {
                 info: ClusterInfo {
                     id: cwm.info.id,
