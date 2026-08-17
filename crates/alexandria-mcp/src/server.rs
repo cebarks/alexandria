@@ -26,8 +26,8 @@ use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo};
 use alexandria_storage::Database;
 
 use crate::tools::{
-    DeleteMemoryParams, RecallParams, RetrieveMemoriesParams, StoreMemoryParams,
-    UpdateMemoryParams,
+    DeleteMemoryParams, ImportDocumentParams, RecallParams, RetrieveMemoriesParams,
+    StoreMemoryParams, UpdateMemoryParams,
 };
 
 #[derive(Clone)]
@@ -117,6 +117,19 @@ impl AlexandriaServer {
         Parameters(params): Parameters<UpdateMemoryParams>,
     ) -> String {
         match self.do_update_memory(params).await {
+            Ok(result) => result,
+            Err(e) => {
+                serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
+            }
+        }
+    }
+
+    #[tool(description = "Import a document as one or many memories. Supports chunking by heading, paragraph, or fixed size.")]
+    async fn import_document(
+        &self,
+        Parameters(params): Parameters<ImportDocumentParams>,
+    ) -> String {
+        match self.do_import_document(params).await {
             Ok(result) => result,
             Err(e) => {
                 serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
@@ -226,6 +239,77 @@ impl AlexandriaServer {
             }).to_string()),
             None => Err(anyhow::anyhow!("Update failed for {}", params.id)),
         }
+    }
+
+    pub async fn do_import_document(&self, params: ImportDocumentParams) -> anyhow::Result<String> {
+        use alexandria_engine::import::{chunk_by_heading, chunk_by_paragraph, chunk_by_fixed_size};
+
+        let mode = params.mode.as_deref().unwrap_or("chunk");
+        let tags = params.tags.unwrap_or_default();
+        let batch_id = uuid::Uuid::new_v4().to_string();
+
+        let chunks = match mode {
+            "whole" => vec![params.content.clone()],
+            "chunk" => {
+                let strategy = params.chunk_strategy.as_deref().unwrap_or("heading");
+                match strategy {
+                    "heading" => chunk_by_heading(&params.content)
+                        .into_iter().map(|c| c.content).collect(),
+                    "paragraph" => chunk_by_paragraph(&params.content)
+                        .into_iter().map(|c| c.content).collect(),
+                    "fixed_size" => chunk_by_fixed_size(&params.content, 1000, 100)
+                        .into_iter().map(|c| c.content).collect(),
+                    other => anyhow::bail!("Unknown chunk strategy: {other}"),
+                }
+            }
+            other => anyhow::bail!("Unknown import mode: {other}"),
+        };
+
+        let repo = MemoryRepo::new(self.db.inner());
+        let cluster_repo = ClusterRepo::new(self.db.inner());
+        let heat_repo = HeatRepo::new(self.db.inner());
+        let mut created_ids = Vec::new();
+
+        for chunk in &chunks {
+            // Embed
+            let embeddings = self.embedding.embed(&[chunk.as_str()]).await?;
+            let embedding = &embeddings[0];
+
+            // Create fact with import confidence
+            let fact_id = repo.create_fact(chunk, 1.0, embedding, &tags).await?;
+
+            // Heat state
+            heat_repo.create_for_memory(&fact_id, 2.0).await?;
+
+            // Cluster assignment
+            let clusters = self.load_cluster_infos().await?;
+            let assignment = assign_to_cluster(embedding, &clusters, self.cluster_join_threshold);
+            match assignment {
+                alexandria_engine::clusters::ClusterAssignment::Existing(cid) => {
+                    cluster_repo.add_member(&cid, &fact_id).await?;
+                    let old = clusters.iter().find(|c| c.id == cid).unwrap();
+                    let new_centroid = update_centroid(&old.centroid, embedding, old.member_count);
+                    self.db.inner()
+                        .query("UPDATE type::record($id) SET centroid = $centroid")
+                        .bind(("id", cid.clone()))
+                        .bind(("centroid", new_centroid))
+                        .await?.check()?;
+                }
+                alexandria_engine::clusters::ClusterAssignment::NewCluster => {
+                    let cid = cluster_repo.create(None, embedding).await?;
+                    cluster_repo.add_member(&cid, &fact_id).await?;
+                }
+            }
+
+            created_ids.push(fact_id);
+        }
+
+        Ok(serde_json::json!({
+            "status": "ok",
+            "count": created_ids.len(),
+            "ids": created_ids,
+            "batch_id": batch_id,
+        }).to_string())
     }
 
     pub async fn do_retrieve_memories(
