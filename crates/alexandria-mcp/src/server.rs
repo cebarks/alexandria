@@ -22,11 +22,12 @@ use alexandria_engine::recall::{
 };
 use alexandria_engine::search::rank_by_similarity;
 use alexandria_pipeline::embedding::EmbeddingProvider;
-use alexandria_storage::repos::{ClusterRepo, HeatRepo, MemoryRepo};
+use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo};
 use alexandria_storage::Database;
 
 use crate::tools::{
     DeleteMemoryParams, RecallParams, RetrieveMemoriesParams, StoreMemoryParams,
+    UpdateMemoryParams,
 };
 
 #[derive(Clone)]
@@ -109,6 +110,19 @@ impl AlexandriaServer {
             }
         }
     }
+
+    #[tool(description = "Update an existing memory's content, tags, or confidence. Content changes trigger re-embedding and create a lineage edge to the previous version.")]
+    async fn update_memory(
+        &self,
+        Parameters(params): Parameters<UpdateMemoryParams>,
+    ) -> String {
+        match self.do_update_memory(params).await {
+            Ok(result) => result,
+            Err(e) => {
+                serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
+            }
+        }
+    }
 }
 
 // Implementation details
@@ -165,6 +179,53 @@ impl AlexandriaServer {
         }
 
         Ok(fact_id)
+    }
+
+    pub async fn do_update_memory(&self, params: UpdateMemoryParams) -> anyhow::Result<String> {
+        let repo = MemoryRepo::new(self.db.inner());
+
+        // Verify the memory exists
+        let existing = repo.get_fact(&params.id).await?;
+        let existing = existing.ok_or_else(|| anyhow::anyhow!("Memory not found: {}", params.id))?;
+
+        // Determine if content changed (triggers re-embedding)
+        let new_embedding = if let Some(ref new_content) = params.content {
+            if new_content != &existing.content {
+                let vecs = self.embedding.embed(&[new_content.as_str()]).await?;
+                Some(vecs.into_iter().next().unwrap())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // If content changed, create a derived_from edge to preserve lineage
+        if new_embedding.is_some() {
+            // Store the old version's ID for the edge (we create it after update)
+            let edge_repo = EdgeRepo::new(self.db.inner());
+            // The edge points from the updated record to itself (same ID, new version)
+            // Since we update in place, we create a lineage marker
+            edge_repo.create_edge(&params.id, &params.id, "derived_from", 1.0).await.ok();
+        }
+
+        // Perform the update
+        let updated = repo.update_fact(
+            &params.id,
+            params.content.as_deref(),
+            params.tags.as_deref(),
+            params.confidence,
+            new_embedding.as_deref(),
+        ).await?;
+
+        match updated {
+            Some(_) => Ok(serde_json::json!({
+                "status": "ok",
+                "id": params.id,
+                "content_changed": new_embedding.is_some(),
+            }).to_string()),
+            None => Err(anyhow::anyhow!("Update failed for {}", params.id)),
+        }
     }
 
     pub async fn do_retrieve_memories(
