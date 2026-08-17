@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/alexandria",
+  "crates/alexandria-storage",
+  "crates/alexandria-engine",
+  "crates/alexandria-pipeline",
+  "crates/alexandria-mcp",
+]
+
+[workspace.package]
+rust-version = "1.88"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+surrealdb = "3.2"
+rmcp = { version = "3.1", features = [
+  "server",
+  "transport-io",
+  "macros",
+  "schemars",
+] }
+schemars = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+tokenizers = "0.22"
+hf-hub = "0.5"

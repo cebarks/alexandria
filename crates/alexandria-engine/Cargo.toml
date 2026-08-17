@@ -1,0 +1,15 @@
+[package]
+name = "alexandria-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alexandria-storage = { path = "../alexandria-storage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

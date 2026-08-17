@@ -1,0 +1,15 @@
+[package]
+name = "alexandria"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alexandria-storage = { path = "../alexandria-storage" }
+alexandria-engine = { path = "../alexandria-engine" }
+alexandria-pipeline = { path = "../alexandria-pipeline" }
+alexandria-mcp = { path = "../alexandria-mcp" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
