@@ -21,9 +21,9 @@ async fn main() -> anyhow::Result<()> {
         config.embedding.device,
     );
 
-    // 2. Connect to SurrealDB
-    let db = Database::connect_embedded().await?;
-    schema::bootstrap(db.inner()).await?;
+    // 2. Connect to SurrealDB (persistent or in-memory based on config)
+    let db = Database::connect(&config.database.data_dir).await?;
+    schema::migrate(db.inner()).await?;
 
     // 3. Initialize embedding provider
     tracing::info!("Loading embedding model: {}", config.embedding.model);
