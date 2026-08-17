@@ -195,3 +195,53 @@ async fn test_update_memory_tags_only() {
     let fact = repo.get_fact(&id).await.unwrap().unwrap();
     assert_eq!(fact.tags, vec!["database", "surrealdb"]);
 }
+
+#[tokio::test]
+async fn test_import_document_whole() {
+    let (server, _db) = setup().await;
+
+    let params = alexandria_mcp::tools::ImportDocumentParams {
+        content: "This is a complete document about Rust programming.".to_string(),
+        mode: Some("whole".to_string()),
+        chunk_strategy: None,
+        tags: Some(vec!["imported".to_string()]),
+    };
+    let result = server.do_import_document(params).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["count"], 1);
+}
+
+#[tokio::test]
+async fn test_import_document_chunk_by_heading() {
+    let (server, _db) = setup().await;
+
+    let doc = "# Chapter 1\nFirst chapter content.\n\n# Chapter 2\nSecond chapter.\n\n# Chapter 3\nThird chapter.";
+    let params = alexandria_mcp::tools::ImportDocumentParams {
+        content: doc.to_string(),
+        mode: Some("chunk".to_string()),
+        chunk_strategy: Some("heading".to_string()),
+        tags: Some(vec!["book".to_string()]),
+    };
+    let result = server.do_import_document(params).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["count"], 3);
+}
+
+#[tokio::test]
+async fn test_import_document_chunk_by_paragraph() {
+    let (server, _db) = setup().await;
+
+    let doc = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.\n\nFourth paragraph.";
+    let params = alexandria_mcp::tools::ImportDocumentParams {
+        content: doc.to_string(),
+        mode: Some("chunk".to_string()),
+        chunk_strategy: Some("paragraph".to_string()),
+        tags: None,
+    };
+    let result = server.do_import_document(params).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["count"], 4);
+}
