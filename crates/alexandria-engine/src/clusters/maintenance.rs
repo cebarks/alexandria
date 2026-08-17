@@ -163,10 +163,18 @@ fn kmeans_split(embeddings: &[Vec<f32>]) -> (Vec<usize>, Vec<usize>, Vec<f32>, V
         }
     }
 
-    let group_a: Vec<usize> = assignments.iter().enumerate()
-        .filter(|(_, &a)| a == 0).map(|(i, _)| i).collect();
-    let group_b: Vec<usize> = assignments.iter().enumerate()
-        .filter(|(_, &a)| a == 1).map(|(i, _)| i).collect();
+    let group_a: Vec<usize> = assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, &a)| a == 0)
+        .map(|(i, _)| i)
+        .collect();
+    let group_b: Vec<usize> = assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, &a)| a == 1)
+        .map(|(i, _)| i)
+        .collect();
 
     (group_a, group_b, centroid_a, centroid_b)
 }
@@ -202,7 +210,9 @@ mod tests {
         ];
         let result = check_cohesion("c1", &centroid, &members, 0.85);
         match result {
-            MaintenanceAction::Split { group_a, group_b, .. } => {
+            MaintenanceAction::Split {
+                group_a, group_b, ..
+            } => {
                 // Should split into two groups
                 assert!(!group_a.is_empty());
                 assert!(!group_b.is_empty());
@@ -215,10 +225,7 @@ mod tests {
     #[test]
     fn test_too_few_members_no_split() {
         let centroid = vec![0.5, 0.5];
-        let members = vec![
-            vec![1.0, 0.0],
-            vec![0.0, 1.0],
-        ];
+        let members = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         // Even if diffuse, <4 members = no split
         let result = check_cohesion("c1", &centroid, &members, 0.9);
         assert!(matches!(result, MaintenanceAction::Healthy));
@@ -230,7 +237,9 @@ mod tests {
         let c_b = vec![0.98, 0.02, 0.0]; // very similar
         let result = check_merge("c1", &c_a, 5, "c2", &c_b, 3, 0.9);
         match result {
-            MergeCheck::Merge { keep_id, remove_id, .. } => {
+            MergeCheck::Merge {
+                keep_id, remove_id, ..
+            } => {
                 assert_eq!(keep_id, "c1"); // more members
                 assert_eq!(remove_id, "c2");
             }

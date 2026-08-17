@@ -19,6 +19,7 @@ surrealdb = { version = "3.2", features = ["kv-mem", "kv-surrealkv"] }
 rmcp = { version = "3.1", features = [
   "server",
   "transport-io",
+  "transport-streamable-http-server",
   "macros",
   "schemars",
 ] }

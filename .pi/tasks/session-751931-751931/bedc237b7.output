@@ -1,0 +1,39 @@
+    Blocking waiting for file lock on build directory
+   Compiling tokio-util v0.7.19
+   Compiling tokio-stream v0.1.19
+   Compiling object_store v0.13.2
+   Compiling h2 v0.4.15
+   Compiling tower v0.5.3
+   Compiling rmcp v3.1.2
+   Compiling tower-http v0.6.11
+   Compiling hyper v1.11.0
+   Compiling hyper-util v0.1.20
+   Compiling hyper-timeout v0.5.2
+   Compiling axum v0.8.9
+   Compiling hyper-tls v0.6.0
+   Compiling reqwest v0.12.28
+   Compiling hf-hub v0.5.0
+   Compiling tonic v0.14.6
+   Compiling tonic-prost v0.14.6
+   Compiling surrealdb-protocol v0.10.2
+   Compiling surrealdb-types v3.2.4
+   Compiling surrealdb-core v3.2.4
+   Compiling surrealdb v3.2.4
+   Compiling alexandria-storage v0.1.0 (/home/anten/code/alexandria/crates/alexandria-storage)
+   Compiling alexandria-engine v0.1.0 (/home/anten/code/alexandria/crates/alexandria-engine)
+   Compiling alexandria-pipeline v0.1.0 (/home/anten/code/alexandria/crates/alexandria-pipeline)
+   Compiling alexandria-mcp v0.1.0 (/home/anten/code/alexandria/crates/alexandria-mcp)
+   Compiling alexandria v0.1.0 (/home/anten/code/alexandria/crates/alexandria)
+warning: associated function `from_toml` is never used
+   --> crates/alexandria/src/config.rs:179:12
+    |
+140 | impl Config {
+    | ----------- associated function in this implementation
+...
+179 |     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
+    |            ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `alexandria` (bin "alexandria") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 16s

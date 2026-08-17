@@ -73,9 +73,7 @@ mod tests {
             propagation_factor: 0.3,
             max_hops: 2,
         };
-        let neighbors = vec![
-            ("fact:b".to_string(), 1, 1.0),
-        ];
+        let neighbors = vec![("fact:b".to_string(), 1, 1.0)];
         let targets = compute_activation_targets(&neighbors, 1.0, &config);
         assert_eq!(targets.len(), 1);
         assert!((targets[0].heat_delta - 0.3).abs() < 0.001);
