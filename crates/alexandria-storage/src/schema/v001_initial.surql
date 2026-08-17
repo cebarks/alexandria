@@ -1,3 +1,5 @@
+-- v001: Initial schema (Alexandria v0.1)
+
 -- Tier 0: Raw session logs
 DEFINE TABLE raw SCHEMAFULL;
 DEFINE FIELD content      ON raw TYPE string;
@@ -27,7 +29,7 @@ DEFINE FIELD metadata     ON provenance TYPE option<object>;
 -- Provenance linkage
 DEFINE TABLE has_provenance SCHEMAFULL TYPE RELATION;
 
--- Heat state (separate table)
+-- Heat state (separate table for cache locality)
 DEFINE TABLE heat_state SCHEMAFULL;
 DEFINE FIELD memory       ON heat_state TYPE record;
 DEFINE FIELD heat         ON heat_state TYPE float DEFAULT 1.0;
