@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use alexandria_mcp::AlexandriaServer;
 use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
-use alexandria_storage::{Database, schema};
+use alexandria_storage::{Database, schema, system_config};
 use config::Config;
 use rmcp::{ServiceExt, transport::stdio};
 
@@ -25,11 +25,13 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::connect(&config.database.data_dir).await?;
     schema::migrate(db.inner()).await?;
 
-    // 3. Initialize embedding provider
+    // 3. Check embedding model safety, then load
     tracing::info!("Loading embedding model: {}", config.embedding.model);
     let embedding =
         CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
-    tracing::info!("Embedding model loaded ({} dimensions)", embedding.dimensions());
+    let dims = embedding.dimensions();
+    system_config::check_embedding_model(db.inner(), &config.embedding.model, dims).await?;
+    tracing::info!("Embedding model loaded ({dims} dimensions)");
 
     // 4. Create MCP server
     let server = AlexandriaServer::new(
