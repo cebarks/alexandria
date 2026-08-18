@@ -158,6 +158,10 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
         }
     });
 
+    // Clone `server` for the debug UI router BEFORE it's moved into the MCP service factory
+    // closure below — StreamableHttpService::new takes ownership of `server` via `move`.
+    let debug_router = alexandria_mcp::debug::router(server.clone());
+
     let service: StreamableHttpService<AlexandriaServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
@@ -165,11 +169,13 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
             http_config,
         );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .merge(debug_router);
     let bind_addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
-    tracing::info!("Alexandria ready, serving HTTP on http://{bind_addr}/mcp");
+    tracing::info!("Alexandria ready, serving HTTP on http://{bind_addr}/mcp (debug UI at http://{bind_addr}/debug)");
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
