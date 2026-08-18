@@ -42,9 +42,9 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 
 ## Testing
 
-- All integration tests use `Database::connect_ephemeral()` (in-memory SurrealDB) — no disk state between tests.
+- All integration tests use `Database::connect_embedded()` (in-memory SurrealDB) — no disk state between tests.
 - `CandleProvider` tests download the real model on first run (~80MB) — they're slow the first time.
-- Test helpers in `alexandria-storage/src/connection.rs`: `connect_ephemeral()` for quick in-memory DB.
+- Test helpers in `alexandria-storage/src/connection.rs`: `connect_embedded()` for quick in-memory DB.
 
 ## Config Precedence
 
