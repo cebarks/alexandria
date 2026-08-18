@@ -1,4 +1,4 @@
-/// Document chunking strategies for import.
+//! Document chunking strategies for import.
 
 /// A single chunk with its content and optional heading context.
 #[derive(Debug, Clone)]
