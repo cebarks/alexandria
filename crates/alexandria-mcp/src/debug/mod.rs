@@ -1,5 +1,6 @@
 pub mod clusters;
 pub mod dashboard;
+pub mod graph;
 pub mod html;
 pub mod memories;
 
@@ -18,5 +19,7 @@ pub fn router(server: AlexandriaServer) -> Router {
         .route("/debug/memories/{id}", get(memories::detail))
         .route("/debug/clusters", get(clusters::list))
         .route("/debug/clusters/{id}", get(clusters::detail))
+        .route("/debug/graph/{id}", get(graph::page))
+        .route("/debug/api/graph/{id}", get(graph::api_graph))
         .with_state(server)
 }
