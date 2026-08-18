@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router};
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use surrealdb::types::{RecordId, RecordIdKey};
 
 /// Helper to convert RecordId to `table:key` string format for SurrealQL.
@@ -62,9 +62,11 @@ impl AlexandriaServer {
     }
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl AlexandriaServer {
-    #[tool(description = "Soft-delete a memory by ID")]
+    #[tool(
+        description = "Soft-delete a memory by ID. Use when the user explicitly says a stored memory is wrong, outdated, or should be forgotten — prefer update_memory for corrections that should be preserved as lineage."
+    )]
     async fn delete_memory(
         &self,
         Parameters(params): Parameters<DeleteMemoryParams>,
@@ -76,7 +78,9 @@ impl AlexandriaServer {
         }
     }
 
-    #[tool(description = "Store a new memory with automatic embedding and clustering")]
+    #[tool(
+        description = "Persist a durable fact, decision, preference, or correction so future sessions/agents can recall it. Call this proactively whenever you learn something worth remembering — a user preference, an architectural decision and its rationale, a resolved bug's root cause, a gotcha you just discovered — not only when explicitly told to 'remember this'. Cheap and idempotent-ish (dedup happens via clustering); prefer storing over losing context. Write content as a standalone statement that makes sense without the current conversation."
+    )]
     async fn store_memory(
         &self,
         Parameters(params): Parameters<StoreMemoryParams>,
@@ -91,7 +95,9 @@ impl AlexandriaServer {
         }
     }
 
-    #[tool(description = "Search memories by semantic similarity with heat-based ranking")]
+    #[tool(
+        description = "Search stored memories by semantic similarity before answering questions about past decisions, prior conversations, established preferences, or previously-solved problems. Call this proactively at the start of a task in a known project/domain, or whenever the user references 'earlier', 'last time', 'we decided', or something you don't have in the current context — don't wait to be told to check memory."
+    )]
     async fn retrieve_memories(
         &self,
         Parameters(params): Parameters<RetrieveMemoriesParams>,
@@ -106,7 +112,9 @@ impl AlexandriaServer {
         }
     }
 
-    #[tool(description = "Progressive recall: broad cluster matching or narrowing within a scope")]
+    #[tool(
+        description = "Progressive two-phase recall for open-ended or broad questions ('what do we know about X', 'what's the state of Y'): first call with no scope_handle to get candidate clusters, then call again with the returned scope_handle to narrow into the most relevant one. Prefer this over retrieve_memories when the query is exploratory rather than a specific lookup."
+    )]
     async fn recall(
         &self,
         Parameters(params): Parameters<RecallParams>,
@@ -119,7 +127,9 @@ impl AlexandriaServer {
         }
     }
 
-    #[tool(description = "Update an existing memory's content, tags, or confidence. Content changes trigger re-embedding and create a lineage edge to the previous version.")]
+    #[tool(
+        description = "Correct or refine an existing memory in place (content, tags, or confidence) instead of storing a duplicate. Content changes trigger re-embedding and preserve the old version via a derived_from lineage edge. Use this the moment you discover a previously stored memory is stale or wrong."
+    )]
     async fn update_memory(
         &self,
         Parameters(params): Parameters<UpdateMemoryParams>,
@@ -132,7 +142,9 @@ impl AlexandriaServer {
         }
     }
 
-    #[tool(description = "Import a document as one or many memories. Supports chunking by heading, paragraph, or fixed size.")]
+    #[tool(
+        description = "Bulk-load a document (design doc, README, spec, meeting notes, etc.) into memory as one or many chunked entries with lineage back to the source. Use this whenever the user shares or points at reference material worth retaining long-term, not just when asked to 'import' something."
+    )]
     async fn import_document(
         &self,
         Parameters(params): Parameters<ImportDocumentParams>,
@@ -145,6 +157,12 @@ impl AlexandriaServer {
         }
     }
 }
+
+#[tool_handler(instructions = "Alexandria is a persistent agent memory system — use it proactively, not just when explicitly asked to 'remember' or 'recall' something.\n\n\
+When to READ memory (retrieve_memories / recall): at the start of a task in a project or domain you've likely worked in before; whenever the user references past context ('last time', 'we decided', 'like before'); before re-deriving a decision or re-debugging something that may have been solved already. Use retrieve_memories for a specific lookup, recall for open-ended/broad exploration (call it once broad, then again with the returned scope_handle to narrow).\n\n\
+When to WRITE memory (store_memory): as soon as you learn a durable fact worth keeping past this conversation — a user preference, an architectural decision and its rationale, a bug's root cause, a non-obvious gotcha, a correction the user gives you. Do this unprompted; don't wait to be told to remember. Write standalone statements that make sense without today's conversation.\n\n\
+Use update_memory (not store_memory) when correcting something already stored — it preserves lineage. Use import_document for bulk reference material (specs, READMEs, notes). Use delete_memory only when the user wants something actually forgotten.")]
+impl ServerHandler for AlexandriaServer {}
 
 // Implementation details
 impl AlexandriaServer {
@@ -579,5 +597,43 @@ impl AlexandriaServer {
             });
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod get_info_tests {
+    use super::*;
+    use rmcp::ServerHandler;
+
+    struct StubEmbedding;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for StubEmbedding {
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.1, 0.2]).collect())
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+    }
+
+    #[tokio::test]
+    async fn get_info_carries_usage_instructions_and_tools_capability() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner()).await.unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        let info = server.get_info();
+
+        let instructions = info
+            .instructions
+            .expect("server must advertise usage instructions to MCP clients");
+        assert!(instructions.contains("proactively"));
+        assert!(instructions.contains("store_memory"));
+        assert!(instructions.contains("retrieve_memories"));
+        assert!(info.capabilities.tools.is_some());
     }
 }

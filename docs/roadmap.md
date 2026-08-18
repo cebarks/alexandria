@@ -26,6 +26,23 @@
 - systemd deployment
 - 64 tests
 
+### v0.2.1 — Proactive Usage Nudges
+
+A memory server only helps if agents actually reach for it unprompted. This milestone made
+Alexandria nudge that behavior at the protocol level rather than relying on client-side prompting
+alone:
+
+- `ServerInfo.instructions` populated via `#[tool_handler(instructions = "...")]` — surfaced to
+  any MCP-compliant client at `initialize` time with guidance on when to read vs. write memory
+- All 6 tool descriptions and their param descriptions rewritten to be directive/trigger-keyed
+  ("call this proactively when...") instead of purely mechanical
+- 86 tests (was 64 — also reflects the debug web UI milestone merged separately, not tracked in
+  this roadmap yet)
+
+Client-side companions (outside this repo, not shipped with the server): a pi `SKILL.md`
+documenting trigger conditions, and an optional pi extension that auto-calls `retrieve_memories`
+on every prompt via `before_agent_start`.
+
 ## Planned
 
 ### v0.3 — Self-Organizing Memory
