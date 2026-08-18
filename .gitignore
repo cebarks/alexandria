@@ -1,3 +1,4 @@
 /target
 Cargo.lock
 /.worktrees
+contrib/pi/extensions/*/node_modules
