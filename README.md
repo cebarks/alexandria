@@ -58,14 +58,16 @@ three levels:
    in its `initialize` response via `ServerInfo.instructions`. Any MCP-compliant client can surface
    this to the model. Tool descriptions are also written directively ("call this proactively
    whenever...") rather than just describing mechanics.
-2. **Client-side skill** — for pi users, a `SKILL.md` (`alexandria-memory`) documents concrete
-   trigger conditions and tool choice guidance, mirroring how other high-usage MCP tools ship
-   skills alongside themselves.
-3. **Optional auto-recall extension** — a pi extension (`alexandria-auto-recall`) can hook
-   `before_agent_start` to call `retrieve_memories` on every prompt automatically and inject hits
-   above a similarity threshold into context, so the agent never has to decide to check memory.
-   This trades latency and potential noise for guaranteed recall; it's opt-in tooling that lives
-   outside this repo (client-side), not part of the server.
+2. **Client-side skill** — for pi users, [`contrib/pi/skills/alexandria-memory/`](contrib/pi/skills/alexandria-memory/)
+   documents concrete trigger conditions and tool choice guidance, mirroring how other high-usage
+   MCP tools ship skills alongside themselves.
+3. **Optional auto-recall extension** — [`contrib/pi/extensions/alexandria-auto-recall/`](contrib/pi/extensions/alexandria-auto-recall/)
+   hooks `before_agent_start` to call `retrieve_memories` on every prompt automatically and inject
+   hits above a similarity threshold into context, so the agent never has to decide to check
+   memory. This trades latency and potential noise for guaranteed recall.
+
+Items 2 and 3 are client-side pi integrations, not part of the MCP server itself — see
+[`contrib/pi/README.md`](contrib/pi/README.md) for what they are and how to install them.
 
 ## Debug Web UI
 
