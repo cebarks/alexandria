@@ -202,6 +202,17 @@ impl<'a> MemoryRepo<'a> {
         let rows: Vec<CountRow> = response.take(0)?;
         Ok(rows.first().map(|r| r.count as usize).unwrap_or(0))
     }
+
+    /// Find the cluster containing this fact, if any (reverse traversal of contains_memory).
+    pub async fn cluster_for_fact(&self, fact_id: &str) -> Result<Option<crate::models::Cluster>> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM type::record($id)<-contains_memory<-cluster")
+            .bind(("id", fact_id.to_string()))
+            .await?;
+        let clusters: Vec<crate::models::Cluster> = response.take(0)?;
+        Ok(clusters.into_iter().next())
+    }
 }
 
 #[cfg(test)]
@@ -248,5 +259,27 @@ mod tests {
         assert_eq!(page1.len(), 1);
         assert_eq!(page2.len(), 1);
         assert_ne!(page1[0].content, page2[0].content);
+    }
+
+    #[tokio::test]
+    async fn test_cluster_for_fact() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+        let cluster_repo = crate::repos::ClusterRepo::new(db.inner());
+
+        let fact_id = repo.create_fact("clustered content", 0.5, &[0.1, 0.2], &[]).await.unwrap();
+        let cluster_id = cluster_repo.create(Some("test cluster"), &[0.1, 0.2]).await.unwrap();
+        cluster_repo.add_member(&cluster_id, &fact_id).await.unwrap();
+
+        let cluster_found = repo.cluster_for_fact(&fact_id).await.unwrap();
+        assert!(cluster_found.is_some());
+        let cluster_found = cluster_found.unwrap();
+        assert_eq!(cluster_found.label.as_deref(), Some("test cluster"));
+
+        // Fact with no cluster returns None
+        let orphan_id = repo.create_fact("orphan content", 0.5, &[0.9, 0.9], &[]).await.unwrap();
+        let none = repo.cluster_for_fact(&orphan_id).await.unwrap();
+        assert!(none.is_none());
     }
 }
