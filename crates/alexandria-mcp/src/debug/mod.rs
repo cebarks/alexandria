@@ -3,11 +3,12 @@ pub mod dashboard;
 pub mod graph;
 pub mod html;
 pub mod memories;
+pub mod query;
 
 #[cfg(test)]
 mod test_support;
 
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use crate::AlexandriaServer;
@@ -21,5 +22,7 @@ pub fn router(server: AlexandriaServer) -> Router {
         .route("/debug/clusters/{id}", get(clusters::detail))
         .route("/debug/graph/{id}", get(graph::page))
         .route("/debug/api/graph/{id}", get(graph::api_graph))
+        .route("/debug/query", get(query::form))
+        .route("/debug/query/run", post(query::run))
         .with_state(server)
 }
