@@ -83,3 +83,22 @@ async fn test_multi_hop_respects_limit() {
     assert_eq!(neighbors.len(), 1);
     assert_eq!(neighbors[0].hop, 1);
 }
+
+#[tokio::test]
+async fn test_get_edges_for_deserializes_in_out_record_ids() {
+    // Regression test: MemoryEdge::in_node/out_node were silently deserializing as None
+    // because the SurrealValue derive macro needs its own #[surreal(rename = "...")] attribute
+    // (not just #[serde(rename = "...")]) to map the SurrealDB "in"/"out" edge fields.
+    let db = setup().await;
+    let mem = MemoryRepo::new(db.inner());
+    let edges = EdgeRepo::new(db.inner());
+
+    let id_a = mem.create_fact("Node A", 0.9, &[0.1], &[]).await.unwrap();
+    let id_b = mem.create_fact("Node B", 0.9, &[0.2], &[]).await.unwrap();
+    edges.create_edge(&id_a, &id_b, "relates_to", 0.9).await.unwrap();
+
+    let found = edges.get_edges_for(&id_a).await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(found[0].in_node.is_some(), "in_node should deserialize, not be None");
+    assert!(found[0].out_node.is_some(), "out_node should deserialize, not be None");
+}
