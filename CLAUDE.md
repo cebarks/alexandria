@@ -15,7 +15,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 ## rmcp (MCP SDK) Patterns
 
 - Uses `schemars` 1.x (not 0.8) — `#[schemars(description = "...")]` on tool param fields
-- Tool macro: `#[tool(description = "...")]` inside `#[tool_router(server_handler)]` impl block
+- Tool macro: `#[tool(description = "...")]` inside a `#[tool_router]` impl block. `#[tool_router(server_handler)]` auto-generates a bare `get_info()`; use bare `#[tool_router]` plus an explicit `#[tool_handler(instructions = "...")]` block on `impl ServerHandler` instead when the server needs to advertise `instructions` (see Non-Obvious Patterns below — `AlexandriaServer` does this).
 - Params: `Parameters(params): Parameters<MyParams>` — the wrapper is required
 - HTTP transport: `transport-streamable-http-server` feature, `StreamableHttpService::new(factory, session_mgr, config)`
 
@@ -29,6 +29,8 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 
 ## Non-Obvious Patterns
 
+- `AlexandriaServer` uses a bare `#[tool_router]` + explicit `#[tool_handler(instructions = "...")]` block — NOT `#[tool_router(server_handler)]` — specifically so `get_info()` carries usage `instructions`. If you add a new tool, add it to the `#[tool_router]` impl block same as the others; the separate `#[tool_handler]` block stays where it is at the bottom of `server.rs` and doesn't need touching unless the overall usage guidance changes.
+- Tool descriptions and param field descriptions (`#[tool(description = ...)]`, `#[schemars(description = ...)]`) are written directively ("call this proactively when...") rather than just describing mechanics — this materially affects how often client LLMs choose to call the tool unprompted. Keep new tools consistent with that style.
 - `record_id_to_string()` is the canonical way to format SurrealDB `RecordId` for use in queries and JSON responses. It's in `alexandria-mcp/src/server.rs` and is `pub`.
 - Cluster `member_count` is queried live (not cached) — `load_cluster_infos()` calls `get_members()` per cluster.
 - `update_memory` with content change: creates a soft-deleted snapshot of old content, then links via `derived_from` edge. The old version is hidden from search but preserved for lineage.

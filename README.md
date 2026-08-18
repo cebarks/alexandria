@@ -49,6 +49,24 @@ First run downloads the embedding model from HuggingFace Hub (~80MB).
 | `import_document` | Import and chunk documents with `extracted_from` edge tracking |
 | `delete_memory` | Soft-delete a memory by ID |
 
+### Getting agents to actually use memory
+
+A memory server is only useful if agents reach for it unprompted. Alexandria nudges this at
+three levels:
+
+1. **MCP `instructions`** — the server advertises usage guidance (when to read vs. write memory)
+   in its `initialize` response via `ServerInfo.instructions`. Any MCP-compliant client can surface
+   this to the model. Tool descriptions are also written directively ("call this proactively
+   whenever...") rather than just describing mechanics.
+2. **Client-side skill** — for pi users, a `SKILL.md` (`alexandria-memory`) documents concrete
+   trigger conditions and tool choice guidance, mirroring how other high-usage MCP tools ship
+   skills alongside themselves.
+3. **Optional auto-recall extension** — a pi extension (`alexandria-auto-recall`) can hook
+   `before_agent_start` to call `retrieve_memories` on every prompt automatically and inject hits
+   above a similarity threshold into context, so the agent never has to decide to check memory.
+   This trades latency and potential noise for guaranteed recall; it's opt-in tooling that lives
+   outside this repo (client-side), not part of the server.
+
 ## Debug Web UI
 
 When `transport = "http"`, a read-only debug web UI is served alongside the MCP endpoint at
@@ -137,7 +155,7 @@ Data flows: **MCP request → server handler → engine algorithm → storage re
 ## Development
 
 ```bash
-cargo test --workspace          # 64 tests
+cargo test --workspace          # 86 tests
 cargo build --workspace         # debug build
 cargo clippy --workspace        # lint
 RUST_LOG=debug cargo run        # run with debug logging
