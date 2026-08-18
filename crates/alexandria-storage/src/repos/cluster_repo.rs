@@ -60,4 +60,53 @@ impl<'a> ClusterRepo<'a> {
         let members: Vec<Fact> = response.take(0)?;
         Ok(members)
     }
+
+    /// List all clusters along with their live member counts.
+    pub async fn list_with_counts(&self) -> Result<Vec<(Cluster, usize)>> {
+        let mut response = self.db.query("SELECT * FROM cluster").await?;
+        let clusters: Vec<Cluster> = response.take(0)?;
+
+        let mut result = Vec::with_capacity(clusters.len());
+        for cluster in clusters {
+            let id = cluster
+                .id
+                .as_ref()
+                .map(|r| r.to_sql())
+                .unwrap_or_default();
+            let count = self.get_members(&id).await.map(|m| m.len()).unwrap_or(0);
+            result.push((cluster, count));
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::Database;
+
+    #[tokio::test]
+    async fn test_list_with_counts() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let cluster_repo = ClusterRepo::new(db.inner());
+        let memory_repo = crate::repos::MemoryRepo::new(db.inner());
+
+        let c1 = cluster_repo.create(Some("cluster one"), &[0.1, 0.1]).await.unwrap();
+        let f1 = memory_repo.create_fact("f1", 0.5, &[0.1, 0.1], &[]).await.unwrap();
+        let f2 = memory_repo.create_fact("f2", 0.5, &[0.1, 0.1], &[]).await.unwrap();
+        cluster_repo.add_member(&c1, &f1).await.unwrap();
+        cluster_repo.add_member(&c1, &f2).await.unwrap();
+
+        let c2 = cluster_repo.create(Some("cluster two"), &[0.9, 0.9]).await.unwrap();
+        let _ = c2;
+
+        let results = cluster_repo.list_with_counts().await.unwrap();
+        assert_eq!(results.len(), 2);
+        let (cluster1, count1) = results.iter().find(|(c, _)| c.label.as_deref() == Some("cluster one")).unwrap();
+        assert_eq!(*count1, 2);
+        let _ = cluster1;
+        let (_, count2) = results.iter().find(|(c, _)| c.label.as_deref() == Some("cluster two")).unwrap();
+        assert_eq!(*count2, 0);
+    }
 }
