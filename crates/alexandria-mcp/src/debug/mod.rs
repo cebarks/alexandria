@@ -14,5 +14,6 @@ pub fn router(server: AlexandriaServer) -> Router {
     Router::new()
         .route("/debug", get(dashboard::handler))
         .route("/debug/memories", get(memories::list))
+        .route("/debug/memories/{id}", get(memories::detail))
         .with_state(server)
 }

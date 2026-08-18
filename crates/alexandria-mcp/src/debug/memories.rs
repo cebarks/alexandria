@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use axum::extract::{Query, State};
-use axum::response::Html;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse};
 
 use super::html::{esc, layout};
 use crate::server::record_id_to_string;
@@ -87,6 +88,95 @@ pub async fn list(
     Html(layout("Memories", &body))
 }
 
+pub async fn detail(
+    State(server): State<AlexandriaServer>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+    let fact = match repo.get_fact(&id).await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Html(layout("Not Found", "<p>Memory not found.</p>")),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(layout(
+                    "Error",
+                    &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
+                )),
+            )
+        }
+    };
+
+    let heat_repo = alexandria_storage::repos::HeatRepo::new(server.db.inner());
+    let heat = heat_repo.get(&id).await.ok().flatten();
+    let heat_html = match &heat {
+        Some(h) => format!(
+            "heat={:.3} stability={:.3} access_count={}",
+            h.heat, h.stability, h.access_count
+        ),
+        None => "no heat state".to_string(),
+    };
+
+    let cluster = repo.cluster_for_fact(&id).await.ok().flatten();
+    let cluster_html = match &cluster {
+        Some(c) => format!(
+            "{} ({})",
+            esc(c.label.as_deref().unwrap_or("unlabeled")),
+            c.id.as_ref().map(record_id_to_string).unwrap_or_default()
+        ),
+        None => "none".to_string(),
+    };
+
+    let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
+    let edges = edge_repo.get_edges_for(&id).await.unwrap_or_default();
+    let edges_html: String = edges
+        .iter()
+        .map(|e| {
+            format!(
+                "<li>{} — {} → {} (strength {:.2})</li>",
+                esc(&e.edge_type),
+                e.in_node.as_ref().map(record_id_to_string).unwrap_or_default(),
+                e.out_node.as_ref().map(record_id_to_string).unwrap_or_default(),
+                e.strength
+            )
+        })
+        .collect();
+
+    let tags: String = fact
+        .tags
+        .iter()
+        .map(|t| format!(r#"<span class="badge">{}</span>"#, esc(t)))
+        .collect();
+
+    let body = format!(
+        r##"<h1>Memory {}</h1>
+<p><a class="link" href="/debug/graph/{}">View graph</a></p>
+<pre>{}</pre>
+<p>Tags: {tags}</p>
+<p>Confidence: {}</p>
+<p>Deleted: {}</p>
+<p>Heat: {}</p>
+<p>Cluster: {}</p>
+<h2>Edges</h2>
+<ul>{}</ul>"##,
+        esc(&id),
+        esc(&id),
+        esc(&fact.content),
+        fact.confidence,
+        fact.deleted,
+        heat_html,
+        cluster_html,
+        edges_html,
+    );
+
+    (StatusCode::OK, Html(layout("Memory Detail", &body)))
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
@@ -152,5 +242,51 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("apple pie"));
         assert!(!text.contains("banana bread"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_shows_content_and_heat() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let heat_repo = alexandria_storage::repos::HeatRepo::new(server.db.inner());
+        let id = repo
+            .create_fact(
+                "detailed memory content",
+                0.7,
+                &[0.1, 0.2],
+                &["x".to_string()],
+            )
+            .await
+            .unwrap();
+        heat_repo.create_for_memory(&id, 1.5).await.unwrap();
+
+        let app = crate::debug::router(server);
+        let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("detailed memory content"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_404_for_missing_id() {
+        let server = super::super::test_support::test_server().await;
+        let app = crate::debug::router(server);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/memories/fact%3Anonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
     }
 }
