@@ -49,6 +49,24 @@ First run downloads the embedding model from HuggingFace Hub (~80MB).
 | `import_document` | Import and chunk documents with `extracted_from` edge tracking |
 | `delete_memory` | Soft-delete a memory by ID |
 
+## Debug Web UI
+
+When `transport = "http"`, a read-only debug web UI is served alongside the MCP endpoint at
+`http://<host>:<port>/debug`:
+
+- **Dashboard** (`/debug`) — live counts of facts, clusters, edges, and raw documents
+- **Memories** (`/debug/memories`) — search/filter facts by content and tag; click through to a
+  detail view showing heat, stability, cluster membership, and graph edges
+- **Clusters** (`/debug/clusters`) — cluster list with live member counts and cohesion; drill into
+  member facts
+- **Graph** (`/debug/graph/:id`) — visualizes a memory's local edge neighborhood
+- **Query Tester** (`/debug/query`) — run `retrieve_memories`/`recall` live against the real
+  embedding model to sanity-check retrieval quality
+
+The debug UI has **no authentication** and is intended for a trusted network boundary (same
+posture as the unauthenticated MCP endpoint) — do not expose it on a public interface without
+putting a reverse proxy/auth layer in front of it.
+
 ## Deployment
 
 ### As a systemd user service (recommended)
