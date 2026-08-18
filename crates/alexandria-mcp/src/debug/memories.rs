@@ -216,6 +216,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_memories_list_escapes_xss_payload_in_content_and_tags() {
+        // Security regression test: stored content/tags must render through esc() and never
+        // reach the response as raw executable HTML.
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        repo.create_fact(
+            "<script>alert(1)</script>",
+            0.5,
+            &[0.1, 0.2],
+            &["<img src=x onerror=alert(2)>".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let app = crate::debug::router(server);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/memories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            !text.contains("<script>alert(1)</script>"),
+            "raw <script> tag must not appear unescaped in the response"
+        );
+        assert!(
+            !text.contains("<img src=x onerror=alert(2)>"),
+            "raw <img onerror> tag must not appear unescaped in the response"
+        );
+        assert!(
+            text.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "content should appear HTML-escaped"
+        );
+        assert!(
+            text.contains("&lt;img src=x onerror=alert(2)&gt;"),
+            "tag should appear HTML-escaped"
+        );
+    }
+
+    #[tokio::test]
     async fn test_memories_search_query_param_filters() {
         let server = super::super::test_support::test_server().await;
         let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
@@ -272,6 +321,38 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("detailed memory content"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_escapes_xss_payload_in_content_and_tags() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let id = repo
+            .create_fact(
+                "<script>alert(1)</script>",
+                0.5,
+                &[0.1, 0.2],
+                &["<img src=x onerror=alert(2)>".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let app = crate::debug::router(server);
+        let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(!text.contains("<script>alert(1)</script>"));
+        assert!(!text.contains("<img src=x onerror=alert(2)>"));
+        assert!(text.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(text.contains("&lt;img src=x onerror=alert(2)&gt;"));
     }
 
     #[tokio::test]
