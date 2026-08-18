@@ -1,8 +1,8 @@
-/// Spreading activation: propagate heat along graph edges.
-///
-/// When a memory is accessed, a fraction of heat passes to its neighbors,
-/// diminishing per hop. **Heat only, not stability** — second-hand
-/// activation warms temporarily but doesn't make memories more durable.
+//! Spreading activation: propagate heat along graph edges.
+//!
+//! When a memory is accessed, a fraction of heat passes to its neighbors,
+//! diminishing per hop. **Heat only, not stability** — second-hand
+//! activation warms temporarily but doesn't make memories more durable.
 
 /// A neighbor that should receive propagated heat.
 #[derive(Debug, Clone)]
