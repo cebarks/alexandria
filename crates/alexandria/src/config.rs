@@ -51,7 +51,7 @@ impl Default for ServerConfig {
 #[serde(default)]
 pub struct DatabaseConfig {
     /// Storage path. Use ":memory:" for in-memory (ephemeral).
-    /// Default: ~/.alexandria/data
+    /// Default: `$XDG_DATA_HOME/alexandria/data`
     pub data_dir: PathBuf,
 }
 
@@ -92,9 +92,14 @@ pub struct ClusterConfig {
 // --- Defaults ---
 
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".alexandria")
+    dirs::data_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local")
+                .join("share")
+        })
+        .join("alexandria")
         .join("data")
 }
 
@@ -276,6 +281,13 @@ mod tests {
         // Everything else is default
         assert_eq!(config.embedding.device, "cpu");
         assert_eq!(config.cluster.join_threshold, 0.75);
+    }
+
+    #[test]
+    fn test_xdg_data_dir_default() {
+        let config = Config::default();
+        let xdg_data = dirs::data_dir().unwrap().join("alexandria").join("data");
+        assert_eq!(config.database.data_dir, xdg_data);
     }
 
     #[test]
