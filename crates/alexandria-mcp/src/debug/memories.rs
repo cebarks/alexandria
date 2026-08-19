@@ -125,7 +125,7 @@ pub async fn list(
             let prev_offset = offset.saturating_sub(limit);
             format!(
                 r#"<a class="link" href="{}">← Prev</a>"#,
-                memories_url(search.map(|s| s.as_str()), tag.map(|s| s.as_str()), include_deleted, limit, prev_offset)
+                esc(&memories_url(search.map(|s| s.as_str()), tag.map(|s| s.as_str()), include_deleted, limit, prev_offset))
             )
         } else {
             String::new()
@@ -133,7 +133,7 @@ pub async fn list(
         next_link = if offset + rows.len() < total {
             format!(
                 r#"<a class="link" href="{}">Next →</a>"#,
-                memories_url(search.map(|s| s.as_str()), tag.map(|s| s.as_str()), include_deleted, limit, offset + limit)
+                esc(&memories_url(search.map(|s| s.as_str()), tag.map(|s| s.as_str()), include_deleted, limit, offset + limit))
             )
         } else {
             String::new()
