@@ -29,7 +29,12 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CONFIG } from "./config.js";
-import { resetClient, closeClient, storeMemory } from "./mcp-client.js";
+import {
+	resetClient,
+	closeClient,
+	storeMemory,
+	extractTextContent,
+} from "./mcp-client.js";
 import { retrieveMemories, formatMemoriesBlock } from "./recall.js";
 import { SessionDedupBuffer } from "./detectors/types.js";
 import { detectCorrection } from "./detectors/correction.js";
@@ -37,6 +42,29 @@ import { detectPreference } from "./detectors/preference.js";
 import { trackToolStore } from "./detectors/tool-tracker.js";
 import { ErrorTracker } from "./detectors/error-tracker.js";
 import { runExtraction } from "./extraction.js";
+
+/**
+ * Extract readable text from a tool_execution_end result.
+ * Handles MCP content blocks ({content: [{type: "text", text: "..."}]}),
+ * plain strings, and objects with a text/message/error field.
+ */
+function extractResultText(result: unknown): string | null {
+	if (typeof result === "string") return result;
+	if (!result || typeof result !== "object") return null;
+
+	const r = result as Record<string, unknown>;
+
+	// MCP content block structure
+	const fromContent = extractTextContent(r.content);
+	if (fromContent) return fromContent;
+
+	// Direct text/message/error fields
+	for (const key of ["text", "message", "error"] as const) {
+		if (typeof r[key] === "string") return r[key] as string;
+	}
+
+	return null;
+}
 
 export default function alexandriaExtension(pi: ExtensionAPI) {
 	// Session-scoped state — reset on each session
@@ -111,10 +139,13 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 
 		// Error resolution tracker — accumulate errors and successes
 		pi.on("tool_execution_end", async (event) => {
+			const text = extractResultText(event.result);
+			if (!text) return;
+
 			if (event.isError) {
-				errorTracker.recordError(event.toolName, event.result);
+				errorTracker.recordError(event.toolName, text);
 			} else {
-				errorTracker.recordSuccess(event.toolName, event.result);
+				errorTracker.recordSuccess(event.toolName, text);
 			}
 		});
 
