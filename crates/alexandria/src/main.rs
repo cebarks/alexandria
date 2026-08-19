@@ -22,6 +22,21 @@ async fn main() -> anyhow::Result<()> {
         config.embedding.model,
     );
 
+    // Check for legacy data dir and advise migration
+    let legacy_data = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".alexandria")
+        .join("data");
+    if legacy_data.exists() && config.database.data_dir != legacy_data {
+        tracing::warn!(
+            "Legacy data directory found at {}. To migrate, run:\n  \
+             mv {} {}",
+            legacy_data.display(),
+            legacy_data.display(),
+            config.database.data_dir.display(),
+        );
+    }
+
     // 2. Connect to SurrealDB (persistent or in-memory based on config)
     let db = Database::connect(&config.database.data_dir).await?;
     schema::migrate(db.inner()).await?;
