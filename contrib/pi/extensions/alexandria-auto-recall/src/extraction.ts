@@ -172,16 +172,19 @@ export async function runExtraction(
 		if (!model) return [];
 	}
 
-	// Call model with timeout
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), CONFIG.extractTimeoutMs);
+	// Call model with timeout via Promise.race — ctx.modelRegistry.complete()
+	// may not support AbortSignal, so we race against a rejection timer.
+	const timeoutPromise = new Promise<never>((_, reject) => {
+		setTimeout(() => reject(new Error("extraction_timeout")), CONFIG.extractTimeoutMs);
+	});
 
 	try {
-		const response = (await ctx.modelRegistry.complete(model, {
-			messages: [{ role: "user", content: userMessage }],
-		})) as Record<string, unknown>;
-
-		clearTimeout(timeout);
+		const response = (await Promise.race([
+			ctx.modelRegistry.complete(model, {
+				messages: [{ role: "user", content: userMessage }],
+			}),
+			timeoutPromise,
+		])) as Record<string, unknown>;
 
 		// Extract text from response
 		const responseText = extractText(response.content);
@@ -205,8 +208,7 @@ export async function runExtraction(
 					: ["extracted"],
 			}));
 	} catch (err) {
-		clearTimeout(timeout);
-		if (controller.signal.aborted) {
+		if (err instanceof Error && err.message === "extraction_timeout") {
 			ctx.ui.notify("Alexandria extraction timed out; skipping.", "warning");
 		}
 		// Fail open
