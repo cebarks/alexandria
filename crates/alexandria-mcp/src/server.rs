@@ -38,6 +38,7 @@ pub struct AlexandriaServer {
     pub cluster_join_threshold: f32,
     pub heat_spacing_halflife: f64,
     pub activation_config: ActivationConfig,
+    pub activation_top_n: usize,
 }
 
 impl AlexandriaServer {
@@ -53,11 +54,17 @@ impl AlexandriaServer {
             cluster_join_threshold,
             heat_spacing_halflife,
             activation_config: ActivationConfig::default(),
+            activation_top_n: 3,
         }
     }
 
     pub fn with_activation_config(mut self, config: ActivationConfig) -> Self {
         self.activation_config = config;
+        self
+    }
+
+    pub fn with_activation_top_n(mut self, n: usize) -> Self {
+        self.activation_top_n = n;
         self
     }
 }
@@ -347,7 +354,7 @@ impl AlexandriaServer {
         let ranked = rank_by_similarity(query_emb, &embeddings, limit);
 
         // 4. Trigger spreading activation for top results
-        for (idx, _) in ranked.iter().take(3) {
+        for (idx, _) in ranked.iter().take(self.activation_top_n) {
             let fact = &facts[*idx];
             if let Some(ref id) = fact.id {
                 let fact_id_str = record_id_to_string(id);

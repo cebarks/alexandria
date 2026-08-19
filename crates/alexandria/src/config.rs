@@ -33,6 +33,8 @@ pub struct ServerConfig {
     pub allowed_origins: Vec<String>,
     /// Allowed hosts for HTTP. Empty = allow all. Default: ["*"].
     pub allowed_hosts: Vec<String>,
+    /// SSE keep-alive interval in seconds. Default: 15.
+    pub sse_keep_alive_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -43,6 +45,7 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             allowed_origins: vec!["*".to_string()],
             allowed_hosts: vec!["*".to_string()],
+            sse_keep_alive_secs: 15,
         }
     }
 }
@@ -76,6 +79,8 @@ pub struct ActivationConfig {
     pub propagation_factor: f32,
     /// Max graph hops for spreading activation. Default 2.
     pub max_hops: u32,
+    /// Number of top retrieval results that trigger spreading activation. Default: 3.
+    pub top_n: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,6 +92,8 @@ pub struct ClusterConfig {
     pub merge_threshold: f32,
     /// Avg member-to-centroid similarity below which a cluster splits. Default 0.6.
     pub cohesion_floor: f32,
+    /// Cluster maintenance check interval in seconds. Default: 300 (5 minutes).
+    pub maintenance_interval_secs: u64,
 }
 
 // --- Defaults ---
@@ -133,6 +140,7 @@ impl Default for ActivationConfig {
         Self {
             propagation_factor: 0.3,
             max_hops: 2,
+            top_n: 3,
         }
     }
 }
@@ -143,6 +151,7 @@ impl Default for ClusterConfig {
             join_threshold: 0.75,
             merge_threshold: 0.9,
             cohesion_floor: 0.6,
+            maintenance_interval_secs: 300,
         }
     }
 }
@@ -321,6 +330,32 @@ mod tests {
             xdg_config_dir.display(),
             legacy_dir.display(),
         );
+    }
+
+    #[test]
+    fn test_new_config_defaults() {
+        let config = Config::default();
+        assert_eq!(config.server.sse_keep_alive_secs, 15);
+        assert_eq!(config.cluster.maintenance_interval_secs, 300);
+        assert_eq!(config.activation.top_n, 3);
+    }
+
+    #[test]
+    fn test_new_config_from_toml() {
+        let toml = r#"
+            [server]
+            sse_keep_alive_secs = 30
+
+            [cluster]
+            maintenance_interval_secs = 600
+
+            [activation]
+            top_n = 5
+        "#;
+        let config = Config::from_toml(toml).unwrap();
+        assert_eq!(config.server.sse_keep_alive_secs, 30);
+        assert_eq!(config.cluster.maintenance_interval_secs, 600);
+        assert_eq!(config.activation.top_n, 5);
     }
 
     #[test]
