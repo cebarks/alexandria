@@ -93,15 +93,18 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 
 		// Tool dedup tracker — watch for agent-initiated store_memory calls
 		pi.on("tool_result", async (event) => {
-			const e = event as unknown as {
-				toolName: string;
-				input: Record<string, unknown>;
-				isError: boolean;
-			};
-			await trackToolStore(
-				{ toolName: e.toolName ?? "", input: e.input ?? {}, isError: e.isError },
-				dedupBuffer,
-			).catch(() => {}); // never fail on tracking
+			// ToolResultEvent variants all extend ToolResultEventBase which has
+			// toolName, input, and isError. CustomToolResultEvent covers MCP tools.
+			try {
+				trackToolStore(
+					{
+						toolName: "toolName" in event ? (event.toolName as string) : "",
+						input: "input" in event ? (event.input as Record<string, unknown>) : {},
+						isError: event.isError,
+					},
+					dedupBuffer,
+				);
+			} catch { /* never fail on tracking */ }
 		});
 
 		// Error resolution tracker — accumulate errors and successes
