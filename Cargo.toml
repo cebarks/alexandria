@@ -10,6 +10,7 @@ members = [
 
 [workspace.package]
 rust-version = "1.88"
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
