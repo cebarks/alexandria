@@ -190,6 +190,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_defaults() {
@@ -247,6 +248,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_env_overrides() {
         // Set env vars
         std::env::set_var("ALEXANDRIA_DATA_DIR", "/tmp/env-test");
