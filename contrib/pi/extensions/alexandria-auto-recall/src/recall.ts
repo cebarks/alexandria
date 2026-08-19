@@ -17,7 +17,9 @@ interface RetrieveMemoriesResponse {
 	error?: string;
 }
 
-export async function retrieveMemories(query: string): Promise<RetrievedMemory[]> {
+export async function retrieveMemories(
+	query: string,
+): Promise<RetrievedMemory[]> {
 	const client = await getClient();
 	const result = await client.callTool({
 		name: "retrieve_memories",
@@ -34,7 +36,9 @@ export async function retrieveMemories(query: string): Promise<RetrievedMemory[]
 		return [];
 	}
 
-	return (parsed.results ?? []).filter((m) => m.similarity >= CONFIG.recallMinSimilarity);
+	return (parsed.results ?? []).filter(
+		(m) => m.similarity >= CONFIG.recallMinSimilarity,
+	);
 }
 
 export function formatMemoriesBlock(memories: RetrievedMemory[]): string {

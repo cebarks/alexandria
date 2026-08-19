@@ -26,7 +26,10 @@ const CORRECTION_PATTERNS: RegExp[] = [
  * Scan a user prompt for correction patterns.
  * Returns a DetectedMemory if an unambiguous correction is found, or null.
  */
-export function detectCorrection(prompt: string, buffer: SessionDedupBuffer): DetectedMemory | null {
+export function detectCorrection(
+	prompt: string,
+	buffer: SessionDedupBuffer,
+): DetectedMemory | null {
 	const trimmed = prompt.trim();
 	// Skip very short or very long prompts — corrections are conversational, not essays
 	if (trimmed.length < 8 || trimmed.length > 500) return null;

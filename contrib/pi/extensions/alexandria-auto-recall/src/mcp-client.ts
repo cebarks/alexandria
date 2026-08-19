@@ -3,7 +3,10 @@
  * Lazily connects on first use, resets on failure, closes on shutdown.
  */
 
-import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import {
+	Client,
+	StreamableHTTPClientTransport,
+} from "@modelcontextprotocol/client";
 import { CONFIG } from "./config.js";
 
 let clientPromise: Promise<Client> | null = null;
@@ -17,7 +20,10 @@ export async function getClient(): Promise<Client> {
 			} catch {
 				throw new Error(`Invalid ALEXANDRIA_URL: ${CONFIG.serverUrl}`);
 			}
-			const client = new Client({ name: "alexandria-auto-recall", version: "2.0.0" });
+			const client = new Client({
+				name: "alexandria-auto-recall",
+				version: "2.0.0",
+			});
 			const transport = new StreamableHTTPClientTransport(url);
 			await client.connect(transport);
 			return client;
@@ -45,14 +51,23 @@ export async function closeClient(): Promise<void> {
 export function extractTextContent(content: unknown): string | undefined {
 	if (!Array.isArray(content)) return undefined;
 	for (const block of content) {
-		if (block && typeof block === "object" && "type" in block && block.type === "text" && "text" in block) {
+		if (
+			block &&
+			typeof block === "object" &&
+			"type" in block &&
+			block.type === "text" &&
+			"text" in block
+		) {
 			return String((block as { text: unknown }).text);
 		}
 	}
 	return undefined;
 }
 
-export async function storeMemory(content: string, tags: string[]): Promise<void> {
+export async function storeMemory(
+	content: string,
+	tags: string[],
+): Promise<void> {
 	const client = await getClient();
 	await client.callTool({
 		name: "store_memory",

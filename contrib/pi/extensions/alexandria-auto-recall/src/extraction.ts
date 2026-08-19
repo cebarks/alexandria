@@ -67,8 +67,13 @@ function serializeEntries(entries: unknown[]): string {
 				if (text) lines.push(`[Turn ${turnNum} - Assistant]: ${text}`);
 			}
 		} else if (e.type === "compaction") {
-			const summary = (e as Record<string, unknown>).summary ??
-				((e as Record<string, unknown>).compaction as Record<string, unknown> | undefined)?.summary;
+			const summary =
+				(e as Record<string, unknown>).summary ??
+				(
+					(e as Record<string, unknown>).compaction as
+						| Record<string, unknown>
+						| undefined
+				)?.summary;
 			if (typeof summary === "string") {
 				lines.push(`[Session Summary]: ${summary}`);
 			}
@@ -93,7 +98,10 @@ function extractText(content: unknown): string {
 /**
  * Build the full extraction prompt with conversation and "already stored" context.
  */
-function buildPrompt(serializedConversation: string, buffer: SessionDedupBuffer): string {
+function buildPrompt(
+	serializedConversation: string,
+	buffer: SessionDedupBuffer,
+): string {
 	const alreadyStored = buffer.getAllStoredContents();
 	const alreadyStoredBlock =
 		alreadyStored.length > 0
@@ -118,7 +126,10 @@ interface ExtractionContext {
 	sessionManager: { buildContextEntries(): unknown[] };
 	modelRegistry: {
 		find(provider: string, modelId: string): unknown | undefined;
-		complete(model: unknown, context: { messages: Array<{ role: string; content: string }> }): Promise<unknown>;
+		complete(
+			model: unknown,
+			context: { messages: Array<{ role: string; content: string }> },
+		): Promise<unknown>;
 	};
 	model: unknown;
 	ui: { notify(msg: string, level: string): void };
@@ -128,7 +139,10 @@ interface ExtractionContext {
  * Run the LLM extraction pass. Falls back to ctx.model if the configured
  * extraction model/provider is not available.
  */
-export async function runExtraction(ctx: ExtractionContext, buffer: SessionDedupBuffer): Promise<DetectedMemory[]> {
+export async function runExtraction(
+	ctx: ExtractionContext,
+	buffer: SessionDedupBuffer,
+): Promise<DetectedMemory[]> {
 	const entries = ctx.sessionManager.buildContextEntries();
 	const serialized = serializeEntries(entries);
 
@@ -137,7 +151,10 @@ export async function runExtraction(ctx: ExtractionContext, buffer: SessionDedup
 
 	// Cap serialized conversation at ~16k tokens (~64k chars)
 	const maxChars = 64_000;
-	const truncated = serialized.length > maxChars ? serialized.slice(serialized.length - maxChars) : serialized;
+	const truncated =
+		serialized.length > maxChars
+			? serialized.slice(serialized.length - maxChars)
+			: serialized;
 
 	const userMessage = buildPrompt(truncated, buffer);
 
@@ -183,7 +200,9 @@ export async function runExtraction(ctx: ExtractionContext, buffer: SessionDedup
 			.filter((m) => typeof m.content === "string" && m.content.length > 0)
 			.map((m) => ({
 				content: m.content,
-				tags: Array.isArray(m.tags) ? m.tags.filter((t) => typeof t === "string") : ["extracted"],
+				tags: Array.isArray(m.tags)
+					? m.tags.filter((t) => typeof t === "string")
+					: ["extracted"],
 			}));
 	} catch (err) {
 		clearTimeout(timeout);

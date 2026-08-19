@@ -24,7 +24,10 @@ function isStoreToolCall(toolName: string): boolean {
  * If this tool_result is a successful store_memory or update_memory call,
  * record the content in the dedup buffer. Returns true if recorded.
  */
-export async function trackToolStore(event: ToolResultLike, buffer: SessionDedupBuffer): Promise<boolean> {
+export async function trackToolStore(
+	event: ToolResultLike,
+	buffer: SessionDedupBuffer,
+): Promise<boolean> {
 	if (!isStoreToolCall(event.toolName)) return false;
 	if (event.isError) return false;
 

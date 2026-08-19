@@ -78,9 +78,10 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 			const prompt = event.prompt?.trim();
 			if (!prompt) return;
 
-			const detections = [detectCorrection(prompt, dedupBuffer), detectPreference(prompt, dedupBuffer)].filter(
-				(d): d is NonNullable<typeof d> => d !== null,
-			);
+			const detections = [
+				detectCorrection(prompt, dedupBuffer),
+				detectPreference(prompt, dedupBuffer),
+			].filter((d): d is NonNullable<typeof d> => d !== null);
 
 			// Fire-and-forget stores — don't block the agent turn
 			for (const detection of detections) {
@@ -92,7 +93,11 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 
 		// Tool dedup tracker — watch for agent-initiated store_memory calls
 		pi.on("tool_result", async (event) => {
-			const e = event as unknown as { toolName: string; input: Record<string, unknown>; isError: boolean };
+			const e = event as unknown as {
+				toolName: string;
+				input: Record<string, unknown>;
+				isError: boolean;
+			};
 			await trackToolStore(
 				{ toolName: e.toolName ?? "", input: e.input ?? {}, isError: e.isError },
 				dedupBuffer,
@@ -122,7 +127,10 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 		// LLM extraction — skip on reload (no meaningful conversation boundary)
 		if (!CONFIG.storeDisabled && event.reason !== "reload") {
 			try {
-				const extracted = await runExtraction(ctx as Parameters<typeof runExtraction>[0], dedupBuffer);
+				const extracted = await runExtraction(
+					ctx as Parameters<typeof runExtraction>[0],
+					dedupBuffer,
+				);
 				for (const mem of extracted) {
 					await storeMemory(mem.content, [...mem.tags, "extracted"]).catch(() => {});
 				}
