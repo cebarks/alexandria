@@ -104,7 +104,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 					},
 					dedupBuffer,
 				);
-			} catch { /* never fail on tracking */ }
+			} catch {
+				/* never fail on tracking */
+			}
 		});
 
 		// Error resolution tracker — accumulate errors and successes
