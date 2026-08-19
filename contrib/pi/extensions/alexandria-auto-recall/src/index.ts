@@ -23,13 +23,12 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CONFIG } from "./config.js";
 import { resetClient, closeClient } from "./mcp-client.js";
 import { retrieveMemories, formatMemoriesBlock } from "./recall.js";
 
-const RECALL_DISABLED = process.env.ALEXANDRIA_AUTO_RECALL === "off";
-
 export default function alexandriaExtension(pi: ExtensionAPI) {
-	if (!RECALL_DISABLED) {
+	if (!CONFIG.recallDisabled) {
 		pi.on("before_agent_start", async (event, ctx) => {
 			const query = event.prompt?.trim();
 			if (!query) return;

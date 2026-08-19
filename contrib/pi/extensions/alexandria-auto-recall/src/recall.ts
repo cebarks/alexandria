@@ -3,9 +3,7 @@
  */
 
 import { getClient, extractTextContent } from "./mcp-client.js";
-
-const RESULT_LIMIT = Number(process.env.ALEXANDRIA_AUTO_RECALL_LIMIT ?? "5");
-const MIN_SIMILARITY = Number(process.env.ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY ?? "0.5");
+import { CONFIG } from "./config.js";
 
 interface RetrievedMemory {
 	id: string;
@@ -23,7 +21,7 @@ export async function retrieveMemories(query: string): Promise<RetrievedMemory[]
 	const client = await getClient();
 	const result = await client.callTool({
 		name: "retrieve_memories",
-		arguments: { query, limit: RESULT_LIMIT },
+		arguments: { query, limit: CONFIG.recallLimit },
 	});
 
 	const text = extractTextContent(result.content);
@@ -36,7 +34,7 @@ export async function retrieveMemories(query: string): Promise<RetrievedMemory[]
 		return [];
 	}
 
-	return (parsed.results ?? []).filter((m) => m.similarity >= MIN_SIMILARITY);
+	return (parsed.results ?? []).filter((m) => m.similarity >= CONFIG.recallMinSimilarity);
 }
 
 export function formatMemoriesBlock(memories: RetrievedMemory[]): string {
