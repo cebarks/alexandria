@@ -175,7 +175,10 @@ export async function runExtraction(
 	// Call model with timeout via Promise.race — ctx.modelRegistry.complete()
 	// may not support AbortSignal, so we race against a rejection timer.
 	const timeoutPromise = new Promise<never>((_, reject) => {
-		setTimeout(() => reject(new Error("extraction_timeout")), CONFIG.extractTimeoutMs);
+		setTimeout(
+			() => reject(new Error("extraction_timeout")),
+			CONFIG.extractTimeoutMs,
+		);
 	});
 
 	try {
