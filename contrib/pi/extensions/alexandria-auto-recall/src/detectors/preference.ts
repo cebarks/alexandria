@@ -17,7 +17,10 @@ const PREFERENCE_PATTERNS: RegExp[] = [
 	/\buse\s+(.+?)\s+instead\s+of\s+(.+)/i, // captures both sides
 ];
 
-export function detectPreference(prompt: string, buffer: SessionDedupBuffer): DetectedMemory | null {
+export function detectPreference(
+	prompt: string,
+	buffer: SessionDedupBuffer,
+): DetectedMemory | null {
 	const trimmed = prompt.trim();
 	if (trimmed.length < 8 || trimmed.length > 500) return null;
 
