@@ -4,8 +4,7 @@
  */
 
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-
-const SERVER_URL = process.env.ALEXANDRIA_URL ?? "http://127.0.0.1:3000/mcp";
+import { CONFIG } from "./config.js";
 
 let clientPromise: Promise<Client> | null = null;
 
@@ -14,9 +13,9 @@ export async function getClient(): Promise<Client> {
 		clientPromise = (async () => {
 			let url: URL;
 			try {
-				url = new URL(SERVER_URL);
+				url = new URL(CONFIG.serverUrl);
 			} catch {
-				throw new Error(`Invalid ALEXANDRIA_URL: ${SERVER_URL}`);
+				throw new Error(`Invalid ALEXANDRIA_URL: ${CONFIG.serverUrl}`);
 			}
 			const client = new Client({ name: "alexandria-auto-recall", version: "2.0.0" });
 			const transport = new StreamableHTTPClientTransport(url);
