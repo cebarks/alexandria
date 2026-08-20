@@ -507,7 +507,8 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         // created_at is written by SurrealDB as current timestamp — year will be present
-        assert!(text.contains("2026"), "expected year from created_at in list");
+        // Check for "UTC" which every formatted created_at includes (format: "YYYY-MM-DD HH:MM UTC")
+        assert!(text.contains("UTC"), "expected formatted created_at (with UTC suffix) in list");
         // Table header should include Created
         assert!(text.contains("Created"), "expected Created column header");
     }
