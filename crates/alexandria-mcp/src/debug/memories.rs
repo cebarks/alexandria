@@ -90,12 +90,15 @@ pub async fn list(
             .map(|t| format!(r#"<span class="badge">{}</span>"#, esc(t)))
             .collect::<String>();
 
-        // Add "…" if content was truncated
-        let raw_preview: String = fact.content.chars().take(120).collect();
-        let content_preview = if fact.content.chars().count() > 120 {
-            format!("{}…", raw_preview)
-        } else {
-            raw_preview
+        // Add "…" if content was truncated (single-pass: peek 121st char to detect overflow)
+        let content_preview = {
+            let mut chars = fact.content.chars();
+            let preview: String = chars.by_ref().take(120).collect();
+            if chars.next().is_some() {
+                        format!("{}…", preview)
+            } else {
+                        preview
+            }
         };
 
         // Format created_at as "YYYY-MM-DD HH:MM UTC", fallback to "—"
