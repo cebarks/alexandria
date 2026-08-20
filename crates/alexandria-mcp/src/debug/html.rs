@@ -29,6 +29,10 @@ button {{ cursor: pointer; }}
 .badge {{ display: inline-block; background: #21262d; padding: 2px 8px; border-radius: 12px; font-size: 12px; margin-right: 4px; }}
 a.link {{ color: #58a6ff; }}
 .error {{ color: #f85149; }}
+tr.deleted td {{ opacity: 0.45; text-decoration: line-through; }}
+tr.deleted td:first-child {{ text-decoration: none; }}
+.pagination {{ display: flex; justify-content: space-between; align-items: center; margin-top: 12px; color: #8b949e; font-size: 14px; }}
+.pagination a {{ margin: 0 4px; }}
 </style>
 </head>
 <body>
