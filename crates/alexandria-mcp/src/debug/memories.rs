@@ -96,9 +96,9 @@ pub async fn list(
             let mut chars = fact.content.chars();
             let preview: String = chars.by_ref().take(120).collect();
             if chars.next().is_some() {
-                        format!("{}…", preview)
+                format!("{}…", preview)
             } else {
-                        preview
+                preview
             }
         };
 
@@ -213,7 +213,7 @@ pub async fn detail(
         Some(c) => {
             let cluster_id = c.id.as_ref().map(record_id_to_string).unwrap_or_default();
             let label = esc(c.label.as_deref().unwrap_or("unlabeled"));
-            let encoded_id = cluster_id.replace(':', "%3A");
+            let encoded_id = esc(&cluster_id.replace(':', "%3A"));
             format!(
                 r#"<a class="link" href="/debug/clusters/{encoded_id}">{label}</a> <span class="badge">{}</span>"#,
                 esc(&cluster_id)
@@ -229,8 +229,8 @@ pub async fn detail(
         .map(|e| {
             let in_id = e.in_node.as_ref().map(record_id_to_string).unwrap_or_default();
             let out_id = e.out_node.as_ref().map(record_id_to_string).unwrap_or_default();
-            let in_encoded = in_id.replace(':', "%3A");
-            let out_encoded = out_id.replace(':', "%3A");
+            let in_encoded = esc(&in_id.replace(':', "%3A"));
+            let out_encoded = esc(&out_id.replace(':', "%3A"));
             format!(
                 r#"<li><span class="badge">{}</span> <a class="link" href="/debug/memories/{in_encoded}">{}</a> → <a class="link" href="/debug/memories/{out_encoded}">{}</a> (strength {:.2})</li>"#,
                 esc(&e.edge_type),
