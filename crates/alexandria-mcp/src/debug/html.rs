@@ -33,6 +33,11 @@ tr.deleted td {{ opacity: 0.45; text-decoration: line-through; }}
 tr.deleted td:first-child {{ text-decoration: none; }}
 .pagination {{ display: flex; justify-content: space-between; align-items: center; margin-top: 12px; color: #8b949e; font-size: 14px; }}
 .pagination a {{ margin: 0 4px; }}
+.badge-deleted {{ background: #3d1a1a; color: #f85149; border: 1px solid #6e2020; padding: 2px 10px; border-radius: 12px; font-size: 13px; margin-left: 8px; }}
+pre.content-block {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow-y: auto; }}
+dl.fact-meta {{ display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px; margin: 12px 0; }}
+dl.fact-meta dt {{ color: #8b949e; font-weight: 600; }}
+dl.fact-meta dd {{ margin: 0; }}
 </style>
 </head>
 <body>

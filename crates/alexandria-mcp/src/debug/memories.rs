@@ -189,11 +189,22 @@ pub async fn detail(
     let heat_repo = alexandria_storage::repos::HeatRepo::new(server.db.inner());
     let heat = heat_repo.get(&id).await.ok().flatten();
     let heat_html = match &heat {
-        Some(h) => format!(
-            "heat={:.3} stability={:.3} access_count={}",
-            h.heat, h.stability, h.access_count
-        ),
-        None => "no heat state".to_string(),
+        Some(h) => {
+            let last_touched = h
+                .last_touched
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "—".to_string());
+            format!(
+                r#"<dl class="fact-meta">
+  <dt>Heat</dt><dd>{:.3}</dd>
+  <dt>Stability</dt><dd>{:.3}</dd>
+  <dt>Access count</dt><dd>{}</dd>
+  <dt>Last touched</dt><dd>{}</dd>
+</dl>"#,
+                h.heat, h.stability, h.access_count, last_touched
+            )
+        }
+        None => "<p>No heat state recorded.</p>".to_string(),
     };
 
     let cluster = repo.cluster_for_fact(&id).await.ok().flatten();
@@ -227,25 +238,44 @@ pub async fn detail(
         .map(|t| format!(r#"<span class="badge">{}</span>"#, esc(t)))
         .collect();
 
+    // Deleted badge — shown prominently if the fact is deleted
+    let deleted_badge = if fact.deleted {
+        r#"<span class="badge-deleted">⚠ Deleted</span>"#.to_string()
+    } else {
+        String::new()
+    };
+
+    // Formatted created_at
+    let created_at_str = fact
+        .created_at
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "—".to_string());
+
     let body = format!(
-        r##"<h1>Memory {}</h1>
-<p><a class="link" href="/debug/graph/{}">View graph</a></p>
-<pre>{}</pre>
-<p>Tags: {tags}</p>
-<p>Confidence: {}</p>
-<p>Deleted: {}</p>
-<p>Heat: {}</p>
-<p>Cluster: {}</p>
+        r##"<p><a class="link" href="/debug/memories">← Back to memories</a></p>
+<h1>Memory {id_esc} {deleted_badge}</h1>
+<p><a class="link" href="/debug/graph/{id_esc}">View graph →</a></p>
+<pre class="content-block">{content_esc}</pre>
+<dl class="fact-meta">
+  <dt>Tags</dt><dd>{tags}</dd>
+  <dt>Confidence</dt><dd>{confidence:.2}</dd>
+  <dt>Created</dt><dd>{created_at}</dd>
+</dl>
+<h2>Heat</h2>
+{heat_section}
+<h2>Cluster</h2>
+<p>{cluster_html}</p>
 <h2>Edges</h2>
-<ul>{}</ul>"##,
-        esc(&id),
-        esc(&id),
-        esc(&fact.content),
-        fact.confidence,
-        fact.deleted,
-        heat_html,
-        cluster_html,
-        edges_html,
+<ul>{edges_html}</ul>"##,
+        id_esc = esc(&id),
+        deleted_badge = deleted_badge,
+        content_esc = esc(&fact.content),
+        tags = tags,
+        confidence = fact.confidence,
+        created_at = created_at_str,
+        heat_section = heat_html,
+        cluster_html = cluster_html,
+        edges_html = edges_html,
     );
 
     (StatusCode::OK, Html(layout("Memory Detail", &body)))
@@ -544,6 +574,81 @@ mod tests {
             text.contains(r#"class="deleted""#),
             "expected deleted class on row"
         );
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_has_back_link() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let id = repo
+            .create_fact("nav test", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+
+        let app = crate::debug::router(server);
+        let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("/debug/memories"),
+            "expected back link to memories list"
+        );
+        assert!(text.contains("Back"), "expected Back text in link");
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_shows_deleted_badge_for_deleted_fact() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let id = repo
+            .create_fact("deleted fact", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        repo.soft_delete_fact(&id).await.unwrap();
+
+        let app = crate::debug::router(server);
+        let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("Deleted"),
+            "expected deleted badge on detail page for deleted fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_shows_created_at() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let id = repo
+            .create_fact("timestamp check", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+
+        let app = crate::debug::router(server);
+        let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Created"), "expected Created label");
+        assert!(text.contains("UTC"), "expected UTC timestamp in created_at");
     }
 
     #[tokio::test]
