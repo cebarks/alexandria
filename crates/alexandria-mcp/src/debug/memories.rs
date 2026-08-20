@@ -89,13 +89,29 @@ pub async fn list(
             .iter()
             .map(|t| format!(r#"<span class="badge">{}</span>"#, esc(t)))
             .collect::<String>();
-        let content_preview: String = fact.content.chars().take(120).collect();
+
+        // Add "…" if content was truncated
+        let raw_preview: String = fact.content.chars().take(120).collect();
+        let content_preview = if fact.content.chars().count() > 120 {
+            format!("{}…", raw_preview)
+        } else {
+            raw_preview
+        };
+
+        // Format created_at as "YYYY-MM-DD HH:MM UTC", fallback to "—"
+        let created = fact
+            .created_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "—".to_string());
+
+        // Deleted rows get a CSS class for dimming
+        let row_class = if fact.deleted { r#" class="deleted""# } else { "" };
+
         rows_html.push_str(&format!(
-            r#"<tr><td><a class="link" href="/debug/memories/{id}">{id}</a></td><td>{}</td><td>{}</td><td>{:.2}</td><td>{}</td></tr>"#,
+            r#"<tr{row_class}><td><a class="link" href="/debug/memories/{id}">{id}</a></td><td>{}</td><td>{}</td><td>{:.2}</td><td>{created}</td></tr>"#,
             esc(&content_preview),
             tags,
             fact.confidence,
-            fact.deleted,
         ));
     }
 
@@ -108,7 +124,7 @@ pub async fn list(
 </form>
 <div id="memory-results">
 <table>
-<tr><th>ID</th><th>Content</th><th>Tags</th><th>Confidence</th><th>Deleted</th></tr>
+<tr><th>ID</th><th>Content</th><th>Tags</th><th>Confidence</th><th>Created</th></tr>
 {rows_html}
 </table>
 <div class="pagination"><span>{summary}</span><span>{prev_link} {next_link}</span></div>
@@ -466,6 +482,64 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("Prev"), "expected Prev link on second page");
         assert!(!text.contains("Next"), "should not have Next link on last page");
+    }
+
+    #[tokio::test]
+    async fn test_memories_list_shows_created_at() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        repo.create_fact("timestamped memory", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+
+        let app = crate::debug::router(server);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/memories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // created_at is written by SurrealDB as current timestamp — year will be present
+        assert!(text.contains("2026"), "expected year from created_at in list");
+        // Table header should include Created
+        assert!(text.contains("Created"), "expected Created column header");
+    }
+
+    #[tokio::test]
+    async fn test_memories_list_deleted_row_has_class() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let id = repo
+            .create_fact("to be deleted", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        repo.soft_delete_fact(&id).await.unwrap();
+
+        let app = crate::debug::router(server);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/memories?include_deleted=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(r#"class="deleted""#),
+            "expected deleted class on row"
+        );
     }
 
     #[tokio::test]
