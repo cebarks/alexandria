@@ -35,8 +35,8 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Cluster `member_count` is queried live (not cached) — `load_cluster_infos()` calls `get_members()` per cluster.
 - `update_memory` with content change: creates a soft-deleted snapshot of old content, then links via `derived_from` edge. The old version is hidden from search but preserved for lineage.
 - `import_document` creates a `raw` table record for the full document, then `extracted_from` edges from each chunk to it.
-- Spreading activation fires on the top 3 results of `retrieve_memories` — it's a side effect, not part of the ranking.
-- Cluster maintenance runs as a background `tokio::spawn` every 5 minutes in HTTP mode only (not stdio).
+- Spreading activation fires on the top N results of `retrieve_memories` (configurable via `activation.top_n`, default 3) — it's a side effect, not part of the ranking.
+- Cluster maintenance runs as a background `tokio::spawn` in HTTP mode only (not stdio), at an interval configurable via `cluster.maintenance_interval_secs` (default 300s / 5 minutes).
 - Schema migrations are forward-only, numbered (`v001`, `v002`, ...), tracked in `system_config` table.
 - Embedding model is locked on first boot — changing `config.toml` model without wiping data will refuse to start.
 
@@ -48,4 +48,14 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 
 ## Config Precedence
 
-defaults → `~/.alexandria/config.toml` → `ALEXANDRIA_CONFIG` env var (path to alt TOML) → individual env vars (`ALEXANDRIA_SERVER_TRANSPORT`, etc.)
+### Server
+
+defaults → `$XDG_CONFIG_HOME/alexandria/config.toml` → `ALEXANDRIA_CONFIG` env var (path to alt TOML) → individual env vars (`ALEXANDRIA_SERVER_TRANSPORT`, etc.)
+
+Legacy path `~/.alexandria/config.toml` is used as fallback if the XDG path doesn't exist.
+
+Data defaults to `$XDG_DATA_HOME/alexandria/data` (was `~/.alexandria/data`).
+
+### Client (Pi extension)
+
+defaults → `$XDG_CONFIG_HOME/alexandria/client.toml` → `ALEXANDRIA_CLIENT_CONFIG` env var → individual `ALEXANDRIA_*` env vars

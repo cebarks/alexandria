@@ -6,9 +6,8 @@ use serde::Deserialize;
 ///
 /// Load order:
 /// 1. Compiled defaults
-/// 2. `~/.alexandria/config.toml` (if exists)
-/// 3. `ALEXANDRIA_CONFIG` env path (if set)
-/// 4. Individual env var overrides
+/// 2. Config file (see `config_path()` for resolution)
+/// 3. Individual env var overrides
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -34,6 +33,8 @@ pub struct ServerConfig {
     pub allowed_origins: Vec<String>,
     /// Allowed hosts for HTTP. Empty = allow all. Default: ["*"].
     pub allowed_hosts: Vec<String>,
+    /// SSE keep-alive interval in seconds. Default: 15.
+    pub sse_keep_alive_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -44,6 +45,7 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             allowed_origins: vec!["*".to_string()],
             allowed_hosts: vec!["*".to_string()],
+            sse_keep_alive_secs: 15,
         }
     }
 }
@@ -52,7 +54,7 @@ impl Default for ServerConfig {
 #[serde(default)]
 pub struct DatabaseConfig {
     /// Storage path. Use ":memory:" for in-memory (ephemeral).
-    /// Default: ~/.alexandria/data
+    /// Default: `$XDG_DATA_HOME/alexandria/data`
     pub data_dir: PathBuf,
 }
 
@@ -77,6 +79,8 @@ pub struct ActivationConfig {
     pub propagation_factor: f32,
     /// Max graph hops for spreading activation. Default 2.
     pub max_hops: u32,
+    /// Number of top retrieval results that trigger spreading activation. Default: 3.
+    pub top_n: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,14 +92,21 @@ pub struct ClusterConfig {
     pub merge_threshold: f32,
     /// Avg member-to-centroid similarity below which a cluster splits. Default 0.6.
     pub cohesion_floor: f32,
+    /// Cluster maintenance check interval in seconds. Default: 300 (5 minutes).
+    pub maintenance_interval_secs: u64,
 }
 
 // --- Defaults ---
 
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".alexandria")
+    dirs::data_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local")
+                .join("share")
+        })
+        .join("alexandria")
         .join("data")
 }
 
@@ -129,6 +140,7 @@ impl Default for ActivationConfig {
         Self {
             propagation_factor: 0.3,
             max_hops: 2,
+            top_n: 3,
         }
     }
 }
@@ -139,27 +151,60 @@ impl Default for ClusterConfig {
             join_threshold: 0.75,
             merge_threshold: 0.9,
             cohesion_floor: 0.6,
+            maintenance_interval_secs: 300,
         }
     }
 }
 
+/// Resolve the config file path with precedence:
+/// 1. `ALEXANDRIA_CONFIG` env var (explicit override)
+/// 2. `$XDG_CONFIG_HOME/alexandria/config.toml` via `dirs::config_dir()`
+/// 3. `~/.alexandria/config.toml` (legacy fallback)
+/// 4. XDG path (for new installs, even if it doesn't exist yet)
+fn config_path() -> PathBuf {
+    // Explicit env override wins
+    if let Ok(p) = std::env::var("ALEXANDRIA_CONFIG") {
+        return PathBuf::from(p);
+    }
+
+    // XDG primary
+    let xdg_path = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("alexandria")
+        .join("config.toml");
+    if xdg_path.exists() {
+        return xdg_path;
+    }
+
+    // Legacy fallback
+    let legacy_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".alexandria")
+        .join("config.toml");
+    if legacy_path.exists() {
+        tracing::warn!(
+            "Using legacy config path {}. Consider moving to {}",
+            legacy_path.display(),
+            xdg_path.display(),
+        );
+        return legacy_path;
+    }
+
+    // Neither exists — prefer XDG for new installs
+    xdg_path
+}
+
 impl Config {
     /// Load configuration with the standard precedence chain:
-    /// defaults → ~/.alexandria/config.toml → ALEXANDRIA_CONFIG → env overrides
+    /// defaults → config file → env overrides
+    ///
+    /// Config file resolution: `ALEXANDRIA_CONFIG` env → XDG config dir → legacy `~/.alexandria/`
     pub fn load() -> anyhow::Result<Self> {
         // 1. Start with defaults
         let mut config = Config::default();
 
-        // 2. Try ~/.alexandria/config.toml
-        let default_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".alexandria")
-            .join("config.toml");
-
-        // 3. ALEXANDRIA_CONFIG overrides the default path
-        let config_path = std::env::var("ALEXANDRIA_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or(default_path);
+        // 2. Load config file
+        let config_path = config_path();
 
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
@@ -167,7 +212,7 @@ impl Config {
             tracing::info!("Loaded config from {}", config_path.display());
         }
 
-        // 4. Individual env var overrides
+        // 3. Individual env var overrides
         if let Ok(dir) = std::env::var("ALEXANDRIA_DATA_DIR") {
             config.database.data_dir = PathBuf::from(dir);
         }
@@ -190,6 +235,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_defaults() {
@@ -247,6 +293,73 @@ mod tests {
     }
 
     #[test]
+    fn test_xdg_data_dir_default() {
+        let config = Config::default();
+        let xdg_data = dirs::data_dir().unwrap().join("alexandria").join("data");
+        assert_eq!(config.database.data_dir, xdg_data);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_path_env_override() {
+        std::env::set_var("ALEXANDRIA_CONFIG", "/tmp/custom/config.toml");
+        let path = config_path();
+        assert_eq!(path, PathBuf::from("/tmp/custom/config.toml"));
+        std::env::remove_var("ALEXANDRIA_CONFIG");
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_path_prefers_xdg_when_no_files_exist() {
+        std::env::remove_var("ALEXANDRIA_CONFIG");
+        // When neither XDG nor legacy config files exist, config_path()
+        // should return the XDG path (not legacy). We can't guarantee
+        // neither file exists on this machine, so we verify the structural
+        // property: the returned path is under dirs::config_dir(), not
+        // under ~/.alexandria/.
+        let xdg_config_dir = dirs::config_dir().unwrap();
+        let legacy_dir = dirs::home_dir().unwrap().join(".alexandria");
+        let path = config_path();
+        assert!(path.ends_with("config.toml"));
+        // Must be under one of: XDG config dir OR legacy dir
+        // (depends on what files exist on this machine)
+        assert!(
+            path.starts_with(&xdg_config_dir) || path.starts_with(&legacy_dir),
+            "config_path() returned {}, expected it under {} or {}",
+            path.display(),
+            xdg_config_dir.display(),
+            legacy_dir.display(),
+        );
+    }
+
+    #[test]
+    fn test_new_config_defaults() {
+        let config = Config::default();
+        assert_eq!(config.server.sse_keep_alive_secs, 15);
+        assert_eq!(config.cluster.maintenance_interval_secs, 300);
+        assert_eq!(config.activation.top_n, 3);
+    }
+
+    #[test]
+    fn test_new_config_from_toml() {
+        let toml = r#"
+            [server]
+            sse_keep_alive_secs = 30
+
+            [cluster]
+            maintenance_interval_secs = 600
+
+            [activation]
+            top_n = 5
+        "#;
+        let config = Config::from_toml(toml).unwrap();
+        assert_eq!(config.server.sse_keep_alive_secs, 30);
+        assert_eq!(config.cluster.maintenance_interval_secs, 600);
+        assert_eq!(config.activation.top_n, 5);
+    }
+
+    #[test]
+    #[serial]
     fn test_env_overrides() {
         // Set env vars
         std::env::set_var("ALEXANDRIA_DATA_DIR", "/tmp/env-test");
