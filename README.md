@@ -21,8 +21,8 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 cargo install --path crates/alexandria
 
 # Create config
-mkdir -p ~/.alexandria
-cat > ~/.alexandria/config.toml << 'EOF'
+mkdir -p ~/.config/alexandria
+cat > ~/.config/alexandria/config.toml << 'EOF'
 [server]
 transport = "http"
 port = 3000
@@ -137,9 +137,13 @@ Or via stdio (for single-session use):
 
 ## Configuration
 
-Config loads with precedence: defaults → `~/.alexandria/config.toml` → `ALEXANDRIA_CONFIG` env → individual env vars.
+Config loads with precedence: defaults → `$XDG_CONFIG_HOME/alexandria/config.toml` → `ALEXANDRIA_CONFIG` env → individual env vars. Data defaults to `$XDG_DATA_HOME/alexandria/data`.
 
-See [docs/configuration.md](docs/configuration.md) for all options.
+Legacy `~/.alexandria/` paths are used as fallback if the XDG paths don't exist yet.
+
+The Pi auto-recall/store extension has its own config at `$XDG_CONFIG_HOME/alexandria/client.toml`.
+
+See [docs/configuration.md](docs/configuration.md) for all options, client config reference, and migration instructions.
 
 ## Architecture
 

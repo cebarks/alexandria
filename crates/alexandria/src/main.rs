@@ -22,6 +22,21 @@ async fn main() -> anyhow::Result<()> {
         config.embedding.model,
     );
 
+    // Check for legacy data dir and advise migration
+    let legacy_data = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".alexandria")
+        .join("data");
+    if legacy_data.exists() && config.database.data_dir != legacy_data {
+        tracing::warn!(
+            "Legacy data directory found at {}. To migrate, run:\n  \
+             mv {} {}",
+            legacy_data.display(),
+            legacy_data.display(),
+            config.database.data_dir.display(),
+        );
+    }
+
     // 2. Connect to SurrealDB (persistent or in-memory based on config)
     let db = Database::connect(&config.database.data_dir).await?;
     schema::migrate(db.inner()).await?;
@@ -45,7 +60,8 @@ async fn main() -> anyhow::Result<()> {
         config.cluster.join_threshold,
         config.heat.spacing_halflife_secs,
     )
-    .with_activation_config(activation_config);
+    .with_activation_config(activation_config)
+    .with_activation_top_n(config.activation.top_n);
 
     // 5. Serve based on transport config
     match config.server.transport.as_str() {
@@ -74,7 +90,7 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
 
     let cancel = CancellationToken::new();
     let mut http_config = StreamableHttpServerConfig::default()
-        .with_sse_keep_alive(Some(std::time::Duration::from_secs(15)))
+        .with_sse_keep_alive(Some(std::time::Duration::from_secs(config.server.sse_keep_alive_secs)))
         .with_cancellation_token(cancel.clone());
 
     // Configure host/origin validation from config
@@ -93,12 +109,13 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
     let maintenance_db = server.db.clone();
     let cohesion_floor = config.cluster.cohesion_floor;
     let merge_threshold = config.cluster.merge_threshold;
+    let maintenance_interval_secs = config.cluster.maintenance_interval_secs;
     let maintenance_cancel = cancel.clone();
     tokio::spawn(async move {
         use alexandria_engine::clusters::maintenance::{check_cohesion, check_merge};
         use alexandria_storage::repos::ClusterRepo;
 
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(maintenance_interval_secs));
         loop {
             tokio::select! {
                 _ = interval.tick() => {},
