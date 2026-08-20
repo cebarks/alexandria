@@ -265,6 +265,14 @@ pub async fn detail(
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "—".to_string());
 
+    let metadata_section = match &fact.metadata {
+        Some(m) => format!(
+            "<h2>Metadata</h2><pre class=\"content-block\">{}</pre>",
+            esc(&format!("{m:#?}"))
+        ),
+        None => "<h2>Metadata</h2><p>None</p>".to_string(),
+    };
+
     let body = format!(
         r##"<p><a class="link" href="/debug/memories">← Back to memories</a></p>
 <h1>Memory {id_esc} {deleted_badge}</h1>
@@ -280,7 +288,8 @@ pub async fn detail(
 <h2>Cluster</h2>
 <p>{cluster_html}</p>
 <h2>Edges</h2>
-{edges_section}"##,
+{edges_section}
+{metadata_section}"##,
         id_esc = esc(&id),
         deleted_badge = deleted_badge,
         content_esc = esc(&fact.content),
@@ -290,6 +299,7 @@ pub async fn detail(
         heat_section = heat_html,
         cluster_html = cluster_html,
         edges_section = edges_section,
+        metadata_section = metadata_section,
     );
 
     (StatusCode::OK, Html(layout("Memory Detail", &body)))
@@ -730,6 +740,33 @@ mod tests {
         assert!(
             text.contains("/debug/memories/"),
             "expected edge nodes to be links to memory detail pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_shows_metadata_section() {
+        // The metadata section header always renders (shows "None" when metadata is null,
+        // which is the case for facts created via create_fact which doesn't set metadata).
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let id = repo
+            .create_fact("metadata check", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+
+        let app = crate::debug::router(server);
+        let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("Metadata"),
+            "expected Metadata section on detail page"
         );
     }
 
