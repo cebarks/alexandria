@@ -210,12 +210,16 @@ pub async fn detail(
 
     let cluster = repo.cluster_for_fact(&id).await.ok().flatten();
     let cluster_html = match &cluster {
-        Some(c) => format!(
-            "{} ({})",
-            esc(c.label.as_deref().unwrap_or("unlabeled")),
-            esc(&c.id.as_ref().map(record_id_to_string).unwrap_or_default())
-        ),
-        None => "none".to_string(),
+        Some(c) => {
+            let cluster_id = c.id.as_ref().map(record_id_to_string).unwrap_or_default();
+            let label = esc(c.label.as_deref().unwrap_or("unlabeled"));
+            let encoded_id = cluster_id.replace(':', "%3A");
+            format!(
+                r#"<a class="link" href="/debug/clusters/{encoded_id}">{label}</a> <span class="badge">{}</span>"#,
+                esc(&cluster_id)
+            )
+        }
+        None => "None".to_string(),
     };
 
     let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
@@ -223,15 +227,24 @@ pub async fn detail(
     let edges_html: String = edges
         .iter()
         .map(|e| {
+            let in_id = e.in_node.as_ref().map(record_id_to_string).unwrap_or_default();
+            let out_id = e.out_node.as_ref().map(record_id_to_string).unwrap_or_default();
+            let in_encoded = in_id.replace(':', "%3A");
+            let out_encoded = out_id.replace(':', "%3A");
             format!(
-                "<li>{} — {} → {} (strength {:.2})</li>",
+                r#"<li><span class="badge">{}</span> <a class="link" href="/debug/memories/{in_encoded}">{}</a> → <a class="link" href="/debug/memories/{out_encoded}">{}</a> (strength {:.2})</li>"#,
                 esc(&e.edge_type),
-                esc(&e.in_node.as_ref().map(record_id_to_string).unwrap_or_default()),
-                esc(&e.out_node.as_ref().map(record_id_to_string).unwrap_or_default()),
+                esc(&in_id),
+                esc(&out_id),
                 e.strength
             )
         })
         .collect();
+    let edges_section = if edges.is_empty() {
+        "<p>No edges.</p>".to_string()
+    } else {
+        format!("<ul>{edges_html}</ul>")
+    };
 
     let tags: String = fact
         .tags
@@ -267,7 +280,7 @@ pub async fn detail(
 <h2>Cluster</h2>
 <p>{cluster_html}</p>
 <h2>Edges</h2>
-<ul>{edges_html}</ul>"##,
+{edges_section}"##,
         id_esc = esc(&id),
         deleted_badge = deleted_badge,
         content_esc = esc(&fact.content),
@@ -276,7 +289,7 @@ pub async fn detail(
         created_at = created_at_str,
         heat_section = heat_html,
         cluster_html = cluster_html,
-        edges_html = edges_html,
+        edges_section = edges_section,
     );
 
     (StatusCode::OK, Html(layout("Memory Detail", &body)))
@@ -650,6 +663,74 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("Created"), "expected Created label");
         assert!(text.contains("UTC"), "expected UTC timestamp in created_at");
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_cluster_is_a_link() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
+
+        let fact_id = repo
+            .create_fact("linked cluster test", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let cluster_id = cluster_repo
+            .create(Some("my cluster"), &[0.1, 0.2])
+            .await
+            .unwrap();
+        cluster_repo.add_member(&cluster_id, &fact_id).await.unwrap();
+
+        let app = crate::debug::router(server);
+        let uri = format!("/debug/memories/{}", fact_id.replace(':', "%3A"));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("/debug/clusters/"),
+            "expected cluster to be a link to /debug/clusters/:id"
+        );
+        assert!(text.contains("my cluster"), "expected cluster label in link");
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_edges_are_links() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
+
+        let id_a = repo
+            .create_fact("edge source", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let id_b = repo
+            .create_fact("edge target", 0.5, &[0.3, 0.4], &[])
+            .await
+            .unwrap();
+        edge_repo
+            .create_edge(&id_a, &id_b, "related", 0.9)
+            .await
+            .unwrap();
+
+        let app = crate::debug::router(server);
+        let uri = format!("/debug/memories/{}", id_a.replace(':', "%3A"));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("/debug/memories/"),
+            "expected edge nodes to be links to memory detail pages"
+        );
     }
 
     #[tokio::test]
