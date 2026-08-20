@@ -1,12 +1,13 @@
 # Configuration Reference
 
-Alexandria loads server config with this precedence (last wins):
+Alexandria loads server config with this precedence:
 
 1. **Built-in defaults**
-2. **`$XDG_CONFIG_HOME/alexandria/config.toml`** (default: `~/.config/alexandria/config.toml` on Linux, `~/Library/Application Support/alexandria/config.toml` on macOS)
-3. **`~/.alexandria/config.toml`** — legacy fallback, used only if the XDG path doesn't exist
-4. **`ALEXANDRIA_CONFIG` env var** — path to an alternate TOML file
-5. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_DATABASE_DATA_DIR`, etc.
+2. **Config file** — exactly one file is loaded, chosen by first-match priority:
+   - `ALEXANDRIA_CONFIG` env var (explicit path override)
+   - `$XDG_CONFIG_HOME/alexandria/config.toml` (default: `~/.config/alexandria/config.toml` on Linux, `~/Library/Application Support/alexandria/config.toml` on macOS)
+   - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
+3. **Individual env vars** — `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`
 
 ## Full Example
 
@@ -20,7 +21,7 @@ allowed_hosts = ["*"]         # Allowed Host headers; ["*"] disables validation 
 sse_keep_alive_secs = 15      # SSE keep-alive interval in seconds (default: 15)
 
 [database]
-data_dir = "~/.local/share/alexandria/data"   # Storage path; ":memory:" for ephemeral (default: $XDG_DATA_HOME/alexandria/data)
+# data_dir = "/home/you/.local/share/alexandria/data"  # Storage path; ":memory:" for ephemeral (default: $XDG_DATA_HOME/alexandria/data)
 
 [embedding]
 model = "sentence-transformers/all-MiniLM-L6-v2"   # HuggingFace model ID (no default — required)
@@ -84,10 +85,10 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 Controls spreading activation — when a memory is accessed, its graph neighbors receive a fraction of heat.
 
 | Key | Type | Default | Description |
-|-----|------|---------|-------------|
+| ----- | ------ | --------- | ------------- |
 | `propagation_factor` | f32 | `0.3` | Heat fraction passed per hop. At hop 1, a neighbor gets `propagation_factor × edge_strength` of the source heat. At hop 2, `propagation_factor² × edge_strength`. |
 | `max_hops` | u32 | `2` | Maximum graph traversal depth. Higher values spread activation further but cost more DB queries. |
-| `top_n` | usize | `3` | Number of top retrieval results that trigger spreading activation. Only the top N results from `retrieve_memories` fire the activation side effect. |
+| `top_n` | integer | `3` | Number of top retrieval results that trigger spreading activation. Only the top N results from `retrieve_memories` fire the activation side effect. |
 
 ### `[cluster]`
 
@@ -100,19 +101,18 @@ Controls automatic cluster assignment, splitting, and merging. Maintenance runs 
 | `cohesion_floor` | f32 | `0.6` | Average member-to-centroid similarity below which a cluster is split via k-means(k=2). |
 | `maintenance_interval_secs` | u64 | `300` | Interval between cluster maintenance runs in seconds (default: 5 minutes). Only active in HTTP mode. |
 
-## Environment Variable Override
+## Environment Variable Overrides
 
-Any config key can be overridden via environment variable using the pattern `ALEXANDRIA_{SECTION}_{KEY}` in uppercase:
+These env vars override individual config values after the TOML file is loaded:
 
-```bash
-ALEXANDRIA_SERVER_TRANSPORT=http
-ALEXANDRIA_SERVER_PORT=8080
-ALEXANDRIA_DATABASE_DATA_DIR=/var/lib/alexandria
-ALEXANDRIA_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-ALEXANDRIA_HEAT_SPACING_HALFLIFE_SECS=172800
-ALEXANDRIA_ACTIVATION_PROPAGATION_FACTOR=0.5
-ALEXANDRIA_CLUSTER_JOIN_THRESHOLD=0.8
-```
+| Variable | Overrides |
+|---|---|
+| `ALEXANDRIA_CONFIG` | Path to an alternate config TOML file |
+| `ALEXANDRIA_DATA_DIR` | `database.data_dir` |
+| `ALEXANDRIA_EMBEDDING_MODEL` | `embedding.model` |
+| `ALEXANDRIA_EMBEDDING_DEVICE` | `embedding.device` |
+
+Other config keys can only be set via the TOML file.
 
 ---
 
@@ -148,7 +148,7 @@ extract_timeout_ms = 5000
 ### `[recall]`
 
 | Key | Type | Default | Env Override | Description |
-|-----|------|---------|-------------|-------------|
+| ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_AUTO_RECALL=off` | Enable auto-recall on every prompt. |
 | `limit` | number | `5` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. |
 | `min_similarity` | number | `0.5` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include a result. |
@@ -156,7 +156,7 @@ extract_timeout_ms = 5000
 ### `[store]`
 
 | Key | Type | Default | Env Override | Description |
-|-----|------|---------|-------------|-------------|
+| ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_AUTO_STORE=off` | Enable heuristic store detectors and LLM extraction. |
 | `extract_model` | string | `"vertex/claude-haiku-4-5"` | `ALEXANDRIA_EXTRACT_MODEL` | Model for session-end LLM extraction. Falls back to session model if unavailable. |
 | `extract_timeout_ms` | number | `5000` | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | Timeout for the extraction LLM call in milliseconds. |

@@ -212,7 +212,7 @@ impl Config {
             tracing::info!("Loaded config from {}", config_path.display());
         }
 
-        // 4. Individual env var overrides
+        // 3. Individual env var overrides
         if let Ok(dir) = std::env::var("ALEXANDRIA_DATA_DIR") {
             config.database.data_dir = PathBuf::from(dir);
         }
