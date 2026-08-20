@@ -84,6 +84,7 @@ pub async fn list(
     let mut rows_html = String::new();
     for fact in &rows {
         let id = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+        let id_esc = esc(&id);
         let tags = fact
             .tags
             .iter()
@@ -111,7 +112,7 @@ pub async fn list(
         let row_class = if fact.deleted { r#" class="deleted""# } else { "" };
 
         rows_html.push_str(&format!(
-            r#"<tr{row_class}><td><a class="link" href="/debug/memories/{id}">{id}</a></td><td>{}</td><td>{}</td><td>{:.2}</td><td>{created}</td></tr>"#,
+            r#"<tr{row_class}><td><a class="link" href="/debug/memories/{id_esc}">{id_esc}</a></td><td>{}</td><td>{}</td><td>{:.2}</td><td>{created}</td></tr>"#,
             esc(&content_preview),
             tags,
             fact.confidence,
@@ -212,7 +213,7 @@ pub async fn detail(
         Some(c) => format!(
             "{} ({})",
             esc(c.label.as_deref().unwrap_or("unlabeled")),
-            c.id.as_ref().map(record_id_to_string).unwrap_or_default()
+            esc(&c.id.as_ref().map(record_id_to_string).unwrap_or_default())
         ),
         None => "none".to_string(),
     };
@@ -225,8 +226,8 @@ pub async fn detail(
             format!(
                 "<li>{} — {} → {} (strength {:.2})</li>",
                 esc(&e.edge_type),
-                e.in_node.as_ref().map(record_id_to_string).unwrap_or_default(),
-                e.out_node.as_ref().map(record_id_to_string).unwrap_or_default(),
+                esc(&e.in_node.as_ref().map(record_id_to_string).unwrap_or_default()),
+                esc(&e.out_node.as_ref().map(record_id_to_string).unwrap_or_default()),
                 e.strength
             )
         })
