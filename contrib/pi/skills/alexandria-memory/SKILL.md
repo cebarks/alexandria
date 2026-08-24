@@ -1,6 +1,6 @@
 ---
 name: alexandria-memory
-description: Use the Alexandria agent-memory MCP tools (store_memory, retrieve_memories, recall, update_memory, import_document, delete_memory) to persist and recall durable facts, decisions, and preferences across sessions. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
+description: Use the Alexandria agent-memory MCP tools (alexandria_store_memory, alexandria_retrieve_memories, alexandria_recall, alexandria_update_memory, alexandria_import_document, alexandria_delete_memory) to persist and recall durable facts, decisions, and preferences across sessions. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
 ---
 
 # Alexandria Memory
@@ -23,10 +23,10 @@ exactly like one with no memory at all. Default to using it; don't wait for an e
   already exists so you don't contradict it silently.
 
 Tool choice:
-- **`retrieve_memories`** — specific lookup, you know roughly what you're searching for. Pass a
+- **`alexandria_retrieve_memories`** — specific lookup, you know roughly what you're searching for. Pass a
   natural-language statement of the fact/topic (not a question). Returns ranked hits with
   similarity + tags.
-- **`recall`** — open-ended/broad exploration ("what do we know about X", "what's the state of
+- **`alexandria_recall`** — open-ended/broad exploration ("what do we know about X", "what's the state of
   Y"). Call once with no `scope_handle` to get candidate clusters, then call again with the
   returned `scope_handle` to narrow into the most relevant one.
 
@@ -42,18 +42,18 @@ Store as soon as something durable and non-obvious emerges — don't wait to be 
 - A correction the user gives you about something you got wrong.
 
 Tool choice:
-- **`store_memory`** — new fact. Write `content` as a standalone statement that still makes
+- **`alexandria_store_memory`** — new fact. Write `content` as a standalone statement that still makes
   sense without today's conversation (no "as discussed above", no pronouns without antecedents).
   Add `tags` for the project/domain so future retrieval scopes well.
-- **`update_memory`** — you found that an *existing* memory is stale/wrong. Prefer this over
-  `store_memory` for corrections — it re-embeds if content changed and preserves the old
+- **`alexandria_update_memory`** — you found that an *existing* memory is stale/wrong. Prefer this over
+  `alexandria_store_memory` for corrections — it re-embeds if content changed and preserves the old
   version via a `derived_from` lineage edge instead of leaving a stale duplicate floating
   around.
-- **`import_document`** — bulk reference material (a design doc, README, spec, meeting notes)
+- **`alexandria_import_document`** — bulk reference material (a design doc, README, spec, meeting notes)
   the user shares or points at that's worth retaining long-term. Chunks automatically
   (heading/paragraph/fixed-size) and links chunks back to the source document.
-- **`delete_memory`** — only when the user explicitly wants something forgotten. This is a
-  soft-delete; for corrections, prefer `update_memory` so the lineage survives.
+- **`alexandria_delete_memory`** — only when the user explicitly wants something forgotten. This is a
+  soft-delete; for corrections, prefer `alexandria_update_memory` so the lineage survives.
 
 ## Guidelines
 
