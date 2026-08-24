@@ -45,6 +45,7 @@ dl.fact-meta dd {{ margin: 0; }}
 <a href="/debug">Dashboard</a>
 <a href="/debug/memories">Memories</a>
 <a href="/debug/clusters">Clusters</a>
+<a href="/debug/maintenance">Maintenance Log</a>
 <a href="/debug/query">Query Tester</a>
 </nav>
 <main>

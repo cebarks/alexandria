@@ -1,6 +1,6 @@
 use anyhow::Result;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{RecordId, ToSql};
+use surrealdb::types::{RecordId, SurrealValue, ToSql};
 use surrealdb::Surreal;
 use tracing::warn;
 
@@ -161,6 +161,18 @@ impl<'a> ClusterRepo<'a> {
         // Delete the old cluster (now empty)
         self.delete(cluster_id).await?;
 
+        // Log the split
+        let members_moved = (group_a.len() + group_b.len()) as i64;
+        if let Err(e) = self.db
+            .query("CREATE maintenance_log SET action = 'split', source_id = $source, target_ids = $targets, members_moved = $count")
+            .bind(("source", cluster_id.to_string()))
+            .bind(("targets", vec![cid_a.clone(), cid_b.clone()]))
+            .bind(("count", members_moved))
+            .await
+        {
+            warn!("Failed to log split: {e}");
+        }
+
         Ok((cid_a, cid_b))
     }
 
@@ -186,13 +198,48 @@ impl<'a> ClusterRepo<'a> {
             }
         }
 
+        let members_moved = removed_members.len() as i64;
+
         self.update_centroid(keep_id, merged_centroid).await?;
         self.delete(remove_id).await?;
+
+        // Log the merge
+        if let Err(e) = self.db
+            .query("CREATE maintenance_log SET action = 'merge', source_id = $source, target_ids = $targets, members_moved = $count")
+            .bind(("source", remove_id.to_string()))
+            .bind(("targets", vec![keep_id.to_string()]))
+            .bind(("count", members_moved))
+            .await
+        {
+            warn!("Failed to log merge: {e}");
+        }
 
         Ok(())
     }
 
     /// List all clusters along with their live member counts.
+    /// List maintenance log entries, newest first.
+    pub async fn list_maintenance_logs(&self, limit: usize, offset: usize) -> Result<Vec<crate::models::MaintenanceLog>> {
+        let mut response = self.db
+            .query("SELECT * FROM maintenance_log ORDER BY created_at DESC LIMIT $limit START $offset")
+            .bind(("limit", limit as i64))
+            .bind(("offset", offset as i64))
+            .await?;
+        let logs: Vec<crate::models::MaintenanceLog> = response.take(0)?;
+        Ok(logs)
+    }
+
+    /// Count total maintenance log entries.
+    pub async fn count_maintenance_logs(&self) -> Result<usize> {
+        let mut response = self.db
+            .query("SELECT count() as total FROM maintenance_log GROUP ALL")
+            .await?;
+        #[derive(serde::Deserialize, SurrealValue)]
+        struct CountRow { total: i64 }
+        let row: Option<CountRow> = response.take(0)?;
+        Ok(row.map(|r| r.total as usize).unwrap_or(0))
+    }
+
     pub async fn list_with_counts(&self) -> Result<Vec<(Cluster, usize)>> {
         let mut response = self.db.query("SELECT * FROM cluster").await?;
         let clusters: Vec<Cluster> = response.take(0)?;
