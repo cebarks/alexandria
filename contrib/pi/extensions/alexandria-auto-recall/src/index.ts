@@ -89,6 +89,8 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 					},
 				};
 			} catch (err) {
+				// callToolWithRetry already handles stale-session reconnect,
+				// so if we still land here the server is genuinely unreachable.
 				resetClient();
 				ctx.ui.notify(
 					`Alexandria auto-recall failed (${err instanceof Error ? err.message : String(err)}); continuing without it.`,
@@ -113,9 +115,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 
 			// Fire-and-forget stores — don't block the agent turn
 			for (const detection of detections) {
-				storeMemory(detection.content, detection.tags).catch(() => {
-					resetClient();
-				});
+				// storeMemory uses callToolWithRetry internally, so stale
+				// sessions are recovered automatically.
+				storeMemory(detection.content, detection.tags).catch(() => {});
 			}
 		});
 
