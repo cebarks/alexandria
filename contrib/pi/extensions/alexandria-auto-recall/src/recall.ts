@@ -2,7 +2,7 @@
  * Auto-recall: queries Alexandria for memories relevant to the user's prompt.
  */
 
-import { getClient, extractTextContent } from "./mcp-client.js";
+import { callToolWithRetry, extractTextContent } from "./mcp-client.js";
 import { CONFIG } from "./config.js";
 
 interface RetrievedMemory {
@@ -20,10 +20,9 @@ interface RetrieveMemoriesResponse {
 export async function retrieveMemories(
 	query: string,
 ): Promise<RetrievedMemory[]> {
-	const client = await getClient();
-	const result = await client.callTool({
-		name: "retrieve_memories",
-		arguments: { query, limit: CONFIG.recallLimit },
+	const result = await callToolWithRetry("retrieve_memories", {
+		query,
+		limit: CONFIG.recallLimit,
 	});
 
 	const text = extractTextContent(result.content);
