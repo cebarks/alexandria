@@ -148,27 +148,83 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
                     .map(|f| f.embedding.clone()).collect();
 
                 let action = check_cohesion(&cid, &cluster.centroid, &member_embeddings, cohesion_floor);
-                if let alexandria_engine::clusters::maintenance::MaintenanceAction::Split { cluster_id, .. } = action {
-                    tracing::info!("Cluster {cluster_id} needs splitting (below cohesion floor)");
-                    // TODO: execute split — reassign members to two new clusters
+                if let alexandria_engine::clusters::maintenance::MaintenanceAction::Split {
+                    cluster_id, group_a, group_b, centroid_a, centroid_b,
+                } = action {
+                    tracing::info!("Splitting cluster {cluster_id} into two groups ({} / {} members)",
+                        group_a.len(), group_b.len());
+
+                    // Create two new clusters
+                    let cid_a = match cluster_repo.create(None, &centroid_a).await {
+                        Ok(id) => id,
+                        Err(e) => { tracing::warn!("Split: failed to create cluster A: {e}"); continue; }
+                    };
+                    let cid_b = match cluster_repo.create(None, &centroid_b).await {
+                        Ok(id) => id,
+                        Err(e) => { tracing::warn!("Split: failed to create cluster B: {e}"); continue; }
+                    };
+
+                    // Reassign members — group indices reference `members` vec
+                    for &idx in &group_a {
+                        if let Some(fact) = members.get(idx) {
+                            let fid = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+                            let _ = cluster_repo.remove_member(&cid, &fid).await;
+                            let _ = cluster_repo.add_member(&cid_a, &fid).await;
+                        }
+                    }
+                    for &idx in &group_b {
+                        if let Some(fact) = members.get(idx) {
+                            let fid = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+                            let _ = cluster_repo.remove_member(&cid, &fid).await;
+                            let _ = cluster_repo.add_member(&cid_b, &fid).await;
+                        }
+                    }
+
+                    // Delete the old cluster (now empty)
+                    let _ = cluster_repo.delete(&cid).await;
+                    tracing::info!("Split complete: {cluster_id} -> {cid_a}, {cid_b}");
                 }
             }
 
             // Check pairs for merge
-            let infos: Vec<_> = clusters.iter().map(|c| {
+            let mut infos: Vec<(String, Vec<f32>, usize)> = Vec::new();
+            for c in &clusters {
                 let id = c.id.as_ref().map(record_id_to_string).unwrap_or_default();
-                (id, c.centroid.clone())
-            }).collect();
+                let count = cluster_repo.get_members(&id).await.map(|m| m.len()).unwrap_or(0);
+                infos.push((id, c.centroid.clone(), count));
+            }
             for i in 0..infos.len() {
                 for j in (i+1)..infos.len() {
                     let result = check_merge(
-                        &infos[i].0, &infos[i].1, 0,
-                        &infos[j].0, &infos[j].1, 0,
+                        &infos[i].0, &infos[i].1, infos[i].2,
+                        &infos[j].0, &infos[j].1, infos[j].2,
                         merge_threshold,
                     );
-                    if let alexandria_engine::clusters::maintenance::MergeCheck::Merge { keep_id, remove_id, .. } = result {
-                        tracing::info!("Clusters {keep_id} and {remove_id} should merge");
-                        // TODO: execute merge — move members, delete old cluster
+                    if let alexandria_engine::clusters::maintenance::MergeCheck::Merge {
+                        keep_id, remove_id, merged_centroid,
+                    } = result {
+                        tracing::info!("Merging cluster {remove_id} into {keep_id}");
+
+                        // Move all members from removed cluster to kept cluster
+                        let removed_members = match cluster_repo.get_members(&remove_id).await {
+                            Ok(m) => m,
+                            Err(e) => { tracing::warn!("Merge: {e}"); continue; }
+                        };
+                        for fact in &removed_members {
+                            let fid = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+                            let _ = cluster_repo.remove_member(&remove_id, &fid).await;
+                            let _ = cluster_repo.add_member(&keep_id, &fid).await;
+                        }
+
+                        // Update kept cluster's centroid to the weighted merge
+                        let _ = cluster_repo.update_centroid(&keep_id, &merged_centroid).await;
+
+                        // Delete the now-empty cluster
+                        let _ = cluster_repo.delete(&remove_id).await;
+                        tracing::info!("Merge complete: {remove_id} -> {keep_id}");
+
+                        // Break out of inner loop — cluster list is stale after mutation
+                        break;
                     }
                 }
             }
