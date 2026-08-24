@@ -2,19 +2,8 @@ use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
-use surrealdb::types::{RecordId, RecordIdKey};
-
-/// Helper to convert RecordId to `table:key` string format for SurrealQL.
-pub fn record_id_to_string(id: &RecordId) -> String {
-    let table = id.table.as_str();
-    let key = match &id.key {
-        RecordIdKey::String(s) => s.clone(),
-        RecordIdKey::Number(n) => n.to_string(),
-        RecordIdKey::Uuid(u) => format!("{u}"),
-        other => format!("{other:?}"),
-    };
-    format!("{table}:{key}")
-}
+// Re-exported from alexandria_storage where it's now defined.
+pub use alexandria_storage::record_id_to_string;
 
 use alexandria_engine::clusters::{assign_to_cluster, update_centroid, ClusterInfo};
 use alexandria_engine::heat::{compute_activation_targets, ActivationConfig};

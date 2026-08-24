@@ -2,8 +2,10 @@ use anyhow::Result;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, ToSql};
 use surrealdb::Surreal;
+use tracing::warn;
 
 use crate::models::{Cluster, Fact};
+use crate::record_id_to_string;
 
 pub struct ClusterRepo<'a> {
     db: &'a Surreal<Any>,
@@ -99,6 +101,94 @@ impl<'a> ClusterRepo<'a> {
             .bind(("centroid", centroid.to_vec()))
             .await?
             .check()?;
+        Ok(())
+    }
+
+    /// Execute a cluster split: create two new clusters from k-means groups,
+    /// reassign all members, and delete the original cluster.
+    ///
+    /// `cluster_id` — the cluster being split.
+    /// `members` — the members of that cluster (order must match the group indices).
+    /// `group_a` / `group_b` — indices into `members` for each new cluster.
+    /// `centroid_a` / `centroid_b` — centroids for the new clusters.
+    pub async fn execute_split(
+        &self,
+        cluster_id: &str,
+        members: &[Fact],
+        group_a: &[usize],
+        group_b: &[usize],
+        centroid_a: &[f32],
+        centroid_b: &[f32],
+    ) -> Result<(String, String)> {
+        let cid_a = self.create(None, centroid_a).await?;
+        let cid_b = match self.create(None, centroid_b).await {
+            Ok(id) => id,
+            Err(e) => {
+                // Clean up the first cluster to avoid orphan
+                warn!("Split: failed to create cluster B, cleaning up A: {e}");
+                let _ = self.delete(&cid_a).await;
+                return Err(e);
+            }
+        };
+
+        // Reassign members — add to new cluster first (idempotent), then remove from old.
+        // This ordering means a failure leaves a duplicate edge rather than an orphan.
+        for &idx in group_a {
+            if let Some(fact) = members.get(idx) {
+                let fid = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+                if let Err(e) = self.add_member(&cid_a, &fid).await {
+                    warn!("Split: failed to add {fid} to new cluster A: {e}");
+                    continue;
+                }
+                if let Err(e) = self.remove_member(cluster_id, &fid).await {
+                    warn!("Split: failed to remove {fid} from old cluster: {e}");
+                }
+            }
+        }
+        for &idx in group_b {
+            if let Some(fact) = members.get(idx) {
+                let fid = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+                if let Err(e) = self.add_member(&cid_b, &fid).await {
+                    warn!("Split: failed to add {fid} to new cluster B: {e}");
+                    continue;
+                }
+                if let Err(e) = self.remove_member(cluster_id, &fid).await {
+                    warn!("Split: failed to remove {fid} from old cluster: {e}");
+                }
+            }
+        }
+
+        // Delete the old cluster (now empty)
+        self.delete(cluster_id).await?;
+
+        Ok((cid_a, cid_b))
+    }
+
+    /// Execute a cluster merge: move all members from `remove_id` to `keep_id`,
+    /// update the kept cluster's centroid, and delete the removed cluster.
+    pub async fn execute_merge(
+        &self,
+        keep_id: &str,
+        remove_id: &str,
+        merged_centroid: &[f32],
+    ) -> Result<()> {
+        let removed_members = self.get_members(remove_id).await?;
+
+        // Add to target first, then remove from source (avoids orphaning on failure)
+        for fact in &removed_members {
+            let fid = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+            if let Err(e) = self.add_member(keep_id, &fid).await {
+                warn!("Merge: failed to add {fid} to kept cluster {keep_id}: {e}");
+                continue;
+            }
+            if let Err(e) = self.remove_member(remove_id, &fid).await {
+                warn!("Merge: failed to remove {fid} from removed cluster {remove_id}: {e}");
+            }
+        }
+
+        self.update_centroid(keep_id, merged_centroid).await?;
+        self.delete(remove_id).await?;
+
         Ok(())
     }
 
