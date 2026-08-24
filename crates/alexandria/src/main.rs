@@ -165,42 +165,51 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
                 }
             }
 
-            // Re-query live clusters for merge phase (split may have mutated the list)
-            let mut infos: Vec<(String, Vec<f32>, usize)> = Vec::new();
-            let merge_clusters: Vec<alexandria_storage::models::Cluster> = match maintenance_db.inner()
-                .query("SELECT * FROM cluster")
-                .await
-                .and_then(|mut r| r.take(0)) {
-                    Ok(c) => c,
-                    Err(e) => { tracing::warn!("Maintenance merge query: {e}"); continue; }
-                };
-            for c in &merge_clusters {
-                let id = c.id.as_ref().map(record_id_to_string).unwrap_or_default();
-                let count = cluster_repo.get_members(&id).await.map(|m| m.len()).unwrap_or(0);
-                infos.push((id, c.centroid.clone(), count));
-            }
-            'merge: for i in 0..infos.len() {
-                for j in (i+1)..infos.len() {
-                    let result = check_merge(
-                        &infos[i].0, &infos[i].1, infos[i].2,
-                        &infos[j].0, &infos[j].1, infos[j].2,
-                        merge_threshold,
-                    );
-                    if let alexandria_engine::clusters::maintenance::MergeCheck::Merge {
-                        keep_id, remove_id, merged_centroid,
-                    } = result {
-                        tracing::info!("Merging cluster {remove_id} into {keep_id}");
-                        match cluster_repo.execute_merge(
-                            &keep_id, &remove_id, &merged_centroid,
-                        ).await {
-                            Ok(()) => {
-                                tracing::info!("Merge complete: {remove_id} -> {keep_id}");
+            // Merge phase: re-query after each merge so we always work with fresh data.
+            // Loop until no more merges are found in a full pass.
+            loop {
+                let merge_clusters: Vec<alexandria_storage::models::Cluster> = match maintenance_db.inner()
+                    .query("SELECT * FROM cluster")
+                    .await
+                    .and_then(|mut r| r.take(0)) {
+                        Ok(c) => c,
+                        Err(e) => { tracing::warn!("Maintenance merge query: {e}"); break; }
+                    };
+                let mut infos: Vec<(String, Vec<f32>, usize)> = Vec::new();
+                for c in &merge_clusters {
+                    let id = c.id.as_ref().map(record_id_to_string).unwrap_or_default();
+                    let count = cluster_repo.get_members(&id).await.map(|m| m.len()).unwrap_or(0);
+                    infos.push((id, c.centroid.clone(), count));
+                }
+
+                let mut merged_one = false;
+                'scan: for i in 0..infos.len() {
+                    for j in (i+1)..infos.len() {
+                        let result = check_merge(
+                            &infos[i].0, &infos[i].1, infos[i].2,
+                            &infos[j].0, &infos[j].1, infos[j].2,
+                            merge_threshold,
+                        );
+                        if let alexandria_engine::clusters::maintenance::MergeCheck::Merge {
+                            keep_id, remove_id, merged_centroid,
+                        } = result {
+                            tracing::info!("Merging cluster {remove_id} into {keep_id}");
+                            match cluster_repo.execute_merge(
+                                &keep_id, &remove_id, &merged_centroid,
+                            ).await {
+                                Ok(()) => {
+                                    tracing::info!("Merge complete: {remove_id} -> {keep_id}");
+                                    merged_one = true;
+                                }
+                                Err(e) => tracing::warn!("Merge failed ({remove_id} -> {keep_id}): {e}"),
                             }
-                            Err(e) => tracing::warn!("Merge failed ({remove_id} -> {keep_id}): {e}"),
+                            // Re-query fresh data before looking for more merges
+                            break 'scan;
                         }
-                        // Cluster list is stale after mutation; next tick catches remaining merges
-                        break 'merge;
                     }
+                }
+                if !merged_one {
+                    break;
                 }
             }
         }
