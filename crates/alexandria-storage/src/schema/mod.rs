@@ -8,6 +8,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     (1, "initial", include_str!("v001_initial.surql")),
     (2, "memory_edge", include_str!("v002_memory_edge.surql")),
     (3, "system_config", include_str!("v003_system_config.surql")),
+    (4, "maintenance_log", include_str!("v004_maintenance_log.surql")),
 ];
 
 /// Run all pending migrations. Safe to call on every startup.
