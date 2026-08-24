@@ -61,6 +61,47 @@ impl<'a> ClusterRepo<'a> {
         Ok(members)
     }
 
+    /// Remove a single fact from this cluster (delete the contains_memory edge).
+    pub async fn remove_member(&self, cluster_id: &str, fact_id: &str) -> Result<()> {
+        let from = RecordId::parse_simple(cluster_id)?;
+        let to = RecordId::parse_simple(fact_id)?;
+        self.db
+            .query("DELETE contains_memory WHERE in = $from AND out = $to")
+            .bind(("from", from))
+            .bind(("to", to))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    /// Delete a cluster record and all its contains_memory edges.
+    pub async fn delete(&self, cluster_id: &str) -> Result<()> {
+        let id = RecordId::parse_simple(cluster_id)?;
+        // Delete edges first, then the cluster itself
+        self.db
+            .query("DELETE contains_memory WHERE in = $id")
+            .bind(("id", id))
+            .await?
+            .check()?;
+        self.db
+            .query("DELETE type::record($id)")
+            .bind(("id", cluster_id.to_string()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    /// Overwrite a cluster's centroid.
+    pub async fn update_centroid(&self, cluster_id: &str, centroid: &[f32]) -> Result<()> {
+        self.db
+            .query("UPDATE type::record($id) SET centroid = $centroid")
+            .bind(("id", cluster_id.to_string()))
+            .bind(("centroid", centroid.to_vec()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
     /// List all clusters along with their live member counts.
     pub async fn list_with_counts(&self) -> Result<Vec<(Cluster, usize)>> {
         let mut response = self.db.query("SELECT * FROM cluster").await?;
@@ -84,6 +125,63 @@ impl<'a> ClusterRepo<'a> {
 mod tests {
     use super::*;
     use crate::connection::Database;
+
+    #[tokio::test]
+    async fn test_remove_member() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let cluster_repo = ClusterRepo::new(db.inner());
+        let memory_repo = crate::repos::MemoryRepo::new(db.inner());
+
+        let cid = cluster_repo.create(Some("c1"), &[0.1, 0.1]).await.unwrap();
+        let f1 = memory_repo.create_fact("f1", 0.5, &[0.1, 0.1], &[]).await.unwrap();
+        let f2 = memory_repo.create_fact("f2", 0.5, &[0.2, 0.2], &[]).await.unwrap();
+        cluster_repo.add_member(&cid, &f1).await.unwrap();
+        cluster_repo.add_member(&cid, &f2).await.unwrap();
+
+        assert_eq!(cluster_repo.get_members(&cid).await.unwrap().len(), 2);
+
+        cluster_repo.remove_member(&cid, &f1).await.unwrap();
+        let remaining = cluster_repo.get_members(&cid).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_delete_cluster() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let cluster_repo = ClusterRepo::new(db.inner());
+        let memory_repo = crate::repos::MemoryRepo::new(db.inner());
+
+        let cid = cluster_repo.create(Some("doomed"), &[0.1, 0.1]).await.unwrap();
+        let f1 = memory_repo.create_fact("f1", 0.5, &[0.1, 0.1], &[]).await.unwrap();
+        cluster_repo.add_member(&cid, &f1).await.unwrap();
+
+        cluster_repo.delete(&cid).await.unwrap();
+
+        // Cluster gone
+        let all = cluster_repo.list_with_counts().await.unwrap();
+        assert!(all.is_empty());
+        // Edges gone too — fact should have no cluster
+        let memory_repo2 = crate::repos::MemoryRepo::new(db.inner());
+        assert!(memory_repo2.cluster_for_fact(&f1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_centroid() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let cluster_repo = ClusterRepo::new(db.inner());
+
+        let cid = cluster_repo.create(Some("c1"), &[1.0, 0.0]).await.unwrap();
+        cluster_repo.update_centroid(&cid, &[0.0, 1.0]).await.unwrap();
+
+        // Re-read and verify
+        let clusters = cluster_repo.list_with_counts().await.unwrap();
+        let (c, _) = &clusters[0];
+        assert!((c.centroid[0] - 0.0).abs() < 0.001);
+        assert!((c.centroid[1] - 1.0).abs() < 0.001);
+    }
 
     #[tokio::test]
     async fn test_list_with_counts() {
