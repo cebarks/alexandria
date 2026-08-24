@@ -6,7 +6,7 @@
 use alexandria_engine::clusters::maintenance::{
     check_cohesion, check_merge, MaintenanceAction, MergeCheck,
 };
-use alexandria_mcp::server::record_id_to_string;
+use alexandria_mcp::record_id_to_string;
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{schema, Database};
 
