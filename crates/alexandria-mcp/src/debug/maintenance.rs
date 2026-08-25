@@ -33,7 +33,7 @@ pub async fn list(
 
     let mut rows_html = String::new();
     for log in &logs {
-        let id = log
+        let _id = log
             .id
             .as_ref()
             .map(record_id_to_string)
@@ -68,7 +68,7 @@ pub async fn list(
         ));
     }
 
-    let total_pages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
+    let total_pages = total.div_ceil(PAGE_SIZE);
     let pagination = if total_pages > 1 {
         let prev = if page > 1 {
             format!(r#"<a class="link" href="/debug/maintenance?page={}">← Prev</a>"#, page - 1)
