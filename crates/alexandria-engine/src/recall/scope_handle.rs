@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 pub struct ScopeHandle {
     pub cluster_id: String,
     pub depth: u32,
-    pub query_embedding: Vec<f32>,
     pub issued_at: u64,
 }
 

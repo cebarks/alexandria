@@ -8,7 +8,6 @@ fn test_scope_handle_roundtrip() {
     let handle = ScopeHandle {
         cluster_id: "cluster:abc123".to_string(),
         depth: 0,
-        query_embedding: vec![0.1, 0.2, 0.3],
         issued_at: 1234567890,
     };
 
@@ -17,7 +16,7 @@ fn test_scope_handle_roundtrip() {
 
     assert_eq!(decoded.cluster_id, handle.cluster_id);
     assert_eq!(decoded.depth, handle.depth);
-    assert_eq!(decoded.query_embedding, handle.query_embedding);
+    assert_eq!(decoded.issued_at, handle.issued_at);
 }
 
 #[test]
@@ -85,7 +84,6 @@ fn test_focused_recall_narrows_within_cluster() {
     let scope = ScopeHandle {
         cluster_id: "c1".into(),
         depth: 0,
-        query_embedding: vec![1.0, 0.0],
         issued_at: 0,
     };
     let query = vec![1.0, 0.0];

@@ -103,7 +103,6 @@ pub fn broad_recall(
             let handle = ScopeHandle {
                 cluster_id: cwm.info.id.clone(),
                 depth: 0,
-                query_embedding: query_embedding.to_vec(),
                 issued_at: now,
             };
 
