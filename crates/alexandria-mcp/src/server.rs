@@ -28,6 +28,8 @@ pub struct AlexandriaServer {
     pub heat_spacing_halflife: f64,
     pub activation_config: ActivationConfig,
     pub activation_top_n: usize,
+    /// Hard floor on cosine similarity for retrieve_memories results.
+    pub retrieve_min_similarity: f32,
 }
 
 impl AlexandriaServer {
@@ -44,6 +46,7 @@ impl AlexandriaServer {
             heat_spacing_halflife,
             activation_config: ActivationConfig::default(),
             activation_top_n: 3,
+            retrieve_min_similarity: 0.30,
         }
     }
 
@@ -54,6 +57,11 @@ impl AlexandriaServer {
 
     pub fn with_activation_top_n(mut self, n: usize) -> Self {
         self.activation_top_n = n;
+        self
+    }
+
+    pub fn with_retrieve_min_similarity(mut self, min_similarity: f32) -> Self {
+        self.retrieve_min_similarity = min_similarity;
         self
     }
 }
@@ -338,9 +346,15 @@ impl AlexandriaServer {
             return Ok(serde_json::json!({ "results": [] }));
         }
 
-        // 3. Rank by similarity
+        // 3. Rank by similarity, then drop results below the server-side floor.
+        // This is a conservative defense-in-depth cutoff: it removes pure noise
+        // even if a client sets a lax threshold, without changing semantics for
+        // deliberate agent lookups (the floor sits well below plausible matches).
         let embeddings: Vec<Vec<f32>> = facts.iter().map(|f| f.embedding.clone()).collect();
-        let ranked = rank_by_similarity(query_emb, &embeddings, limit);
+        let ranked: Vec<(usize, f32)> = rank_by_similarity(query_emb, &embeddings, limit)
+            .into_iter()
+            .filter(|(_, sim)| *sim >= self.retrieve_min_similarity)
+            .collect();
 
         // 4. Trigger spreading activation for top results
         for (idx, _) in ranked.iter().take(self.activation_top_n) {
@@ -631,5 +645,142 @@ mod get_info_tests {
         assert!(instructions.contains("store_memory"));
         assert!(instructions.contains("retrieve_memories"));
         assert!(info.capabilities.tools.is_some());
+    }
+
+    /// Stub that maps content/query text to fixed embeddings so we can assert
+    /// the retrieve floor deterministically: text containing "far" -> [0, 1]
+    /// (orthogonal to the query, cosine 0), everything else -> [1, 0] (aligned
+    /// with the query, cosine 1).
+    struct DirectionalEmbedding;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for DirectionalEmbedding {
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    if t.contains("far") {
+                        vec![0.0, 1.0]
+                    } else {
+                        vec![1.0, 0.0]
+                    }
+                })
+                .collect())
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "directional-stub"
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieve_memories_drops_results_below_floor() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner()).await.unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0)
+            .with_retrieve_min_similarity(0.30);
+
+        server
+            .do_store_memory(StoreMemoryParams {
+                content: "a near match memory".to_string(),
+                tags: None,
+            })
+            .await
+            .unwrap();
+        server
+            .do_store_memory(StoreMemoryParams {
+                content: "a far away memory".to_string(),
+                tags: None,
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .do_retrieve_memories(RetrieveMemoriesParams {
+                query: "looking for something".to_string(),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+
+        let results = result["results"].as_array().unwrap();
+        // The orthogonal "far" memory (cosine 0.0) is below the 0.30 floor and
+        // must be dropped; only the aligned "near" memory survives.
+        assert_eq!(results.len(), 1, "floor should drop the orthogonal memory");
+        assert!(results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("near"));
+        assert!(results[0]["similarity"].as_f64().unwrap() >= 0.30);
+    }
+
+    /// Stub producing vectors with exact cosine similarity to the query [1, 0]:
+    /// text containing "below" -> cosine 0.29, "above" -> cosine 0.31. A unit
+    /// vector [s, sqrt(1 - s^2)] has cosine s with [1, 0], so these straddle a
+    /// 0.30 floor and catch `<` vs `<=` / off-by-epsilon regressions.
+    struct BoundaryEmbedding;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for BoundaryEmbedding {
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let s: f32 = if t.contains("below") {
+                        0.29
+                    } else if t.contains("above") {
+                        0.31
+                    } else {
+                        1.0
+                    };
+                    vec![s, (1.0 - s * s).sqrt()]
+                })
+                .collect())
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "boundary-stub"
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieve_memories_floor_is_inclusive_at_boundary() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner()).await.unwrap();
+        let server =
+            AlexandriaServer::new(Arc::new(db), Arc::new(BoundaryEmbedding), 0.75, 86400.0)
+                .with_retrieve_min_similarity(0.30);
+
+        server
+            .do_store_memory(StoreMemoryParams {
+                content: "just below the floor".to_string(),
+                tags: None,
+            })
+            .await
+            .unwrap();
+        server
+            .do_store_memory(StoreMemoryParams {
+                content: "just above the floor".to_string(),
+                tags: None,
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .do_retrieve_memories(RetrieveMemoriesParams {
+                query: "query".to_string(),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+
+        let results = result["results"].as_array().unwrap();
+        // 0.31 >= 0.30 survives; 0.29 < 0.30 is dropped.
+        assert_eq!(results.len(), 1, "only the above-floor memory should survive");
+        assert!(results[0]["content"].as_str().unwrap().contains("above"));
     }
 }

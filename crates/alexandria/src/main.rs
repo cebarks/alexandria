@@ -62,7 +62,8 @@ async fn main() -> anyhow::Result<()> {
         config.heat.spacing_halflife_secs,
     )
     .with_activation_config(activation_config)
-    .with_activation_top_n(config.activation.top_n);
+    .with_activation_top_n(config.activation.top_n)
+    .with_retrieve_min_similarity(config.retrieve.min_similarity);
 
     // 5. Serve based on transport config
     match config.server.transport.as_str() {

@@ -40,6 +40,9 @@ join_threshold = 0.75              # Cosine similarity threshold to join existin
 merge_threshold = 0.9              # Centroid similarity above which two clusters merge (default: 0.9)
 cohesion_floor = 0.6               # Avg member-to-centroid similarity below which a cluster splits (default: 0.6)
 maintenance_interval_secs = 300    # Cluster maintenance check interval in seconds (default: 300)
+
+[retrieve]
+min_similarity = 0.30              # Server-side hard floor on cosine similarity for retrieve_memories (default: 0.30)
 ```
 
 ## Section Details
@@ -101,6 +104,14 @@ Controls automatic cluster assignment, splitting, and merging. Maintenance runs 
 | `cohesion_floor` | f32 | `0.6` | Average member-to-centroid similarity below which a cluster is split via k-means(k=2). |
 | `maintenance_interval_secs` | u64 | `300` | Interval between cluster maintenance runs in seconds (default: 5 minutes). Only active in HTTP mode. |
 
+### `[retrieve]`
+
+Controls server-side filtering of `retrieve_memories` results.
+
+| Key | Type | Default | Description |
+| ----- | ------ | --------- | ------------- |
+| `min_similarity` | f32 | `0.30` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A conservative defense-in-depth cutoff that removes pure noise even if a client sets a lax threshold. Note this is model-dependent: for `all-MiniLM-L6-v2`, genuine matches score ~0.6+, weak-but-plausible matches ~0.3–0.5, and unrelated text stays below ~0.15. Keep this well below the auto-recall client threshold so deliberate agent lookups still surface marginal results. |
+
 ## Environment Variable Overrides
 
 These env vars override individual config values after the TOML file is loaded:
@@ -131,7 +142,7 @@ url = "http://127.0.0.1:3000/mcp"
 [recall]
 enabled = true
 limit = 5
-min_similarity = 0.5
+min_similarity = 0.58
 
 [store]
 enabled = true
@@ -151,7 +162,7 @@ extract_timeout_ms = 5000
 | ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_AUTO_RECALL=off` | Enable auto-recall on every prompt. |
 | `limit` | number | `5` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. |
-| `min_similarity` | number | `0.5` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include a result. |
+| `min_similarity` | number | `0.58` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. Model-dependent: for `all-MiniLM-L6-v2`, genuine matches score ~0.6+ while loosely-topical noise clears ~0.5, so `0.58` blocks near-noise while keeping real hits. Sits above the server-side `[retrieve] min_similarity` floor. |
 
 ### `[store]`
 
