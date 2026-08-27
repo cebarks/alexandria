@@ -73,7 +73,7 @@ export const CONFIG = {
 	recallMinSimilarity: Number(
 		process.env.ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY ??
 			toml.recall?.min_similarity ??
-			0.5,
+			0.58,
 	),
 
 	storeDisabled:

@@ -18,6 +18,7 @@ pub struct Config {
     pub heat: HeatConfig,
     pub activation: ActivationConfig,
     pub cluster: ClusterConfig,
+    pub retrieve: RetrieveConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +86,16 @@ pub struct ActivationConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct RetrieveConfig {
+    /// Server-side hard floor on cosine similarity for `retrieve_memories`
+    /// results. A conservative defense-in-depth cutoff that drops pure noise
+    /// even if a client is misconfigured; it is intentionally well below the
+    /// auto-recall client threshold. Default 0.30.
+    pub min_similarity: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ClusterConfig {
     /// Similarity threshold for joining an existing cluster. Default 0.75.
     pub join_threshold: f32,
@@ -141,6 +152,14 @@ impl Default for ActivationConfig {
             propagation_factor: 0.3,
             max_hops: 2,
             top_n: 3,
+        }
+    }
+}
+
+impl Default for RetrieveConfig {
+    fn default() -> Self {
+        Self {
+            min_similarity: 0.30,
         }
     }
 }
@@ -248,6 +267,7 @@ mod tests {
         assert_eq!(config.cluster.join_threshold, 0.75);
         assert_eq!(config.activation.propagation_factor, 0.3);
         assert_eq!(config.activation.max_hops, 2);
+        assert_eq!(config.retrieve.min_similarity, 0.30);
         assert!(config.database.data_dir.ends_with("data"));
     }
 
@@ -356,6 +376,15 @@ mod tests {
         assert_eq!(config.server.sse_keep_alive_secs, 30);
         assert_eq!(config.cluster.maintenance_interval_secs, 600);
         assert_eq!(config.activation.top_n, 5);
+        // retrieve uses default since not specified
+        assert_eq!(config.retrieve.min_similarity, 0.30);
+
+        let toml_retrieve = r#"
+            [retrieve]
+            min_similarity = 0.45
+        "#;
+        let config_retrieve = Config::from_toml(toml_retrieve).unwrap();
+        assert_eq!(config_retrieve.retrieve.min_similarity, 0.45);
     }
 
     #[test]

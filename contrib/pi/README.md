@@ -49,7 +49,7 @@ npm install
 | --- | --- | --- |
 | `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | Alexandria MCP server URL |
 | `ALEXANDRIA_AUTO_RECALL_LIMIT` | `5` | Max memories retrieved per prompt |
-| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.5` | Minimum similarity to inject a hit |
+| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.58` | Minimum similarity to inject a hit |
 | `ALEXANDRIA_AUTO_RECALL` | (unset) | Set to `off` to disable |
 
 The extension fails open: if the Alexandria server is unreachable or errors, the agent turn
