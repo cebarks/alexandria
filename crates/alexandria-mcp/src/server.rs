@@ -933,7 +933,7 @@ mod get_info_tests {
         let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
 
         // Store memories with a session_id — session auto-creates
-        let id1 = server
+        let _id1 = server
             .do_store_memory(StoreMemoryParams {
                 content: "first session fact".to_string(),
                 tags: None,

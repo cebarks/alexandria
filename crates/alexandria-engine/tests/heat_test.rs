@@ -59,7 +59,7 @@ fn test_bulk_projected_heat() {
 
 #[test]
 fn test_bulk_matches_scalar() {
-    let states = vec![
+    let states = [
         HeatState {
             heat: 3.0,
             stability: 2.0,

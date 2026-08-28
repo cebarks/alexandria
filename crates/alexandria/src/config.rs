@@ -246,6 +246,7 @@ impl Config {
     }
 
     /// Load from a TOML string (for testing).
+    #[cfg(test)]
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(s)?)
     }
