@@ -1,7 +1,7 @@
 use anyhow::Result;
-use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::SurrealValue;
+use surrealdb::Surreal;
 
 #[derive(Debug, serde::Deserialize, SurrealValue)]
 struct ConfigRow {

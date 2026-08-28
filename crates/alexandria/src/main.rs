@@ -3,9 +3,9 @@ mod config;
 use std::sync::Arc;
 
 use alexandria_mcp::AlexandriaServer;
-use alexandria_storage::record_id_to_string;
 use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
-use alexandria_storage::{Database, schema, system_config};
+use alexandria_storage::record_id_to_string;
+use alexandria_storage::{schema, system_config, Database};
 use config::Config;
 use rmcp::ServiceExt;
 
@@ -44,8 +44,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 3. Check embedding model safety, then load
     tracing::info!("Loading embedding model: {}", config.embedding.model);
-    let embedding =
-        CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
+    let embedding = CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
     let dims = embedding.dimensions();
     system_config::check_embedding_model(db.inner(), &config.embedding.model, dims).await?;
     tracing::info!("Embedding model loaded ({dims} dimensions)");
@@ -85,14 +84,15 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService,
-        session::local::LocalSessionManager,
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
     use tokio_util::sync::CancellationToken;
 
     let cancel = CancellationToken::new();
     let mut http_config = StreamableHttpServerConfig::default()
-        .with_sse_keep_alive(Some(std::time::Duration::from_secs(config.server.sse_keep_alive_secs)))
+        .with_sse_keep_alive(Some(std::time::Duration::from_secs(
+            config.server.sse_keep_alive_secs,
+        )))
         .with_cancellation_token(cancel.clone());
 
     // Configure host/origin validation from config
@@ -117,7 +117,8 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
         use alexandria_engine::clusters::maintenance::{check_cohesion, check_merge};
         use alexandria_storage::repos::ClusterRepo;
 
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(maintenance_interval_secs));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(maintenance_interval_secs));
         loop {
             tokio::select! {
                 _ = interval.tick() => {},
@@ -127,37 +128,53 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
             let cluster_repo = ClusterRepo::new(maintenance_db.inner());
 
             // Load all clusters with members for cohesion check
-            let mut response = match maintenance_db.inner()
-                .query("SELECT * FROM cluster")
-                .await {
-                    Ok(r) => r,
-                    Err(e) => { tracing::warn!("Maintenance: {e}"); continue; }
-                };
+            let mut response = match maintenance_db.inner().query("SELECT * FROM cluster").await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("Maintenance: {e}");
+                    continue;
+                }
+            };
             let clusters: Vec<alexandria_storage::models::Cluster> = match response.take(0) {
                 Ok(c) => c,
-                Err(e) => { tracing::warn!("Maintenance: {e}"); continue; }
+                Err(e) => {
+                    tracing::warn!("Maintenance: {e}");
+                    continue;
+                }
             };
 
             for cluster in &clusters {
-                let cid = cluster.id.as_ref()
+                let cid = cluster
+                    .id
+                    .as_ref()
                     .map(record_id_to_string)
                     .unwrap_or_default();
                 let members = match cluster_repo.get_members(&cid).await {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
-                let member_embeddings: Vec<Vec<f32>> = members.iter()
-                    .map(|f| f.embedding.clone()).collect();
+                let member_embeddings: Vec<Vec<f32>> =
+                    members.iter().map(|f| f.embedding.clone()).collect();
 
-                let action = check_cohesion(&cid, &cluster.centroid, &member_embeddings, cohesion_floor);
+                let action =
+                    check_cohesion(&cid, &cluster.centroid, &member_embeddings, cohesion_floor);
                 if let alexandria_engine::clusters::maintenance::MaintenanceAction::Split {
-                    cluster_id, group_a, group_b, centroid_a, centroid_b,
-                } = action {
-                    tracing::info!("Splitting cluster {cluster_id} ({} / {} members)",
-                        group_a.len(), group_b.len());
-                    match cluster_repo.execute_split(
-                        &cid, &members, &group_a, &group_b, &centroid_a, &centroid_b,
-                    ).await {
+                    cluster_id,
+                    group_a,
+                    group_b,
+                    centroid_a,
+                    centroid_b,
+                } = action
+                {
+                    tracing::info!(
+                        "Splitting cluster {cluster_id} ({} / {} members)",
+                        group_a.len(),
+                        group_b.len()
+                    );
+                    match cluster_repo
+                        .execute_split(&cid, &members, &group_a, &group_b, &centroid_a, &centroid_b)
+                        .await
+                    {
                         Ok((cid_a, cid_b)) => {
                             tracing::info!("Split complete: {cluster_id} -> {cid_a}, {cid_b}");
                         }
@@ -169,40 +186,59 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
             // Merge phase: re-query after each merge so we always work with fresh data.
             // Loop until no more merges are found in a full pass.
             loop {
-                let merge_clusters: Vec<alexandria_storage::models::Cluster> = match maintenance_db.inner()
+                let merge_clusters: Vec<alexandria_storage::models::Cluster> = match maintenance_db
+                    .inner()
                     .query("SELECT * FROM cluster")
                     .await
-                    .and_then(|mut r| r.take(0)) {
-                        Ok(c) => c,
-                        Err(e) => { tracing::warn!("Maintenance merge query: {e}"); break; }
-                    };
+                    .and_then(|mut r| r.take(0))
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("Maintenance merge query: {e}");
+                        break;
+                    }
+                };
                 let mut infos: Vec<(String, Vec<f32>, usize)> = Vec::new();
                 for c in &merge_clusters {
                     let id = c.id.as_ref().map(record_id_to_string).unwrap_or_default();
-                    let count = cluster_repo.get_members(&id).await.map(|m| m.len()).unwrap_or(0);
+                    let count = cluster_repo
+                        .get_members(&id)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                     infos.push((id, c.centroid.clone(), count));
                 }
 
                 let mut merged_one = false;
                 'scan: for i in 0..infos.len() {
-                    for j in (i+1)..infos.len() {
+                    for j in (i + 1)..infos.len() {
                         let result = check_merge(
-                            &infos[i].0, &infos[i].1, infos[i].2,
-                            &infos[j].0, &infos[j].1, infos[j].2,
+                            &infos[i].0,
+                            &infos[i].1,
+                            infos[i].2,
+                            &infos[j].0,
+                            &infos[j].1,
+                            infos[j].2,
                             merge_threshold,
                         );
                         if let alexandria_engine::clusters::maintenance::MergeCheck::Merge {
-                            keep_id, remove_id, merged_centroid,
-                        } = result {
+                            keep_id,
+                            remove_id,
+                            merged_centroid,
+                        } = result
+                        {
                             tracing::info!("Merging cluster {remove_id} into {keep_id}");
-                            match cluster_repo.execute_merge(
-                                &keep_id, &remove_id, &merged_centroid,
-                            ).await {
+                            match cluster_repo
+                                .execute_merge(&keep_id, &remove_id, &merged_centroid)
+                                .await
+                            {
                                 Ok(()) => {
                                     tracing::info!("Merge complete: {remove_id} -> {keep_id}");
                                     merged_one = true;
                                 }
-                                Err(e) => tracing::warn!("Merge failed ({remove_id} -> {keep_id}): {e}"),
+                                Err(e) => {
+                                    tracing::warn!("Merge failed ({remove_id} -> {keep_id}): {e}")
+                                }
                             }
                             // Re-query fresh data before looking for more merges
                             break 'scan;
@@ -221,11 +257,7 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
     let debug_router = alexandria_mcp::debug::router(server.clone());
 
     let service: StreamableHttpService<AlexandriaServer, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || Ok(server.clone()),
-            Default::default(),
-            http_config,
-        );
+        StreamableHttpService::new(move || Ok(server.clone()), Default::default(), http_config);
 
     let router = axum::Router::new()
         .nest_service("/mcp", service)

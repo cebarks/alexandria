@@ -8,7 +8,10 @@ async fn test_candle_embed_produces_vectors() {
 
     assert_eq!(provider.dimensions(), 384);
 
-    let vectors = provider.embed(&["hello world", "test memory"]).await.unwrap();
+    let vectors = provider
+        .embed(&["hello world", "test memory"])
+        .await
+        .unwrap();
     assert_eq!(vectors.len(), 2);
     assert_eq!(vectors[0].len(), 384);
     assert_eq!(vectors[1].len(), 384);

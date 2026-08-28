@@ -1,4 +1,4 @@
-use alexandria_storage::{Database, schema, system_config};
+use alexandria_storage::{schema, system_config, Database};
 
 #[tokio::test]
 async fn test_first_boot_stores_embedding_config() {

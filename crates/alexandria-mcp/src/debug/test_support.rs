@@ -25,6 +25,8 @@ impl EmbeddingProvider for StubEmbedding {
 
 pub(super) async fn test_server() -> AlexandriaServer {
     let db = Database::connect_embedded().await.unwrap();
-    alexandria_storage::schema::migrate(db.inner()).await.unwrap();
+    alexandria_storage::schema::migrate(db.inner())
+        .await
+        .unwrap();
     AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0)
 }

@@ -1,5 +1,5 @@
-pub mod provider;
 pub mod candle;
+pub mod provider;
 
-pub use provider::EmbeddingProvider;
 pub use candle::CandleProvider;
+pub use provider::EmbeddingProvider;

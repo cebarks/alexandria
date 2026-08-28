@@ -38,6 +38,7 @@ async fn test_full_flow_store_and_retrieve() {
         let params = alexandria_mcp::tools::StoreMemoryParams {
             content: content.to_string(),
             tags: Some(vec!["auth".to_string()]),
+            session_id: None,
         };
         let result = server.do_store_memory(params).await;
         assert!(result.is_ok(), "Failed to store: {content}");
@@ -47,6 +48,7 @@ async fn test_full_flow_store_and_retrieve() {
         let params = alexandria_mcp::tools::StoreMemoryParams {
             content: content.to_string(),
             tags: Some(vec!["database".to_string()]),
+            session_id: None,
         };
         let result = server.do_store_memory(params).await;
         assert!(result.is_ok(), "Failed to store: {content}");
@@ -56,6 +58,7 @@ async fn test_full_flow_store_and_retrieve() {
     let params = alexandria_mcp::tools::RetrieveMemoriesParams {
         query: "OAuth token expiration".to_string(),
         limit: Some(3),
+        session_id: None,
     };
     let result = server.do_retrieve_memories(params).await.unwrap();
     let results = result["results"].as_array().unwrap();
@@ -63,7 +66,9 @@ async fn test_full_flow_store_and_retrieve() {
     // First result should be auth-related
     let first_content = results[0]["content"].as_str().unwrap();
     assert!(
-        first_content.contains("OAuth") || first_content.contains("token") || first_content.contains("JWT"),
+        first_content.contains("OAuth")
+            || first_content.contains("token")
+            || first_content.contains("JWT"),
         "Expected auth-related first result, got: {first_content}"
     );
 }
@@ -76,6 +81,7 @@ async fn test_delete_excludes_from_search() {
     let params = alexandria_mcp::tools::StoreMemoryParams {
         content: "temporary secret key is abc123".to_string(),
         tags: None,
+        session_id: None,
     };
     let fact_id = server.do_store_memory(params).await.unwrap();
 
@@ -83,6 +89,7 @@ async fn test_delete_excludes_from_search() {
     let params = alexandria_mcp::tools::RetrieveMemoriesParams {
         query: "secret key".to_string(),
         limit: Some(5),
+        session_id: None,
     };
     let result = server.do_retrieve_memories(params).await.unwrap();
     let results = result["results"].as_array().unwrap();
@@ -96,6 +103,7 @@ async fn test_delete_excludes_from_search() {
     let params = alexandria_mcp::tools::RetrieveMemoriesParams {
         query: "secret key".to_string(),
         limit: Some(5),
+        session_id: None,
     };
     let result = server.do_retrieve_memories(params).await.unwrap();
     let results = result["results"].as_array().unwrap();
@@ -109,6 +117,7 @@ async fn test_empty_database_retrieve() {
     let params = alexandria_mcp::tools::RetrieveMemoriesParams {
         query: "anything".to_string(),
         limit: Some(5),
+        session_id: None,
     };
     let result = server.do_retrieve_memories(params).await.unwrap();
     let results = result["results"].as_array().unwrap();
@@ -127,6 +136,7 @@ async fn test_recall_broad_and_focused() {
         let params = alexandria_mcp::tools::StoreMemoryParams {
             content: content.to_string(),
             tags: None,
+            session_id: None,
         };
         server.do_store_memory(params).await.unwrap();
     }
@@ -149,6 +159,7 @@ async fn test_update_memory_content() {
     let params = alexandria_mcp::tools::StoreMemoryParams {
         content: "Rust is version 1.75".to_string(),
         tags: Some(vec!["rust".to_string()]),
+        session_id: None,
     };
     let id = server.do_store_memory(params).await.unwrap();
 
@@ -177,6 +188,7 @@ async fn test_update_memory_tags_only() {
     let params = alexandria_mcp::tools::StoreMemoryParams {
         content: "SurrealDB is a database".to_string(),
         tags: Some(vec!["db".to_string()]),
+        session_id: None,
     };
     let id = server.do_store_memory(params).await.unwrap();
 

@@ -1,5 +1,5 @@
-use alexandria_storage::{Database, schema};
-use alexandria_storage::repos::{MemoryRepo, HeatRepo, ClusterRepo};
+use alexandria_storage::repos::{ClusterRepo, HeatRepo, MemoryRepo};
+use alexandria_storage::{schema, Database};
 
 #[tokio::test]
 async fn test_create_and_get_fact() {

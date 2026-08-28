@@ -33,21 +33,28 @@ pub async fn list(
 
     let mut rows_html = String::new();
     for log in &logs {
-        let _id = log
-            .id
-            .as_ref()
-            .map(record_id_to_string)
-            .unwrap_or_default();
+        let _id = log.id.as_ref().map(record_id_to_string).unwrap_or_default();
         let action_badge = match log.action.as_str() {
-            "merge" => r#"<span class="badge" style="background:#1a3d2a;color:#3fb950;">merge</span>"#,
-            "split" => r#"<span class="badge" style="background:#3d2f1a;color:#d29922;">split</span>"#,
+            "merge" => {
+                r#"<span class="badge" style="background:#1a3d2a;color:#3fb950;">merge</span>"#
+            }
+            "split" => {
+                r#"<span class="badge" style="background:#3d2f1a;color:#d29922;">split</span>"#
+            }
             _ => r#"<span class="badge">unknown</span>"#,
         };
 
-        let target_links: Vec<String> = log.target_ids.iter().map(|tid| {
-            let encoded = tid.replace(':', "%3A");
-            format!(r#"<a class="link" href="/debug/clusters/{encoded}">{}</a>"#, esc(tid))
-        }).collect();
+        let target_links: Vec<String> = log
+            .target_ids
+            .iter()
+            .map(|tid| {
+                let encoded = tid.replace(':', "%3A");
+                format!(
+                    r#"<a class="link" href="/debug/clusters/{encoded}">{}</a>"#,
+                    esc(tid)
+                )
+            })
+            .collect();
         let targets = target_links.join(", ");
 
         let timestamp = log
@@ -71,12 +78,18 @@ pub async fn list(
     let total_pages = total.div_ceil(PAGE_SIZE);
     let pagination = if total_pages > 1 {
         let prev = if page > 1 {
-            format!(r#"<a class="link" href="/debug/maintenance?page={}">← Prev</a>"#, page - 1)
+            format!(
+                r#"<a class="link" href="/debug/maintenance?page={}">← Prev</a>"#,
+                page - 1
+            )
         } else {
             String::new()
         };
         let next = if page < total_pages {
-            format!(r#"<a class="link" href="/debug/maintenance?page={}">Next →</a>"#, page + 1)
+            format!(
+                r#"<a class="link" href="/debug/maintenance?page={}">Next →</a>"#,
+                page + 1
+            )
         } else {
             String::new()
         };
@@ -134,9 +147,18 @@ mod tests {
         let memory_repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
 
         // Set up two clusters and merge them
-        let c1 = cluster_repo.create(Some("keep"), &[1.0, 0.0]).await.unwrap();
-        let c2 = cluster_repo.create(Some("remove"), &[0.98, 0.02]).await.unwrap();
-        let f1 = memory_repo.create_fact("fact1", 0.5, &[1.0, 0.0], &[]).await.unwrap();
+        let c1 = cluster_repo
+            .create(Some("keep"), &[1.0, 0.0])
+            .await
+            .unwrap();
+        let c2 = cluster_repo
+            .create(Some("remove"), &[0.98, 0.02])
+            .await
+            .unwrap();
+        let f1 = memory_repo
+            .create_fact("fact1", 0.5, &[1.0, 0.0], &[])
+            .await
+            .unwrap();
         cluster_repo.add_member(&c2, &f1).await.unwrap();
 
         cluster_repo

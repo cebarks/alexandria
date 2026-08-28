@@ -31,12 +31,16 @@ pub struct QueryForm {
     pub limit: Option<usize>,
 }
 
-pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryForm>) -> Html<String> {
+pub async fn run(
+    State(server): State<AlexandriaServer>,
+    Form(form): Form<QueryForm>,
+) -> Html<String> {
     let body = match form.mode.as_str() {
         "retrieve" => {
             let params = RetrieveMemoriesParams {
                 query: form.query.clone(),
                 limit: form.limit,
+                session_id: None,
             };
             match server.do_retrieve_memories(params).await {
                 Ok(value) => render_retrieve_results(&value),
@@ -84,9 +88,7 @@ fn render_retrieve_results(value: &serde_json::Value) -> String {
         ));
     }
 
-    format!(
-        r#"<table><tr><th>ID</th><th>Content</th><th>Similarity</th></tr>{rows}</table>"#
-    )
+    format!(r#"<table><tr><th>ID</th><th>Content</th><th>Similarity</th></tr>{rows}</table>"#)
 }
 
 fn render_recall_results(json_str: &str) -> String {
@@ -124,7 +126,9 @@ fn render_recall_results(json_str: &str) -> String {
                 similarity,
             ));
         }
-        format!(r#"<h3>Focused recall</h3><table><tr><th>ID</th><th>Content</th><th>Similarity</th></tr>{rows}</table>"#)
+        format!(
+            r#"<h3>Focused recall</h3><table><tr><th>ID</th><th>Content</th><th>Similarity</th></tr>{rows}</table>"#
+        )
     } else {
         let empty = Vec::new();
         let clusters = value

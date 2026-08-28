@@ -30,7 +30,9 @@ impl<'a> HeatRepo<'a> {
 
         let created: Option<HeatState> = response.take(0)?;
         let state = created.ok_or_else(|| anyhow::anyhow!("Failed to create heat_state"))?;
-        let id = state.id.ok_or_else(|| anyhow::anyhow!("Created heat_state has no id"))?;
+        let id = state
+            .id
+            .ok_or_else(|| anyhow::anyhow!("Created heat_state has no id"))?;
         Ok(id.to_sql())
     }
 
@@ -44,7 +46,13 @@ impl<'a> HeatRepo<'a> {
         Ok(state)
     }
 
-    pub async fn update(&self, id: &str, heat: f64, stability: f64, access_count: i64) -> Result<()> {
+    pub async fn update(
+        &self,
+        id: &str,
+        heat: f64,
+        stability: f64,
+        access_count: i64,
+    ) -> Result<()> {
         self.db
             .query(
                 "UPDATE type::record($id) SET \

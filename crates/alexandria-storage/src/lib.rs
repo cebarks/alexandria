@@ -1,7 +1,7 @@
 mod connection;
-pub mod schema;
 pub mod models;
 pub mod repos;
+pub mod schema;
 pub mod stats;
 pub mod system_config;
 

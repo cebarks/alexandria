@@ -16,11 +16,7 @@ impl<'a> ClusterRepo<'a> {
         Self { db }
     }
 
-    pub async fn create(
-        &self,
-        label: Option<&str>,
-        centroid: &[f32],
-    ) -> Result<String> {
+    pub async fn create(&self, label: Option<&str>, centroid: &[f32]) -> Result<String> {
         let mut response = self
             .db
             .query(
@@ -35,7 +31,9 @@ impl<'a> ClusterRepo<'a> {
 
         let created: Option<Cluster> = response.take(0)?;
         let cluster = created.ok_or_else(|| anyhow::anyhow!("Failed to create cluster"))?;
-        let id = cluster.id.ok_or_else(|| anyhow::anyhow!("Created cluster has no id"))?;
+        let id = cluster
+            .id
+            .ok_or_else(|| anyhow::anyhow!("Created cluster has no id"))?;
         Ok(id.to_sql())
     }
 
@@ -54,9 +52,7 @@ impl<'a> ClusterRepo<'a> {
     pub async fn get_members(&self, cluster_id: &str) -> Result<Vec<Fact>> {
         let mut response = self
             .db
-            .query(
-                "SELECT * FROM type::record($cluster_id)->contains_memory->fact",
-            )
+            .query("SELECT * FROM type::record($cluster_id)->contains_memory->fact")
             .bind(("cluster_id", cluster_id.to_string()))
             .await?;
         let members: Vec<Fact> = response.take(0)?;
@@ -135,7 +131,11 @@ impl<'a> ClusterRepo<'a> {
         // This ordering means a failure leaves a duplicate edge rather than an orphan.
         for &idx in group_a {
             if let Some(fact) = members.get(idx) {
-                let fid = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+                let fid = fact
+                    .id
+                    .as_ref()
+                    .map(record_id_to_string)
+                    .unwrap_or_default();
                 if let Err(e) = self.add_member(&cid_a, &fid).await {
                     warn!("Split: failed to add {fid} to new cluster A: {e}");
                     continue;
@@ -147,7 +147,11 @@ impl<'a> ClusterRepo<'a> {
         }
         for &idx in group_b {
             if let Some(fact) = members.get(idx) {
-                let fid = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+                let fid = fact
+                    .id
+                    .as_ref()
+                    .map(record_id_to_string)
+                    .unwrap_or_default();
                 if let Err(e) = self.add_member(&cid_b, &fid).await {
                     warn!("Split: failed to add {fid} to new cluster B: {e}");
                     continue;
@@ -188,7 +192,11 @@ impl<'a> ClusterRepo<'a> {
 
         // Add to target first, then remove from source (avoids orphaning on failure)
         for fact in &removed_members {
-            let fid = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+            let fid = fact
+                .id
+                .as_ref()
+                .map(record_id_to_string)
+                .unwrap_or_default();
             if let Err(e) = self.add_member(keep_id, &fid).await {
                 warn!("Merge: failed to add {fid} to kept cluster {keep_id}: {e}");
                 continue;
@@ -219,9 +227,16 @@ impl<'a> ClusterRepo<'a> {
 
     /// List all clusters along with their live member counts.
     /// List maintenance log entries, newest first.
-    pub async fn list_maintenance_logs(&self, limit: usize, offset: usize) -> Result<Vec<crate::models::MaintenanceLog>> {
-        let mut response = self.db
-            .query("SELECT * FROM maintenance_log ORDER BY created_at DESC LIMIT $limit START $offset")
+    pub async fn list_maintenance_logs(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::models::MaintenanceLog>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM maintenance_log ORDER BY created_at DESC LIMIT $limit START $offset",
+            )
             .bind(("limit", limit as i64))
             .bind(("offset", offset as i64))
             .await?;
@@ -231,11 +246,14 @@ impl<'a> ClusterRepo<'a> {
 
     /// Count total maintenance log entries.
     pub async fn count_maintenance_logs(&self) -> Result<usize> {
-        let mut response = self.db
+        let mut response = self
+            .db
             .query("SELECT count() as total FROM maintenance_log GROUP ALL")
             .await?;
         #[derive(serde::Deserialize, SurrealValue)]
-        struct CountRow { total: i64 }
+        struct CountRow {
+            total: i64,
+        }
         let row: Option<CountRow> = response.take(0)?;
         Ok(row.map(|r| r.total as usize).unwrap_or(0))
     }
@@ -246,11 +264,7 @@ impl<'a> ClusterRepo<'a> {
 
         let mut result = Vec::with_capacity(clusters.len());
         for cluster in clusters {
-            let id = cluster
-                .id
-                .as_ref()
-                .map(|r| r.to_sql())
-                .unwrap_or_default();
+            let id = cluster.id.as_ref().map(|r| r.to_sql()).unwrap_or_default();
             let count = self.get_members(&id).await.map(|m| m.len()).unwrap_or(0);
             result.push((cluster, count));
         }
@@ -271,8 +285,14 @@ mod tests {
         let memory_repo = crate::repos::MemoryRepo::new(db.inner());
 
         let cid = cluster_repo.create(Some("c1"), &[0.1, 0.1]).await.unwrap();
-        let f1 = memory_repo.create_fact("f1", 0.5, &[0.1, 0.1], &[]).await.unwrap();
-        let f2 = memory_repo.create_fact("f2", 0.5, &[0.2, 0.2], &[]).await.unwrap();
+        let f1 = memory_repo
+            .create_fact("f1", 0.5, &[0.1, 0.1], &[])
+            .await
+            .unwrap();
+        let f2 = memory_repo
+            .create_fact("f2", 0.5, &[0.2, 0.2], &[])
+            .await
+            .unwrap();
         cluster_repo.add_member(&cid, &f1).await.unwrap();
         cluster_repo.add_member(&cid, &f2).await.unwrap();
 
@@ -290,8 +310,14 @@ mod tests {
         let cluster_repo = ClusterRepo::new(db.inner());
         let memory_repo = crate::repos::MemoryRepo::new(db.inner());
 
-        let cid = cluster_repo.create(Some("doomed"), &[0.1, 0.1]).await.unwrap();
-        let f1 = memory_repo.create_fact("f1", 0.5, &[0.1, 0.1], &[]).await.unwrap();
+        let cid = cluster_repo
+            .create(Some("doomed"), &[0.1, 0.1])
+            .await
+            .unwrap();
+        let f1 = memory_repo
+            .create_fact("f1", 0.5, &[0.1, 0.1], &[])
+            .await
+            .unwrap();
         cluster_repo.add_member(&cid, &f1).await.unwrap();
 
         cluster_repo.delete(&cid).await.unwrap();
@@ -311,7 +337,10 @@ mod tests {
         let cluster_repo = ClusterRepo::new(db.inner());
 
         let cid = cluster_repo.create(Some("c1"), &[1.0, 0.0]).await.unwrap();
-        cluster_repo.update_centroid(&cid, &[0.0, 1.0]).await.unwrap();
+        cluster_repo
+            .update_centroid(&cid, &[0.0, 1.0])
+            .await
+            .unwrap();
 
         // Re-read and verify
         let clusters = cluster_repo.list_with_counts().await.unwrap();
@@ -327,21 +356,39 @@ mod tests {
         let cluster_repo = ClusterRepo::new(db.inner());
         let memory_repo = crate::repos::MemoryRepo::new(db.inner());
 
-        let c1 = cluster_repo.create(Some("cluster one"), &[0.1, 0.1]).await.unwrap();
-        let f1 = memory_repo.create_fact("f1", 0.5, &[0.1, 0.1], &[]).await.unwrap();
-        let f2 = memory_repo.create_fact("f2", 0.5, &[0.1, 0.1], &[]).await.unwrap();
+        let c1 = cluster_repo
+            .create(Some("cluster one"), &[0.1, 0.1])
+            .await
+            .unwrap();
+        let f1 = memory_repo
+            .create_fact("f1", 0.5, &[0.1, 0.1], &[])
+            .await
+            .unwrap();
+        let f2 = memory_repo
+            .create_fact("f2", 0.5, &[0.1, 0.1], &[])
+            .await
+            .unwrap();
         cluster_repo.add_member(&c1, &f1).await.unwrap();
         cluster_repo.add_member(&c1, &f2).await.unwrap();
 
-        let c2 = cluster_repo.create(Some("cluster two"), &[0.9, 0.9]).await.unwrap();
+        let c2 = cluster_repo
+            .create(Some("cluster two"), &[0.9, 0.9])
+            .await
+            .unwrap();
         let _ = c2;
 
         let results = cluster_repo.list_with_counts().await.unwrap();
         assert_eq!(results.len(), 2);
-        let (cluster1, count1) = results.iter().find(|(c, _)| c.label.as_deref() == Some("cluster one")).unwrap();
+        let (cluster1, count1) = results
+            .iter()
+            .find(|(c, _)| c.label.as_deref() == Some("cluster one"))
+            .unwrap();
         assert_eq!(*count1, 2);
         let _ = cluster1;
-        let (_, count2) = results.iter().find(|(c, _)| c.label.as_deref() == Some("cluster two")).unwrap();
+        let (_, count2) = results
+            .iter()
+            .find(|(c, _)| c.label.as_deref() == Some("cluster two"))
+            .unwrap();
         assert_eq!(*count2, 0);
     }
 }

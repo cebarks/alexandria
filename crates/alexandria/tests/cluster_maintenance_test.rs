@@ -143,7 +143,11 @@ async fn test_split_leaves_no_orphan_on_partial_failure() {
     let cid = cluster_repo.create(Some("c"), &[0.5, 0.5]).await.unwrap();
     let mut fact_ids = Vec::new();
     for i in 0..4 {
-        let emb = if i < 2 { vec![1.0, 0.0] } else { vec![0.0, 1.0] };
+        let emb = if i < 2 {
+            vec![1.0, 0.0]
+        } else {
+            vec![0.0, 1.0]
+        };
         let fid = memory_repo
             .create_fact(&format!("f{i}"), 0.5, &emb, &[])
             .await
@@ -155,14 +159,7 @@ async fn test_split_leaves_no_orphan_on_partial_failure() {
     // Execute split with explicit groups
     let members = cluster_repo.get_members(&cid).await.unwrap();
     let (cid_a, cid_b) = cluster_repo
-        .execute_split(
-            &cid,
-            &members,
-            &[0, 1],
-            &[2, 3],
-            &[1.0, 0.0],
-            &[0.0, 1.0],
-        )
+        .execute_split(&cid, &members, &[0, 1], &[2, 3], &[1.0, 0.0], &[0.0, 1.0])
         .await
         .unwrap();
 
@@ -171,7 +168,11 @@ async fn test_split_leaves_no_orphan_on_partial_failure() {
         let cluster = memory_repo.cluster_for_fact(fid).await.unwrap();
         assert!(cluster.is_some(), "Fact {fid} has no cluster assignment");
         let cluster = cluster.unwrap();
-        let cluster_id = cluster.id.as_ref().map(record_id_to_string).unwrap_or_default();
+        let cluster_id = cluster
+            .id
+            .as_ref()
+            .map(record_id_to_string)
+            .unwrap_or_default();
         assert!(
             cluster_id == cid_a || cluster_id == cid_b,
             "Fact {fid} assigned to unexpected cluster {cluster_id}"
