@@ -27,10 +27,16 @@ FROM alpine:3.22
 
 # libstdc++/libgcc for the statically-built C++ objects' runtime, libssl for
 # openssl-sys, ca-certificates for the Hugging Face model download.
+# shadow (usermod/groupmod) + su-exec support the PUID/PGID remapping done in
+# the entrypoint.
 RUN apk add --no-cache libssl3 libcrypto3 libstdc++ libgcc ca-certificates \
-    && adduser -S -u 10001 -h /home/alexandria alexandria
+        shadow su-exec \
+    && addgroup -g 10001 alexandria \
+    && adduser -S -u 10001 -G alexandria -h /home/alexandria alexandria
 
 COPY --from=builder /usr/local/bin/alexandria /usr/local/bin/alexandria
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 ENV ALEXANDRIA_SERVER_TRANSPORT=http \
     ALEXANDRIA_SERVER_HOST=0.0.0.0 \
@@ -40,10 +46,13 @@ ENV ALEXANDRIA_SERVER_TRANSPORT=http \
     # kept under /data so the volume persists it.
     HF_HOME=/data/hf-cache
 
-RUN mkdir -p /data && chown alexandria /data
+RUN mkdir -p /data && chown alexandria:alexandria /data
 
-USER alexandria
+# No USER: the container starts as root so Unraid's Tailscale integration can
+# inject tailscaled. The entrypoint remaps the alexandria user to PUID/PGID
+# (default 10001/10001), chowns /data, and drops privileges via su-exec before
+# exec'ing the server. UMASK is also honored.
 VOLUME /data
 EXPOSE 3000
 
-ENTRYPOINT ["/usr/local/bin/alexandria"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
