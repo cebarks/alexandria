@@ -232,6 +232,17 @@ impl Config {
         }
 
         // 3. Individual env var overrides
+        if let Ok(transport) = std::env::var("ALEXANDRIA_SERVER_TRANSPORT") {
+            config.server.transport = transport;
+        }
+        if let Ok(host) = std::env::var("ALEXANDRIA_SERVER_HOST") {
+            config.server.host = host;
+        }
+        if let Ok(port) = std::env::var("ALEXANDRIA_SERVER_PORT") {
+            config.server.port = port
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid ALEXANDRIA_SERVER_PORT `{port}`: {e}"))?;
+        }
         if let Ok(dir) = std::env::var("ALEXANDRIA_DATA_DIR") {
             config.database.data_dir = PathBuf::from(dir);
         }
@@ -401,5 +412,37 @@ mod tests {
         // Clean up
         std::env::remove_var("ALEXANDRIA_DATA_DIR");
         std::env::remove_var("ALEXANDRIA_EMBEDDING_MODEL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_server_env_overrides() {
+        std::env::set_var("ALEXANDRIA_SERVER_TRANSPORT", "http");
+        std::env::set_var("ALEXANDRIA_SERVER_HOST", "0.0.0.0");
+        std::env::set_var("ALEXANDRIA_SERVER_PORT", "8080");
+
+        let config = Config::load().unwrap();
+        assert_eq!(config.server.transport, "http");
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 8080);
+
+        std::env::remove_var("ALEXANDRIA_SERVER_TRANSPORT");
+        std::env::remove_var("ALEXANDRIA_SERVER_HOST");
+        std::env::remove_var("ALEXANDRIA_SERVER_PORT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_server_env_invalid_port() {
+        std::env::set_var("ALEXANDRIA_SERVER_PORT", "not-a-port");
+
+        let result = Config::load();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ALEXANDRIA_SERVER_PORT"));
+
+        std::env::remove_var("ALEXANDRIA_SERVER_PORT");
     }
 }
