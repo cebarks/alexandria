@@ -1,7 +1,7 @@
 use anyhow::Result;
-use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue};
+use surrealdb::Surreal;
 
 use crate::models::MemoryEdge;
 
@@ -65,9 +65,7 @@ impl<'a> EdgeRepo<'a> {
         // Outgoing edges: id -> neighbor
         let mut out_response = self
             .db
-            .query(
-                "SELECT out, edge_type, strength FROM memory_edge WHERE in = type::record($id)",
-            )
+            .query("SELECT out, edge_type, strength FROM memory_edge WHERE in = type::record($id)")
             .bind(("id", id.to_string()))
             .await?;
         let outgoing: Vec<NeighborRow> = out_response.take(0)?;
@@ -129,11 +127,15 @@ impl<'a> EdgeRepo<'a> {
                 }
                 visited.insert(neighbor_key);
 
-                let neighbor_id_str = format!("{}:{}", neighbor.id.table, match &neighbor.id.key {
-                    surrealdb::types::RecordIdKey::String(s) => s.clone(),
-                    surrealdb::types::RecordIdKey::Number(n) => n.to_string(),
-                    other => format!("{other:?}"),
-                });
+                let neighbor_id_str = format!(
+                    "{}:{}",
+                    neighbor.id.table,
+                    match &neighbor.id.key {
+                        surrealdb::types::RecordIdKey::String(s) => s.clone(),
+                        surrealdb::types::RecordIdKey::Number(n) => n.to_string(),
+                        other => format!("{other:?}"),
+                    }
+                );
 
                 all_neighbors.push(Neighbor {
                     id: neighbor.id,

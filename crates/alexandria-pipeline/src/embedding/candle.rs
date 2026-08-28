@@ -22,11 +22,10 @@ impl CandleProvider {
         let device_str_owned = device_str.to_string();
 
         // Model loading is CPU-bound, run in blocking task
-        let (model, tokenizer, device, dimensions) =
-            tokio::task::spawn_blocking(move || {
-                Self::load_model(&model_id_owned, &device_str_owned)
-            })
-            .await??;
+        let (model, tokenizer, device, dimensions) = tokio::task::spawn_blocking(move || {
+            Self::load_model(&model_id_owned, &device_str_owned)
+        })
+        .await??;
 
         Ok(Self {
             model,
@@ -88,8 +87,7 @@ impl CandleProvider {
             let token_type_ids = encoding.get_type_ids().to_vec();
             let len = input_ids.len();
 
-            let input_ids =
-                Tensor::new(input_ids.as_slice(), &self.device)?.reshape((1, len))?;
+            let input_ids = Tensor::new(input_ids.as_slice(), &self.device)?.reshape((1, len))?;
             let attention_mask =
                 Tensor::new(attention_mask.as_slice(), &self.device)?.reshape((1, len))?;
             let token_type_ids =

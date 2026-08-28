@@ -19,7 +19,10 @@ fn memories_url(
 ) -> String {
     let mut parts = vec![format!("limit={limit}"), format!("offset={offset}")];
     if let Some(s) = search {
-        parts.push(format!("search={}", s.replace('&', "%26").replace(' ', "+")));
+        parts.push(format!(
+            "search={}",
+            s.replace('&', "%26").replace(' ', "+")
+        ));
     }
     if let Some(t) = tag {
         parts.push(format!("tag={}", t.replace('&', "%26").replace(' ', "+")));
@@ -83,7 +86,11 @@ pub async fn list(
 
     let mut rows_html = String::new();
     for fact in &rows {
-        let id = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+        let id = fact
+            .id
+            .as_ref()
+            .map(record_id_to_string)
+            .unwrap_or_default();
         let id_esc = esc(&id);
         let tags = fact
             .tags
@@ -109,7 +116,11 @@ pub async fn list(
             .unwrap_or_else(|| "—".to_string());
 
         // Deleted rows get a CSS class for dimming
-        let row_class = if fact.deleted { r#" class="deleted""# } else { "" };
+        let row_class = if fact.deleted {
+            r#" class="deleted""#
+        } else {
+            ""
+        };
 
         rows_html.push_str(&format!(
             r#"<tr{row_class}><td><a class="link" href="/debug/memories/{id_esc}">{id_esc}</a></td><td>{}</td><td>{}</td><td>{:.2}</td><td>{created}</td></tr>"#,
@@ -145,7 +156,13 @@ pub async fn list(
             let prev_offset = offset.saturating_sub(limit);
             format!(
                 r#"<a class="link" href="{}">← Prev</a>"#,
-                esc(&memories_url(search.map(|s| s.as_str()), tag.map(|s| s.as_str()), include_deleted, limit, prev_offset))
+                esc(&memories_url(
+                    search.map(|s| s.as_str()),
+                    tag.map(|s| s.as_str()),
+                    include_deleted,
+                    limit,
+                    prev_offset
+                ))
             )
         } else {
             String::new()
@@ -153,7 +170,13 @@ pub async fn list(
         next_link = if offset + rows.len() < total {
             format!(
                 r#"<a class="link" href="{}">Next →</a>"#,
-                esc(&memories_url(search.map(|s| s.as_str()), tag.map(|s| s.as_str()), include_deleted, limit, offset + limit))
+                esc(&memories_url(
+                    search.map(|s| s.as_str()),
+                    tag.map(|s| s.as_str()),
+                    include_deleted,
+                    limit,
+                    offset + limit
+                ))
             )
         } else {
             String::new()
@@ -488,9 +511,15 @@ mod tests {
         let server = super::super::test_support::test_server().await;
         let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
         // Create 3 facts, request limit=2 so we need pagination
-        repo.create_fact("first memory", 0.5, &[0.1, 0.2], &[]).await.unwrap();
-        repo.create_fact("second memory", 0.5, &[0.3, 0.4], &[]).await.unwrap();
-        repo.create_fact("third memory", 0.5, &[0.5, 0.6], &[]).await.unwrap();
+        repo.create_fact("first memory", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        repo.create_fact("second memory", 0.5, &[0.3, 0.4], &[])
+            .await
+            .unwrap();
+        repo.create_fact("third memory", 0.5, &[0.5, 0.6], &[])
+            .await
+            .unwrap();
 
         let app = crate::debug::router(server);
         let response = app
@@ -508,20 +537,32 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         // Should show a total of 3 (not just the 2 on this page)
-        assert!(text.contains("of 3"), "expected total count in pagination summary");
+        assert!(
+            text.contains("of 3"),
+            "expected total count in pagination summary"
+        );
         // Should have a Next link (there are more rows)
         assert!(text.contains("Next"), "expected a Next pagination link");
         // Should NOT have a Prev link (we're on page 1)
-        assert!(!text.contains("Prev"), "should not have Prev link on first page");
+        assert!(
+            !text.contains("Prev"),
+            "should not have Prev link on first page"
+        );
     }
 
     #[tokio::test]
     async fn test_memories_list_prev_link_on_second_page() {
         let server = super::super::test_support::test_server().await;
         let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
-        repo.create_fact("alpha", 0.5, &[0.1, 0.2], &[]).await.unwrap();
-        repo.create_fact("beta", 0.5, &[0.3, 0.4], &[]).await.unwrap();
-        repo.create_fact("gamma", 0.5, &[0.5, 0.6], &[]).await.unwrap();
+        repo.create_fact("alpha", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        repo.create_fact("beta", 0.5, &[0.3, 0.4], &[])
+            .await
+            .unwrap();
+        repo.create_fact("gamma", 0.5, &[0.5, 0.6], &[])
+            .await
+            .unwrap();
 
         let app = crate::debug::router(server);
         let response = app
@@ -538,7 +579,10 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("Prev"), "expected Prev link on second page");
-        assert!(!text.contains("Next"), "should not have Next link on last page");
+        assert!(
+            !text.contains("Next"),
+            "should not have Next link on last page"
+        );
     }
 
     #[tokio::test]
@@ -565,7 +609,10 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         // created_at is written by SurrealDB as current timestamp — year will be present
         // Check for "UTC" which every formatted created_at includes (format: "YYYY-MM-DD HH:MM UTC")
-        assert!(text.contains("UTC"), "expected formatted created_at (with UTC suffix) in list");
+        assert!(
+            text.contains("UTC"),
+            "expected formatted created_at (with UTC suffix) in list"
+        );
         // Table header should include Created
         assert!(text.contains("Created"), "expected Created column header");
     }
@@ -689,7 +736,10 @@ mod tests {
             .create(Some("my cluster"), &[0.1, 0.2])
             .await
             .unwrap();
-        cluster_repo.add_member(&cluster_id, &fact_id).await.unwrap();
+        cluster_repo
+            .add_member(&cluster_id, &fact_id)
+            .await
+            .unwrap();
 
         let app = crate::debug::router(server);
         let uri = format!("/debug/memories/{}", fact_id.replace(':', "%3A"));
@@ -705,7 +755,10 @@ mod tests {
             text.contains("/debug/clusters/"),
             "expected cluster to be a link to /debug/clusters/:id"
         );
-        assert!(text.contains("my cluster"), "expected cluster label in link");
+        assert!(
+            text.contains("my cluster"),
+            "expected cluster label in link"
+        );
     }
 
     #[tokio::test]

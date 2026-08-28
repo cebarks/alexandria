@@ -110,7 +110,11 @@ pub async fn detail(
 
     let mut rows_html = String::new();
     for fact in &members {
-        let fid = fact.id.as_ref().map(record_id_to_string).unwrap_or_default();
+        let fid = fact
+            .id
+            .as_ref()
+            .map(record_id_to_string)
+            .unwrap_or_default();
         let content_preview: String = fact.content.chars().take(120).collect();
         rows_html.push_str(&format!(
             r#"<tr><td><a class="link" href="/debug/memories/{fid}">{fid}</a></td><td>{}</td></tr>"#,

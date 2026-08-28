@@ -39,7 +39,9 @@ impl<'a> MemoryRepo<'a> {
 
         let created: Option<Fact> = response.take(0)?;
         let fact = created.ok_or_else(|| anyhow::anyhow!("Failed to create fact"))?;
-        let id = fact.id.ok_or_else(|| anyhow::anyhow!("Created fact has no id"))?;
+        let id = fact
+            .id
+            .ok_or_else(|| anyhow::anyhow!("Created fact has no id"))?;
         Ok(id.to_sql())
     }
 
@@ -126,7 +128,8 @@ impl<'a> MemoryRepo<'a> {
             conditions.push("deleted = false".to_string());
         }
         if search.is_some() {
-            conditions.push("string::lowercase(content) CONTAINS string::lowercase($search)".to_string());
+            conditions
+                .push("string::lowercase(content) CONTAINS string::lowercase($search)".to_string());
         }
         if tag.is_some() {
             conditions.push("$tag IN tags".to_string());
@@ -171,7 +174,8 @@ impl<'a> MemoryRepo<'a> {
             conditions.push("deleted = false".to_string());
         }
         if search.is_some() {
-            conditions.push("string::lowercase(content) CONTAINS string::lowercase($search)".to_string());
+            conditions
+                .push("string::lowercase(content) CONTAINS string::lowercase($search)".to_string());
         }
         if tag.is_some() {
             conditions.push("$tag IN tags".to_string());
@@ -226,9 +230,16 @@ mod tests {
         crate::schema::migrate(db.inner()).await.unwrap();
         let repo = MemoryRepo::new(db.inner());
 
-        repo.create_fact("alpha content", 0.5, &[0.1, 0.2], &["tag1".to_string()]).await.unwrap();
-        repo.create_fact("beta content", 0.5, &[0.3, 0.4], &["tag2".to_string()]).await.unwrap();
-        let deleted_id = repo.create_fact("gamma content", 0.5, &[0.5, 0.6], &[]).await.unwrap();
+        repo.create_fact("alpha content", 0.5, &[0.1, 0.2], &["tag1".to_string()])
+            .await
+            .unwrap();
+        repo.create_fact("beta content", 0.5, &[0.3, 0.4], &["tag2".to_string()])
+            .await
+            .unwrap();
+        let deleted_id = repo
+            .create_fact("gamma content", 0.5, &[0.5, 0.6], &[])
+            .await
+            .unwrap();
         repo.soft_delete_fact(&deleted_id).await.unwrap();
 
         // Default: excludes deleted
@@ -268,9 +279,18 @@ mod tests {
         let repo = MemoryRepo::new(db.inner());
         let cluster_repo = crate::repos::ClusterRepo::new(db.inner());
 
-        let fact_id = repo.create_fact("clustered content", 0.5, &[0.1, 0.2], &[]).await.unwrap();
-        let cluster_id = cluster_repo.create(Some("test cluster"), &[0.1, 0.2]).await.unwrap();
-        cluster_repo.add_member(&cluster_id, &fact_id).await.unwrap();
+        let fact_id = repo
+            .create_fact("clustered content", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let cluster_id = cluster_repo
+            .create(Some("test cluster"), &[0.1, 0.2])
+            .await
+            .unwrap();
+        cluster_repo
+            .add_member(&cluster_id, &fact_id)
+            .await
+            .unwrap();
 
         let cluster_found = repo.cluster_for_fact(&fact_id).await.unwrap();
         assert!(cluster_found.is_some());
@@ -278,7 +298,10 @@ mod tests {
         assert_eq!(cluster_found.label.as_deref(), Some("test cluster"));
 
         // Fact with no cluster returns None
-        let orphan_id = repo.create_fact("orphan content", 0.5, &[0.9, 0.9], &[]).await.unwrap();
+        let orphan_id = repo
+            .create_fact("orphan content", 0.5, &[0.9, 0.9], &[])
+            .await
+            .unwrap();
         let none = repo.cluster_for_fact(&orphan_id).await.unwrap();
         assert!(none.is_none());
     }

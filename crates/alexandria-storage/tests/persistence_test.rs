@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use alexandria_storage::{Database, schema};
+use alexandria_storage::{schema, Database};
 
 #[tokio::test]
 async fn test_persistent_storage_round_trip() {
@@ -8,7 +8,9 @@ async fn test_persistent_storage_round_trip() {
     let db_path = tmp_dir.path().join("test-db");
 
     // 1. Write a fact to persistent storage
-    let db = Database::connect_persistent(db_path.as_path()).await.unwrap();
+    let db = Database::connect_persistent(db_path.as_path())
+        .await
+        .unwrap();
     schema::migrate(db.inner()).await.unwrap();
 
     db.inner()
@@ -25,16 +27,22 @@ async fn test_persistent_storage_round_trip() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // 2. Reconnect and read it back
-    let db2 = Database::connect_persistent(db_path.as_path()).await.unwrap();
+    let db2 = Database::connect_persistent(db_path.as_path())
+        .await
+        .unwrap();
     schema::migrate(db2.inner()).await.unwrap();
 
-    let mut result = db2.inner()
+    let mut result = db2
+        .inner()
         .query("SELECT * FROM fact:persist_test")
         .await
         .unwrap();
     let rows: Vec<serde_json::Value> = result.take(0).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["content"].as_str().unwrap(), "I persist across restarts");
+    assert_eq!(
+        rows[0]["content"].as_str().unwrap(),
+        "I persist across restarts"
+    );
 }
 
 #[tokio::test]

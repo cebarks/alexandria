@@ -1,4 +1,4 @@
-use alexandria_storage::{Database, schema};
+use alexandria_storage::{schema, Database};
 
 #[tokio::test]
 async fn test_connect_embedded() {
@@ -11,7 +11,8 @@ async fn test_schema_bootstrap() {
     let db = Database::connect_embedded().await.unwrap();
     schema::bootstrap(db.inner()).await.unwrap();
     // Verify tables exist by attempting a SELECT
-    let result: Vec<serde_json::Value> = db.inner()
+    let result: Vec<serde_json::Value> = db
+        .inner()
         .query("INFO FOR DB")
         .await
         .unwrap()
