@@ -22,7 +22,7 @@ async fn test_cluster_split_mechanics() {
         .create(Some("mixed"), &[0.5, 0.5, 0.0])
         .await
         .unwrap();
-    let embeddings = vec![
+    let embeddings = [
         vec![1.0, 0.0, 0.0],
         vec![0.95, 0.05, 0.0],
         vec![0.98, 0.02, 0.0],
