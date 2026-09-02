@@ -1,5 +1,6 @@
 target/
 .git/
+.pi/
 docs/
 contrib/
 *.md
