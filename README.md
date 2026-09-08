@@ -58,8 +58,9 @@ three levels:
    in its `initialize` response via `ServerInfo.instructions`. Any MCP-compliant client can surface
    this to the model. Tool descriptions are also written directively ("call this proactively
    whenever...") rather than just describing mechanics.
-2. **Client-side skill** — for pi users, [`contrib/pi/skills/alexandria-memory/`](contrib/pi/skills/alexandria-memory/)
-   documents concrete trigger conditions and tool choice guidance, mirroring how other high-usage
+2. **Client-side skill** — [`contrib/pi/skills/alexandria-memory/`](contrib/pi/skills/alexandria-memory/)
+   (Pi) and [`contrib/claude/skills/alexandria-memory/`](contrib/claude/skills/alexandria-memory/)
+   (Claude Code) document concrete trigger conditions and tool choice guidance, mirroring how other high-usage
    MCP tools ship skills alongside themselves.
 3. **Optional auto-recall extension** — [`contrib/pi/extensions/alexandria-auto-recall/`](contrib/pi/extensions/alexandria-auto-recall/)
    hooks `before_agent_start` to call `retrieve_memories` on every prompt automatically and inject
@@ -119,10 +120,8 @@ journalctl --user -u alexandria -f  # tail logs
 
 ```bash
 claude mcp add --transport http --scope user alexandria http://127.0.0.1:3000/mcp
-# optional: the client-side skill from contrib/pi works unchanged in Claude Code,
-# except tool names there are mcp__alexandria__<tool> rather than alexandria_<tool>
-cp -r contrib/pi/skills/alexandria-memory ~/.claude/skills/
-sed -i 's/alexandria_/mcp__alexandria__/g' ~/.claude/skills/alexandria-memory/SKILL.md
+# optional: client-side skill (same as contrib/pi, with Claude Code's mcp__alexandria__<tool> names)
+cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
 ```
 
 **Generic (any MCP client):**

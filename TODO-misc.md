@@ -15,16 +15,9 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   was chosen under the same "genuine matches score 0.6+" assumption that turned out wrong.
   With MiniLM that threshold will almost never inject anything for question-style prompts.
   Re-measure and lower, or fix alongside the model change above.
-- **`broad_recall` floor is hardcoded** (`alexandria-engine/src/recall/algorithm.rs`) while
-  the `retrieve_memories` floor is configurable via `[retrieve] min_similarity`. Consider
-  passing the same config value into `broad_recall` so the two can't drift.
 
 ## Claude Code integration
 
-- **Skill tool names are Pi-specific.** `contrib/pi/skills/alexandria-memory/SKILL.md`
-  references `alexandria_<tool>`; Claude Code exposes `mcp__alexandria__<tool>`. README
-  currently papers over this with a `sed`. A client-neutral phrasing (or a
-  `contrib/claude-code/` copy) would be cleaner.
 - **No auto-recall equivalent for Claude Code.** The Pi extension hooks
   `before_agent_start`. The Claude Code analogue is a `UserPromptSubmit` hook that POSTs to
   `/mcp` and prints hits to stdout. Only worth doing if the server `instructions` + skill
