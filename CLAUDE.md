@@ -9,7 +9,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `RELATE` needs pre-parsed `RecordId` via `.bind()` — inline `type::record()` in RELATE fails
 - `type::record()` replaces `type::thing()` (removed in 3.x)
 - Query result structs need `#[derive(SurrealValue)]` from `surrealdb::types`
-- `RecordId` formatting: use `record_id_to_string()` helper (in `server.rs`), not `.to_string()`
+- `RecordId` formatting: use `record_id_to_string()` helper (in `alexandria-storage/src/lib.rs`, re-exported by `alexandria-mcp/src/server.rs`), not `.to_string()`
 - Connection: `surrealdb::engine::any::connect("mem://")` with `kv-mem` feature; `surrealkv://path` with `kv-surrealkv`
 
 ## rmcp (MCP SDK) Patterns
@@ -31,7 +31,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 
 - `AlexandriaServer` uses a bare `#[tool_router]` + explicit `#[tool_handler(instructions = "...")]` block — NOT `#[tool_router(server_handler)]` — specifically so `get_info()` carries usage `instructions`. If you add a new tool, add it to the `#[tool_router]` impl block same as the others; the separate `#[tool_handler]` block stays where it is at the bottom of `server.rs` and doesn't need touching unless the overall usage guidance changes.
 - Tool descriptions and param field descriptions (`#[tool(description = ...)]`, `#[schemars(description = ...)]`) are written directively ("call this proactively when...") rather than just describing mechanics — this materially affects how often client LLMs choose to call the tool unprompted. Keep new tools consistent with that style.
-- `record_id_to_string()` is the canonical way to format SurrealDB `RecordId` for use in queries and JSON responses. It's in `alexandria-mcp/src/server.rs` and is `pub`.
+- `record_id_to_string()` is the canonical way to format SurrealDB `RecordId` for use in queries and JSON responses. It lives in `alexandria-storage/src/lib.rs` (`pub`); `alexandria-mcp/src/server.rs` only re-exports it.
 - Cluster `member_count` is queried live (not cached) — `load_cluster_infos()` calls `get_members()` per cluster.
 - `update_memory` with content change: creates a soft-deleted snapshot of old content, then links via `derived_from` edge. The old version is hidden from search but preserved for lineage.
 - `import_document` creates a `raw` table record for the full document, then `extracted_from` edges from each chunk to it.
