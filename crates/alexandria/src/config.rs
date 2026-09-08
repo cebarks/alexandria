@@ -411,11 +411,13 @@ mod tests {
         let env = env(&[
             ("ALEXANDRIA_DATA_DIR", "/tmp/env-test"),
             ("ALEXANDRIA_EMBEDDING_MODEL", "env-model"),
+            ("ALEXANDRIA_EMBEDDING_DEVICE", "env-device"),
         ]);
 
         let config = Config::load_from(&env).unwrap();
         assert_eq!(config.database.data_dir, PathBuf::from("/tmp/env-test"));
         assert_eq!(config.embedding.model, "env-model");
+        assert_eq!(config.embedding.device, "env-device");
     }
 
     #[test]
