@@ -58,6 +58,22 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Env-mutating config tests must carry `#[serial]` (`serial_test`) — `cargo test` runs them in parallel within a binary and they otherwise race.
 - The pi extension under `contrib/pi/` has **no** test suite; detector regexes are unguarded.
 
+## CI
+
+- Actions are pinned by full commit SHA with a trailing `# vN` comment, and Dependabot
+  (`.github/dependabot.yml`, weekly, 7-day cooldown) proposes bumps.
+- Failure signature of a dead pin: a job dies in **"Set up job"** after a few seconds with
+  `Unable to resolve action <owner>/<repo>@<sha>, unable to find version`. Everything using that pin
+  fails identically, and no recipe ever runs. Fix = repin to the commit the tag names now
+  (`gh api repos/<owner>/<repo>/git/ref/tags/v2`), not to a branch head.
+- Triage by duration before reading logs: a real run of this suite is ~2–7 min per job. A run that
+  concludes in 10–40s failed in setup, which means infrastructure, not code.
+- Do not test whether a pin is reachable with `gh api repos/<owner>/<repo>/commits/<sha>` — it
+  returns 422 "No commit found" for pins that Actions resolves fine. Trust the Actions error text, or
+  the fact that a job using that pin passed.
+- Nothing watched the branch while CI was red for 11 days, because no check is required to merge.
+  Revisit branch protection if regressions keep landing.
+
 ## Docs Map
 
 - `README.md` — feature/tool overview, quick start, deployment (systemd, Docker), debug UI
