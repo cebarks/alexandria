@@ -39,7 +39,6 @@ impl<'a> SessionRepo<'a> {
                  external_id = $external_id, \
                  agent_id = $agent_id, \
                  model = $model, \
-                 memory_count = 0, \
                  tags = []",
             )
             .bind(("external_id", external_id.to_string()));
@@ -60,12 +59,11 @@ impl<'a> SessionRepo<'a> {
         Ok(crate::record_id_to_string(&id))
     }
 
-    /// Increment memory_count and refresh ended_at on a session.
+    /// Refresh ended_at on a session.
     pub async fn touch(&self, external_id: &str) -> Result<()> {
         self.db
             .query(
                 "UPDATE `session` SET \
-                 memory_count += 1, \
                  ended_at = time::now() \
                  WHERE external_id = $external_id",
             )
@@ -170,7 +168,6 @@ mod tests {
         assert!(found.is_some());
         let session = found.unwrap();
         assert_eq!(session.external_id, "sess-001");
-        assert_eq!(session.memory_count, 0);
 
         // Add a memory
         let fact_id = memory_repo
@@ -179,10 +176,6 @@ mod tests {
             .unwrap();
         repo.add_memory(&session_id, &fact_id).await.unwrap();
         repo.touch("sess-001").await.unwrap();
-
-        // Verify memory_count incremented
-        let updated = repo.find_by_external_id("sess-001").await.unwrap().unwrap();
-        assert_eq!(updated.memory_count, 1);
 
         // Get memories
         let memories = repo.get_memories("sess-001").await.unwrap();

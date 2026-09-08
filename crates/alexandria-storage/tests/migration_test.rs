@@ -13,9 +13,9 @@ async fn test_fresh_db_runs_all_migrations() {
         .unwrap();
     let rows: Vec<serde_json::Value> = result.take(0).unwrap();
     assert_eq!(rows.len(), 1);
-    // Version should be "5" (latest migration)
+    // Version should be "6" (latest migration)
     let version = rows[0]["value"].as_str().unwrap();
-    assert_eq!(version, "5");
+    assert_eq!(version, "6");
 }
 
 #[tokio::test]
@@ -33,7 +33,7 @@ async fn test_migrate_idempotent() {
         .await
         .unwrap();
     let rows: Vec<serde_json::Value> = result.take(0).unwrap();
-    assert_eq!(rows[0]["value"].as_str().unwrap(), "5");
+    assert_eq!(rows[0]["value"].as_str().unwrap(), "6");
 }
 
 #[tokio::test]

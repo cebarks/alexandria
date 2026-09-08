@@ -28,7 +28,14 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   outside the storage tests reads it; `touch` still increments it on every store. Harmless. Drop the
   column and the `touch` increment in a future migration, or keep it as a "memories written" stat.
   Since 2026-09-08 `import_document` also calls `touch` once per import, not once per chunk, so as
-  a "memories written" stat it would undercount imports; another reason to drop it.
+  a "memories written" stat it would undercount imports; another reason to drop it. Done 2026-09-08:
+  `v006_drop_session_memory_count` removes the field and unsets it on existing rows (`REMOVE FIELD`
+  before `UNSET`, since a non-optional int rejects NONE); `Session` struct, `create`, and `touch` no
+  longer mention it. `touch` stays for the `ended_at` refresh. Schema version is now 6.
+- **`tests/migration_test.rs` hardcodes the latest schema version.** Noticed 2026-09-08 while adding
+  v006: two asserts compare `schema_version` to a literal string and must be bumped with every new
+  migration. `MIGRATIONS` is private to `schema/mod.rs`; exposing a `LATEST_VERSION` const would
+  remove the churn. Cosmetic, do it the next time a migration lands.
 - **Session find-or-create is duplicated.** `do_store_memory` and `do_import_document` (2026-09-08)
   each carry the same find-by-external-id, create-if-missing, re-find, unwrap-record-id block. Two
   copies is tolerable; on a third caller move it into `SessionRepo::find_or_create` returning the
