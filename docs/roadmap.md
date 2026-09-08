@@ -89,7 +89,7 @@ The goal: memories should organize themselves without manual curation.
 
 **Operational**
 
-- Embedding model migration CLI (`alexandria migrate-embeddings`)
+- ~~Embedding model migration CLI (`alexandria migrate-embeddings`)~~ Done 2026-09-08
 - Cascade soft-deletes through lineage chains
 - Scope handle expiry / TTL
 - Metrics endpoint

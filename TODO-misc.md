@@ -11,6 +11,14 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   asymmetric retrieval model (e.g. an msmarco/bge/e5 family model) would separate real
   matches from noise far better. Blocked on: model is locked on first boot, so switching
   the default needs a migration/re-embed story.
+  Measured 2026-09-08 on the live corpus (143 facts, 12 questions; see
+  `docs/plans/2026-09-08-embedding-model-swap-measurements.md`): none of msmarco-MiniLM-L6-cos-v5,
+  multi-qa-MiniLM-L6-cos-v1, or bge-small-en-v1.5 beat MiniLM (mean rank 1.42 vs 2.33 for the best
+  challenger, mean gap +0.148 vs +0.091). Default unchanged. bge-small scores higher in absolute
+  terms (hit_min 0.620 vs 0.338) but its noise floor rises just as much (nonhit_p50 0.564 vs 0.077),
+  so separation is worse. The blocker is gone: `alexandria migrate-embeddings` re-embeds an existing
+  database and CLS-pooled models load, so a future candidate is a config change plus one command.
+  Note bge was measured without its query instruction prefix.
 
 ## Server
 
