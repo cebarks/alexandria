@@ -70,8 +70,10 @@ pub fn broad_recall(
         .iter()
         .filter_map(|cwm| {
             let centroid_sim = cosine_similarity(query_embedding, &cwm.info.centroid);
-            if centroid_sim < 0.3 {
-                return None; // skip clusters with very low centroid match
+            // Noise floor only. With all-MiniLM-L6-v2 a question against a
+            // stored statement scores ~0.2; unrelated text ~0.0.
+            if centroid_sim < 0.1 {
+                return None;
             }
 
             // Find best member similarity

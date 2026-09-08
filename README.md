@@ -115,6 +115,18 @@ journalctl --user -u alexandria -f  # tail logs
 
 ### MCP client configuration
 
+**Claude Code:**
+
+```bash
+claude mcp add --transport http --scope user alexandria http://127.0.0.1:3000/mcp
+# optional: the client-side skill from contrib/pi works unchanged in Claude Code,
+# except tool names there are mcp__alexandria__<tool> rather than alexandria_<tool>
+cp -r contrib/pi/skills/alexandria-memory ~/.claude/skills/
+sed -i 's/alexandria_/mcp__alexandria__/g' ~/.claude/skills/alexandria-memory/SKILL.md
+```
+
+**Generic (any MCP client):**
+
 ```json
 {
   "alexandria": {

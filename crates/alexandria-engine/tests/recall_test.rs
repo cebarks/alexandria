@@ -93,3 +93,33 @@ fn test_focused_recall_narrows_within_cluster() {
     // First result should be the closest match
     assert_eq!(result.memories[0].id, "f1");
 }
+
+#[test]
+fn test_broad_recall_keeps_weak_but_real_matches_and_drops_noise() {
+    // With all-MiniLM-L6-v2 a natural-language question against a stored
+    // statement scores ~0.2 cosine; unrelated text scores ~0.0. The floor must
+    // sit between those.
+    let mk = |id: &str, centroid: Vec<f32>| ClusterWithMembers {
+        info: ClusterInfo {
+            id: id.into(),
+            centroid: centroid.clone(),
+            member_count: 1,
+        },
+        members: vec![FactSummary {
+            id: format!("{id}-f"),
+            content: id.into(),
+            embedding: centroid,
+            heat: 1.0,
+        }],
+    };
+    let clusters = vec![mk("weak", vec![0.2, 0.98]), mk("noise", vec![0.0, 1.0])];
+
+    let result = broad_recall(&[1.0, 0.0], &clusters, 5);
+
+    let ids: Vec<_> = result
+        .clusters
+        .iter()
+        .map(|c| c.cluster_id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["weak"]);
+}

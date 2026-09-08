@@ -42,7 +42,7 @@ cohesion_floor = 0.6               # Avg member-to-centroid similarity below whi
 maintenance_interval_secs = 300    # Cluster maintenance check interval in seconds (default: 300)
 
 [retrieve]
-min_similarity = 0.30              # Server-side hard floor on cosine similarity for retrieve_memories (default: 0.30)
+min_similarity = 0.10              # Server-side hard floor on cosine similarity for retrieve_memories (default: 0.10)
 ```
 
 ## Section Details
@@ -110,7 +110,7 @@ Controls server-side filtering of `retrieve_memories` results.
 
 | Key | Type | Default | Description |
 | ----- | ------ | --------- | ------------- |
-| `min_similarity` | f32 | `0.30` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A conservative defense-in-depth cutoff that removes pure noise even if a client sets a lax threshold. Note this is model-dependent: for `all-MiniLM-L6-v2`, genuine matches score ~0.6+, weak-but-plausible matches ~0.3–0.5, and unrelated text stays below ~0.15. Keep this well below the auto-recall client threshold so deliberate agent lookups still surface marginal results. |
+| `min_similarity` | f32 | `0.10` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A noise cutoff only. Model-dependent: for `all-MiniLM-L6-v2`, a near-paraphrase or keyword hit scores ~0.6+, but a natural-language question against a stored statement (the common agent case, e.g. "which database does the project use" vs "the project uses SurrealDB") scores only ~0.1–0.2, while unrelated text sits at ~0.0. Values above ~0.2 silently drop real matches. |
 
 ## Environment Variable Overrides
 

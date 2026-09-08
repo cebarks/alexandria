@@ -88,9 +88,9 @@ pub struct ActivationConfig {
 #[serde(default)]
 pub struct RetrieveConfig {
     /// Server-side hard floor on cosine similarity for `retrieve_memories`
-    /// results. A conservative defense-in-depth cutoff that drops pure noise
-    /// even if a client is misconfigured; it is intentionally well below the
-    /// auto-recall client threshold. Default 0.30.
+    /// results. A noise cutoff only: with all-MiniLM-L6-v2 a natural-language
+    /// question against a stored statement scores ~0.2 and unrelated text
+    /// ~0.0, so this must stay low. Default 0.10.
     pub min_similarity: f32,
 }
 
@@ -159,7 +159,7 @@ impl Default for ActivationConfig {
 impl Default for RetrieveConfig {
     fn default() -> Self {
         Self {
-            min_similarity: 0.30,
+            min_similarity: 0.10,
         }
     }
 }
@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(config.cluster.join_threshold, 0.75);
         assert_eq!(config.activation.propagation_factor, 0.3);
         assert_eq!(config.activation.max_hops, 2);
-        assert_eq!(config.retrieve.min_similarity, 0.30);
+        assert_eq!(config.retrieve.min_similarity, 0.10);
         assert!(config.database.data_dir.ends_with("data"));
     }
 
@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(config.cluster.maintenance_interval_secs, 600);
         assert_eq!(config.activation.top_n, 5);
         // retrieve uses default since not specified
-        assert_eq!(config.retrieve.min_similarity, 0.30);
+        assert_eq!(config.retrieve.min_similarity, 0.10);
 
         let toml_retrieve = r#"
             [retrieve]
