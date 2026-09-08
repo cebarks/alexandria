@@ -72,8 +72,9 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   sets `target-cpu=x86-64-v2` for the three Windows targets alongside the Linux `mold` target; there's
   no Windows toolchain in this environment to cross-compile and confirm they take effect.
 - [ ] **`[profile.release]` (lto = "thin", codegen-units = 1, strip) added 2026-09-08, never built.**
-  Only `cargo build --workspace` (dev profile) has been run since the toolchain/profile changes;
-  do a `cargo build --release` smoke test before shipping a release artifact.
+  Only `cargo build --workspace` (dev profile) has been run since the toolchain/profile changes,
+  and the 2026-09-08 dependency major bumps (notably `hf-hub` 1.0 / `hf-xet`) were likewise only
+  dev-built and tested; do a `cargo build --release` smoke test before shipping a release artifact.
 
 - [ ] **Startup memory doubled during model load (2026-09-08).** `candle.rs` now reads the safetensors
   file into a `Vec<u8>` (`from_buffered_safetensors`) instead of mmap, so the workspace can carry
@@ -94,6 +95,17 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   `local_files_only` first and only downloads on a miss, restoring 0.5 behaviour (~0.4 s cached start
   with the Hub blackholed). Net tree: openssl/native-tls/ureq gone, `hf-xet` (mandatory in 1.0) in;
   629 → 662 crates.
+- [ ] **`hf-hub` 1.0 is heavy for what we use.** We call one thing (download four files into the
+  standard HF cache) and pay for the whole client plus mandatory `hf-xet` (redb, sysinfo, statrs,
+  xet-*): +33 crates net. `reqwest` 0.13 is already in the tree via rmcp/surrealdb, so a ~40-line
+  downloader writing the same `models--owner--name/snapshots/<sha>/` layout would let us drop
+  `hf-hub` entirely. Do it if build time or binary size becomes a complaint; until then the crate
+  is one isolated commit (98295e5) to revert.
+- [-] **Cache-first model loading never refreshes a cached revision** (2026-09-08, hf-hub 1.0 port).
+  Same as 0.5 behaved: once `main` is on disk it is served forever; delete
+  `~/.cache/huggingface/hub/models--<owner>--<name>` to re-fetch. Also, a model that lacks
+  `1_Pooling/config.json` needs one online boot to write hf-hub's `.no_exist` marker; after that the
+  cache-first path honours it without a network call. Accepted as-is.
 - [ ] **Two `tokenizers` versions compile** until candle bumps: candle-core 0.11 still pins 0.22, we're
   on 0.23. Behaviourally harmless; revert ours to 0.22 if the duplicate build cost bothers anyone.
 - [ ] **Transitive "Unchanged" `cargo update` entries are upstream pins, not ours.** `generic-array`
