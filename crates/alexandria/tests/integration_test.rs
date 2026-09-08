@@ -3,7 +3,7 @@ use std::sync::Arc;
 use alexandria_mcp::AlexandriaServer;
 use alexandria_pipeline::embedding::CandleProvider;
 use alexandria_storage::repos::MemoryRepo;
-use alexandria_storage::{schema, Database};
+use alexandria_storage::{Database, schema};
 
 async fn setup() -> (AlexandriaServer, Arc<Database>) {
     let db = Database::connect_embedded().await.unwrap();

@@ -1,11 +1,11 @@
+use axum::Form;
 use axum::extract::State;
 use axum::response::Html;
-use axum::Form;
 use serde::Deserialize;
 
 use super::html::{esc, layout};
-use crate::tools::{RecallParams, RetrieveMemoriesParams};
 use crate::AlexandriaServer;
+use crate::tools::{RecallParams, RetrieveMemoriesParams};
 
 pub async fn form(State(_server): State<AlexandriaServer>) -> Html<String> {
     let body = r##"<h1>Query Tester</h1>
@@ -98,7 +98,7 @@ fn render_recall_results(json_str: &str) -> String {
             return format!(
                 r#"<p class="error">Failed to parse recall response: {}</p>"#,
                 esc(&e.to_string())
-            )
+            );
         }
     };
 

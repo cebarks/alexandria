@@ -1,8 +1,8 @@
 use anyhow::Result;
 use serde::Serialize;
+use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::SurrealValue;
-use surrealdb::Surreal;
 
 /// Aggregate counts for the debug dashboard.
 #[derive(Debug, Clone, Serialize, Default)]

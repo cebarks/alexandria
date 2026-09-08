@@ -2,6 +2,6 @@ pub mod activation;
 mod columns;
 mod decay;
 
-pub use activation::{compute_activation_targets, ActivationConfig, ActivationTarget};
+pub use activation::{ActivationConfig, ActivationTarget, compute_activation_targets};
 pub use columns::HeatColumns;
-pub use decay::{on_access, projected_heat, HeatState};
+pub use decay::{HeatState, on_access, projected_heat};

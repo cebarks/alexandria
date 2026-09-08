@@ -1,7 +1,7 @@
 use anyhow::Result;
+use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::RecordId;
-use surrealdb::Surreal;
 
 use crate::models::Session;
 

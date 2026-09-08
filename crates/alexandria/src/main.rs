@@ -5,7 +5,7 @@ use std::sync::Arc;
 use alexandria_mcp::AlexandriaServer;
 use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
 use alexandria_storage::record_id_to_string;
-use alexandria_storage::{schema, system_config, Database};
+use alexandria_storage::{Database, schema, system_config};
 use config::Config;
 use rmcp::ServiceExt;
 
@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
 /// `alexandria migrate-embeddings`: re-embed everything with the model in config and
 /// move the lock. Run with the server stopped; the data dir is single-writer.
 async fn migrate_embeddings() -> anyhow::Result<()> {
-    use alexandria_mcp::migrate::{reembed, ReembedOutcome};
+    use alexandria_mcp::migrate::{ReembedOutcome, reembed};
 
     let config = Config::load()?;
     let db = Database::connect(&config.database.data_dir).await?;
@@ -116,7 +116,7 @@ async fn migrate_embeddings() -> anyhow::Result<()> {
 
 async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -297,7 +297,9 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
     let bind_addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
-    tracing::info!("Alexandria ready, serving HTTP on http://{bind_addr}/mcp (debug UI at http://{bind_addr}/debug)");
+    tracing::info!(
+        "Alexandria ready, serving HTTP on http://{bind_addr}/mcp (debug UI at http://{bind_addr}/debug)"
+    );
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {

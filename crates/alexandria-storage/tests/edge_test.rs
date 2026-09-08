@@ -1,5 +1,5 @@
 use alexandria_storage::repos::{EdgeRepo, MemoryRepo};
-use alexandria_storage::{schema, Database};
+use alexandria_storage::{Database, schema};
 
 async fn setup() -> Database {
     let db = Database::connect_embedded().await.unwrap();

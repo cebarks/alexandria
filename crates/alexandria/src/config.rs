@@ -334,16 +334,22 @@ mod tests {
     #[test]
     #[serial]
     fn test_config_path_env_override() {
-        std::env::set_var("ALEXANDRIA_CONFIG", "/tmp/custom/config.toml");
+        unsafe {
+            std::env::set_var("ALEXANDRIA_CONFIG", "/tmp/custom/config.toml");
+        }
         let path = config_path();
         assert_eq!(path, PathBuf::from("/tmp/custom/config.toml"));
-        std::env::remove_var("ALEXANDRIA_CONFIG");
+        unsafe {
+            std::env::remove_var("ALEXANDRIA_CONFIG");
+        }
     }
 
     #[test]
     #[serial]
     fn test_config_path_prefers_xdg_when_no_files_exist() {
-        std::env::remove_var("ALEXANDRIA_CONFIG");
+        unsafe {
+            std::env::remove_var("ALEXANDRIA_CONFIG");
+        }
         // When neither XDG nor legacy config files exist, config_path()
         // should return the XDG path (not legacy). We can't guarantee
         // neither file exists on this machine, so we verify the structural
@@ -403,47 +409,73 @@ mod tests {
     #[serial]
     fn test_env_overrides() {
         // Set env vars
-        std::env::set_var("ALEXANDRIA_DATA_DIR", "/tmp/env-test");
-        std::env::set_var("ALEXANDRIA_EMBEDDING_MODEL", "env-model");
+        unsafe {
+            std::env::set_var("ALEXANDRIA_DATA_DIR", "/tmp/env-test");
+        }
+        unsafe {
+            std::env::set_var("ALEXANDRIA_EMBEDDING_MODEL", "env-model");
+        }
 
         let config = Config::load().unwrap();
         assert_eq!(config.database.data_dir, PathBuf::from("/tmp/env-test"));
         assert_eq!(config.embedding.model, "env-model");
 
         // Clean up
-        std::env::remove_var("ALEXANDRIA_DATA_DIR");
-        std::env::remove_var("ALEXANDRIA_EMBEDDING_MODEL");
+        unsafe {
+            std::env::remove_var("ALEXANDRIA_DATA_DIR");
+        }
+        unsafe {
+            std::env::remove_var("ALEXANDRIA_EMBEDDING_MODEL");
+        }
     }
 
     #[test]
     #[serial]
     fn test_server_env_overrides() {
-        std::env::set_var("ALEXANDRIA_SERVER_TRANSPORT", "http");
-        std::env::set_var("ALEXANDRIA_SERVER_HOST", "0.0.0.0");
-        std::env::set_var("ALEXANDRIA_SERVER_PORT", "8080");
+        unsafe {
+            std::env::set_var("ALEXANDRIA_SERVER_TRANSPORT", "http");
+        }
+        unsafe {
+            std::env::set_var("ALEXANDRIA_SERVER_HOST", "0.0.0.0");
+        }
+        unsafe {
+            std::env::set_var("ALEXANDRIA_SERVER_PORT", "8080");
+        }
 
         let config = Config::load().unwrap();
         assert_eq!(config.server.transport, "http");
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
 
-        std::env::remove_var("ALEXANDRIA_SERVER_TRANSPORT");
-        std::env::remove_var("ALEXANDRIA_SERVER_HOST");
-        std::env::remove_var("ALEXANDRIA_SERVER_PORT");
+        unsafe {
+            std::env::remove_var("ALEXANDRIA_SERVER_TRANSPORT");
+        }
+        unsafe {
+            std::env::remove_var("ALEXANDRIA_SERVER_HOST");
+        }
+        unsafe {
+            std::env::remove_var("ALEXANDRIA_SERVER_PORT");
+        }
     }
 
     #[test]
     #[serial]
     fn test_server_env_invalid_port() {
-        std::env::set_var("ALEXANDRIA_SERVER_PORT", "not-a-port");
+        unsafe {
+            std::env::set_var("ALEXANDRIA_SERVER_PORT", "not-a-port");
+        }
 
         let result = Config::load();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("ALEXANDRIA_SERVER_PORT"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("ALEXANDRIA_SERVER_PORT")
+        );
 
-        std::env::remove_var("ALEXANDRIA_SERVER_PORT");
+        unsafe {
+            std::env::remove_var("ALEXANDRIA_SERVER_PORT");
+        }
     }
 }

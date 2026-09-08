@@ -9,8 +9,8 @@ pub mod query;
 #[cfg(test)]
 mod test_support;
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 
 use crate::AlexandriaServer;
 

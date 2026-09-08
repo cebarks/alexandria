@@ -1,6 +1,6 @@
 use alexandria_engine::clusters::ClusterInfo;
 use alexandria_engine::recall::{
-    broad_recall, focused_recall, ClusterWithMembers, FactSummary, ScopeHandle,
+    ClusterWithMembers, FactSummary, ScopeHandle, broad_recall, focused_recall,
 };
 
 #[test]

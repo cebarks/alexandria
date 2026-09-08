@@ -4,7 +4,7 @@
 
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
-use alexandria_storage::{record_id_to_string, system_config, Database};
+use alexandria_storage::{Database, record_id_to_string, system_config};
 
 pub enum ReembedOutcome {
     /// Nothing to do; the string is a human-readable reason.
@@ -24,10 +24,10 @@ pub async fn reembed(
         None => {
             return Ok(ReembedOutcome::Skipped(
                 "no embedding lock found (fresh database); just start the server".into(),
-            ))
+            ));
         }
         Some(stored) if stored == new_model => {
-            return Ok(ReembedOutcome::Skipped(format!("already on {new_model}")))
+            return Ok(ReembedOutcome::Skipped(format!("already on {new_model}")));
         }
         Some(stored) => tracing::info!("Re-embedding {stored} -> {new_model}"),
     }

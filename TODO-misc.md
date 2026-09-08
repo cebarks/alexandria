@@ -68,6 +68,15 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   copy-first-member; no test for lock-present-over-empty-corpus (`Done { 0, 0 }`);
   `all_ids_and_content` test assertions are positional and could flip on same-tick `created_at`.
 
+## Build / toolchain
+
+- [ ] **Windows `rustflags` (msvc/gnu/gnullvm targets) added 2026-09-08 but unverified.** `.cargo/config.toml`
+  sets `target-cpu=x86-64-v2` for the three Windows targets alongside the Linux `mold` target; there's
+  no Windows toolchain in this environment to cross-compile and confirm they take effect.
+- [ ] **`[profile.release]` (lto = "thin", codegen-units = 1, strip) added 2026-09-08, never built.**
+  Only `cargo build --workspace` (dev profile) has been run since the toolchain/profile changes;
+  do a `cargo build --release` smoke test before shipping a release artifact.
+
 ## Dependencies
 
 - [ ] **Blocked `cargo update` targets (semver-incompatible, need Cargo.toml bump).** `cargo update

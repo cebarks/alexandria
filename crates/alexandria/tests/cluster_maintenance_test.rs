@@ -4,11 +4,11 @@
 //! which are the same methods the maintenance loop calls.
 
 use alexandria_engine::clusters::maintenance::{
-    check_cohesion, check_merge, MaintenanceAction, MergeCheck,
+    MaintenanceAction, MergeCheck, check_cohesion, check_merge,
 };
 use alexandria_storage::record_id_to_string;
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
-use alexandria_storage::{schema, Database};
+use alexandria_storage::{Database, schema};
 
 #[tokio::test]
 async fn test_cluster_split_mechanics() {

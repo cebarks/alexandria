@@ -1,7 +1,7 @@
 use anyhow::Result;
+use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue, ToSql};
-use surrealdb::Surreal;
 use tracing::warn;
 
 use crate::models::{Cluster, Fact};

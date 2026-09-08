@@ -2,19 +2,19 @@ use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 // Re-exported from alexandria_storage where it's now defined.
 pub use alexandria_storage::record_id_to_string;
 
-use alexandria_engine::clusters::{assign_to_cluster, update_centroid, ClusterInfo};
-use alexandria_engine::heat::{compute_activation_targets, ActivationConfig};
+use alexandria_engine::clusters::{ClusterInfo, assign_to_cluster, update_centroid};
+use alexandria_engine::heat::{ActivationConfig, compute_activation_targets};
 use alexandria_engine::recall::{
-    broad_recall, focused_recall, ClusterWithMembers, FactSummary, ScopeHandle,
+    ClusterWithMembers, FactSummary, ScopeHandle, broad_recall, focused_recall,
 };
 use alexandria_engine::search::rank_by_similarity;
 use alexandria_pipeline::embedding::EmbeddingProvider;
-use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo, SessionRepo};
 use alexandria_storage::Database;
+use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo, SessionRepo};
 
 use crate::tools::{
     DeleteMemoryParams, FinalizeSessionParams, GetSessionParams, ImportDocumentParams,

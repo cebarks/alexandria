@@ -1,7 +1,7 @@
-use alexandria_mcp::migrate::{reembed, ReembedOutcome};
+use alexandria_mcp::migrate::{ReembedOutcome, reembed};
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
-use alexandria_storage::{system_config, Database};
+use alexandria_storage::{Database, system_config};
 
 /// Fake model "b": every text embeds to the same unit vector in 3 dims.
 struct ModelB;
@@ -130,8 +130,10 @@ async fn reembed_is_noop_on_fresh_database() {
 
     let outcome = reembed(&db, &ModelB).await.unwrap();
     assert!(matches!(outcome, ReembedOutcome::Skipped(_)));
-    assert!(system_config::get_config(db.inner(), "embedding_model")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        system_config::get_config(db.inner(), "embedding_model")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

@@ -27,7 +27,7 @@ pub async fn list(
             return Html(layout(
                 "Maintenance Log",
                 &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
-            ))
+            ));
         }
     };
 
