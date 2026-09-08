@@ -65,8 +65,8 @@ pub async fn check_embedding_model(
                      \n\
                      Options:\n\
                      1. Change your config back to: {stored_m}\n\
-                     2. Delete the database and start fresh\n\
-                     3. (Future) Run `alexandria migrate-embeddings` to re-embed everything"
+                     2. Run `alexandria migrate-embeddings` with the server stopped to re-embed everything with {model}\n\
+                     3. Delete the database and start fresh"
                 );
             }
             let stored_dim: usize = stored_d.parse().unwrap_or(0);

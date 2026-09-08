@@ -14,6 +14,15 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("Alexandria v0.2 starting...");
 
+    if let Some(arg) = std::env::args().nth(1) {
+        return match arg.as_str() {
+            "migrate-embeddings" => migrate_embeddings().await,
+            other => {
+                anyhow::bail!("unknown argument `{other}`. Usage: alexandria [migrate-embeddings]")
+            }
+        };
+    }
+
     // 1. Load configuration
     let config = Config::load()?;
     tracing::info!(
@@ -79,6 +88,29 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// `alexandria migrate-embeddings`: re-embed everything with the model in config and
+/// move the lock. Run with the server stopped; the data dir is single-writer.
+async fn migrate_embeddings() -> anyhow::Result<()> {
+    use alexandria_mcp::migrate::{reembed, ReembedOutcome};
+
+    let config = Config::load()?;
+    let db = Database::connect(&config.database.data_dir).await?;
+    schema::migrate(db.inner()).await?;
+
+    tracing::info!("Loading embedding model: {}", config.embedding.model);
+    let embedding = CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
+
+    match reembed(&db, &embedding).await? {
+        ReembedOutcome::Skipped(why) => println!("Nothing to do: {why}"),
+        ReembedOutcome::Done { facts, clusters } => println!(
+            "Re-embedded {facts} facts and {clusters} cluster centroids with {} ({} dims). Restart the service.",
+            embedding.model_id(),
+            embedding.dimensions()
+        ),
+    }
     Ok(())
 }
 
