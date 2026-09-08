@@ -284,6 +284,11 @@ just install-hooks
 CI job. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs fmt, clippy, tests, and
 cargo-deny on push and PR.
 
+[`.github/workflows/container.yml`](.github/workflows/container.yml) additionally builds the Docker
+image and boot-tests it — waits on `/debug`, then performs a real MCP `initialize` handshake against
+`/mcp` — but only when a change touches the `Dockerfile`, `.dockerignore`, the manifests, or
+`crates/**`. A green `CI` run therefore says nothing about the image, and vice versa.
+
 ## License
 
 Distributed under **AGPL-3.0-or-later** — see [`LICENSE`](LICENSE) and the `license` field in

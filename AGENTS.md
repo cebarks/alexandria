@@ -66,8 +66,12 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
   `Unable to resolve action <owner>/<repo>@<sha>, unable to find version`. Everything using that pin
   fails identically, and no recipe ever runs. Fix = repin to the commit the tag names now
   (`gh api repos/<owner>/<repo>/git/ref/tags/v2`), not to a branch head.
-- Triage by duration before reading logs: a real run of this suite is ~2–7 min per job. A run that
-  concludes in 10–40s failed in setup, which means infrastructure, not code.
+- Triage by duration before reading logs: a real `ci.yml` job is ~2–7 min. A run that concludes in
+  10–40s failed in setup, which means infrastructure, not code.
+- The separate `Container` workflow (`.github/workflows/container.yml`) is path-scoped to
+  `Dockerfile`/`Cargo.*`/`crates/**` and legitimately takes far longer than the rest of CI — it does a
+  cold release build of the workspace inside the image with no layer cache. Do not apply the 10–40s
+  duration heuristic to it, and do not expect it to appear on docs-only pushes.
 - Do not test whether a pin is reachable with `gh api repos/<owner>/<repo>/commits/<sha>` — it
   returns 422 "No commit found" for pins that Actions resolves fine. Trust the Actions error text, or
   the fact that a job using that pin passed.
