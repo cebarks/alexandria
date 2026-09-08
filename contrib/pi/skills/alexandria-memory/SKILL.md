@@ -1,6 +1,6 @@
 ---
 name: alexandria-memory
-description: Use the Alexandria agent-memory MCP tools (alexandria_store_memory, alexandria_retrieve_memories, alexandria_recall, alexandria_update_memory, alexandria_import_document, alexandria_delete_memory) to persist and recall durable facts, decisions, and preferences across sessions. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
+description: Use the Alexandria agent-memory MCP tools (alexandria_store_memory, alexandria_retrieve_memories, alexandria_recall, alexandria_update_memory, alexandria_import_document, alexandria_delete_memory, alexandria_get_session, alexandria_finalize_session) to persist and recall durable facts, decisions, and preferences across sessions. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
 ---
 
 # Alexandria Memory
@@ -23,6 +23,7 @@ exactly like one with no memory at all. Default to using it; don't wait for an e
   already exists so you don't contradict it silently.
 
 Tool choice:
+
 - **`alexandria_retrieve_memories`** — specific lookup, you know roughly what you're searching for. Pass a
   natural-language statement of the fact/topic (not a question). Returns ranked hits with
   similarity + tags.
@@ -42,6 +43,7 @@ Store as soon as something durable and non-obvious emerges — don't wait to be 
 - A correction the user gives you about something you got wrong.
 
 Tool choice:
+
 - **`alexandria_store_memory`** — new fact. Write `content` as a standalone statement that still makes
   sense without today's conversation (no "as discussed above", no pronouns without antecedents).
   Add `tags` for the project/domain so future retrieval scopes well.
@@ -54,6 +56,26 @@ Tool choice:
   (heading/paragraph/fixed-size) and links chunks back to the source document.
 - **`alexandria_delete_memory`** — only when the user explicitly wants something forgotten. This is a
   soft-delete; for corrections, prefer `alexandria_update_memory` so the lineage survives.
+
+## Sessions
+
+`alexandria_store_memory` accepts an optional `session_id` — an opaque handle you choose, typically
+this conversation's identifier or a task name — which groups that memory under a session and creates
+the session on first use. Worth doing when the grouping itself is the useful thing: "everything we
+learned about the auth refactor" stays retrievable as a unit even though the memories are
+topically scattered across clusters.
+
+- **`alexandria_get_session`** — review everything stored in one session, oldest first, with its
+  metadata. Use when the user asks what was captured in a specific past conversation, or before
+  writing a session summary so you don't restate something already stored.
+- **`alexandria_finalize_session`** — set the session's summary, tags, and end timestamp. Call once
+  as work wraps up; it is what makes a session skimmable later instead of a pile of fragments.
+
+Rules that matter: a session's `ended_at` is refreshed by every store, so it tracks last activity,
+not closure — an unfinalized session still has `ended_at` set, and `summary: null` is the real signal
+that it was never closed. Sessions are not searchable by content and there is no way to enumerate
+them: `get_session` only works for an id you already know, so record the id you chose somewhere
+durable if you expect to revisit it. See `docs/session-memory.md` in the Alexandria repo for details.
 
 ## Guidelines
 

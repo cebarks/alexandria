@@ -1,18 +1,34 @@
 # pi client-side integrations
 
-These are optional client-side companions for using Alexandria from
-[pi](https://github.com/earendil-works/pi-mono). They are not part of the MCP server and are not
-required to use Alexandria — they exist purely to make pi agents reach for memory more
-proactively. See the "Getting agents to actually use memory" section in the root
+Optional client-side companions for using Alexandria from
+[pi](https://github.com/earendil-works/pi-mono). They are not part of the MCP server, are not
+shipped with it, and are not required to use Alexandria — they exist purely to make pi agents reach
+for memory more proactively. See the "Getting agents to actually use memory" section in the root
 [README.md](../../README.md) for the full rationale.
 
 Nothing here auto-installs. Copy what you want into your pi config directory.
 
+## Which one do you want?
+
+| | Skill | Extension |
+| --- | --- | --- |
+| What it is | Prose guidance in agent context | TypeScript extension with event hooks |
+| Read side | Tells the agent when to call `retrieve_memories` | Calls it for you on every prompt |
+| Write side | Tells the agent when to call `store_memory` | Heuristic detectors + session-end LLM extraction |
+| Cost | Context tokens only | HTTP + embedding round trip per prompt, one LLM call per session |
+| Install | Copy a directory | Copy a directory + `npm install` |
+
+Start with the skill. Add the extension only if agents still aren't checking memory often enough,
+or if you want capture to continue even when the agent forgets to write.
+
 ## `skills/alexandria-memory/`
 
 A pi [skill](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/skills.md)
-documenting concrete trigger conditions for when an agent should read/write memory and which tool
-to use. Skills are prose guidance loaded into the agent's context — no code, no dependencies.
+documenting concrete trigger conditions for when an agent should read or write memory and which tool
+to pick. Skills are guidance loaded into the agent's context — no code, no dependencies.
+
+The tool names in the skill are the MCP-prefixed forms pi exposes (`alexandria_store_memory`,
+`alexandria_retrieve_memories`, …), not the bare server-side names.
 
 **Install:**
 
@@ -24,16 +40,32 @@ cp -r contrib/pi/skills/alexandria-memory ~/.pi/agent/skills/
 
 ## `extensions/alexandria-auto-recall/`
 
-A pi extension that hooks `before_agent_start` to automatically call `retrieve_memories` on every
-user prompt and inject matches above a similarity threshold into context — so the agent never has
-to decide to check memory. This is the more aggressive nudge (Tier 3 in the root README): it trades
-latency (one extra HTTP + embedding round trip per prompt) and potential noise for guaranteed
-recall. Prefer the skill alone unless you find agents still aren't checking memory often enough.
+Despite the directory name — kept for install-path stability — this is a recall **and** store
+extension (package version 2.0). Four things happen:
 
-Requires an npm install because it depends on `@modelcontextprotocol/client` — pi's extension
-loader (jiti) doesn't alias third-party npm packages the way it does pi's own internal packages,
-so a bare `.ts` file can't resolve this dependency. It has to be a package-style extension
-directory with its own `node_modules`.
+1. **Auto-recall** — on `before_agent_start`, the user's prompt is embedded and searched; hits at or
+   above `recall.min_similarity` are injected as a custom context message before the agent reasons.
+2. **Heuristic detectors** — pattern matching on prompts and tool results, with no LLM in the loop:
+   correction-shaped language ("no, use X"), forward-looking preference statements ("always do X"),
+   and error→success pairs per tool, which become "this error resolves this way" memories. Stores are
+   fire-and-forget so they never add latency to the turn.
+3. **Dedup tracking** — every heuristic store, and every agent-initiated `store_memory` /
+   `update_memory` the extension observes on the way past `tool_result`, is buffered so the
+   extraction pass below can be told what is already saved.
+4. **LLM extraction** — on `session_shutdown`, the conversation is serialized and a cheap model
+   (`store.extract_model`) extracts durable facts that layers 1–3 missed. Skipped on `reload`, since
+   that is not a real conversation boundary.
+
+This mirrors the server's own design intent: the skill is highest-quality but depends on the agent
+choosing to act, heuristics are zero-latency but shallow, and extraction is thorough but arrives
+only at the end.
+
+### Requires `npm install`
+
+It depends on `@modelcontextprotocol/client` and `smol-toml`. pi's extension loader (jiti) does not
+alias third-party npm packages the way it does pi's own internal packages, so a bare `.ts` file
+cannot resolve them — this has to be a package-style extension directory with its own
+`node_modules`.
 
 **Install:**
 
@@ -43,14 +75,44 @@ cd ~/.pi/agent/extensions/alexandria-auto-recall
 npm install
 ```
 
-**Config (env vars, all optional):**
+### Configuration
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | Alexandria MCP server URL |
-| `ALEXANDRIA_AUTO_RECALL_LIMIT` | `5` | Max memories retrieved per prompt |
-| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.58` | Minimum similarity to inject a hit |
-| `ALEXANDRIA_AUTO_RECALL` | (unset) | Set to `off` to disable |
+Config file: `$XDG_CONFIG_HOME/alexandria/client.toml`, same precedence as the server
+(defaults → file → `ALEXANDRIA_CLIENT_CONFIG` → individual env vars). See
+[docs/configuration.md](../../docs/configuration.md) for the full reference. Every key is optional;
+the defaults work against a locally running server.
 
-The extension fails open: if the Alexandria server is unreachable or errors, the agent turn
-proceeds normally with a warning notification, never blocked.
+```toml
+[server]
+url = "http://127.0.0.1:3000/mcp"
+
+[recall]
+enabled = true
+limit = 5
+min_similarity = 0.58
+
+[store]
+enabled = true
+extract_model = "vertex/claude-haiku-4-5"
+extract_timeout_ms = 5000
+```
+
+### Failure behavior
+
+The extension **fails open** in every path: if the server is unreachable or a call errors, the agent
+turn proceeds normally with a warning notification, and extraction failures are logged and skipped.
+A stopped Alexandria server never blocks a pi session.
+
+Stale Streamable HTTP sessions (typically an Alexandria restart) are recovered transparently — the
+client detects "Session not found", reconnects, and retries once before surfacing an error.
+
+### Limitations worth knowing
+
+- **No unit tests.** The detector and extraction-prompt logic has no test coverage in the repo, even
+  though the original design called for one. Regex changes are currently unguarded.
+- **No session memory integration.** The extension stores and retrieves without a `session_id`, so
+  its writes are ungrouped. See [docs/session-memory.md](../../docs/session-memory.md).
+- **Recall ignores `recall`.** It uses `retrieve_memories`, never the two-phase `recall` tool, so
+  broad "what do we know about X" exploration is not what auto-recall is tuned for.
+- **Extraction is end-of-session and best-effort.** It reads the tail of a long conversation (capped
+  by character budget) and can time out; treat it as a safety net, not a transcript index.
