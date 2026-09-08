@@ -110,7 +110,7 @@ Controls server-side filtering of `retrieve_memories` results.
 
 | Key | Type | Default | Description |
 | ----- | ------ | --------- | ------------- |
-| `min_similarity` | f32 | `0.10` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A noise cutoff only. Model-dependent: for `all-MiniLM-L6-v2`, a near-paraphrase or keyword hit scores ~0.6+, but a natural-language question against a stored statement (the common agent case, e.g. "which database does the project use" vs "the project uses SurrealDB") scores only ~0.1–0.2, while unrelated text sits at ~0.0. Values above ~0.2 silently drop real matches. |
+| `min_similarity` | f32 | `0.10` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A noise cutoff only. Model-dependent: for `all-MiniLM-L6-v2` (measured 2026-09-08), a keyword or near-paraphrase hit scores 0.55–0.76, a natural-language question against its matching statement 0.40–0.65, and a question sharing no vocabulary with the statement as low as ~0.2. Unrelated memories score 0.07–0.40. The floor stays below the vocabulary-free cases; client thresholds do the real filtering. |
 
 ## Environment Variable Overrides
 
@@ -162,7 +162,7 @@ extract_timeout_ms = 5000
 | ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_AUTO_RECALL=off` | Enable auto-recall on every prompt. |
 | `limit` | number | `5` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. |
-| `min_similarity` | number | `0.58` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. Model-dependent: for `all-MiniLM-L6-v2`, genuine matches score ~0.6+ while loosely-topical noise clears ~0.5, so `0.58` blocks near-noise while keeping real hits. Sits above the server-side `[retrieve] min_similarity` floor. |
+| `min_similarity` | number | `0.58` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. **Recommended: `0.35`.** The `0.58` Pi default predates measurement and assumed genuine matches score 0.6+; on `all-MiniLM-L6-v2` (measured 2026-09-08, synthetic pairs) question-vs-matching-statement scores 0.40–0.65 and unrelated memories 0.07–0.40, so `0.58` drops most real hits. `0.35` keeps them and admits only topically adjacent memories. The Claude Code hook (`contrib/claude`) already defaults to `0.35`; the Pi default is left at `0.58` pending a change to the extension. |
 
 ### `[store]`
 
