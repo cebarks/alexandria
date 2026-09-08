@@ -86,16 +86,19 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 
 ## Dependencies
 
-- [ ] **Blocked `cargo update` targets (semver-incompatible, need Cargo.toml bump).** `cargo update
-  --verbose` (2026-09-08) only had compatible updates to apply; these are "Unchanged" because the
-  available version is a breaking bump past what `Cargo.toml` allows. Direct deps: `base64` 0.22.1 →
-  0.23.1, `dirs` 6.0.0 → 7.0.0, `toml` 0.8.23 → 1.1.5, `tokenizers` 0.22.2 → 0.23.2, `hf-hub` 0.5.0 →
-  1.0.0, `serial_test` 3.5.0 → 4.0.1 (dev-dep). Transitive (bump the pulling crate, not these
-  directly): `generic-array` 0.14.7 → 0.14.9, `i_float`/`i_overlay`/`i_shape` (geometry stack, likely
-  via a shared dep) 1.15.0/4.0.7/1.14.0 → 1.16.0/4.5.2/1.18.0, `matchit` 0.8.4 → 0.8.6, `pdqselect`
-  0.1.0 → 0.1.1. Each needs its own bump + changelog check before touching `Cargo.toml`; expect
-  breaking changes in the major-version jumps (`toml` 0.8→1.x, `hf-hub` 0.5→1.x, `dirs` 6→7,
-  `serial_test` 3→4) — deconflict one at a time, not as a batch.
+- [x] **Direct-dep major bumps done 2026-09-08**, one commit each: `dirs` 7, `base64` 0.23, `toml` 1.1,
+  `tokenizers` 0.23, `hf-hub` 1.0. `serial_test` was already gone from the workspace. Only `hf-hub`
+  needed code: 1.0 is a rewrite (reqwest client, `blocking` feature runs its own runtime thread) and
+  by default revalidates every cached file against the Hub on each boot, retrying on transient
+  errors — a cached offline start went from 0.5 s to 12 s. `candle.rs` now resolves
+  `local_files_only` first and only downloads on a miss, restoring 0.5 behaviour (~0.4 s cached start
+  with the Hub blackholed). Net tree: openssl/native-tls/ureq gone, `hf-xet` (mandatory in 1.0) in;
+  629 → 662 crates.
+- [ ] **Two `tokenizers` versions compile** until candle bumps: candle-core 0.11 still pins 0.22, we're
+  on 0.23. Behaviourally harmless; revert ours to 0.22 if the duplicate build cost bothers anyone.
+- [ ] **Transitive "Unchanged" `cargo update` entries are upstream pins, not ours.** `generic-array`
+  0.14.7, `i_float`/`i_overlay`/`i_shape`, `matchit` 0.8.4, `pdqselect` 0.1.0 stay put even after
+  the direct bumps above; they move when the pulling crate (surrealdb stack) does.
 
 ## Claude Code integration
 
