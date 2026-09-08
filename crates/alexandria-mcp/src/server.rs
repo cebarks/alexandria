@@ -483,7 +483,7 @@ impl AlexandriaServer {
         } else {
             // Broad recall
             let clusters = self.load_all_clusters_with_members().await?;
-            let result = broad_recall(query_emb, &clusters, 5);
+            let result = broad_recall(query_emb, &clusters, 5, self.retrieve_min_similarity);
 
             let cluster_results: Vec<serde_json::Value> = result
                 .clusters

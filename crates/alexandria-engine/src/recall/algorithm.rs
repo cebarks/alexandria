@@ -56,10 +56,14 @@ pub struct FocusedRecallResult {
 /// For each cluster, check centroid similarity, verify against actual members,
 /// then rank by best_member_sim × cluster_heat. Return top `limit` clusters
 /// with scope handles for narrowing.
+///
+/// `min_similarity` is the noise floor on centroid similarity; callers should
+/// pass the same value used for `retrieve_memories` so the two can't drift.
 pub fn broad_recall(
     query_embedding: &[f32],
     clusters: &[ClusterWithMembers],
     limit: usize,
+    min_similarity: f32,
 ) -> BroadRecallResult {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -72,7 +76,7 @@ pub fn broad_recall(
             let centroid_sim = cosine_similarity(query_embedding, &cwm.info.centroid);
             // Noise floor only. With all-MiniLM-L6-v2 a question against a
             // stored statement scores ~0.2; unrelated text ~0.0.
-            if centroid_sim < 0.1 {
+            if centroid_sim < min_similarity {
                 return None;
             }
 

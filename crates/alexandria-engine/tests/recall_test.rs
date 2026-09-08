@@ -44,7 +44,7 @@ fn test_broad_recall_returns_cluster_matches() {
     }];
 
     let query = vec![0.95, 0.05, 0.0]; // auth-related
-    let result = broad_recall(&query, &clusters, 5);
+    let result = broad_recall(&query, &clusters, 5, 0.1);
 
     assert!(!result.clusters.is_empty());
     assert!(result.clusters[0].scope_handle.is_some());
@@ -114,7 +114,7 @@ fn test_broad_recall_keeps_weak_but_real_matches_and_drops_noise() {
     };
     let clusters = vec![mk("weak", vec![0.2, 0.98]), mk("noise", vec![0.0, 1.0])];
 
-    let result = broad_recall(&[1.0, 0.0], &clusters, 5);
+    let result = broad_recall(&[1.0, 0.0], &clusters, 5, 0.1);
 
     let ids: Vec<_> = result
         .clusters
@@ -122,4 +122,33 @@ fn test_broad_recall_keeps_weak_but_real_matches_and_drops_noise() {
         .map(|c| c.cluster_id.as_str())
         .collect();
     assert_eq!(ids, vec!["weak"]);
+}
+
+#[test]
+fn test_broad_recall_honors_min_similarity() {
+    let mk = |id: &str, centroid: Vec<f32>| ClusterWithMembers {
+        info: ClusterInfo {
+            id: id.into(),
+            centroid: centroid.clone(),
+            member_count: 1,
+        },
+        members: vec![FactSummary {
+            id: format!("{id}-f"),
+            content: id.into(),
+            embedding: centroid,
+            heat: 1.0,
+        }],
+    };
+    // "weak" has centroid_sim ~0.2 against the query: above 0.1, below 0.5.
+    let clusters = vec![mk("strong", vec![0.9, 0.1]), mk("weak", vec![0.2, 0.98])];
+
+    let ids = |floor: f32| -> Vec<String> {
+        broad_recall(&[1.0, 0.0], &clusters, 5, floor)
+            .clusters
+            .iter()
+            .map(|c| c.cluster_id.clone())
+            .collect()
+    };
+    assert_eq!(ids(0.1), vec!["strong", "weak"]);
+    assert_eq!(ids(0.5), vec!["strong"]);
 }
