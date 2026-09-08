@@ -82,7 +82,7 @@ impl CandleProvider {
         let cls_pooling = get("1_Pooling/config.json")
             .inspect_err(|e| {
                 tracing::warn!(
-                    "no 1_Pooling/config.json for {model_id} ({e}); assuming mean pooling"
+                    "could not load 1_Pooling/config.json for {model_id} ({e}); assuming mean pooling"
                 )
             })
             .ok()
