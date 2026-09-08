@@ -18,6 +18,17 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   Change `contrib/pi/extensions/alexandria-auto-recall/src/config.ts` and the three Pi doc
   tables when Pi is next touched.
 
+## Server
+
+- **`get_session` returns soft-deleted memories.** Found 2026-09-08: `SessionRepo::get_memories`
+  (`crates/alexandria-storage/src/repos/session_repo.rs`) walks the `contains_session_memory` edges and
+  fetches each fact with `get_fact`, which does not check `deleted`, and the response carries no `deleted`
+  field. A memory deleted via `delete_memory` still shows up in `get_session` (verified: store, delete,
+  `get_session` still lists it) while search correctly hides it. Knock-ons: the extract hook's
+  "already stored" dedup list includes deleted memories; `session.memory_count` is never decremented;
+  `test.sh` cleanup only works because the id is still listed. Decide: filter `deleted = false` in
+  `get_memories`, or expose `deleted` in the response and let clients filter.
+
 ## Claude Code integration
 
 - **Error-resolution tracker not ported.** `contrib/claude/hooks/` now has auto-recall,
@@ -81,6 +92,15 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 - **`test.sh` now takes ~6 s instead of ~1.5 s.** The `sleep 1` flush wait in `alexandria-extract.sh`
   runs on each of the five Stop calls in the harness. Done 2026-09-08: the wait is
   `ALEXANDRIA_EXTRACT_FLUSH_WAIT` (default 1) and `test.sh` sets it to 0.
+- **Remaining `test.sh` time is the detach check.** After the flush-wait change (2026-09-08) the run is
+  ~4 s: the `slow.sh` stub sleeps 2 s and the poll loop adds up to 0.5 s. Not worth touching; noted so
+  nobody hunts for another `sleep 1`.
+- **Hook development in a live interactive session pollutes the real database.** Companion to the
+  headless item below: the installed Stop hook extracts from this session's transcript too, so stub
+  payloads and probe strings from tests pasted into the conversation become `extracted` memories (a
+  "Detach debug probe" memory from 2026-09-08 surfaced in auto-recall today). `test.sh` itself is
+  clean (own session id, deletes on exit); the leak is the interactive session around it. Mitigation
+  is the same: `ALEXANDRIA_AUTO_STORE=off` in the developing session's env, or delete by hand.
 - **A queued follow-up prompt lands in the previous turn's chunk.** If the user types the next
   prompt while a turn is still generating, Claude Code dispatches it as soon as the turn ends, inside
   the 1 s flush wait, so the extract hook sees it with the previous turn. Harmless (it is extracted
