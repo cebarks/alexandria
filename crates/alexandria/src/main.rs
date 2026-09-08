@@ -12,7 +12,6 @@ use rmcp::ServiceExt;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    tracing::info!("Alexandria v0.2 starting...");
 
     const USAGE: &str = "Usage: alexandria [migrate-embeddings | --help]";
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -25,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => anyhow::bail!("unexpected arguments {args:?}. {USAGE}"),
     }
+    tracing::info!("Alexandria v0.2 starting...");
 
     // 1. Load configuration
     let config = Config::load()?;
