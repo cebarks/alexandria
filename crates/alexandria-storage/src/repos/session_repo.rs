@@ -88,7 +88,7 @@ impl<'a> SessionRepo<'a> {
         Ok(())
     }
 
-    /// Get all facts belonging to a session, ordered by creation time.
+    /// Get all non-deleted facts belonging to a session, ordered by creation time.
     pub async fn get_memories(&self, external_id: &str) -> Result<Vec<crate::models::Fact>> {
         // First get the fact IDs from the edges
         let mut response = self
@@ -120,7 +120,9 @@ impl<'a> SessionRepo<'a> {
         let repo = crate::repos::MemoryRepo::new(self.db);
         for fid in &fact_ids {
             if let Some(fact) = repo.get_fact(fid).await? {
-                facts.push(fact);
+                if !fact.deleted {
+                    facts.push(fact);
+                }
             }
         }
 
@@ -223,6 +225,31 @@ mod tests {
         assert!(finalized.ended_at.is_some());
         assert_eq!(finalized.summary.as_deref(), Some("session summary"));
         assert_eq!(finalized.tags, vec!["debug"]);
+    }
+
+    #[tokio::test]
+    async fn test_get_memories_excludes_deleted() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = SessionRepo::new(db.inner());
+        let memory_repo = crate::repos::MemoryRepo::new(db.inner());
+
+        let session_id = repo.create("sess-002", None, None).await.unwrap();
+        let keep = memory_repo
+            .create_fact("kept", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let gone = memory_repo
+            .create_fact("deleted", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        repo.add_memory(&session_id, &keep).await.unwrap();
+        repo.add_memory(&session_id, &gone).await.unwrap();
+        memory_repo.soft_delete_fact(&gone).await.unwrap();
+
+        let memories = repo.get_memories("sess-002").await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, "kept");
     }
 
     #[tokio::test]

@@ -550,7 +550,7 @@ impl AlexandriaServer {
                 "started_at": session.started_at,
                 "ended_at": session.ended_at,
                 "summary": session.summary,
-                "memory_count": session.memory_count,
+                "memory_count": memories.len(),
                 "tags": session.tags,
             },
             "memories": memory_list,
@@ -924,6 +924,59 @@ mod get_info_tests {
             "only the above-floor memory should survive"
         );
         assert!(results[0]["content"].as_str().unwrap().contains("above"));
+    }
+
+    #[tokio::test]
+    async fn get_session_hides_deleted_and_reports_live_count() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        let _kept = server
+            .do_store_memory(StoreMemoryParams {
+                content: "kept fact".to_string(),
+                tags: None,
+                session_id: Some("sess-del".to_string()),
+            })
+            .await
+            .unwrap();
+        let gone = server
+            .do_store_memory(StoreMemoryParams {
+                content: "deleted fact".to_string(),
+                tags: None,
+                session_id: Some("sess-del".to_string()),
+            })
+            .await
+            .unwrap();
+        MemoryRepo::new(server.db.inner())
+            .soft_delete_fact(&gone)
+            .await
+            .unwrap();
+
+        let session_json = server
+            .do_get_session(GetSessionParams {
+                session_id: "sess-del".to_string(),
+            })
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&session_json).unwrap();
+        let memories = parsed["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0]["content"], "kept fact");
+        assert_eq!(parsed["session"]["memory_count"], 1);
+
+        // Session-scoped search shares the same path and must hide it too.
+        let result = server
+            .do_retrieve_memories(RetrieveMemoriesParams {
+                query: "fact".to_string(),
+                limit: Some(10),
+                session_id: Some("sess-del".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["results"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -26,8 +26,16 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   field. A memory deleted via `delete_memory` still shows up in `get_session` (verified: store, delete,
   `get_session` still lists it) while search correctly hides it. Knock-ons: the extract hook's
   "already stored" dedup list includes deleted memories; `session.memory_count` is never decremented;
-  `test.sh` cleanup only works because the id is still listed. Decide: filter `deleted = false` in
-  `get_memories`, or expose `deleted` in the response and let clients filter.
+  `test.sh` cleanup only works because the id is still listed. Done 2026-09-08: `get_memories` now
+  drops deleted facts, which also fixes session-scoped `retrieve_memories` (same path, was leaking
+  too); `get_session` reports `memory_count` as the live list length instead of the stored
+  write-counter, which is left as is (`delete_memory` has no session to decrement).
+- **`session.memory_count` column is now unread.** After the 2026-09-08 change above, nothing
+  outside the storage tests reads it; `touch` still increments it on every store. Harmless. Drop the
+  column and the `touch` increment in a future migration, or keep it as a "memories written" stat.
+- **`get_memories` is N+1.** It selects the edge rows, then calls `get_fact` once per id. Fine at
+  session sizes seen so far (tens of memories); fold into one
+  `SELECT * FROM fact WHERE id IN $ids AND deleted = false` if a session ever gets large.
 
 ## Claude Code integration
 
