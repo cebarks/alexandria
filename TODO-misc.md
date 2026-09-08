@@ -53,6 +53,9 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   "Alexandria v0.2 starting..." log run before argument parsing (2026-09-08), so `alexandria --help`
   prints a log line to stderr before the usage. Cosmetic; move the subscriber init below the arg
   match if it bothers anyone.
+- [-] **`migrate-embeddings` no longer logs "Alexandria v0.2 starting..."** (2026-09-08, side effect of
+  ed923ee): the subcommand returns from inside the argument match, before the startup log line. It
+  still logs its own progress. Accepted; add a line at the top of `migrate_embeddings()` if it matters.
 - [x] **Pooling-config warn text** (done 2026-09-08, 843f325) in `candle.rs` says "no 1_Pooling/config.json" even when the cause
   was a network failure; the real cause is only in the interpolated `{e}`.
 - [ ] **Spec defect: threshold-derivation rule has no valid solution when `nonhit_p99 > hit_min`.**
