@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Claude Code Stop hook: LLM extraction of durable facts into Alexandria.
+#
+# Reads the hook JSON on stdin, serializes the transcript lines added since the
+# last run, asks `claude -p` (haiku by default) for standalone memories using the
+# same prompt as the Pi extension, and stores them with session_id and the
+# `extracted` tag. Incremental: a marker file holds the transcript line count at
+# the last run; short turns accumulate until enough new text exists. Fails open
+# and always exits 0.
+#
+# Env (all optional):
+#   ALEXANDRIA_AUTO_STORE          "off" disables
+#   ALEXANDRIA_EXTRACT_MODEL       default haiku
+#   ALEXANDRIA_EXTRACT_MIN_CHARS   default 1500; new text below this is deferred to a later turn
+#   ALEXANDRIA_EXTRACT_CMD         override the LLM command (reads prompt on stdin, prints JSON); tests use a stub
+#   ALEXANDRIA_HOOK_CHILD          set by this hook on the `claude -p` child; every hook exits at once
+set -uo pipefail
+[ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
+[ "${ALEXANDRIA_AUTO_STORE:-}" != "off" ] || exit 0
+
+MCP="$(dirname "$(readlink -f "$0")")/alexandria-recall.sh"   # debug CLI mode = one-shot tool calls
+MIN_CHARS="${ALEXANDRIA_EXTRACT_MIN_CHARS:-1500}"
+CMD="${ALEXANDRIA_EXTRACT_CMD:-claude -p --model ${ALEXANDRIA_EXTRACT_MODEL:-haiku} --output-format text}"
+
+input=$(cat)
+[ "$(jq -r '.stop_hook_active // false' <<<"$input")" = false ] || exit 0
+session=$(jq -r '.session_id // ""' <<<"$input")
+transcript=$(jq -r '.transcript_path // ""' <<<"$input")
+[ -n "$session" ] && [ -r "$transcript" ] || exit 0
+
+marker="${XDG_RUNTIME_DIR:-/tmp}/alexandria/$session.extracted"
+done_lines=$(cat "$marker" 2>/dev/null || echo 0)
+total=$(wc -l <"$transcript")
+[ "$total" -gt "$done_lines" ] || exit 0
+
+# user (string or text blocks; skip tool_result-only and injected/system lines) + assistant text
+text=$(tail -n +"$((done_lines + 1))" "$transcript" | jq -rR '
+  fromjson? | select(.type == "user" or .type == "assistant") | .type as $role
+  | (.message.content // "") | (if type == "string" then . else [.[]? | select(.type == "text") | .text] | join("\n") end)
+  | select(length > 0)
+  | select(startswith("<local-command") or startswith("<command-") or startswith("<system-reminder")
+           or startswith("Relevant memories retrieved automatically") | not)
+  | (if $role == "user" then "[User]: " else "[Assistant]: " end) + . + "\n"')
+[ ${#text} -ge "$MIN_CHARS" ] || exit 0
+[ ${#text} -le 64000 ] || text=${text: -64000}
+
+# Marker first: a broken or slow turn is never retried.
+mkdir -p "${marker%/*}"; echo "$total" >"$marker"
+
+stored=$("$MCP" get_session "$(jq -cn --arg s "$session" '{session_id:$s}')" 2>/dev/null \
+  | jq -r '.memories[]?.content | "- " + .')
+[ -n "$stored" ] || stored="(nothing stored yet this session)"
+
+# Prompt text is verbatim from contrib/pi/extensions/alexandria-auto-recall/src/extraction.ts.
+prompt="You are a memory extraction system. Given a conversation between a user and an AI coding assistant, extract durable facts worth remembering across sessions.
+
+Extract:
+- User preferences and conventions (tooling choices, style rules, workflow habits)
+- Architectural/design decisions AND their rationale
+- Bug root causes once resolved (not symptoms)
+- Non-obvious gotchas, footguns, or platform/library quirks
+- Corrections the user gave about something the assistant got wrong
+
+Do NOT extract:
+- Ephemeral task details (file paths being edited, current branch name, etc.)
+- Things already in the \"already stored\" list below
+- Common knowledge or well-documented behavior
+- Incomplete work or open questions
+
+Each extracted memory must be a standalone statement that makes sense without this conversation. No \"as discussed above\", no pronouns without antecedents.
+
+Respond with JSON only:
+{
+  \"memories\": [
+    {\"content\": \"standalone statement\", \"tags\": [\"relevant\", \"tags\"]},
+    ...
+  ]
+}
+
+If nothing is worth extracting, respond with: {\"memories\": []}
+
+Already stored this session (do not duplicate):
+<already_stored>
+$stored
+</already_stored>
+
+Conversation:
+<conversation>
+$text
+</conversation>"
+
+# shellcheck disable=SC2086  # CMD is deliberately word-split
+out=$(ALEXANDRIA_HOOK_CHILD=1 timeout 80 $CMD <<<"$prompt" 2>/dev/null) || { echo "alexandria-extract: LLM call failed" >&2; exit 0; }
+# Models often wrap the JSON in a ``` fence and add prose after it: keep the first fenced block.
+json=$(sed -n '/^```/,/^```/{/^```/d;p}' <<<"$out"); [ -n "$json" ] || json=$out
+jq -c '.memories[]? | select((.content|type) == "string" and .content != "")
+  | {content, tags: ([.tags[]? | strings] + ["extracted"] | unique)}' <<<"$json" 2>/dev/null |
+while read -r m; do
+  res=$("$MCP" store_memory "$(jq -c --arg s "$session" '. + {session_id:$s}' <<<"$m")") \
+    || echo "alexandria-extract: store failed: $res" >&2
+done
+exit 0

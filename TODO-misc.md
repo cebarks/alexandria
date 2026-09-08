@@ -20,19 +20,29 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 
 ## Claude Code integration
 
-- **No auto-store for Claude Code.** `contrib/claude/hooks/` covers auto-recall and
-  session_id injection (plan: `docs/plans/2026-09-08-todo-misc-plan.md`, A3/A4), but the Pi extension's heuristic detectors
-  (correction/preference/error-resolution) and session-end LLM extraction have no Claude Code
-  equivalent. Candidates: a `Stop`/`SessionEnd` hook for extraction, `UserPromptSubmit` for the
-  detectors.
-- **Recall hook reads env vars only, not `client.toml`.** Bash has no TOML parser; the Pi
-  extension honours `$XDG_CONFIG_HOME/alexandria/client.toml`. Revisit if the hook grows enough
-  config to matter.
-- **Recall hook does a full MCP handshake per prompt.** Four localhost round trips
-  (initialize, initialized, tools/call, DELETE) plus one query embedding, every prompt. Fine at
-  human typing speed; revisit only if latency becomes noticeable.
-
-## Minor
-
-- Debug UI cluster page shows cohesion `0` for single-member clusters; probably fine, but
-  undocumented.
+- **Error-resolution tracker not ported.** `contrib/claude/hooks/` now has auto-recall,
+  session_id injection, correction/preference detectors, and Stop-hook LLM extraction
+  (plan: `docs/plans/2026-09-08-todo-misc-plan.md`). The Pi error-resolution detector was
+  deliberately skipped: it needs PostToolUse state across a turn and yields low-signal
+  "Error with X / Resolution: <200 chars>" memories; the extraction pass captures root causes
+  once resolved. Revisit only if extracted memories turn out to miss resolved errors.
+- **Hooks read env vars only, not `client.toml`.** Won't fix (2026-09-08): bash has no TOML parser
+  and a `yq`/`tomlq` dependency for a handful of values is worse than env vars in `settings.json`.
+  Documented in `contrib/claude/README.md`.
+- **Extraction is one-shot per turn and non-deterministic.** The Stop hook writes its marker before
+  calling haiku, so each transcript chunk gets exactly one extraction attempt. Measured 2026-09-08
+  on the same 9.7k-char prompt: first run returned `{"memories": []}`, second run returned three good
+  memories. Options if recall quality suffers: retry once on an empty result, raise the temperature
+  floor by asking for "at least N candidates", or switch `ALEXANDRIA_EXTRACT_MODEL` to sonnet.
+- **Extraction wall time is 15–45 s against a 90 s hook timeout.** Most of it is `claude -p`
+  startup plus haiku latency, not prompt size (9.7k chars). If long sessions hit the timeout, raise
+  `timeout` in `settings.json` or lower the 64,000-char cap in `alexandria-extract.sh`. Also
+  untested: whether `claude -p` inside a Stop hook holds the user's turn visibly for that long, or
+  whether it should be backgrounded (`nohup ... &` with the marker still written up front).
+- **Manual in-UI checks still pending.** Tested only by piping hook JSON into the installed scripts.
+  Not yet observed in a live Claude Code session: the `systemMessage` warning rendering when the
+  server is down, `updatedInput` from `alexandria-session.sh` being honoured without a
+  `permissionDecision`, and the Stop hook firing on a real turn.
+- **Per-prompt MCP handshake latency.** Measured 2026-09-08: recall hook end to end (initialize,
+  initialized, tools/call with query embedding, DELETE) against the local service, 10 runs,
+  median 88 ms, max 90 ms. Closed; nothing to optimise.
