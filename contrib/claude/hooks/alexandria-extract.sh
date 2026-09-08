@@ -28,6 +28,10 @@ session=$(jq -r '.session_id // ""' <<<"$input")
 transcript=$(jq -r '.transcript_path // ""' <<<"$input")
 [ -n "$session" ] && [ -r "$transcript" ] || exit 0
 
+# Stop fires before the final assistant message is appended to the transcript (measured ~50 ms
+# behind); without this wait every extraction runs one assistant message late and a session's
+# last reply is never seen. Cheap: the hook is async.
+sleep 1
 marker="${XDG_RUNTIME_DIR:-/tmp}/alexandria/$session.extracted"
 done_lines=$(cat "$marker" 2>/dev/null || echo 0)
 total=$(wc -l <"$transcript")
@@ -89,14 +93,22 @@ Conversation:
 $text
 </conversation>"
 
-# shellcheck disable=SC2086  # CMD is deliberately word-split
-out=$(ALEXANDRIA_HOOK_CHILD=1 timeout 80 $CMD <<<"$prompt" 2>/dev/null) || { echo "alexandria-extract: LLM call failed" >&2; exit 0; }
-# Models often wrap the JSON in a ``` fence and add prose after it: keep the first fenced block.
-json=$(sed -n '/^```/,/^```/{/^```/d;p}' <<<"$out"); [ -n "$json" ] || json=$out
-jq -c '.memories[]? | select((.content|type) == "string" and .content != "")
-  | {content, tags: ([.tags[]? | strings] + ["extracted"] | unique)}' <<<"$json" 2>/dev/null |
+# Haiku is non-deterministic on the same prompt (measured: empty, then three good memories), so an
+# empty first attempt gets one retry within the remaining 80 s budget.
+SECONDS=0
+for attempt in 1 2; do
+  left=$((80 - SECONDS)); [ "$left" -ge 10 ] || break
+  # shellcheck disable=SC2086  # CMD is deliberately word-split
+  out=$(ALEXANDRIA_HOOK_CHILD=1 timeout "$left" $CMD <<<"$prompt" 2>/dev/null) || { echo "alexandria-extract: LLM call $attempt failed" >&2; continue; }
+  # Models often wrap the JSON in a ``` fence and add prose after it: keep the first fenced block.
+  json=$(sed -n '/^```/,/^```/{/^```/d;p}' <<<"$out"); [ -n "$json" ] || json=$out
+  mems=$(jq -c '.memories[]? | select((.content|type) == "string" and .content != "")
+    | {content, tags: ([.tags[]? | strings] + ["extracted"] | unique)}' <<<"$json" 2>/dev/null)
+  [ -z "$mems" ] || break
+done
+[ -n "${mems:-}" ] || exit 0
 while read -r m; do
   res=$("$MCP" store_memory "$(jq -c --arg s "$session" '. + {session_id:$s}' <<<"$m")") \
     || echo "alexandria-extract: store failed: $res" >&2
-done
+done <<<"$mems"
 exit 0

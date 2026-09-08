@@ -37,7 +37,9 @@ asks `claude -p --model haiku` for standalone durable facts using the Pi extract
 session's already-stored memories listed for dedup. Results are stored with the session id and an
 `extracted` tag. Short turns cost nothing; one haiku call covers several turns. A marker file
 `$XDG_RUNTIME_DIR/alexandria/<session_id>.extracted` holds the transcript line count and is written
-before the LLM call, so a failed or slow turn is never retried. The child `claude` runs with
+before the LLM call, so a failed or slow turn is never retried across turns. Within a turn, an empty
+or failed first attempt gets one retry inside the remaining 80 s budget (haiku is non-deterministic
+on the same prompt), so purely tactical turns cost two calls. The child `claude` runs with
 `ALEXANDRIA_HOOK_CHILD=1`, which makes every hook here exit immediately (no recursion). Measured
 2026-09-08 on a ~40-line transcript: about 15 s wall time, haiku correctly returned no memories for a
 purely tactical session.
@@ -80,7 +82,7 @@ Then add to `~/.claude/settings.json` (merge with any existing `hooks` block):
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "/home/you/.claude/hooks/alexandria-extract.sh", "timeout": 90 }
+          { "type": "command", "command": "/home/you/.claude/hooks/alexandria-extract.sh", "async": true }
         ]
       }
     ]
@@ -89,7 +91,10 @@ Then add to `~/.claude/settings.json` (merge with any existing `hooks` block):
 ```
 
 The extract hook must live under `Stop`, not `SessionEnd`: `SessionEnd` hooks share a 1.5 s budget,
-far too short for an LLM call.
+far too short for an LLM call. `"async": true` runs it in the background so the 15–80 s LLM call
+never holds your next turn; Claude Code enforces no `timeout` on async hooks, and the script's own
+80 s budget bounds a wedged `claude -p`. Claude Code kills async hooks still running when the
+session ends, so quitting within a minute of your last turn can lose that turn's extraction.
 
 **Config (env vars, all optional):**
 

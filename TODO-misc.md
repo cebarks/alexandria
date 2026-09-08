@@ -29,20 +29,52 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 - **Hooks read env vars only, not `client.toml`.** Won't fix (2026-09-08): bash has no TOML parser
   and a `yq`/`tomlq` dependency for a handful of values is worse than env vars in `settings.json`.
   Documented in `contrib/claude/README.md`.
-- **Extraction is one-shot per turn and non-deterministic.** The Stop hook writes its marker before
-  calling haiku, so each transcript chunk gets exactly one extraction attempt. Measured 2026-09-08
-  on the same 9.7k-char prompt: first run returned `{"memories": []}`, second run returned three good
-  memories. Options if recall quality suffers: retry once on an empty result, raise the temperature
-  floor by asking for "at least N candidates", or switch `ALEXANDRIA_EXTRACT_MODEL` to sonnet.
-- **Extraction wall time is 15–45 s against a 90 s hook timeout.** Most of it is `claude -p`
-  startup plus haiku latency, not prompt size (9.7k chars). If long sessions hit the timeout, raise
-  `timeout` in `settings.json` or lower the 64,000-char cap in `alexandria-extract.sh`. Also
-  untested: whether `claude -p` inside a Stop hook holds the user's turn visibly for that long, or
-  whether it should be backgrounded (`nohup ... &` with the marker still written up front).
-- **Manual in-UI checks still pending.** Tested only by piping hook JSON into the installed scripts.
-  Not yet observed in a live Claude Code session: the `systemMessage` warning rendering when the
-  server is down, `updatedInput` from `alexandria-session.sh` being honoured without a
-  `permissionDecision`, and the Stop hook firing on a real turn.
+- **Extraction is non-deterministic.** Measured 2026-09-08 on the same 9.7k-char prompt: first run
+  returned `{"memories": []}`, second run returned three good memories. Done 2026-09-08: the Stop hook
+  now retries once on an empty or failed result within its 80 s budget. Remaining options if recall
+  quality still suffers: ask for "at least N candidates", or switch `ALEXANDRIA_EXTRACT_MODEL` to sonnet.
+- **Extraction wall time is 15–45 s per call, up to 80 s with the retry.** Most of it is `claude -p`
+  startup plus haiku latency, not prompt size (9.7k chars). Done 2026-09-08: Stop hooks block the
+  turn by default, so the hook now runs with `"async": true` (native Claude Code option, no hook
+  timeout enforced, no `nohup` needed). If the script's own 80 s budget is too tight, lower the
+  64,000-char cap in `alexandria-extract.sh`.
+- **Async extraction is lost on session teardown.** Claude Code kills async hooks still running when
+  the session ends (verified 2026-09-08 headless, two-turn `--input-format stream-json` session: the
+  hook starts ~45 ms after the turn ends and a child still running at teardown never finishes).
+  Quitting within ~80 s of the last qualifying turn drops that turn's extraction. `SessionEnd` can't
+  help (1.5 s budget). Option if it bites: have the hook `setsid` a fully detached `claude -p` child
+  so the call outlives the session; needs its own test.
+- **Stop fires before the transcript has the final assistant message.** Found 2026-09-08: the hook
+  read 215 lines while the turn's last assistant text was line 216 (flushed ~50 ms later), so every
+  extraction ran one assistant message late and a session's last reply was never seen (the
+  previous session's final turn came to 1293 chars without it, under the 1500 threshold, and was
+  deferred into oblivion). Fixed 2026-09-08 with a `sleep 1` before reading the transcript (async, so
+  free). Alternative if the wait ever proves too short: the Stop hook input carries
+  `last_assistant_message`; append it to the chunk instead.
+- **Retry doubles cost on tactical turns.** Every turn where haiku correctly finds nothing now pays a
+  second call (up to ~80 s wall, hidden by async). Watch the `extracted` volume; if it is mostly
+  noise or the cost matters, drop the retry or gate it on transcript size.
+- **Installed hooks drift from the repo.** `~/.claude/hooks/alexandria-extract.sh` was found stale
+  (pre-retry) on 2026-09-08 because the README says `cp`. Symlinking the three scripts from the repo
+  instead would remove the step; update the README install snippet when next touched.
+- **Manual in-UI checks.** Done 2026-09-08, none pending: `updatedInput` from
+  `alexandria-session.sh` is honoured without a `permissionDecision` (a `store_memory` call with no
+  `session_id` from a live session landed under that session); the Stop hook fires on real turns
+  (seven `extracted` memories under a live session id); the async Stop hook does not hold the turn
+  (`turn_duration` logged 23 s before the extracted memories were stored); the server-down warning
+  surfaces as an informational system message, "UserPromptSubmit says: Alexandria memory
+  unavailable: cannot reach <url>" (seen headless via `--output-format stream-json`).
+- **Headless experiments write to the live server.** Any `claude -p` run on this machine fires the
+  installed hooks, so a stub extractor's output (or haiku's) lands in the real database under a
+  throwaway session id; 2026-09-08 testing left six `stub` memories that had to be deleted by hand.
+  Prefix experiments with `ALEXANDRIA_AUTO_STORE=off` or point `ALEXANDRIA_URL` at a scratch server.
+- **`test.sh` now takes ~6 s instead of ~1.5 s.** The `sleep 1` flush wait in `alexandria-extract.sh`
+  runs on each of the five Stop calls in the harness. Fine for a manual check; if it ever matters,
+  make the wait an env var and set it to 0 in the test.
+- **A queued follow-up prompt lands in the previous turn's chunk.** If the user types the next
+  prompt while a turn is still generating, Claude Code dispatches it as soon as the turn ends, inside
+  the 1 s flush wait, so the extract hook sees it with the previous turn. Harmless (it is extracted
+  once, just one turn early); noted so it is not mistaken for a marker bug.
 - **Per-prompt MCP handshake latency.** Measured 2026-09-08: recall hook end to end (initialize,
   initialized, tools/call with query embedding, DELETE) against the local service, 10 runs,
   median 88 ms, max 90 ms. Closed; nothing to optimise.

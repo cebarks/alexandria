@@ -61,7 +61,8 @@ jq -cn '{type:"user",message:{content:"<local-command-caveat>ignore me</local-co
         ,{type:"assistant",message:{content:[{type:"text",text:"We decided to use SurrealKV because it needs no external process."}]}}' >"$td/t.jsonl"
 cat >"$td/stub.sh" <<'STUB'
 #!/usr/bin/env bash
-cat >"$(dirname "$0")/prompt.txt"; echo "$(( $(cat "$(dirname "$0")/calls" 2>/dev/null || echo 0) + 1 ))" >"$(dirname "$0")/calls"
+cat >"$(dirname "$0")/prompt.txt"; n=$(( $(cat "$(dirname "$0")/calls" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$(dirname "$0")/calls"
+[ "$n" -gt 1 ] || { echo '{"memories": []}'; exit 0; }   # first call empty: hook must retry once
 printf '```json\n{"memories":[{"content":"We decided to use SurrealKV because it needs no external process","tags":["decision"]},{"content":""}]}\n```\nNothing else worth keeping.\n'
 STUB
 chmod +x "$td/stub.sh"
@@ -76,10 +77,15 @@ got=$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:
 echo "$got"
 [ "$got" = '[{"content":"We decided to use SurrealKV because it needs no external process","tags":["decision","extracted"]}]' ]
 # No new transcript lines: LLM not called again. New short line: deferred (marker unchanged).
-stop; [ "$(cat "$td/calls")" = 1 ]
+stop; [ "$(cat "$td/calls")" = 2 ]
 jq -cn '{type:"user",message:{content:"ok"}}' >>"$td/t.jsonl"
-ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 5 ]
+ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 2 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 5 ]
 # stop_hook_active / child guard: no call.
 jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ./alexandria-extract.sh
-[ "$(cat "$td/calls")" = 1 ]
+[ "$(cat "$td/calls")" = 2 ]
+# Empty twice: exactly two calls, nothing stored.
+printf '#!/usr/bin/env bash\necho "$(( $(cat "$(dirname "$0")/calls2" 2>/dev/null || echo 0) + 1 ))" >"$(dirname "$0")/calls2"; echo "{\"memories\": []}"\n' >"$td/empty.sh"; chmod +x "$td/empty.sh"
+jq -cn '{type:"user",message:{content:"purely tactical chatter, nothing durable here"}}' >>"$td/t.jsonl"
+ALEXANDRIA_EXTRACT_CMD="$td/empty.sh" stop; [ "$(cat "$td/calls2")" = 2 ]
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("extracted"))] | length')" = 1 ]
 echo OK
