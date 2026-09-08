@@ -14,20 +14,25 @@ Same guidance as the Pi skill, using Claude Code's `mcp__alexandria__<tool>` nam
 cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
 ```
 
-## `hooks/alexandria-recall.sh`
+## `hooks/alexandria-recall.sh` and `hooks/alexandria-session.sh`
 
-A `UserPromptSubmit` hook that calls `retrieve_memories` on every prompt and prints hits above a
-similarity threshold to stdout, which Claude Code appends to context. It also prints the Claude
-Code `session_id` so the agent can pass it to `store_memory` and group memories per session.
-Equivalent of the Pi auto-recall extension, minus auto-store. Needs only `bash`, `curl` ≥ 8 and `jq`.
+`alexandria-recall.sh` is a `UserPromptSubmit` hook that calls `retrieve_memories` on every prompt
+and returns hits above a similarity threshold as `additionalContext`, which Claude Code appends to
+the prompt. Equivalent of the Pi auto-recall extension, minus auto-store. Needs only `bash`,
+`curl` ≥ 8 and `jq`.
 
-Fails open: if the server is unreachable or errors, the prompt proceeds with nothing injected
-(a one-line note goes to stderr).
+`alexandria-session.sh` is a `PreToolUse` hook matched on `mcp__alexandria__store_memory`. When
+the agent calls `store_memory` without a `session_id`, it rewrites the call to include the Claude
+Code session id, so memories are grouped per session without relying on the model to remember.
+
+Both fail open. If the server is unreachable or errors, the recall hook returns a `systemMessage`
+("Alexandria memory unavailable: ...") so you can see it, and the prompt proceeds with nothing
+injected. The session hook never blocks a tool call.
 
 **Install:**
 
 ```bash
-cp contrib/claude/hooks/alexandria-recall.sh ~/.claude/hooks/
+cp contrib/claude/hooks/alexandria-recall.sh contrib/claude/hooks/alexandria-session.sh ~/.claude/hooks/
 ```
 
 Then add to `~/.claude/settings.json` (merge with any existing `hooks` block):
@@ -41,6 +46,14 @@ Then add to `~/.claude/settings.json` (merge with any existing `hooks` block):
           { "type": "command", "command": "/home/you/.claude/hooks/alexandria-recall.sh" }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__alexandria__store_memory",
+        "hooks": [
+          { "type": "command", "command": "/home/you/.claude/hooks/alexandria-session.sh" }
+        ]
+      }
     ]
   }
 }
@@ -52,8 +65,9 @@ Then add to `~/.claude/settings.json` (merge with any existing `hooks` block):
 | --- | --- | --- |
 | `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | Alexandria MCP server URL |
 | `ALEXANDRIA_AUTO_RECALL_LIMIT` | `5` | Max memories retrieved per prompt |
-| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.15` | Minimum similarity to inject a hit (see `[retrieve]` in [docs/configuration.md](../../docs/configuration.md) for why this is low) |
+| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.35` | Minimum similarity to inject a hit (measured; see `[recall]` in [docs/configuration.md](../../docs/configuration.md)) |
 | `ALEXANDRIA_AUTO_RECALL` | (unset) | Set to `off` to disable |
+| `ALEXANDRIA_HOOK_CHILD` | (unset) | Set by hooks that shell out to `claude -p`; both hooks exit immediately when set |
 
 Set them in the hook command itself if needed, e.g.
 `"command": "ALEXANDRIA_AUTO_RECALL_LIMIT=3 /home/you/.claude/hooks/alexandria-recall.sh"`.

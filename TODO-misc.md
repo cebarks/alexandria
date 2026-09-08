@@ -11,36 +11,28 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   asymmetric retrieval model (e.g. an msmarco/bge/e5 family model) would separate real
   matches from noise far better. Blocked on: model is locked on first boot, so switching
   the default needs a migration/re-embed story.
-- **Auto-recall client default `min_similarity = 0.58`** (`contrib/pi`, `docs/configuration.md`)
-  was chosen under the same "genuine matches score 0.6+" assumption that turned out wrong.
-  With MiniLM that threshold will almost never inject anything for question-style prompts.
-  Re-measure and lower, or fix alongside the model change above. The Claude Code hook
-  (`contrib/claude/hooks/alexandria-recall.sh`) defaults to `0.15`, which is an unmeasured guess
-  in the other direction — settle both on the same measured number.
+- **Pi auto-recall default `min_similarity = 0.58`** (`contrib/pi`) is too high. Measured
+  2026-09-08 on MiniLM with synthetic pairs: question-vs-matching-statement scores 0.40–0.65,
+  unrelated memories 0.07–0.40. The Claude Code hook now defaults to the measured `0.35`;
+  the Pi code and docs are annotated with that recommendation but deliberately left at `0.58`.
+  Change `contrib/pi/extensions/alexandria-auto-recall/src/config.ts` and the three Pi doc
+  tables when Pi is next touched.
 
 ## Claude Code integration
 
-- **No auto-store for Claude Code.** `contrib/claude/hooks/alexandria-recall.sh` covers
-  auto-recall and session_id injection, but the Pi extension's heuristic detectors
+- **No auto-store for Claude Code.** `contrib/claude/hooks/` covers auto-recall and
+  session_id injection (plan: `docs/plans/2026-09-08-todo-misc-plan.md`, A3/A4), but the Pi extension's heuristic detectors
   (correction/preference/error-resolution) and session-end LLM extraction have no Claude Code
   equivalent. Candidates: a `Stop`/`SessionEnd` hook for extraction, `UserPromptSubmit` for the
   detectors.
 - **Recall hook reads env vars only, not `client.toml`.** Bash has no TOML parser; the Pi
   extension honours `$XDG_CONFIG_HOME/alexandria/client.toml`. Revisit if the hook grows enough
   config to matter.
-- **Recall hook `session_id` is advisory.** The hook can only print "pass this session_id to
-  store_memory"; whether the agent actually does so is up to the model. A `PreToolUse` hook on
-  `mcp__alexandria__store_memory` could inject it into the call itself.
-- **Recall hook failures are silent to the user.** Errors go to stderr only; Claude Code shows
-  nothing unless hook output is inspected. Pi surfaces a warning notification. No obvious
-  Claude Code equivalent short of injecting a "memory unavailable" line into context.
 - **Recall hook does a full MCP handshake per prompt.** Four localhost round trips
   (initialize, initialized, tools/call, DELETE) plus one query embedding, every prompt. Fine at
   human typing speed; revisit only if latency becomes noticeable.
 
 ## Minor
 
-- `retrieve_memories` result JSON is returned as a stringified blob inside a `text` content
-  block. Works, but structured `structuredContent` output would let clients render it.
 - Debug UI cluster page shows cohesion `0` for single-member clusters; probably fine, but
   undocumented.
