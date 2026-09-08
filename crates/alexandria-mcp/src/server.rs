@@ -180,7 +180,7 @@ impl AlexandriaServer {
     instructions = "Alexandria is a persistent agent memory system — use it proactively, not just when explicitly asked to 'remember' or 'recall' something.\n\n\
 When to READ memory (retrieve_memories / recall): at the start of a task in a project or domain you've likely worked in before; whenever the user references past context ('last time', 'we decided', 'like before'); before re-deriving a decision or re-debugging something that may have been solved already. Use retrieve_memories for a specific lookup, recall for open-ended/broad exploration (call it once broad, then again with the returned scope_handle to narrow).\n\n\
 When to WRITE memory (store_memory): as soon as you learn a durable fact worth keeping past this conversation — a user preference, an architectural decision and its rationale, a bug's root cause, a non-obvious gotcha, a correction the user gives you. Do this unprompted; don't wait to be told to remember. Write standalone statements that make sense without today's conversation.\n\n\
-Session memory: pass session_id to store_memory to group memories by session. Use get_session to review all memories from a session. Use finalize_session at the end of a session to attach a summary and tags.\n\n\
+Session memory: pass session_id to store_memory or import_document to group memories by session. Use get_session to review all memories from a session. Use finalize_session at the end of a session to attach a summary and tags.\n\n\
 Use update_memory (not store_memory) when correcting something already stored — it preserves lineage. Use import_document for bulk reference material (specs, READMEs, notes). Use delete_memory only when the user wants something actually forgotten."
 )]
 impl ServerHandler for AlexandriaServer {}
@@ -347,6 +347,23 @@ impl AlexandriaServer {
         let mut import_tags = tags;
         import_tags.push(format!("import_batch:{batch_id}"));
 
+        // Session linkage (implicit create on first use), resolved once for all chunks
+        let session_repo = SessionRepo::new(self.db.inner());
+        let session_rid = match params.session_id {
+            Some(ref session_id) => {
+                if session_repo
+                    .find_by_external_id(session_id)
+                    .await?
+                    .is_none()
+                {
+                    session_repo.create(session_id, None, None).await?;
+                }
+                let session = session_repo.find_by_external_id(session_id).await?.unwrap();
+                Some(session.id.map(|r| record_id_to_string(&r)).unwrap())
+            }
+            None => None,
+        };
+
         for chunk in &chunks {
             // Embed
             let embeddings = self.embedding.embed(&[chunk.as_str()]).await?;
@@ -370,7 +387,15 @@ impl AlexandriaServer {
             self.assign_to_cluster_and_update(embedding, &fact_id)
                 .await?;
 
+            if let Some(ref session_rid) = session_rid {
+                session_repo.add_memory(session_rid, &fact_id).await?;
+            }
+
             created_ids.push(fact_id);
+        }
+
+        if let Some(ref session_id) = params.session_id {
+            session_repo.touch(session_id).await?;
         }
 
         Ok(serde_json::json!({
@@ -977,6 +1002,53 @@ mod get_info_tests {
             .await
             .unwrap();
         assert_eq!(result["results"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_document_links_chunks_to_session() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        server
+            .do_store_memory(StoreMemoryParams {
+                content: "unrelated fact outside the session".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+        server
+            .do_import_document(ImportDocumentParams {
+                content: "first paragraph\n\nsecond paragraph".to_string(),
+                mode: None,
+                chunk_strategy: Some("paragraph".to_string()),
+                tags: None,
+                session_id: Some("sess-import".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let session_json = server
+            .do_get_session(GetSessionParams {
+                session_id: "sess-import".to_string(),
+            })
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&session_json).unwrap();
+        assert_eq!(parsed["memories"].as_array().unwrap().len(), 2);
+
+        let result = server
+            .do_retrieve_memories(RetrieveMemoriesParams {
+                query: "paragraph".to_string(),
+                limit: Some(10),
+                session_id: Some("sess-import".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["results"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

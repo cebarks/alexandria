@@ -44,9 +44,10 @@ on the same prompt), so purely tactical turns cost two calls. The child `claude`
 2026-09-08 on a ~40-line transcript: about 15 s wall time, haiku correctly returned no memories for a
 purely tactical session.
 
-`alexandria-session.sh` is a `PreToolUse` hook matched on `mcp__alexandria__store_memory`. When
-the agent calls `store_memory` without a `session_id`, it rewrites the call to include the Claude
-Code session id, so memories are grouped per session without relying on the model to remember.
+`alexandria-session.sh` is a `PreToolUse` hook matched on `mcp__alexandria__store_memory` and
+`mcp__alexandria__import_document`. When the agent calls either without a `session_id`, it rewrites
+the call to include the Claude Code session id, so memories and imported chunks are grouped per
+session without relying on the model to remember.
 
 All three fail open. If the server is unreachable or errors, the recall hook returns a `systemMessage`
 ("Alexandria memory unavailable: ...") so you can see it, and the prompt proceeds with nothing
@@ -76,7 +77,7 @@ Then add to `~/.claude/settings.json` (merge with any existing `hooks` block):
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__alexandria__store_memory",
+        "matcher": "mcp__alexandria__(store_memory|import_document)",
         "hooks": [
           { "type": "command", "command": "/home/you/.claude/hooks/alexandria-session.sh" }
         ]

@@ -27,6 +27,12 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 - **`session.memory_count` column is now unread.** After the 2026-09-08 change above, nothing
   outside the storage tests reads it; `touch` still increments it on every store. Harmless. Drop the
   column and the `touch` increment in a future migration, or keep it as a "memories written" stat.
+  Since 2026-09-08 `import_document` also calls `touch` once per import, not once per chunk, so as
+  a "memories written" stat it would undercount imports; another reason to drop it.
+- **Session find-or-create is duplicated.** `do_store_memory` and `do_import_document` (2026-09-08)
+  each carry the same find-by-external-id, create-if-missing, re-find, unwrap-record-id block. Two
+  copies is tolerable; on a third caller move it into `SessionRepo::find_or_create` returning the
+  record id string.
 - **`get_memories` is N+1.** It selects the edge rows, then calls `get_fact` once per id. Fine at
   session sizes seen so far (tens of memories). Done 2026-09-08: replaced with one graph traversal,
   `SELECT * FROM $sess->contains_session_memory->fact WHERE deleted = false ORDER BY created_at`
@@ -42,8 +48,17 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   session facts in one query; use a sequence field then, not `id`.
 - **`import_document` chunks are never grouped under a session.** Noticed 2026-09-08: `ImportDocumentParams`
   has no `session_id`, so imported chunks are not reachable via `get_session` or session-scoped
-  `retrieve_memories`, unlike `store_memory`. Add the param and the `add_memory` edge per chunk if
-  session-scoped review of imported material is ever wanted.
+  `retrieve_memories`, unlike `store_memory`. Done 2026-09-08: `session_id` added to
+  `ImportDocumentParams`, the session is resolved once per import and every chunk gets a
+  `contains_session_memory` edge; the Claude Code `PreToolUse` session hook matcher widened to
+  `mcp__alexandria__(store_memory|import_document)` (README snippet and local `settings.json`).
+- **`raw` record carries no session.** The 2026-09-08 `import_document` session linkage attaches
+  the chunks only; the `raw` document record is reachable from them via `extracted_from` but has no
+  session edge of its own. Add one if a session view ever needs the source document directly.
+- **Widened session-hook matcher is untested.** `contrib/claude/hooks/test.sh` exercises
+  `alexandria-session.sh` with a `store_memory` payload only; the `import_document` path relies on
+  the script being generic over `tool_input`. Add a second payload case if the script ever grows
+  tool-specific logic.
 
 ## Claude Code integration
 

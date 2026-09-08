@@ -217,6 +217,7 @@ async fn test_import_document_whole() {
         mode: Some("whole".to_string()),
         chunk_strategy: None,
         tags: Some(vec!["imported".to_string()]),
+        session_id: None,
     };
     let result = server.do_import_document(params).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -234,6 +235,7 @@ async fn test_import_document_chunk_by_heading() {
         mode: Some("chunk".to_string()),
         chunk_strategy: Some("heading".to_string()),
         tags: Some(vec!["book".to_string()]),
+        session_id: None,
     };
     let result = server.do_import_document(params).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -251,6 +253,7 @@ async fn test_import_document_chunk_by_paragraph() {
         mode: Some("chunk".to_string()),
         chunk_strategy: Some("paragraph".to_string()),
         tags: None,
+        session_id: None,
     };
     let result = server.do_import_document(params).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
