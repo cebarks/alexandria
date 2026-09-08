@@ -75,6 +75,11 @@ impl CandleProvider {
         // Optional: pooling config. Not every repo has it; absence means mean pooling.
         let cls_pooling = repo
             .get("1_Pooling/config.json")
+            .inspect_err(|e| {
+                tracing::warn!(
+                    "no 1_Pooling/config.json for {model_id} ({e}); assuming mean pooling"
+                )
+            })
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|s| cls_pooling_from_json(&s))

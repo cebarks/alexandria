@@ -21,10 +21,15 @@ Corpus: 143 active facts from the live database. Questions: 12, listed below.
 | retrieve.min_similarity | 0.36 |
 | client auto-recall threshold | 0.22 |
 
+Not applied: the incumbent won, so config defaults are unchanged. The retrieve
+floor derived here (0.36) would cut a true hit at 0.338, and nonhit_p99 (0.373)
+exceeds hit_min, so the spec's threshold rule has no valid solution on this
+corpus. bge-small was measured without its query instruction prefix.
+
 Reasoning: no candidate beat the incumbent on both criteria — MiniLM has the
 lowest mean_rank (1.42 vs 2.33 / 5.42 / 12.58) and the largest mean_gap
 (+0.148), so the decision rule keeps `all-MiniLM-L6-v2` and Task 6 becomes a
-docs/threshold-only change. The surprise is bge-small: its absolute scores are
+docs-only change. The surprise is bge-small: its absolute scores are
 much higher across the board (hit_min 0.620) but so is its noise floor
 (nonhit_p50 0.564, fact-fact p50 0.592), so the separation between a hit and
 the rest of the corpus is *worse*, not better — high cosine values on a
