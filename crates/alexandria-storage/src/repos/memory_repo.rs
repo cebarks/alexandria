@@ -345,10 +345,15 @@ mod tests {
             .unwrap();
         repo.soft_delete_fact(&b).await.unwrap();
 
-        let rows = repo.all_ids_and_content().await.unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], (a.clone(), "first".to_string()));
-        assert_eq!(rows[1], (b.clone(), "second".to_string()));
+        // Sorted: same-tick created_at makes the query order unstable.
+        let mut rows = repo.all_ids_and_content().await.unwrap();
+        rows.sort();
+        let mut expected = vec![
+            (a.clone(), "first".to_string()),
+            (b.clone(), "second".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(rows, expected);
 
         // update_fact with only an embedding is the write path reembed uses
         let updated = repo

@@ -186,7 +186,22 @@ impl EmbeddingProvider for CandleProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::cls_pooling_from_json;
+    use super::{CandleProvider, cls_pooling_from_json};
+
+    /// Same model, same text: flipping the pooling flag must change the vector,
+    /// proving the CLS branch is actually taken rather than falling back to mean.
+    #[tokio::test]
+    async fn cls_and_mean_pooling_differ() {
+        let mut provider = CandleProvider::new("sentence-transformers/all-MiniLM-L6-v2", "cpu")
+            .await
+            .unwrap();
+        assert!(!provider.cls_pooling, "MiniLM ships mean pooling");
+        let mean = provider.embed_sync(&["hello world"]).unwrap().remove(0);
+        provider.cls_pooling = true;
+        let cls = provider.embed_sync(&["hello world"]).unwrap().remove(0);
+        assert_eq!(mean.len(), cls.len());
+        assert_ne!(mean, cls);
+    }
 
     #[test]
     fn cls_true_when_flag_set() {

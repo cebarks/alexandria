@@ -3,13 +3,22 @@ use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{Database, system_config};
 
-/// Fake model "b": every text embeds to the same unit vector in 3 dims.
+/// Fake model "b": 3-dim unit vectors chosen per text so a mean centroid is
+/// distinguishable from any single member.
 struct ModelB;
+
+fn embed_b(text: &str) -> Vec<f32> {
+    match text {
+        "one" => vec![1.0, 0.0, 0.0],
+        "two" => vec![0.0, 1.0, 0.0],
+        _ => vec![0.0, 0.0, 1.0],
+    }
+}
 
 #[async_trait::async_trait]
 impl EmbeddingProvider for ModelB {
     async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        Ok(texts.iter().map(|t| embed_b(t)).collect())
     }
     fn dimensions(&self) -> usize {
         3
@@ -71,7 +80,7 @@ async fn reembed_rewrites_facts_centroids_and_lock() {
     let memories = MemoryRepo::new(db.inner());
     for id in [&live1, &live2, &gone] {
         let fact = memories.get_fact(id).await.unwrap().unwrap();
-        assert_eq!(fact.embedding, vec![1.0, 0.0, 0.0], "fact {id}");
+        assert_eq!(fact.embedding, embed_b(&fact.content), "fact {id}");
     }
     assert!(memories.get_fact(&gone).await.unwrap().unwrap().deleted);
 
@@ -85,7 +94,11 @@ async fn reembed_rewrites_facts_centroids_and_lock() {
             c.id.as_ref().map(alexandria_storage::record_id_to_string) == Some(cid.clone())
         })
         .expect("cluster still exists");
-    assert_eq!(cluster.centroid, vec![1.0, 0.0, 0.0]);
+    assert_eq!(
+        cluster.centroid,
+        vec![0.5, 0.5, 0.0],
+        "mean of both members"
+    );
 
     assert_eq!(
         system_config::get_config(db.inner(), "embedding_model")
@@ -179,4 +192,31 @@ async fn reembed_drops_empty_clusters() {
         .filter_map(|c| c.id.as_ref().map(alexandria_storage::record_id_to_string))
         .collect();
     assert_eq!(ids, vec![cid], "empty cluster {empty} should be gone");
+}
+
+#[tokio::test]
+async fn reembed_moves_lock_over_empty_corpus() {
+    let db = Database::connect_embedded().await.unwrap();
+    alexandria_storage::schema::migrate(db.inner())
+        .await
+        .unwrap();
+    system_config::set_config(db.inner(), "embedding_model", "a")
+        .await
+        .unwrap();
+
+    let outcome = reembed(&db, &ModelB).await.unwrap();
+    assert!(matches!(
+        outcome,
+        ReembedOutcome::Done {
+            facts: 0,
+            clusters: 0
+        }
+    ));
+    assert_eq!(
+        system_config::get_config(db.inner(), "embedding_model")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("b")
+    );
 }
