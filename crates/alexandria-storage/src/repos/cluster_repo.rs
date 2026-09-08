@@ -269,7 +269,7 @@ impl<'a> ClusterRepo<'a> {
         let mut result = Vec::with_capacity(clusters.len());
         for cluster in clusters {
             let id = cluster.id.as_ref().map(|r| r.to_sql()).unwrap_or_default();
-            let count = self.get_members(&id).await.map(|m| m.len()).unwrap_or(0);
+            let count = self.get_members(&id).await?.len();
             result.push((cluster, count));
         }
         Ok(result)
