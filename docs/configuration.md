@@ -24,7 +24,7 @@ sse_keep_alive_secs = 15      # SSE keep-alive interval in seconds (default: 15)
 # data_dir = "/home/you/.local/share/alexandria/data"  # Storage path; ":memory:" for ephemeral (default: $XDG_DATA_HOME/alexandria/data)
 
 [embedding]
-model = "sentence-transformers/all-MiniLM-L6-v2"   # HuggingFace model ID (no default — required)
+model = "sentence-transformers/all-MiniLM-L6-v2"   # HuggingFace model ID (default shown; omit to use it)
 device = "cpu"                                       # "cpu" only for now (default: "cpu")
 
 [heat]
