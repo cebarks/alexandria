@@ -34,8 +34,14 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   outside the storage tests reads it; `touch` still increments it on every store. Harmless. Drop the
   column and the `touch` increment in a future migration, or keep it as a "memories written" stat.
 - **`get_memories` is N+1.** It selects the edge rows, then calls `get_fact` once per id. Fine at
-  session sizes seen so far (tens of memories); fold into one
-  `SELECT * FROM fact WHERE id IN $ids AND deleted = false` if a session ever gets large.
+  session sizes seen so far (tens of memories). Done 2026-09-08: replaced with one graph traversal,
+  `SELECT * FROM $sess->contains_session_memory->fact WHERE deleted = false ORDER BY created_at`
+  (same shape as `ClusterRepo::get_members`), after a `find_by_external_id` lookup. Two round trips
+  regardless of session size; the Rust-side filter and sort are gone.
+- **`get_memories` tiebreak on equal `created_at` is unspecified.** After the 2026-09-08 rewrite the
+  ordering comes from `ORDER BY created_at`; the old Rust stable sort preserved edge order for facts
+  created in the same instant. Only matters for bulk inserts within one tick (e.g. `import_document`
+  chunks landing in the same session). Add `, id` as a secondary key if chunk order ever looks shuffled.
 
 ## Claude Code integration
 

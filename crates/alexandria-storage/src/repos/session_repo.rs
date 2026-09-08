@@ -1,6 +1,6 @@
 use anyhow::Result;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{RecordId, SurrealValue};
+use surrealdb::types::RecordId;
 use surrealdb::Surreal;
 
 use crate::models::Session;
@@ -90,44 +90,21 @@ impl<'a> SessionRepo<'a> {
 
     /// Get all non-deleted facts belonging to a session, ordered by creation time.
     pub async fn get_memories(&self, external_id: &str) -> Result<Vec<crate::models::Fact>> {
-        // First get the fact IDs from the edges
+        let Some(session) = self.find_by_external_id(external_id).await? else {
+            return Ok(vec![]);
+        };
+        let Some(sess) = session.id else {
+            return Ok(vec![]);
+        };
         let mut response = self
             .db
             .query(
-                "SELECT out AS fact_id FROM contains_session_memory \
-                 WHERE in = (SELECT VALUE id FROM `session` WHERE external_id = $external_id LIMIT 1)[0]",
+                "SELECT * FROM $sess->contains_session_memory->fact \
+                 WHERE deleted = false ORDER BY created_at ASC",
             )
-            .bind(("external_id", external_id.to_string()))
+            .bind(("sess", sess))
             .await?;
-
-        #[derive(serde::Deserialize, surrealdb::types::SurrealValue)]
-        struct EdgeRow {
-            fact_id: Option<RecordId>,
-        }
-
-        let rows: Vec<EdgeRow> = response.take(0)?;
-        let fact_ids: Vec<String> = rows
-            .into_iter()
-            .filter_map(|r| r.fact_id.map(|id| crate::record_id_to_string(&id)))
-            .collect();
-
-        if fact_ids.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Fetch the actual facts
-        let mut facts = Vec::with_capacity(fact_ids.len());
-        let repo = crate::repos::MemoryRepo::new(self.db);
-        for fid in &fact_ids {
-            if let Some(fact) = repo.get_fact(fid).await? {
-                if !fact.deleted {
-                    facts.push(fact);
-                }
-            }
-        }
-
-        // Sort by created_at ascending
-        facts.sort_by_key(|a| a.created_at);
+        let facts: Vec<crate::models::Fact> = response.take(0)?;
         Ok(facts)
     }
 
@@ -250,6 +227,33 @@ mod tests {
         let memories = repo.get_memories("sess-002").await.unwrap();
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].content, "kept");
+    }
+
+    #[tokio::test]
+    async fn test_get_memories_ordered_by_created_at() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = SessionRepo::new(db.inner());
+        let memory_repo = crate::repos::MemoryRepo::new(db.inner());
+
+        let session_id = repo.create("sess-003", None, None).await.unwrap();
+        let mut ids = Vec::new();
+        for content in ["first", "second", "third"] {
+            ids.push(
+                memory_repo
+                    .create_fact(content, 0.5, &[0.1, 0.2], &[])
+                    .await
+                    .unwrap(),
+            );
+        }
+        // Link in reverse so edge order differs from creation order.
+        for id in ids.iter().rev() {
+            repo.add_memory(&session_id, id).await.unwrap();
+        }
+
+        let memories = repo.get_memories("sess-003").await.unwrap();
+        let contents: Vec<&str> = memories.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["first", "second", "third"]);
     }
 
     #[tokio::test]
