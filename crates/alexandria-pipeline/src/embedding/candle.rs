@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use hf_hub::{Repo, RepoType, api::sync::Api};
+use hf_hub::HFClientSync;
 use tokenizers::Tokenizer;
 
 use super::provider::EmbeddingProvider;
@@ -59,22 +59,27 @@ impl CandleProvider {
             _ => Device::Cpu, // fallback to CPU
         };
 
-        let api = Api::new().context("Failed to create HuggingFace Hub API")?;
-        let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
+        let client = HFClientSync::new().context("Failed to create HuggingFace Hub client")?;
+        // Short-form ids like "gpt2" have no owner.
+        let (owner, name) = model_id.split_once('/').unwrap_or(("", model_id));
+        let repo = client.model(owner, name);
+        // Cache first, as hf-hub 0.5 did. Without this, 1.0 revalidates every
+        // cached file against the Hub on each boot and retries when offline.
+        let get = |file: &str| {
+            repo.download_file()
+                .filename(file)
+                .local_files_only(true)
+                .send()
+                .or_else(|_| repo.download_file().filename(file).send())
+        };
 
-        let config_path = repo
-            .get("config.json")
-            .context("Failed to download config.json")?;
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .context("Failed to download tokenizer.json")?;
-        let weights_path = repo
-            .get("model.safetensors")
-            .context("Failed to download model.safetensors")?;
+        let config_path = get("config.json").context("Failed to download config.json")?;
+        let tokenizer_path = get("tokenizer.json").context("Failed to download tokenizer.json")?;
+        let weights_path =
+            get("model.safetensors").context("Failed to download model.safetensors")?;
 
         // Optional: pooling config. Not every repo has it; absence means mean pooling.
-        let cls_pooling = repo
-            .get("1_Pooling/config.json")
+        let cls_pooling = get("1_Pooling/config.json")
             .inspect_err(|e| {
                 tracing::warn!(
                     "no 1_Pooling/config.json for {model_id} ({e}); assuming mean pooling"
