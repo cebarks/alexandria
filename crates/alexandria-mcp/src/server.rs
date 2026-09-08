@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 // Re-exported from alexandria_storage where it's now defined.
 pub use alexandria_storage::record_id_to_string;
@@ -97,13 +98,14 @@ impl AlexandriaServer {
     async fn retrieve_memories(
         &self,
         Parameters(params): Parameters<RetrieveMemoriesParams>,
-    ) -> String {
+    ) -> CallToolResult {
+        // `structured()` also puts the same JSON in a text block, so clients that
+        // only read `content[].text` (Pi extension, Claude hook) are unaffected.
         match self.do_retrieve_memories(params).await {
-            Ok(results) => serde_json::to_string(&results)
-                .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string()),
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
-            }
+            Ok(results) => CallToolResult::structured(results),
+            Err(e) => CallToolResult::structured_error(
+                serde_json::json!({ "status": "error", "message": e.to_string() }),
+            ),
         }
     }
 
@@ -1021,5 +1023,43 @@ mod get_info_tests {
             })
             .await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn retrieve_memories_tool_returns_structured_content() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server =
+            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0);
+        server
+            .do_store_memory(StoreMemoryParams {
+                content: "a near match memory".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .retrieve_memories(Parameters(RetrieveMemoriesParams {
+                query: "anything".to_string(),
+                limit: Some(10),
+                session_id: None,
+            }))
+            .await;
+
+        let structured = result.structured_content.expect("structuredContent set");
+        assert_eq!(structured["results"].as_array().unwrap().len(), 1);
+        // Text block carries the same JSON so clients reading content[].text keep working.
+        let rmcp::model::ContentBlock::Text(t) = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&t.text).unwrap(),
+            structured
+        );
+        assert_eq!(result.is_error, Some(false));
     }
 }
