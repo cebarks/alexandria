@@ -26,9 +26,11 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   each carry the same find-by-external-id, create-if-missing, re-find, unwrap-record-id block. Two
   copies is tolerable; on a third caller move it into `SessionRepo::find_or_create` returning the
   record id string.
-- [ ] **`raw` record carries no session.** The 2026-09-08 `import_document` session linkage attaches
+- [-] **`raw` record carries no session.** The 2026-09-08 `import_document` session linkage attaches
   the chunks only; the `raw` document record is reachable from them via `extracted_from` but has no
-  session edge of its own. Add one if a session view ever needs the source document directly.
+  session edge of its own. Parked 2026-09-08: `contains_session_memory` is declared `IN session OUT fact`,
+  so linking `raw` needs a new edge table plus a schema migration, and nothing reads it. Add one if a
+  session view ever needs the source document directly.
 
 ### Embedding migration follow-ups (deferred from the 2026-09-08 branch review)
 
@@ -39,16 +41,17 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   back to MiniLM. Throw the copy away.
 - [ ] **`migrate.rs` batch size is a hardcoded 32** (2026-09-08, added with fact batching). Fine for
   MiniLM on CPU; make it a config knob only if a larger model or GPU makes a different size matter.
-- [ ] **`ClusterRepo::list_with_counts` swallows `get_members` errors** (`unwrap_or(0)`), so a failing
-  membership query reads as an empty cluster. Pre-existing; noticed 2026-09-08 while splitting out
-  `ClusterRepo::list()`. Propagate the error if a caller ever needs to tell "empty" from "broken".
-- [ ] **Empty clusters keep a stale-dimension centroid** after a dimension-changing migration.
-  `engine::search::cosine_similarity` only `debug_assert`s equal lengths, so release builds would
-  silently score a truncated dot product. Near-unreachable (split/merge delete their originals).
-- [ ] **"Fresh database" is inferred purely from a missing lock.** A database predating the v003
-  `system_config` table has facts and no lock; `migrate-embeddings` would say "just start the
-  server" and the next boot stamps the current model over old vectors. Guard: if there are facts
-  and no lock, say so instead. Almost certainly nonexistent in the wild.
+- [x] **`ClusterRepo::list_with_counts` swallows `get_members` errors** (`unwrap_or(0)`), so a failing
+  membership query reads as an empty cluster. Done 2026-09-08 (bfaa52a): the error now propagates; the
+  debug clusters page already rendered it.
+- [x] **Empty clusters keep a stale-dimension centroid** after a dimension-changing migration.
+  Done 2026-09-08 (5326677): `migrate-embeddings` deletes empty clusters instead of skipping them.
+  `engine::search::cosine_similarity` still only `debug_assert`s equal lengths; no other path leaves
+  a stale centroid behind (split/merge delete their originals).
+- [x] **"Fresh database" is inferred purely from a missing lock.** Done 2026-09-08 (df7db27):
+  `migrate-embeddings` now errors when facts exist without a lock and tells the user to boot once with
+  config naming the model that produced them. The server boot path itself still stamps whatever the
+  config names over an unlocked corpus; see the open item below.
 - [x] **`--help` output is preceded by a tracing INFO line.** Done 2026-09-08 (ed923ee). `tracing_subscriber::fmt::init()` and the
   "Alexandria v0.2 starting..." log run before argument parsing (2026-09-08), so `alexandria --help`
   prints a log line to stderr before the usage. Cosmetic; move the subscriber init below the arg
@@ -64,10 +67,14 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   next model bench (see `docs/plans/2026-09-08-embedding-model-swap-measurements.md`).
 - [x] **`CLAUDE.md` says `record_id_to_string()` lives in `alexandria-mcp/src/server.rs`.** Fixed 2026-09-08 (4f2d961). It lives
   in `alexandria-storage/src/lib.rs` and `server.rs` only re-exports it. Fix the note.
-- [ ] **Test gaps, low priority.** No test asserts CLS output differs from mean output for the same
-  model; the `reembed` centroid test uses a constant fake vector so it cannot distinguish mean from
-  copy-first-member; no test for lock-present-over-empty-corpus (`Done { 0, 0 }`);
-  `all_ids_and_content` test assertions are positional and could flip on same-tick `created_at`.
+- [x] **Test gaps, low priority.** Done 2026-09-08 (d4bc3eb): CLS-vs-mean unit test in `candle.rs`
+  (loads the real MiniLM, slow like the other provider tests), per-text fake vectors in the `reembed`
+  centroid test, a `Done { 0, 0 }` test, and an order-independent `all_ids_and_content` assertion.
+- [ ] **Server boot stamps the lock over an unlocked corpus.** Companion to the guard above (2026-09-08):
+  `migrate-embeddings` refuses, but a normal start with facts present and no lock still writes the
+  configured model as the lock without checking that the stored vectors came from it. Same
+  pre-v003 population, so almost certainly nonexistent in the wild; add the same facts-without-lock
+  check to the boot path if it ever matters.
 
 ## Build / toolchain
 
