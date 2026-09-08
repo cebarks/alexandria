@@ -1,9 +1,10 @@
 use anyhow::Result;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{SurrealValue, ToSql};
+use surrealdb::types::{RecordId, SurrealValue, ToSql};
 use surrealdb::Surreal;
 
 use crate::models::Fact;
+use crate::record_id_to_string;
 
 pub struct MemoryRepo<'a> {
     db: &'a Surreal<Any>,
@@ -217,6 +218,28 @@ impl<'a> MemoryRepo<'a> {
         let clusters: Vec<crate::models::Cluster> = response.take(0)?;
         Ok(clusters.into_iter().next())
     }
+
+    /// Every fact, deleted ones included, as (id, content). Used by the embedding
+    /// migration, which must re-embed lineage snapshots too so they stay comparable.
+    pub async fn all_ids_and_content(&self) -> Result<Vec<(String, String)>> {
+        #[derive(serde::Deserialize, SurrealValue)]
+        struct Row {
+            id: RecordId,
+            content: String,
+            // Projected only so ORDER BY has it; not returned.
+            #[allow(dead_code)]
+            created_at: Option<chrono::DateTime<chrono::Utc>>,
+        }
+        let mut response = self
+            .db
+            .query("SELECT id, content, created_at FROM fact ORDER BY created_at")
+            .await?;
+        let rows: Vec<Row> = response.take(0)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (record_id_to_string(&r.id), r.content))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -304,5 +327,36 @@ mod tests {
             .unwrap();
         let none = repo.cluster_for_fact(&orphan_id).await.unwrap();
         assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_all_ids_and_content_includes_deleted() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let a = repo
+            .create_fact("first", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let b = repo
+            .create_fact("second", 0.5, &[0.3, 0.4], &[])
+            .await
+            .unwrap();
+        repo.soft_delete_fact(&b).await.unwrap();
+
+        let rows = repo.all_ids_and_content().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (a.clone(), "first".to_string()));
+        assert_eq!(rows[1], (b.clone(), "second".to_string()));
+
+        // update_fact with only an embedding is the write path reembed uses
+        let updated = repo
+            .update_fact(&a, None, None, None, Some(&[9.0, 8.0, 7.0]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.embedding, vec![9.0, 8.0, 7.0]);
+        assert_eq!(updated.content, "first");
     }
 }
