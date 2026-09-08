@@ -56,8 +56,11 @@ exits 0.
 **Install:**
 
 ```bash
-cp contrib/claude/hooks/alexandria-{recall,session,extract}.sh ~/.claude/hooks/
+ln -sf "$PWD"/contrib/claude/hooks/alexandria-{recall,session,extract}.sh ~/.claude/hooks/
 ```
+
+Symlinks, not copies: the installed hooks then track the repo, and the extract hook resolves its
+sibling through `readlink -f`, so it still finds `alexandria-recall.sh` next to the real file.
 
 Then add to `~/.claude/settings.json` (merge with any existing `hooks` block):
 
@@ -82,7 +85,7 @@ Then add to `~/.claude/settings.json` (merge with any existing `hooks` block):
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "/home/you/.claude/hooks/alexandria-extract.sh", "async": true }
+          { "type": "command", "command": "/home/you/.claude/hooks/alexandria-extract.sh" }
         ]
       }
     ]
@@ -91,13 +94,13 @@ Then add to `~/.claude/settings.json` (merge with any existing `hooks` block):
 ```
 
 The extract hook must live under `Stop`, not `SessionEnd`: `SessionEnd` hooks share a 1.5 s budget,
-far too short for an LLM call. `"async": true` runs it in the background so the 15–80 s LLM call
-never holds your next turn; Claude Code enforces no `timeout` on async hooks, and the script's own
-80 s budget bounds a wedged `claude -p`. Claude Code kills hooks still running when the session
-ends, so the script re-execs itself with `setsid -f` (own session and process group, no inherited
-pipes) and returns at once; the detached copy finishes the extraction even if you quit right after
+far too short for an LLM call. Stop hooks block the next turn until they exit, and Claude Code
+kills hooks still running when the session ends, so the script re-execs itself with `setsid -f`
+(own session and process group, no inherited pipes) and returns in milliseconds; the detached copy
+does the 15–80 s LLM call, never holds your next turn, and finishes even if you quit right after
 your last turn (verified 2026-09-08: a 10 s stub completed 11 s after the headless session exited).
-Its stderr goes to `$XDG_RUNTIME_DIR/alexandria/extract.log`.
+The script's own 80 s budget bounds a wedged `claude -p`. No `"async": true` is needed. Its stderr
+goes to `$XDG_RUNTIME_DIR/alexandria/extract.log`.
 
 **Config (env vars, all optional):**
 
@@ -110,6 +113,7 @@ Its stderr goes to `$XDG_RUNTIME_DIR/alexandria/extract.log`.
 | `ALEXANDRIA_AUTO_STORE` | (unset) | Set to `off` to disable the detectors and extraction |
 | `ALEXANDRIA_EXTRACT_MODEL` | `haiku` | Model passed to `claude -p --model` for extraction |
 | `ALEXANDRIA_EXTRACT_MIN_CHARS` | `1500` | New transcript text required before an extraction call |
+| `ALEXANDRIA_EXTRACT_FLUSH_WAIT` | `1` | Seconds to wait before reading the transcript; Stop fires ~50 ms before the last assistant message is flushed (tests set `0`) |
 | `ALEXANDRIA_EXTRACT_CMD` | (unset) | Replace the `claude -p ...` command (prompt on stdin, JSON on stdout); used by tests |
 | `ALEXANDRIA_HOOK_CHILD` | (unset) | Set by the extract hook on its `claude -p` child; every hook exits immediately when set |
 | `ALEXANDRIA_DETACHED` | (unset) | Set by the extract hook on its detached copy; set it yourself to run the hook inline (tests do) |

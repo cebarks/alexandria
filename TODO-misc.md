@@ -57,15 +57,16 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   second call (up to ~80 s wall, hidden by async). Watch the `extracted` volume; if it is mostly
   noise or the cost matters, drop the retry or gate it on transcript size.
 - **Installed hooks drift from the repo.** `~/.claude/hooks/alexandria-extract.sh` was found stale
-  (pre-retry) on 2026-09-08 because the README says `cp`. Symlinking the three scripts from the repo
-  instead would remove the step; update the README install snippet when next touched.
+  (pre-retry) on 2026-09-08 because the README says `cp`. Done 2026-09-08: the README install snippet
+  now symlinks the three scripts from the repo (`ln -sf`); `readlink -f` in the extract hook resolves
+  the sibling path, so nothing else changed.
 - **`test.sh` `empty.sh` stub emits unquoted JSON.** Found 2026-09-08: bash `printf` turns `\"` into a
   bare quote, so the stub prints `{memories: []}`; the "empty twice" check passes only because a parse
-  failure and an empty result look the same to the hook. Rewrite it as a quoted heredoc like the
-  other stubs when `test.sh` is next touched.
+  failure and an empty result look the same to the hook. Done 2026-09-08: rewritten as a quoted
+  heredoc like the other stubs; the check now passes on real JSON.
 - **`"async": true` on the Stop hook is now redundant.** The hook returns in milliseconds since it
-  detaches itself (2026-09-08), so the flag no longer buys anything. Harmless; drop it from the README
-  snippet and `settings.json` next time the install docs change.
+  detaches itself (2026-09-08), so the flag no longer buys anything. Done 2026-09-08: dropped from the
+  README snippet, the README paragraph, and the local `~/.claude/settings.json`.
 - **Manual in-UI checks.** Done 2026-09-08, none pending: `updatedInput` from
   `alexandria-session.sh` is honoured without a `permissionDecision` (a `store_memory` call with no
   `session_id` from a live session landed under that session); the Stop hook fires on real turns
@@ -78,8 +79,8 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   throwaway session id; 2026-09-08 testing left six `stub` memories that had to be deleted by hand.
   Prefix experiments with `ALEXANDRIA_AUTO_STORE=off` or point `ALEXANDRIA_URL` at a scratch server.
 - **`test.sh` now takes ~6 s instead of ~1.5 s.** The `sleep 1` flush wait in `alexandria-extract.sh`
-  runs on each of the five Stop calls in the harness. Fine for a manual check; if it ever matters,
-  make the wait an env var and set it to 0 in the test.
+  runs on each of the five Stop calls in the harness. Done 2026-09-08: the wait is
+  `ALEXANDRIA_EXTRACT_FLUSH_WAIT` (default 1) and `test.sh` sets it to 0.
 - **A queued follow-up prompt lands in the previous turn's chunk.** If the user types the next
   prompt while a turn is still generating, Claude Code dispatches it as soon as the turn ends, inside
   the 1 s flush wait, so the extract hook sees it with the previous turn. Harmless (it is extracted

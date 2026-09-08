@@ -66,7 +66,7 @@ cat >"$(dirname "$0")/prompt.txt"; n=$(( $(cat "$(dirname "$0")/calls" 2>/dev/nu
 printf '```json\n{"memories":[{"content":"We decided to use SurrealKV because it needs no external process","tags":["decision"]},{"content":""}]}\n```\nNothing else worth keeping.\n'
 STUB
 chmod +x "$td/stub.sh"
-export ALEXANDRIA_EXTRACT_CMD="$td/stub.sh" ALEXANDRIA_EXTRACT_MIN_CHARS=10 ALEXANDRIA_DETACHED=1   # run inline: assertions below are synchronous
+export ALEXANDRIA_EXTRACT_CMD="$td/stub.sh" ALEXANDRIA_EXTRACT_MIN_CHARS=10 ALEXANDRIA_EXTRACT_FLUSH_WAIT=0 ALEXANDRIA_DETACHED=1   # run inline: assertions below are synchronous
 stop() { jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:false}' | ./alexandria-extract.sh; }
 stop
 grep -q '^\[User\]: which storage engine' "$td/prompt.txt"
@@ -84,7 +84,12 @@ ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 2 ]; [ "$(cat "
 jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ./alexandria-extract.sh
 [ "$(cat "$td/calls")" = 2 ]
 # Empty twice: exactly two calls, nothing stored.
-printf '#!/usr/bin/env bash\necho "$(( $(cat "$(dirname "$0")/calls2" 2>/dev/null || echo 0) + 1 ))" >"$(dirname "$0")/calls2"; echo "{\"memories\": []}"\n' >"$td/empty.sh"; chmod +x "$td/empty.sh"
+cat >"$td/empty.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "$(( $(cat "$(dirname "$0")/calls2" 2>/dev/null || echo 0) + 1 ))" >"$(dirname "$0")/calls2"
+echo '{"memories": []}'
+STUB
+chmod +x "$td/empty.sh"
 jq -cn '{type:"user",message:{content:"purely tactical chatter, nothing durable here"}}' >>"$td/t.jsonl"
 ALEXANDRIA_EXTRACT_CMD="$td/empty.sh" stop; [ "$(cat "$td/calls2")" = 2 ]
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("extracted"))] | length')" = 1 ]

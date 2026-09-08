@@ -12,6 +12,7 @@
 #   ALEXANDRIA_AUTO_STORE          "off" disables
 #   ALEXANDRIA_EXTRACT_MODEL       default haiku
 #   ALEXANDRIA_EXTRACT_MIN_CHARS   default 1500; new text below this is deferred to a later turn
+#   ALEXANDRIA_EXTRACT_FLUSH_WAIT  default 1; seconds to wait for the transcript to flush before reading it (tests set 0)
 #   ALEXANDRIA_EXTRACT_CMD         override the LLM command (reads prompt on stdin, prints JSON); tests use a stub
 #   ALEXANDRIA_HOOK_CHILD          set by this hook on the `claude -p` child; every hook exits at once
 #   ALEXANDRIA_DETACHED            set by this hook on its detached copy; tests set it to run inline
@@ -36,8 +37,8 @@ transcript=$(jq -r '.transcript_path // ""' <<<"$input")
 
 # Stop fires before the final assistant message is appended to the transcript (measured ~50 ms
 # behind); without this wait every extraction runs one assistant message late and a session's
-# last reply is never seen. Cheap: the hook is async.
-sleep 1
+# last reply is never seen. Cheap: this copy is detached.
+sleep "${ALEXANDRIA_EXTRACT_FLUSH_WAIT:-1}"
 marker="${XDG_RUNTIME_DIR:-/tmp}/alexandria/$session.extracted"
 done_lines=$(cat "$marker" 2>/dev/null || echo 0)
 total=$(wc -l <"$transcript")
