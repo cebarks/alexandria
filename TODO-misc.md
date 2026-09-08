@@ -77,6 +77,15 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   Only `cargo build --workspace` (dev profile) has been run since the toolchain/profile changes;
   do a `cargo build --release` smoke test before shipping a release artifact.
 
+- [ ] **Startup memory doubled during model load (2026-09-08).** `candle.rs` now reads the safetensors
+  file into a `Vec<u8>` (`from_buffered_safetensors`) instead of mmap, so the workspace can carry
+  `unsafe_code = "forbid"`. For MiniLM (~90 MB) the buffer plus the built tensors coexist briefly at
+  boot, then the buffer drops. Revisit only if a much larger model is adopted; the escape hatch is a
+  `#[allow(unsafe_code)]` on that one call plus `from_mmaped_safetensors`.
+- [ ] **`ALEXANDRIA_EMBEDDING_DEVICE` env override has no test.** Noticed 2026-09-08 while moving the
+  config tests off process env; the other five overrides are covered by `test_env_overrides` /
+  `test_server_env_overrides`, this one is not. One-line addition to `test_env_overrides`.
+
 ## Dependencies
 
 - [ ] **Blocked `cargo update` targets (semver-incompatible, need Cargo.toml bump).** `cargo update

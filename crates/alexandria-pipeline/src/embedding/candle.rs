@@ -92,9 +92,11 @@ impl CandleProvider {
         let tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)?
-        };
+        let vb = VarBuilder::from_buffered_safetensors(
+            std::fs::read(&weights_path)?,
+            candle_core::DType::F32,
+            &device,
+        )?;
         let model = BertModel::load(vb, &config)?;
 
         Ok((model, tokenizer, device, dimensions, cls_pooling))

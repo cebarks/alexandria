@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 alexandria-storage = { path = "../alexandria-storage" }
 serde = { workspace = true }

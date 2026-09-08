@@ -13,6 +13,9 @@ edition = "2024"
 rust-version = "1.98"
 license = "AGPL-3.0-or-later"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [profile.release]
 lto = "thin"
 opt-level = 3

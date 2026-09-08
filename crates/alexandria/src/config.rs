@@ -6,7 +6,7 @@ use serde::Deserialize;
 ///
 /// Load order:
 /// 1. Compiled defaults
-/// 2. Config file (see `config_path()` for resolution)
+/// 2. Config file (see `config_path_from()` for resolution)
 /// 3. Individual env var overrides
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -180,9 +180,9 @@ impl Default for ClusterConfig {
 /// 2. `$XDG_CONFIG_HOME/alexandria/config.toml` via `dirs::config_dir()`
 /// 3. `~/.alexandria/config.toml` (legacy fallback)
 /// 4. XDG path (for new installs, even if it doesn't exist yet)
-fn config_path() -> PathBuf {
+fn config_path_from(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
     // Explicit env override wins
-    if let Ok(p) = std::env::var("ALEXANDRIA_CONFIG") {
+    if let Some(p) = env("ALEXANDRIA_CONFIG") {
         return PathBuf::from(p);
     }
 
@@ -219,11 +219,15 @@ impl Config {
     ///
     /// Config file resolution: `ALEXANDRIA_CONFIG` env → XDG config dir → legacy `~/.alexandria/`
     pub fn load() -> anyhow::Result<Self> {
+        Self::load_from(&|k| std::env::var(k).ok())
+    }
+
+    fn load_from(env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         // 1. Start with defaults
         let mut config = Config::default();
 
         // 2. Load config file
-        let config_path = config_path();
+        let config_path = config_path_from(env);
 
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
@@ -232,24 +236,24 @@ impl Config {
         }
 
         // 3. Individual env var overrides
-        if let Ok(transport) = std::env::var("ALEXANDRIA_SERVER_TRANSPORT") {
+        if let Some(transport) = env("ALEXANDRIA_SERVER_TRANSPORT") {
             config.server.transport = transport;
         }
-        if let Ok(host) = std::env::var("ALEXANDRIA_SERVER_HOST") {
+        if let Some(host) = env("ALEXANDRIA_SERVER_HOST") {
             config.server.host = host;
         }
-        if let Ok(port) = std::env::var("ALEXANDRIA_SERVER_PORT") {
+        if let Some(port) = env("ALEXANDRIA_SERVER_PORT") {
             config.server.port = port
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid ALEXANDRIA_SERVER_PORT `{port}`: {e}"))?;
         }
-        if let Ok(dir) = std::env::var("ALEXANDRIA_DATA_DIR") {
+        if let Some(dir) = env("ALEXANDRIA_DATA_DIR") {
             config.database.data_dir = PathBuf::from(dir);
         }
-        if let Ok(model) = std::env::var("ALEXANDRIA_EMBEDDING_MODEL") {
+        if let Some(model) = env("ALEXANDRIA_EMBEDDING_MODEL") {
             config.embedding.model = model;
         }
-        if let Ok(device) = std::env::var("ALEXANDRIA_EMBEDDING_DEVICE") {
+        if let Some(device) = env("ALEXANDRIA_EMBEDDING_DEVICE") {
             config.embedding.device = device;
         }
 
@@ -266,7 +270,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+
+    fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
 
     #[test]
     fn test_defaults() {
@@ -332,38 +343,28 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_config_path_env_override() {
-        unsafe {
-            std::env::set_var("ALEXANDRIA_CONFIG", "/tmp/custom/config.toml");
-        }
-        let path = config_path();
+        let env = env(&[("ALEXANDRIA_CONFIG", "/tmp/custom/config.toml")]);
+        let path = config_path_from(&env);
         assert_eq!(path, PathBuf::from("/tmp/custom/config.toml"));
-        unsafe {
-            std::env::remove_var("ALEXANDRIA_CONFIG");
-        }
     }
 
     #[test]
-    #[serial]
     fn test_config_path_prefers_xdg_when_no_files_exist() {
-        unsafe {
-            std::env::remove_var("ALEXANDRIA_CONFIG");
-        }
-        // When neither XDG nor legacy config files exist, config_path()
+        // When neither XDG nor legacy config files exist, config_path_from()
         // should return the XDG path (not legacy). We can't guarantee
         // neither file exists on this machine, so we verify the structural
         // property: the returned path is under dirs::config_dir(), not
         // under ~/.alexandria/.
         let xdg_config_dir = dirs::config_dir().unwrap();
         let legacy_dir = dirs::home_dir().unwrap().join(".alexandria");
-        let path = config_path();
+        let path = config_path_from(&env(&[]));
         assert!(path.ends_with("config.toml"));
         // Must be under one of: XDG config dir OR legacy dir
         // (depends on what files exist on this machine)
         assert!(
             path.starts_with(&xdg_config_dir) || path.starts_with(&legacy_dir),
-            "config_path() returned {}, expected it under {} or {}",
+            "config_path_from() returned {}, expected it under {} or {}",
             path.display(),
             xdg_config_dir.display(),
             legacy_dir.display(),
@@ -406,66 +407,36 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_env_overrides() {
-        // Set env vars
-        unsafe {
-            std::env::set_var("ALEXANDRIA_DATA_DIR", "/tmp/env-test");
-        }
-        unsafe {
-            std::env::set_var("ALEXANDRIA_EMBEDDING_MODEL", "env-model");
-        }
+        let env = env(&[
+            ("ALEXANDRIA_DATA_DIR", "/tmp/env-test"),
+            ("ALEXANDRIA_EMBEDDING_MODEL", "env-model"),
+        ]);
 
-        let config = Config::load().unwrap();
+        let config = Config::load_from(&env).unwrap();
         assert_eq!(config.database.data_dir, PathBuf::from("/tmp/env-test"));
         assert_eq!(config.embedding.model, "env-model");
-
-        // Clean up
-        unsafe {
-            std::env::remove_var("ALEXANDRIA_DATA_DIR");
-        }
-        unsafe {
-            std::env::remove_var("ALEXANDRIA_EMBEDDING_MODEL");
-        }
     }
 
     #[test]
-    #[serial]
     fn test_server_env_overrides() {
-        unsafe {
-            std::env::set_var("ALEXANDRIA_SERVER_TRANSPORT", "http");
-        }
-        unsafe {
-            std::env::set_var("ALEXANDRIA_SERVER_HOST", "0.0.0.0");
-        }
-        unsafe {
-            std::env::set_var("ALEXANDRIA_SERVER_PORT", "8080");
-        }
+        let env = env(&[
+            ("ALEXANDRIA_SERVER_TRANSPORT", "http"),
+            ("ALEXANDRIA_SERVER_HOST", "0.0.0.0"),
+            ("ALEXANDRIA_SERVER_PORT", "8080"),
+        ]);
 
-        let config = Config::load().unwrap();
+        let config = Config::load_from(&env).unwrap();
         assert_eq!(config.server.transport, "http");
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
-
-        unsafe {
-            std::env::remove_var("ALEXANDRIA_SERVER_TRANSPORT");
-        }
-        unsafe {
-            std::env::remove_var("ALEXANDRIA_SERVER_HOST");
-        }
-        unsafe {
-            std::env::remove_var("ALEXANDRIA_SERVER_PORT");
-        }
     }
 
     #[test]
-    #[serial]
     fn test_server_env_invalid_port() {
-        unsafe {
-            std::env::set_var("ALEXANDRIA_SERVER_PORT", "not-a-port");
-        }
+        let env = env(&[("ALEXANDRIA_SERVER_PORT", "not-a-port")]);
 
-        let result = Config::load();
+        let result = Config::load_from(&env);
         assert!(result.is_err());
         assert!(
             result
@@ -473,9 +444,5 @@ mod tests {
                 .to_string()
                 .contains("ALEXANDRIA_SERVER_PORT")
         );
-
-        unsafe {
-            std::env::remove_var("ALEXANDRIA_SERVER_PORT");
-        }
     }
 }
