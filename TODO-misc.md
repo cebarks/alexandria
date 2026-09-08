@@ -26,6 +26,19 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   the chunks only; the `raw` document record is reachable from them via `extracted_from` but has no
   session edge of its own. Add one if a session view ever needs the source document directly.
 
+## Dependencies
+
+- [ ] **Blocked `cargo update` targets (semver-incompatible, need Cargo.toml bump).** `cargo update
+  --verbose` (2026-09-08) only had compatible updates to apply; these are "Unchanged" because the
+  available version is a breaking bump past what `Cargo.toml` allows. Direct deps: `base64` 0.22.1 →
+  0.23.1, `dirs` 6.0.0 → 7.0.0, `toml` 0.8.23 → 1.1.5, `tokenizers` 0.22.2 → 0.23.2, `hf-hub` 0.5.0 →
+  1.0.0, `serial_test` 3.5.0 → 4.0.1 (dev-dep). Transitive (bump the pulling crate, not these
+  directly): `generic-array` 0.14.7 → 0.14.9, `i_float`/`i_overlay`/`i_shape` (geometry stack, likely
+  via a shared dep) 1.15.0/4.0.7/1.14.0 → 1.16.0/4.5.2/1.18.0, `matchit` 0.8.4 → 0.8.6, `pdqselect`
+  0.1.0 → 0.1.1. Each needs its own bump + changelog check before touching `Cargo.toml`; expect
+  breaking changes in the major-version jumps (`toml` 0.8→1.x, `hf-hub` 0.5→1.x, `dirs` 6→7,
+  `serial_test` 3→4) — deconflict one at a time, not as a batch.
+
 ## Claude Code integration
 
 - [ ] **Error-resolution tracker not ported.** `contrib/claude/hooks/` now has auto-recall,
