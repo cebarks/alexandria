@@ -34,6 +34,40 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   the chunks only; the `raw` document record is reachable from them via `extracted_from` but has no
   session edge of its own. Add one if a session view ever needs the source document directly.
 
+### Embedding migration follow-ups (deferred from the 2026-09-08 branch review)
+
+- [ ] **`migrate-embeddings` has never run against a real SurrealKV database.** Only the fake-provider
+  test on `kv-mem` and an empty scratch dir exercised it. Before first real use: stop the service,
+  `cp -a` the data dir to `/tmp`, run it there with `ALEXANDRIA_DATA_DIR` pointed at the copy and
+  `ALEXANDRIA_EMBEDDING_MODEL=sentence-transformers/multi-qa-MiniLM-L6-cos-v1`, then migrate the copy
+  back to MiniLM. Throw the copy away.
+- [ ] **`migrate.rs` rough edges.** `&vecs[0]` is an unchecked index on provider output
+  (`vecs.first().context(..)?`); `ReembedOutcome` derives no `Debug`; one `embed()` call per fact, no
+  batching (wall-clock only); `list_with_counts()` is called and the counts discarded, then
+  `get_members` re-fetched (2N queries). Module comment at lines 2-3 says a partial failure "keeps
+  refusing to boot", which is only true while config still names the new model.
+- [ ] **Empty clusters keep a stale-dimension centroid** after a dimension-changing migration.
+  `engine::search::cosine_similarity` only `debug_assert`s equal lengths, so release builds would
+  silently score a truncated dot product. Near-unreachable (split/merge delete their originals).
+- [ ] **"Fresh database" is inferred purely from a missing lock.** A database predating the v003
+  `system_config` table has facts and no lock; `migrate-embeddings` would say "just start the
+  server" and the next boot stamps the current model over old vectors. Guard: if there are facts
+  and no lock, say so instead. Almost certainly nonexistent in the wild.
+- [ ] **CLI ignores trailing arguments.** `alexandria migrate-embeddings --dry-run` runs a real
+  migration (`args().nth(1)`). Reject `args().count() > 2`. `--help` errors rather than prints usage.
+- [ ] **Pooling-config warn text** in `candle.rs` says "no 1_Pooling/config.json" even when the cause
+  was a network failure; the real cause is only in the interpolated `{e}`.
+- [ ] **Spec defect: threshold-derivation rule has no valid solution when `nonhit_p99 > hit_min`.**
+  The design spec's `retrieve.min_similarity` rule (and its midpoint fallback) lands above `hit_min`
+  on this corpus (0.373 vs 0.338), so any derived floor cuts a true hit. Rewrite the rule before the
+  next model bench (see `docs/plans/2026-09-08-embedding-model-swap-measurements.md`).
+- [ ] **`CLAUDE.md` says `record_id_to_string()` lives in `alexandria-mcp/src/server.rs`.** It lives
+  in `alexandria-storage/src/lib.rs` and `server.rs` only re-exports it. Fix the note.
+- [ ] **Test gaps, low priority.** No test asserts CLS output differs from mean output for the same
+  model; the `reembed` centroid test uses a constant fake vector so it cannot distinguish mean from
+  copy-first-member; no test for lock-present-over-empty-corpus (`Done { 0, 0 }`);
+  `all_ids_and_content` test assertions are positional and could flip on same-tick `created_at`.
+
 ## Dependencies
 
 - [ ] **Blocked `cargo update` targets (semver-incompatible, need Cargo.toml bump).** `cargo update

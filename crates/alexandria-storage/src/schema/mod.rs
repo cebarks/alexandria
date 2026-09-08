@@ -98,7 +98,9 @@ mod tests {
     /// clear it and the field-less Session struct must still read them back.
     #[tokio::test]
     async fn v006_clears_legacy_memory_count() {
-        let db = crate::connection::Database::connect_embedded().await.unwrap();
+        let db = crate::connection::Database::connect_embedded()
+            .await
+            .unwrap();
         let db = db.inner();
 
         for (_, _, sql) in MIGRATIONS.iter().filter(|(v, _, _)| *v <= 5) {

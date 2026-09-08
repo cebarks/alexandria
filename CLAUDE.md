@@ -40,6 +40,15 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Schema migrations are forward-only, numbered (`v001`, `v002`, ...), tracked in `system_config` table.
 - Embedding model is locked on first boot — changing `config.toml` model without wiping data will refuse to start.
 
+## Build Gate
+
+Before any `cargo check`, `cargo run`, or `cargo build`, run these in order and fix what they report:
+
+1. `cargo fmt --check`
+2. `cargo clippy -- -D warnings`
+
+Both must pass clean first. Do not skip the gate to "just see if it compiles".
+
 ## Testing
 
 - All integration tests use `Database::connect_embedded()` (in-memory SurrealDB) — no disk state between tests.
