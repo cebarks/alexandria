@@ -71,16 +71,20 @@ pub async fn reembed(
     }
 
     // 2. Centroids: plain mean of all members, deleted included, matching how the
-    //    maintenance loop reads members via get_members.
+    //    maintenance loop reads members via get_members. Empty clusters are dropped:
+    //    their centroid would keep the old dimension and nothing references them.
     let clusters = ClusterRepo::new(db.inner());
     let dims = provider.dimensions();
     let mut updated = 0;
+    let mut dropped = 0;
     for cluster in clusters.list().await? {
         let Some(id) = cluster.id.as_ref().map(record_id_to_string) else {
             continue;
         };
         let members = clusters.get_members(&id).await?;
         if members.is_empty() {
+            clusters.delete(&id).await?;
+            dropped += 1;
             continue;
         }
         let mut centroid = vec![0.0f32; dims];
@@ -95,6 +99,10 @@ pub async fn reembed(
         }
         clusters.update_centroid(&id, &centroid).await?;
         updated += 1;
+    }
+
+    if dropped > 0 {
+        tracing::info!("Dropped {dropped} empty clusters");
     }
 
     // 3. Lock last.

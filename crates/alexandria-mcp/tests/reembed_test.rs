@@ -162,3 +162,21 @@ async fn reembed_refuses_unlocked_database_with_facts() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn reembed_drops_empty_clusters() {
+    let (db, _, _, _, cid) = seed().await;
+    let clusters = ClusterRepo::new(db.inner());
+    let empty = clusters.create(None, &[0.1, 0.9]).await.unwrap();
+
+    reembed(&db, &ModelB).await.unwrap();
+
+    let ids: Vec<String> = clusters
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|c| c.id.as_ref().map(alexandria_storage::record_id_to_string))
+        .collect();
+    assert_eq!(ids, vec![cid], "empty cluster {empty} should be gone");
+}
