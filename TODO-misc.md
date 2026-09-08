@@ -41,9 +41,11 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 - **Async extraction is lost on session teardown.** Claude Code kills async hooks still running when
   the session ends (verified 2026-09-08 headless, two-turn `--input-format stream-json` session: the
   hook starts ~45 ms after the turn ends and a child still running at teardown never finishes).
-  Quitting within ~80 s of the last qualifying turn drops that turn's extraction. `SessionEnd` can't
-  help (1.5 s budget). Option if it bites: have the hook `setsid` a fully detached `claude -p` child
-  so the call outlives the session; needs its own test.
+  Done 2026-09-08: the hook re-execs itself with `setsid -f` right after reading stdin and returns;
+  the detached copy does the wait, LLM call, and store (detaching only `claude -p` would not do, the
+  parse-and-store step runs in the script after it). Guard env `ALEXANDRIA_DETACHED`; `test.sh` sets
+  it to run inline and has one fork check. Re-verified headless: a 10 s stub finished 11 s after the
+  session exited. Stderr of the detached copy goes to `$XDG_RUNTIME_DIR/alexandria/extract.log`.
 - **Stop fires before the transcript has the final assistant message.** Found 2026-09-08: the hook
   read 215 lines while the turn's last assistant text was line 216 (flushed ~50 ms later), so every
   extraction ran one assistant message late and a session's last reply was never seen (the
@@ -57,6 +59,13 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 - **Installed hooks drift from the repo.** `~/.claude/hooks/alexandria-extract.sh` was found stale
   (pre-retry) on 2026-09-08 because the README says `cp`. Symlinking the three scripts from the repo
   instead would remove the step; update the README install snippet when next touched.
+- **`test.sh` `empty.sh` stub emits unquoted JSON.** Found 2026-09-08: bash `printf` turns `\"` into a
+  bare quote, so the stub prints `{memories: []}`; the "empty twice" check passes only because a parse
+  failure and an empty result look the same to the hook. Rewrite it as a quoted heredoc like the
+  other stubs when `test.sh` is next touched.
+- **`"async": true` on the Stop hook is now redundant.** The hook returns in milliseconds since it
+  detaches itself (2026-09-08), so the flag no longer buys anything. Harmless; drop it from the README
+  snippet and `settings.json` next time the install docs change.
 - **Manual in-UI checks.** Done 2026-09-08, none pending: `updatedInput` from
   `alexandria-session.sh` is honoured without a `permissionDecision` (a `store_memory` call with no
   `session_id` from a live session landed under that session); the Stop hook fires on real turns

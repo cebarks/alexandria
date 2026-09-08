@@ -66,7 +66,7 @@ cat >"$(dirname "$0")/prompt.txt"; n=$(( $(cat "$(dirname "$0")/calls" 2>/dev/nu
 printf '```json\n{"memories":[{"content":"We decided to use SurrealKV because it needs no external process","tags":["decision"]},{"content":""}]}\n```\nNothing else worth keeping.\n'
 STUB
 chmod +x "$td/stub.sh"
-export ALEXANDRIA_EXTRACT_CMD="$td/stub.sh" ALEXANDRIA_EXTRACT_MIN_CHARS=10
+export ALEXANDRIA_EXTRACT_CMD="$td/stub.sh" ALEXANDRIA_EXTRACT_MIN_CHARS=10 ALEXANDRIA_DETACHED=1   # run inline: assertions below are synchronous
 stop() { jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:false}' | ./alexandria-extract.sh; }
 stop
 grep -q '^\[User\]: which storage engine' "$td/prompt.txt"
@@ -88,4 +88,20 @@ printf '#!/usr/bin/env bash\necho "$(( $(cat "$(dirname "$0")/calls2" 2>/dev/nul
 jq -cn '{type:"user",message:{content:"purely tactical chatter, nothing durable here"}}' >>"$td/t.jsonl"
 ALEXANDRIA_EXTRACT_CMD="$td/empty.sh" stop; [ "$(cat "$td/calls2")" = 2 ]
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("extracted"))] | length')" = 1 ]
+# Detach: without ALEXANDRIA_DETACHED the hook returns at once; the work finishes in a detached copy.
+cat >"$td/slow.sh" <<'STUB'
+#!/usr/bin/env bash
+sleep 2; echo '{"memories":[{"content":"Detached extraction outlives the hook","tags":[]}]}'
+STUB
+chmod +x "$td/slow.sh"
+jq -cn '{type:"user",message:{content:"enough new text that the marker advances again"}}' >>"$td/t.jsonl"
+start=$SECONDS
+ALEXANDRIA_DETACHED='' ALEXANDRIA_EXTRACT_CMD="$td/slow.sh" stop
+[ $((SECONDS - start)) -le 1 ]
+found=
+for _ in $(seq 20); do
+  ./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq -e '.memories[] | select(.content == "Detached extraction outlives the hook")' >/dev/null && { found=1; break; }
+  sleep 0.5
+done
+[ -n "$found" ]
 echo OK

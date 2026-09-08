@@ -14,6 +14,7 @@
 #   ALEXANDRIA_EXTRACT_MIN_CHARS   default 1500; new text below this is deferred to a later turn
 #   ALEXANDRIA_EXTRACT_CMD         override the LLM command (reads prompt on stdin, prints JSON); tests use a stub
 #   ALEXANDRIA_HOOK_CHILD          set by this hook on the `claude -p` child; every hook exits at once
+#   ALEXANDRIA_DETACHED            set by this hook on its detached copy; tests set it to run inline
 set -uo pipefail
 [ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
 [ "${ALEXANDRIA_AUTO_STORE:-}" != "off" ] || exit 0
@@ -23,6 +24,11 @@ MIN_CHARS="${ALEXANDRIA_EXTRACT_MIN_CHARS:-1500}"
 CMD="${ALEXANDRIA_EXTRACT_CMD:-claude -p --model ${ALEXANDRIA_EXTRACT_MODEL:-haiku} --output-format text}"
 
 input=$(cat)
+# Claude Code kills hooks still running at session teardown, which would drop the last turn's
+# extraction (15-80 s of LLM call). Re-exec detached: own session and process group, no inherited
+# pipes, so neither a group kill nor pipe closure reaches it. The caller returns at once.
+log="${XDG_RUNTIME_DIR:-/tmp}/alexandria/extract.log"
+[ -n "${ALEXANDRIA_DETACHED:-}" ] || { mkdir -p "${log%/*}"; ALEXANDRIA_DETACHED=1 setsid -f "$0" <<<"$input" >/dev/null 2>>"$log"; exit 0; }
 [ "$(jq -r '.stop_hook_active // false' <<<"$input")" = false ] || exit 0
 session=$(jq -r '.session_id // ""' <<<"$input")
 transcript=$(jq -r '.transcript_path // ""' <<<"$input")
