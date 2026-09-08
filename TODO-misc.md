@@ -49,17 +49,17 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   `system_config` table has facts and no lock; `migrate-embeddings` would say "just start the
   server" and the next boot stamps the current model over old vectors. Guard: if there are facts
   and no lock, say so instead. Almost certainly nonexistent in the wild.
-- [ ] **`--help` output is preceded by a tracing INFO line.** `tracing_subscriber::fmt::init()` and the
+- [x] **`--help` output is preceded by a tracing INFO line.** Done 2026-09-08 (ed923ee). `tracing_subscriber::fmt::init()` and the
   "Alexandria v0.2 starting..." log run before argument parsing (2026-09-08), so `alexandria --help`
   prints a log line to stderr before the usage. Cosmetic; move the subscriber init below the arg
   match if it bothers anyone.
-- [ ] **Pooling-config warn text** in `candle.rs` says "no 1_Pooling/config.json" even when the cause
+- [x] **Pooling-config warn text** (done 2026-09-08, 843f325) in `candle.rs` says "no 1_Pooling/config.json" even when the cause
   was a network failure; the real cause is only in the interpolated `{e}`.
 - [ ] **Spec defect: threshold-derivation rule has no valid solution when `nonhit_p99 > hit_min`.**
   The design spec's `retrieve.min_similarity` rule (and its midpoint fallback) lands above `hit_min`
   on this corpus (0.373 vs 0.338), so any derived floor cuts a true hit. Rewrite the rule before the
   next model bench (see `docs/plans/2026-09-08-embedding-model-swap-measurements.md`).
-- [ ] **`CLAUDE.md` says `record_id_to_string()` lives in `alexandria-mcp/src/server.rs`.** It lives
+- [x] **`CLAUDE.md` says `record_id_to_string()` lives in `alexandria-mcp/src/server.rs`.** Fixed 2026-09-08 (4f2d961). It lives
   in `alexandria-storage/src/lib.rs` and `server.rs` only re-exports it. Fix the note.
 - [ ] **Test gaps, low priority.** No test asserts CLS output differs from mean output for the same
   model; the `reembed` centroid test uses a constant fake vector so it cannot distinguish mean from
@@ -81,7 +81,7 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   `unsafe_code = "forbid"`. For MiniLM (~90 MB) the buffer plus the built tensors coexist briefly at
   boot, then the buffer drops. Revisit only if a much larger model is adopted; the escape hatch is a
   `#[allow(unsafe_code)]` on that one call plus `from_mmaped_safetensors`.
-- [ ] **`ALEXANDRIA_EMBEDDING_DEVICE` env override has no test.** Noticed 2026-09-08 while moving the
+- [x] **`ALEXANDRIA_EMBEDDING_DEVICE` env override has no test.** Done 2026-09-08 (fc582e0). Noticed 2026-09-08 while moving the
   config tests off process env; the other five overrides are covered by `test_env_overrides` /
   `test_server_env_overrides`, this one is not. One-line addition to `test_env_overrides`.
 
