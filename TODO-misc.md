@@ -70,6 +70,11 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 - [x] **Test gaps, low priority.** Done 2026-09-08 (d4bc3eb): CLS-vs-mean unit test in `candle.rs`
   (loads the real MiniLM, slow like the other provider tests), per-text fake vectors in the `reembed`
   centroid test, a `Done { 0, 0 }` test, and an order-independent `all_ids_and_content` assertion.
+- [-] **`alexandria-pipeline` unit tests now need the real model** (2026-09-08, d4bc3eb). The CLS-vs-mean
+  test sits in `candle.rs` under `#[cfg(test)]` because it flips the private pooling flag, so
+  `cargo test -p alexandria-pipeline --lib` downloads MiniLM on a cold cache where before only the
+  `tests/` integration tests did. Accepted; if it bothers anyone, expose a test-only constructor and
+  move the test to `tests/embedding_test.rs` with the other slow ones.
 - [ ] **Server boot stamps the lock over an unlocked corpus.** Companion to the guard above (2026-09-08):
   `migrate-embeddings` refuses, but a normal start with facts present and no lock still writes the
   configured model as the lock without checking that the stored vectors came from it. Same
