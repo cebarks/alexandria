@@ -11,12 +11,6 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   asymmetric retrieval model (e.g. an msmarco/bge/e5 family model) would separate real
   matches from noise far better. Blocked on: model is locked on first boot, so switching
   the default needs a migration/re-embed story.
-- **Pi auto-recall default `min_similarity = 0.58`** (`contrib/pi`) is too high. Measured
-  2026-09-08 on MiniLM with synthetic pairs: question-vs-matching-statement scores 0.40–0.65,
-  unrelated memories 0.07–0.40. The Claude Code hook now defaults to the measured `0.35`;
-  the Pi code and docs are annotated with that recommendation but deliberately left at `0.58`.
-  Change `contrib/pi/extensions/alexandria-auto-recall/src/config.ts` and the three Pi doc
-  tables when Pi is next touched.
 
 ## Server
 
@@ -40,8 +34,16 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   regardless of session size; the Rust-side filter and sort are gone.
 - **`get_memories` tiebreak on equal `created_at` is unspecified.** After the 2026-09-08 rewrite the
   ordering comes from `ORDER BY created_at`; the old Rust stable sort preserved edge order for facts
-  created in the same instant. Only matters for bulk inserts within one tick (e.g. `import_document`
-  chunks landing in the same session). Add `, id` as a secondary key if chunk order ever looks shuffled.
+  created in the same instant. Closed 2026-09-08, not an issue: `import_document` takes no `session_id`
+  and never creates a session edge, so the only writer of session facts is `store_memory`, one fact
+  per MCP call with an embedding round trip between them, and `created_at` is `time::now()` at
+  nanosecond precision. Ties do not occur. A `, id` secondary key would also not restore insertion
+  order (fact ids are random), only make ties stable. Revisit if a bulk path ever writes several
+  session facts in one query; use a sequence field then, not `id`.
+- **`import_document` chunks are never grouped under a session.** Noticed 2026-09-08: `ImportDocumentParams`
+  has no `session_id`, so imported chunks are not reachable via `get_session` or session-scoped
+  `retrieve_memories`, unlike `store_memory`. Add the param and the `add_memory` edge per chunk if
+  session-scoped review of imported material is ever wanted.
 
 ## Claude Code integration
 
