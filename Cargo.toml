@@ -51,7 +51,7 @@ dirs = "7"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-base64 = "0.22"
+base64 = "0.23"
 candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"
