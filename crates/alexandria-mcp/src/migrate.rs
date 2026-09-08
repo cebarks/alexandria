@@ -26,8 +26,18 @@ pub async fn reembed(
     provider: &dyn EmbeddingProvider,
 ) -> anyhow::Result<ReembedOutcome> {
     let new_model = provider.model_id();
+    let memories = MemoryRepo::new(db.inner());
     match system_config::get_config(db.inner(), "embedding_model").await? {
         None => {
+            // A database from before the lock existed has facts but no lock; stamping
+            // the new model over them would silently mix vector spaces.
+            let facts = memories.count(None, None, true).await?;
+            ensure!(
+                facts == 0,
+                "no embedding lock but {facts} fact(s) exist; the database predates the lock. \
+                 Start the server once with config naming the model that produced them, \
+                 then rerun"
+            );
             return Ok(ReembedOutcome::Skipped(
                 "no embedding lock found (fresh database); just start the server".into(),
             ));
@@ -39,7 +49,6 @@ pub async fn reembed(
     }
 
     // 1. Facts, deleted ones included.
-    let memories = MemoryRepo::new(db.inner());
     let rows = memories.all_ids_and_content().await?;
     let total = rows.len();
     let mut done = 0;

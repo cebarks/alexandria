@@ -137,3 +137,28 @@ async fn reembed_is_noop_on_fresh_database() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn reembed_refuses_unlocked_database_with_facts() {
+    let db = Database::connect_embedded().await.unwrap();
+    alexandria_storage::schema::migrate(db.inner())
+        .await
+        .unwrap();
+    let memories = MemoryRepo::new(db.inner());
+    let id = memories
+        .create_fact("pre-lock", 0.5, &[0.6, 0.8], &[])
+        .await
+        .unwrap();
+
+    let err = reembed(&db, &ModelB).await.unwrap_err();
+    assert!(err.to_string().contains("1 fact"), "{err}");
+
+    let fact = memories.get_fact(&id).await.unwrap().unwrap();
+    assert_eq!(fact.embedding, vec![0.6, 0.8], "untouched");
+    assert!(
+        system_config::get_config(db.inner(), "embedding_model")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
