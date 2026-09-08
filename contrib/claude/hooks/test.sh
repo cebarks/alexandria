@@ -52,6 +52,10 @@ out=$(jq -cn '{session_id:"sess-test-123",tool_name:"mcp__alexandria__store_memo
 [ -z "$(jq -cn '{session_id:"s",tool_input:{content:"x",session_id:"already"}}' | ./alexandria-session.sh)" ]
 # Garbage stdin never blocks the tool call.
 [ -z "$(echo 'not json' | ./alexandria-session.sh)" ]
+# Session hook is generic over tool_input: import_document payload gets the same treatment.
+out=$(jq -cn '{session_id:"sess-test-123",tool_name:"mcp__alexandria__import_document",tool_input:{content:"doc text",mode:"chunk"}}' | ./alexandria-session.sh)
+[ "$(jq -r '.hookSpecificOutput.updatedInput.session_id' <<<"$out")" = "sess-test-123" ]
+[ "$(jq -r '.hookSpecificOutput.updatedInput.mode' <<<"$out")" = "chunk" ]
 # Extract hook: fake transcript + stub LLM, incremental marker, extracted tag.
 td=$(mktemp -d); trap 'cleanup; rm -rf "$XDG_RUNTIME_DIR" "$td"' EXIT
 jq -cn '{type:"user",message:{content:"<local-command-caveat>ignore me</local-command-caveat>"}}

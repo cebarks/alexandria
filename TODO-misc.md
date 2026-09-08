@@ -55,10 +55,11 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 - **`raw` record carries no session.** The 2026-09-08 `import_document` session linkage attaches
   the chunks only; the `raw` document record is reachable from them via `extracted_from` but has no
   session edge of its own. Add one if a session view ever needs the source document directly.
-- **Widened session-hook matcher is untested.** `contrib/claude/hooks/test.sh` exercises
+- **Widened session-hook matcher is untested.** `contrib/claude/hooks/test.sh` exercised
   `alexandria-session.sh` with a `store_memory` payload only; the `import_document` path relies on
-  the script being generic over `tool_input`. Add a second payload case if the script ever grows
-  tool-specific logic.
+  the script being generic over `tool_input`. Done 2026-09-08: added an `import_document`-shaped
+  payload case (`tool_name` + `content`/`mode` fields, no `session_id`) asserting the same injection
+  behavior; `alexandria-session.sh` never reads `tool_name` so no script change was needed.
 
 ## Claude Code integration
 
