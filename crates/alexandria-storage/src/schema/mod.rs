@@ -21,6 +21,9 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     ),
 ];
 
+/// Version a fully migrated database reports in `system_config.schema_version`.
+pub const LATEST_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
+
 /// Run all pending migrations. Safe to call on every startup.
 ///
 /// On a fresh database (no system_config table), runs all migrations from v001.

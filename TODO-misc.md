@@ -22,10 +22,6 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 
 ## Server
 
-- [ ] **`tests/migration_test.rs` hardcodes the latest schema version.** Noticed 2026-09-08 while adding
-  v006: two asserts compare `schema_version` to a literal string and must be bumped with every new
-  migration. `MIGRATIONS` is private to `schema/mod.rs`; exposing a `LATEST_VERSION` const would
-  remove the churn. Cosmetic, do it the next time a migration lands.
 - [ ] **Session find-or-create is duplicated.** `do_store_memory` and `do_import_document` (2026-09-08)
   each carry the same find-by-external-id, create-if-missing, re-find, unwrap-record-id block. Two
   copies is tolerable; on a third caller move it into `SessionRepo::find_or_create` returning the
@@ -41,11 +37,11 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   `cp -a` the data dir to `/tmp`, run it there with `ALEXANDRIA_DATA_DIR` pointed at the copy and
   `ALEXANDRIA_EMBEDDING_MODEL=sentence-transformers/multi-qa-MiniLM-L6-cos-v1`, then migrate the copy
   back to MiniLM. Throw the copy away.
-- [ ] **`migrate.rs` rough edges.** `&vecs[0]` is an unchecked index on provider output
-  (`vecs.first().context(..)?`); `ReembedOutcome` derives no `Debug`; one `embed()` call per fact, no
-  batching (wall-clock only); `list_with_counts()` is called and the counts discarded, then
-  `get_members` re-fetched (2N queries). Module comment at lines 2-3 says a partial failure "keeps
-  refusing to boot", which is only true while config still names the new model.
+- [ ] **`migrate.rs` batch size is a hardcoded 32** (2026-09-08, added with fact batching). Fine for
+  MiniLM on CPU; make it a config knob only if a larger model or GPU makes a different size matter.
+- [ ] **`ClusterRepo::list_with_counts` swallows `get_members` errors** (`unwrap_or(0)`), so a failing
+  membership query reads as an empty cluster. Pre-existing; noticed 2026-09-08 while splitting out
+  `ClusterRepo::list()`. Propagate the error if a caller ever needs to tell "empty" from "broken".
 - [ ] **Empty clusters keep a stale-dimension centroid** after a dimension-changing migration.
   `engine::search::cosine_similarity` only `debug_assert`s equal lengths, so release builds would
   silently score a truncated dot product. Near-unreachable (split/merge delete their originals).
@@ -53,8 +49,10 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   `system_config` table has facts and no lock; `migrate-embeddings` would say "just start the
   server" and the next boot stamps the current model over old vectors. Guard: if there are facts
   and no lock, say so instead. Almost certainly nonexistent in the wild.
-- [ ] **CLI ignores trailing arguments.** `alexandria migrate-embeddings --dry-run` runs a real
-  migration (`args().nth(1)`). Reject `args().count() > 2`. `--help` errors rather than prints usage.
+- [ ] **`--help` output is preceded by a tracing INFO line.** `tracing_subscriber::fmt::init()` and the
+  "Alexandria v0.2 starting..." log run before argument parsing (2026-09-08), so `alexandria --help`
+  prints a log line to stderr before the usage. Cosmetic; move the subscriber init below the arg
+  match if it bothers anyone.
 - [ ] **Pooling-config warn text** in `candle.rs` says "no 1_Pooling/config.json" even when the cause
   was a network failure; the real cause is only in the interpolated `{e}`.
 - [ ] **Spec defect: threshold-derivation rule has no valid solution when `nonhit_p99 > hit_min`.**

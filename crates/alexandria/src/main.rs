@@ -14,13 +14,16 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("Alexandria v0.2 starting...");
 
-    if let Some(arg) = std::env::args().nth(1) {
-        return match arg.as_str() {
-            "migrate-embeddings" => migrate_embeddings().await,
-            other => {
-                anyhow::bail!("unknown argument `{other}`. Usage: alexandria [migrate-embeddings]")
-            }
-        };
+    const USAGE: &str = "Usage: alexandria [migrate-embeddings | --help]";
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] => {}
+        ["migrate-embeddings"] => return migrate_embeddings().await,
+        ["--help"] | ["-h"] => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        _ => anyhow::bail!("unexpected arguments {args:?}. {USAGE}"),
     }
 
     // 1. Load configuration

@@ -13,9 +13,8 @@ async fn test_fresh_db_runs_all_migrations() {
         .unwrap();
     let rows: Vec<serde_json::Value> = result.take(0).unwrap();
     assert_eq!(rows.len(), 1);
-    // Version should be "6" (latest migration)
     let version = rows[0]["value"].as_str().unwrap();
-    assert_eq!(version, "6");
+    assert_eq!(version, schema::LATEST_VERSION.to_string());
 }
 
 #[tokio::test]
@@ -26,14 +25,16 @@ async fn test_migrate_idempotent() {
     schema::migrate(db.inner()).await.unwrap();
     schema::migrate(db.inner()).await.unwrap();
 
-    // Still at version 5
     let mut result = db
         .inner()
         .query("SELECT * FROM system_config WHERE key = 'schema_version'")
         .await
         .unwrap();
     let rows: Vec<serde_json::Value> = result.take(0).unwrap();
-    assert_eq!(rows[0]["value"].as_str().unwrap(), "6");
+    assert_eq!(
+        rows[0]["value"].as_str().unwrap(),
+        schema::LATEST_VERSION.to_string()
+    );
 }
 
 #[tokio::test]

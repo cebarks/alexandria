@@ -258,9 +258,13 @@ impl<'a> ClusterRepo<'a> {
         Ok(row.map(|r| r.total as usize).unwrap_or(0))
     }
 
-    pub async fn list_with_counts(&self) -> Result<Vec<(Cluster, usize)>> {
+    pub async fn list(&self) -> Result<Vec<Cluster>> {
         let mut response = self.db.query("SELECT * FROM cluster").await?;
-        let clusters: Vec<Cluster> = response.take(0)?;
+        Ok(response.take(0)?)
+    }
+
+    pub async fn list_with_counts(&self) -> Result<Vec<(Cluster, usize)>> {
+        let clusters = self.list().await?;
 
         let mut result = Vec::with_capacity(clusters.len());
         for cluster in clusters {
