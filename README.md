@@ -65,10 +65,13 @@ three levels:
 3. **Optional auto-recall extension** — [`contrib/pi/extensions/alexandria-auto-recall/`](contrib/pi/extensions/alexandria-auto-recall/)
    hooks `before_agent_start` to call `retrieve_memories` on every prompt automatically and inject
    hits above a similarity threshold into context, so the agent never has to decide to check
-   memory. This trades latency and potential noise for guaranteed recall.
+   memory. This trades latency and potential noise for guaranteed recall. The Claude Code
+   equivalent is a `UserPromptSubmit` hook at
+   [`contrib/claude/hooks/alexandria-recall.sh`](contrib/claude/hooks/alexandria-recall.sh).
 
-Items 2 and 3 are client-side pi integrations, not part of the MCP server itself — see
-[`contrib/pi/README.md`](contrib/pi/README.md) for what they are and how to install them.
+Items 2 and 3 are client-side integrations, not part of the MCP server itself — see
+[`contrib/pi/README.md`](contrib/pi/README.md) and [`contrib/claude/README.md`](contrib/claude/README.md)
+for what they are and how to install them.
 
 ## Debug Web UI
 
@@ -122,6 +125,8 @@ journalctl --user -u alexandria -f  # tail logs
 claude mcp add --transport http --scope user alexandria http://127.0.0.1:3000/mcp
 # optional: client-side skill (same as contrib/pi, with Claude Code's mcp__alexandria__<tool> names)
 cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
+# optional: auto-recall hook (see contrib/claude/README.md for the settings.json snippet)
+cp contrib/claude/hooks/alexandria-recall.sh ~/.claude/hooks/
 ```
 
 **Generic (any MCP client):**

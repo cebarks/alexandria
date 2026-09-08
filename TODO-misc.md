@@ -14,17 +14,29 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 - **Auto-recall client default `min_similarity = 0.58`** (`contrib/pi`, `docs/configuration.md`)
   was chosen under the same "genuine matches score 0.6+" assumption that turned out wrong.
   With MiniLM that threshold will almost never inject anything for question-style prompts.
-  Re-measure and lower, or fix alongside the model change above.
+  Re-measure and lower, or fix alongside the model change above. The Claude Code hook
+  (`contrib/claude/hooks/alexandria-recall.sh`) defaults to `0.15`, which is an unmeasured guess
+  in the other direction — settle both on the same measured number.
 
 ## Claude Code integration
 
-- **No auto-recall equivalent for Claude Code.** The Pi extension hooks
-  `before_agent_start`. The Claude Code analogue is a `UserPromptSubmit` hook that POSTs to
-  `/mcp` and prints hits to stdout. Only worth doing if the server `instructions` + skill
-  prove insufficient in practice.
-- **`session_id` is never populated from Claude Code.** Nothing on the client side passes a
-  session identifier to `store_memory`, so `get_session` / `finalize_session` are unused
-  there. A hook could inject the Claude Code session id if per-session grouping matters.
+- **No auto-store for Claude Code.** `contrib/claude/hooks/alexandria-recall.sh` covers
+  auto-recall and session_id injection, but the Pi extension's heuristic detectors
+  (correction/preference/error-resolution) and session-end LLM extraction have no Claude Code
+  equivalent. Candidates: a `Stop`/`SessionEnd` hook for extraction, `UserPromptSubmit` for the
+  detectors.
+- **Recall hook reads env vars only, not `client.toml`.** Bash has no TOML parser; the Pi
+  extension honours `$XDG_CONFIG_HOME/alexandria/client.toml`. Revisit if the hook grows enough
+  config to matter.
+- **Recall hook `session_id` is advisory.** The hook can only print "pass this session_id to
+  store_memory"; whether the agent actually does so is up to the model. A `PreToolUse` hook on
+  `mcp__alexandria__store_memory` could inject it into the call itself.
+- **Recall hook failures are silent to the user.** Errors go to stderr only; Claude Code shows
+  nothing unless hook output is inspected. Pi surfaces a warning notification. No obvious
+  Claude Code equivalent short of injecting a "memory unavailable" line into context.
+- **Recall hook does a full MCP handshake per prompt.** Four localhost round trips
+  (initialize, initialized, tools/call, DELETE) plus one query embedding, every prompt. Fine at
+  human typing speed; revisit only if latency becomes noticeable.
 
 ## Minor
 
