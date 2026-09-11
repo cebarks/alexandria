@@ -26,7 +26,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 
 ## Architecture Boundaries
 
-- **storage** owns all DB access — no raw SurrealDB queries outside this crate (the `alexandria-mcp` handlers still issue some inline queries directly; don't add new ones without reason)
+- **storage** owns all DB access — no raw SurrealDB queries outside this crate (the `alexandria-mcp` `provenance` create in `do_store_memory` is the one remaining inline query and is maintained elsewhere; don't add new ones)
 - **engine** is pure algorithms — no DB, no async (except test helpers). Takes data in, returns results.
 - **pipeline** owns embedding — abstracts over providers via `EmbeddingProvider` trait
 - **mcp** wires tools to engine+storage — the only crate that knows about both. Also owns the debug web UI (`alexandria-mcp/src/debug/`), which is Axum handlers over the same repos, plus `crates/alexandria-mcp/templates/` (askama, compiled at build time) and `crates/alexandria-mcp/assets/` (vendored third-party JS, `include_bytes!`). Both are **compile-time contracts**: a missing template or asset file is a build error, not a runtime 404.
