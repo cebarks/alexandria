@@ -449,6 +449,55 @@ copy of the data dir, loaded `SELECT * FROM fact WHERE deleted = false`, ran
 `cosine_similarity` over all pairs, and printed the histogram plus every pair at or above 0.85
 with both contents, which is what makes the false positives readable.
 
+### Lexical search (A4, 1173 facts)
+
+Finding A4 in `docs/performance-and-ability-findings.md` proposed a BM25 full-text index on
+`fact.content` fused with cosine by reciprocal-rank fusion, on the argument that a sentence model
+is weak on identifiers, and said to ship only if `top1` or `mean_rank` move. On 2026-09-10 it was
+measured on a copy of the live corpus (1173 active facts, 256-token vectors). The throwaway
+defined `DEFINE ANALYZER ... TOKENIZERS blank, class, punct FILTERS lowercase, ascii,
+snowball(english)` and `DEFINE INDEX ... FULLTEXT ANALYZER ... BM25` on the copy, ran
+`content @1,OR@ $q ORDER BY search::score(1) DESC LIMIT 50` per question, and fused that list with
+the exact-cosine top 50 by RRF (k = 60), with the BM25 list's weight swept. A target absent from the
+fused top 50 counts as rank 51.
+
+| set | cosine mean_rank | fused, BM25 weight 1.0 | 0.5 | 0.25 |
+|---|---|---|---|---|
+| 20 frozen questions | 3.35 | 6.00 | 4.40 | 3.90 |
+| 7 identifier probes | 1.57 | 1.14 | 1.29 | 1.29 |
+
+`top1` on the frozen set is 12/20 on cosine and never higher fused (11/20 at weights 1.0 and 0.5,
+12/20 at 0.25).
+
+**BM25 misses the questions cosine gets wrong.** Four targets are absent from the BM25 top 50
+outright (q1 at cosine rank 8, q9 at 1, q11 at 13, q12 at 17): they share no stemmed token with
+their question. Fusion then pushes them down because every competitor scores
+from two lists. q9 (`systemd` flag gotcha) falls from 1 to 11 at weight 1.0 and to 9 at 0.25,
+and it is a delivered hit at cosine 0.556.
+
+**Every target fusion rescues is under the client threshold.** q4 (7 to 3–5), q10 (2 to 1–2),
+q15 (2 to 1) and q20 (4 to 3) move up, but their target cosines are 0.369, 0.368, 0.410 and
+0.429, all under `T = 0.45`, so the client drops them whatever the server's order.
+
+**MiniLM already handles identifiers.** Seven throwaway probes were written around a unique
+token in a real fact: a rustc error code (`E0423`), env var names (`ALEXANDRIA_EXTRACT_FLUSH_WAIT`,
+`ALEXANDRIA_MARKER_MAX_AGE_DAYS`, `ALEXANDRIA_DETACHED`), CLI flags (`--events-backend=none`,
+`--insecure-no-password`) and a Rust path (`Operator::SOURCE`). Cosine alone ranked every target
+1, 1, 3, 1, 3, 1, 1, all at or above 0.487, so all seven are delivered. BM25 ranked them 1, 1, 1,
+1, 2, 1, 1. Fusion turned the two rank-3s into 2 and 1. That is the whole gain, on the shape of
+question the finding was written for. Three further probes were dropped because their token
+appeared in more than one fact.
+
+**Decision.** Not shipped. The cost side is small — SurrealDB 3.2 ships the analyzer, the
+`FULLTEXT ... BM25` index, the `@@` operator, `search::score` and a built-in `search::rrf`, none
+feature-gated — but there is no benefit to buy: the hard questions are semantic misses with no
+lexical hook, the identifier questions are already found, and shipping would also have to change
+what `similarity` means on the wire or the client threshold discards every rescue. Rerun this
+before revisiting: the probe was a `bench-lexical` subcommand on the binary that read the corpus
+through `MemoryRepo::list`, defined the two objects above on the copy, and printed cosine, BM25 and
+fused rank per question beside the target's cosine. Untried: `AND` matching and a phrase boost;
+neither helps a target that shares no token with its question. 27 questions is a small sample.
+
 ## Metric definitions
 
 - **rank** — position of the target fact when the whole corpus is sorted by cosine descending
