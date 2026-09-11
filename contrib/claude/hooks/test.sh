@@ -68,11 +68,12 @@ jq -cn '{type:"user",message:{content:"<local-command-caveat>ignore me</local-co
         ,{type:"user",message:{content:"which storage engine should we pick?"}}
         ,{type:"assistant",message:{content:[{type:"thinking",thinking:"hmm"},{type:"tool_use",name:"Bash"}]}}
         ,{type:"user",message:{content:[{type:"tool_result",content:"ok"}]}}
+        ,{type:"user",message:{content:[{type:"tool_result",is_error:true,content:"<tool_use_error>File has not been read yet.</tool_use_error>"}]}}
+        ,{type:"user",message:{content:[{type:"tool_result",is_error:true,content:[{type:"text",text:"Exit code 101\nerror[E0433]: failed to resolve: use of undeclared crate"}]}]}}
         ,{type:"assistant",message:{content:[{type:"text",text:"We decided to use SurrealKV because it needs no external process."}]}}' >"$td/t.jsonl"
 cat >"$td/stub.sh" <<'STUB'
 #!/usr/bin/env bash
-cat >"$(dirname "$0")/prompt.txt"; n=$(( $(cat "$(dirname "$0")/calls" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$(dirname "$0")/calls"
-[ "$n" -gt 1 ] || { echo '{"memories": []}'; exit 0; }   # first call empty: hook must retry once
+cat >"$(dirname "$0")/prompt.txt"; echo "$(( $(cat "$(dirname "$0")/calls" 2>/dev/null || echo 0) + 1 ))" >"$(dirname "$0")/calls"
 printf '```json\n{"memories":[{"content":"We decided to use SurrealKV because it needs no external process","tags":["decision"]},{"content":""}]}\n```\nNothing else worth keeping.\n'
 STUB
 chmod +x "$td/stub.sh"
@@ -81,22 +82,24 @@ stop() { jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript
 stop
 grep -q '^\[User\]: which storage engine' "$td/prompt.txt"
 grep -q '^\[Assistant\]: We decided' "$td/prompt.txt"
-! grep -q 'ignore me\|hmm\|tool_result' "$td/prompt.txt"
+grep -q 'ignore me\|hmm\|tool_result' "$td/prompt.txt" && exit 1   # `! cmd` never trips set -e
+grep -q '^\[Tool error\]: Exit code 101' "$td/prompt.txt"   # is_error results are fed in; harness <tool_use_error> ones are not
+grep -q 'tool_use_error\|has not been read' "$td/prompt.txt" && exit 1
 grep -q 'User correction: jj instead of git' "$td/prompt.txt"   # already-stored block
 got=$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq -c '[.memories[] | select(.tags|index("extracted")) | {content,tags}]')
 echo "$got"
 [ "$got" = '[{"content":"We decided to use SurrealKV because it needs no external process","tags":["decision","extracted"]}]' ]
 # No new transcript lines: LLM not called again. New short line: deferred (marker unchanged).
-stop; [ "$(cat "$td/calls")" = 2 ]
+stop; [ "$(cat "$td/calls")" = 1 ]
 jq -cn '{type:"user",message:{content:"ok"}}' >>"$td/t.jsonl"
-ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 2 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 5 ]
+ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 7 ]
 # stop_hook_active / child guard: no call.
 jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ./alexandria-extract.sh
-[ "$(cat "$td/calls")" = 2 ]
+[ "$(cat "$td/calls")" = 1 ]
 # Headless session: no call, marker untouched.
 jq -cn '{type:"user",message:{content:"headless chatter that must not be extracted"}}' >>"$td/t.jsonl"
-CLAUDE_CODE_ENTRYPOINT=sdk-py stop; [ "$(cat "$td/calls")" = 2 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 5 ]
-# Empty twice: exactly two calls, nothing stored.
+CLAUDE_CODE_ENTRYPOINT=sdk-py stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 7 ]
+# Empty result: exactly one call, nothing stored.
 cat >"$td/empty.sh" <<'STUB'
 #!/usr/bin/env bash
 echo "$(( $(cat "$(dirname "$0")/calls2" 2>/dev/null || echo 0) + 1 ))" >"$(dirname "$0")/calls2"
@@ -104,7 +107,7 @@ echo '{"memories": []}'
 STUB
 chmod +x "$td/empty.sh"
 jq -cn '{type:"user",message:{content:"purely tactical chatter, nothing durable here"}}' >>"$td/t.jsonl"
-ALEXANDRIA_EXTRACT_CMD="$td/empty.sh" stop; [ "$(cat "$td/calls2")" = 2 ]
+ALEXANDRIA_EXTRACT_CMD="$td/empty.sh" stop; [ "$(cat "$td/calls2")" = 1 ]
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("extracted"))] | length')" = 1 ]
 # Detach: without ALEXANDRIA_DETACHED the hook returns at once; the work finishes in a detached copy.
 cat >"$td/slow.sh" <<'STUB'

@@ -17,6 +17,7 @@
 #   ALEXANDRIA_HOOK_CHILD          set by this hook on the `claude -p` child; every hook exits at once
 #   ALEXANDRIA_DETACHED            set by this hook on its detached copy; tests set it to run inline
 set -uo pipefail
+input=$(cat)   # before any guard: exiting with stdin unread can SIGPIPE the writer (test.sh pipes jq in)
 [ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
 # Headless sessions (`claude -p`, Agent SDK) inherit CLAUDE_CODE_ENTRYPOINT=sdk-*: auto-store is off
 # there unless ALEXANDRIA_AUTO_STORE=on, so scripted experiments never land in the real database.
@@ -27,7 +28,6 @@ MCP="$(dirname "$(readlink -f "$0")")/alexandria-recall.sh"   # debug CLI mode =
 MIN_CHARS="${ALEXANDRIA_EXTRACT_MIN_CHARS:-1500}"
 CMD="${ALEXANDRIA_EXTRACT_CMD:-claude -p --model ${ALEXANDRIA_EXTRACT_MODEL:-haiku} --output-format text}"
 
-input=$(cat)
 # Claude Code kills hooks still running at session teardown, which would drop the last turn's
 # extraction (15-80 s of LLM call). Re-exec detached: own session and process group, no inherited
 # pipes, so neither a group kill nor pipe closure reaches it. The caller returns at once.
@@ -47,14 +47,19 @@ done_lines=$(cat "$marker" 2>/dev/null || echo 0)
 total=$(wc -l <"$transcript")
 [ "$total" -gt "$done_lines" ] || exit 0
 
-# user (string or text blocks; skip tool_result-only and injected/system lines) + assistant text
+# user (string or text blocks; skip injected/system lines) + assistant text + failed tool results.
+# Errors go in so a silent fix-and-retry still shows the LLM the root cause; <tool_use_error> is the
+# harness refusing a call (file not read, old_string missing), never durable knowledge.
 text=$(tail -n +"$((done_lines + 1))" "$transcript" | jq -rR '
-  fromjson? | select(.type == "user" or .type == "assistant") | .type as $role
-  | (.message.content // "") | (if type == "string" then . else [.[]? | select(.type == "text") | .text] | join("\n") end)
-  | select(length > 0)
-  | select(startswith("<local-command") or startswith("<command-") or startswith("<system-reminder")
-           or startswith("Relevant memories retrieved automatically") | not)
-  | (if $role == "user" then "[User]: " else "[Assistant]: " end) + . + "\n"')
+  def txt: if type == "string" then . else [.[]? | select(.type == "text") | .text] | join("\n") end;
+  fromjson? | select(.type == "user" or .type == "assistant") | .type as $role | (.message.content // "")
+  | ((txt | select(length > 0)
+      | select(startswith("<local-command") or startswith("<command-") or startswith("<system-reminder")
+               or startswith("Relevant memories retrieved automatically") | not)
+      | (if $role == "user" then "[User]: " else "[Assistant]: " end) + .),
+     (.[]? | select(.type == "tool_result" and .is_error == true) | .content | txt
+      | select(startswith("<tool_use_error>") | not) | "[Tool error]: " + .[:300]))
+  | . + "\n"')
 [ ${#text} -ge "$MIN_CHARS" ] || exit 0
 [ ${#text} -le 64000 ] || text=${text: -64000}
 
@@ -103,20 +108,13 @@ Conversation:
 $text
 </conversation>"
 
-# Haiku is non-deterministic on the same prompt (measured: empty, then three good memories), so an
-# empty first attempt gets one retry within the remaining 80 s budget.
-SECONDS=0
-for attempt in 1 2; do
-  left=$((80 - SECONDS)); [ "$left" -ge 10 ] || break
-  # shellcheck disable=SC2086  # CMD is deliberately word-split
-  out=$(ALEXANDRIA_HOOK_CHILD=1 timeout "$left" $CMD <<<"$prompt" 2>/dev/null) || { echo "alexandria-extract: LLM call $attempt failed" >&2; continue; }
-  # Models often wrap the JSON in a ``` fence and add prose after it: keep the first fenced block.
-  json=$(sed -n '/^```/,/^```/{/^```/d;p}' <<<"$out"); [ -n "$json" ] || json=$out
-  mems=$(jq -c '.memories[]? | select((.content|type) == "string" and .content != "")
-    | {content, tags: ([.tags[]? | strings] + ["extracted"] | unique)}' <<<"$json" 2>/dev/null)
-  [ -z "$mems" ] || break
-done
-[ -n "${mems:-}" ] || exit 0
+# shellcheck disable=SC2086  # CMD is deliberately word-split
+out=$(ALEXANDRIA_HOOK_CHILD=1 timeout 80 $CMD <<<"$prompt" 2>/dev/null) || { echo "alexandria-extract: LLM call failed" >&2; exit 0; }
+# Models often wrap the JSON in a ``` fence and add prose after it: keep the first fenced block.
+json=$(sed -n '/^```/,/^```/{/^```/d;p}' <<<"$out"); [ -n "$json" ] || json=$out
+mems=$(jq -c '.memories[]? | select((.content|type) == "string" and .content != "")
+  | {content, tags: ([.tags[]? | strings] + ["extracted"] | unique)}' <<<"$json" 2>/dev/null)
+[ -n "$mems" ] || exit 0
 while read -r m; do
   res=$("$MCP" store_memory "$(jq -c --arg s "$session" '. + {session_id:$s}' <<<"$m")") \
     || echo "alexandria-extract: store failed: $res" >&2
