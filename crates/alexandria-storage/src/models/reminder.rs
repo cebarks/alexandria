@@ -2,6 +2,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use surrealdb::types::{RecordId, SurrealValue};
 
+/// `Reminder::schedule_kind` discriminators. Single source of truth for the
+/// string set that is also asserted by `DEFINE FIELD schedule_kind ... ASSERT
+/// $value IN [...]` in `schema/v006_reminder.surql`; writers and
+/// `alexandria_engine::reminders::spec_from_reminder` match on these constants
+/// so the two sides can't drift silently.
+pub mod schedule_kind {
+    pub const ONCE: &str = "once";
+    pub const PATTERN: &str = "pattern";
+    pub const CRON: &str = "cron";
+}
+
 /// A scheduled message. Flat storage shape; see
 /// `alexandria_engine::reminders::spec_from_reminder` for reconstruction into a
 /// validated schedule.
@@ -16,7 +27,9 @@ pub struct Reminder {
     pub prov_session_id: Option<String>,
     pub note: Option<String>,
     // Schedule: kind discriminator + kind-specific fields
-    pub schedule_kind: String, // "once" | "pattern" | "cron"
+    /// One of [`schedule_kind::ONCE`], [`schedule_kind::PATTERN`],
+    /// [`schedule_kind::CRON`].
+    pub schedule_kind: String,
     pub due_at: Option<DateTime<Utc>>,
     pub freq: Option<String>,
     pub time_of_day: Option<String>,

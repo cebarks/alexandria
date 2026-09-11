@@ -13,5 +13,5 @@ pub use heat::HeatState;
 pub use maintenance::MaintenanceLog;
 pub use memory::{Fact, RawRecord};
 pub use provenance::Provenance;
-pub use reminder::Reminder;
+pub use reminder::{schedule_kind, Reminder};
 pub use session::Session;

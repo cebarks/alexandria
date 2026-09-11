@@ -1,7 +1,8 @@
 //! Pure reminder scheduling: spec parsing/validation, next-fire computation,
 //! occurrence counting. No DB, no async — engine crate rules.
 
-use anyhow::{bail, Context, Result};
+use alexandria_storage::models::schedule_kind;
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, NaiveTime, Utc, Weekday};
 use chrono_tz::Tz;
 use cron::Schedule;
@@ -319,6 +320,86 @@ pub fn human_readable(spec: &ScheduleSpec) -> String {
     }
 }
 
+/// Reconstruct a validated spec from the flat storage row. Errors on corrupt
+/// or inconsistent rows (never panics). Every error names the row, so a caller
+/// iterating a batch (e.g. the delivery loop over `list_due`) can identify — and
+/// isolate — the single bad row instead of reporting an anonymous failure.
+///
+/// This is the row→spec direction; the spec→row mapping built by the reminder
+/// writer must stay field-for-field consistent with it (including cron
+/// normalization and the `day_of_month`/`weekdays` per-freq rules).
+pub fn spec_from_reminder(r: &alexandria_storage::models::Reminder) -> Result<ScheduleSpec> {
+    spec_from_row(r).map_err(|e| {
+        let id =
+            r.id.as_ref()
+                .map(alexandria_storage::record_id_to_string)
+                .unwrap_or_else(|| "<no id>".to_string());
+        // `{e:#}` flattens the cause chain onto one line: callers surface errors
+        // through `Display` (the MCP layer JSON-encodes `e.to_string()`), so the
+        // row id must not hide which field actually failed.
+        anyhow!("reminder {id}: {e:#}")
+    })
+}
+
+/// Kind-specific field extraction. `schedule_kind` discriminators come from
+/// [`schedule_kind`], the same constants the storage schema's `ASSERT` mirrors.
+fn spec_from_row(r: &alexandria_storage::models::Reminder) -> Result<ScheduleSpec> {
+    match r.schedule_kind.as_str() {
+        schedule_kind::ONCE => Ok(ScheduleSpec::Once {
+            due_at: r.due_at.context("once reminder missing due_at")?,
+        }),
+        schedule_kind::PATTERN => {
+            let freq = parse_freq(r.freq.as_deref().context("pattern missing freq")?)?;
+            let time = parse_time_of_day(
+                r.time_of_day
+                    .as_deref()
+                    .context("pattern missing time_of_day")?,
+            )?;
+            let weekdays: Vec<Weekday> = r
+                .weekdays
+                .iter()
+                .map(|w| parse_weekday(w).with_context(|| format!("stored weekdays entry {w:?}")))
+                .collect::<Result<Vec<_>>>()?;
+            // day_of_month is only meaningful for Monthly, but the flat row
+            // carries the column for every freq: reject junk whenever present,
+            // require a value for Monthly (guessing "the 1st" would silently
+            // misfire), and default only where the field is genuinely unused.
+            let day_of_month = match r.day_of_month {
+                Some(d) if !(1..=31).contains(&d) => bail!("day_of_month out of range: {d}"),
+                Some(d) => d as u32,
+                None if freq == Freq::Monthly => bail!("monthly pattern missing day_of_month"),
+                None => 1, // unused for Daily/Weekly; ScheduleSpec requires a concrete u32
+            };
+            // Re-run pattern validation so cross-field inconsistencies (weekly
+            // with no weekdays, daily/monthly carrying weekdays) fail here
+            // instead of later inside next_fire. day_of_month only applies to
+            // Monthly; the flat row carries a default for the other freqs.
+            pattern_to_cron(
+                freq,
+                time,
+                &weekdays,
+                (freq == Freq::Monthly).then_some(day_of_month),
+            )?;
+            Ok(ScheduleSpec::Pattern {
+                freq,
+                time,
+                weekdays,
+                day_of_month,
+            })
+        }
+        schedule_kind::CRON => {
+            let expr = r
+                .cron_expr
+                .as_deref()
+                .context("cron reminder missing cron_expr")?;
+            Ok(ScheduleSpec::Cron {
+                expr: normalize_cron(expr)?,
+            })
+        }
+        other => bail!("unknown schedule_kind {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +673,145 @@ mod tests {
             }),
             "cron '0 0 9 * * 1-5'"
         );
+    }
+
+    #[test]
+    fn spec_from_reminder_roundtrips_all_kinds() {
+        use alexandria_storage::models::Reminder;
+
+        fn base() -> Reminder {
+            Reminder {
+                id: None,
+                message: "m".into(),
+                target_project: None,
+                prov_project: None,
+                prov_session_id: None,
+                note: None,
+                schedule_kind: "once".into(),
+                due_at: None,
+                freq: None,
+                time_of_day: None,
+                weekdays: vec![],
+                day_of_month: None,
+                cron_expr: None,
+                next_due_at: None,
+                status: "pending".into(),
+                created_at: None,
+                cancelled_at: None,
+                last_delivered_at: None,
+                delivered_count: 0,
+            }
+        }
+
+        fn pattern() -> Reminder {
+            let mut r = base();
+            r.schedule_kind = schedule_kind::PATTERN.into();
+            r.time_of_day = Some("09:00".into());
+            r
+        }
+
+        let mut once = base();
+        once.due_at = Some(utc(2026, 9, 10, 15, 0));
+        assert_eq!(
+            spec_from_reminder(&once).unwrap(),
+            ScheduleSpec::Once {
+                due_at: utc(2026, 9, 10, 15, 0)
+            }
+        );
+
+        // Every field the conversion wires must come back exactly: day_of_month
+        // is the flat row's default (unused for Weekly).
+        let mut weekly = pattern();
+        weekly.freq = Some("weekly".into());
+        weekly.weekdays = vec!["fri".into()];
+        assert_eq!(
+            spec_from_reminder(&weekly).unwrap(),
+            ScheduleSpec::Pattern {
+                freq: Freq::Weekly,
+                time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+                weekdays: vec![Weekday::Fri],
+                day_of_month: 1,
+            }
+        );
+
+        let mut monthly = pattern();
+        monthly.freq = Some("monthly".into());
+        monthly.day_of_month = Some(15);
+        assert_eq!(
+            spec_from_reminder(&monthly).unwrap(),
+            ScheduleSpec::Pattern {
+                freq: Freq::Monthly,
+                time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+                weekdays: vec![],
+                day_of_month: 15,
+            }
+        );
+
+        let mut cr = base();
+        cr.schedule_kind = schedule_kind::CRON.into();
+        cr.cron_expr = Some("0 0 9 * * 1-5".into());
+        assert_eq!(
+            spec_from_reminder(&cr).unwrap(),
+            ScheduleSpec::Cron {
+                expr: "0 0 9 * * 1-5".into()
+            }
+        );
+
+        // A stored 5-field expression must come back normalized to 6 fields —
+        // `compiled_schedule` feeds `expr` straight to `Schedule::from_str`.
+        let mut five = base();
+        five.schedule_kind = schedule_kind::CRON.into();
+        five.cron_expr = Some("0 9 * * 1-5".into());
+        assert_eq!(
+            spec_from_reminder(&five).unwrap(),
+            ScheduleSpec::Cron {
+                expr: "0 0 9 * * 1-5".into()
+            }
+        );
+
+        // Corrupt row → error, not panic
+        let mut bad = base();
+        bad.schedule_kind = schedule_kind::PATTERN.into();
+        assert!(spec_from_reminder(&bad).is_err());
+
+        // Inconsistent row (weekly without weekdays) → error at conversion time,
+        // not later inside next_fire.
+        let mut no_days = pattern();
+        no_days.freq = Some("weekly".into());
+        assert!(spec_from_reminder(&no_days).is_err());
+
+        // Monthly with no day_of_month: error rather than defaulting to the 1st,
+        // which would silently misfire. Errors also name the row (id is None for
+        // an unpersisted row) while keeping the specific reason on the same line,
+        // so one corrupt row in a delivery batch is diagnosable via `to_string`.
+        let mut no_dom = pattern();
+        no_dom.freq = Some("monthly".into());
+        let err = spec_from_reminder(&no_dom).unwrap_err().to_string();
+        assert!(
+            err.contains("monthly pattern missing day_of_month"),
+            "{err}"
+        );
+        assert!(err.contains("reminder <no id>"), "{err}");
+
+        // i64 -> u32 bounds: out-of-range must error, not truncate/wrap — both
+        // for Monthly (where the value is used) and for a row carrying junk in
+        // the otherwise-unused column, which pattern_to_cron never re-checks.
+        for bad_dom in [0i64, -1, 32, i64::MAX] {
+            for (freq, weekdays) in [("monthly", vec![]), ("weekly", vec!["fri".to_string()])] {
+                let mut r = pattern();
+                r.freq = Some(freq.into());
+                r.weekdays = weekdays;
+                r.day_of_month = Some(bad_dom);
+                assert!(spec_from_reminder(&r).is_err(), "{freq} dom {bad_dom}");
+            }
+        }
+
+        // A corrupt stored weekday reads as stored-row corruption, not user input.
+        let mut bad_day = pattern();
+        bad_day.freq = Some("weekly".into());
+        bad_day.weekdays = vec!["xyz".into()];
+        let err = spec_from_reminder(&bad_day).unwrap_err().to_string();
+        assert!(err.contains("stored weekdays entry \"xyz\""), "{err}");
+        assert!(err.contains("invalid weekday"), "{err}");
     }
 }
