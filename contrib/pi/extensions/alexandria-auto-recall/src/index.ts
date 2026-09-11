@@ -68,6 +68,16 @@ function extractResultText(result: unknown): string | null {
 	return null;
 }
 
+function notifyStoreFailed(
+	ctx: { ui: { notify(message: string, level: "warning"): void } },
+	err: unknown,
+): void {
+	ctx.ui.notify(
+		`Alexandria store_memory failed (${err instanceof Error ? err.message : String(err)})`,
+		"warning",
+	);
+}
+
 export default function alexandriaExtension(pi: ExtensionAPI) {
 	// Session-scoped state — reset on each session
 	let dedupBuffer = new SessionDedupBuffer();
@@ -119,8 +129,8 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 			for (const detection of detections) {
 				// storeMemory uses callToolWithRetry internally, so stale
 				// sessions are recovered automatically.
-				storeMemory(detection.content, detection.tags, sessionArgs(ctx)).catch(
-					() => {},
+				storeMemory(detection.content, detection.tags, sessionArgs(ctx)).catch((err) =>
+					notifyStoreFailed(ctx, err),
 				);
 			}
 		});
@@ -159,7 +169,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 		pi.on("agent_end", async (_event, ctx) => {
 			const resolutions = errorTracker.flush();
 			for (const mem of resolutions) {
-				storeMemory(mem.content, mem.tags, sessionArgs(ctx)).catch(() => {});
+				storeMemory(mem.content, mem.tags, sessionArgs(ctx)).catch((err) =>
+					notifyStoreFailed(ctx, err),
+				);
 			}
 		});
 	}
@@ -175,7 +187,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 					dedupBuffer,
 				);
 				for (const mem of extracted.memories) {
-					await storeMemory(mem.content, [...mem.tags, "extracted"], session).catch(() => {});
+					await storeMemory(mem.content, [...mem.tags, "extracted"], session).catch((err) =>
+						notifyStoreFailed(ctx, err),
+					);
 				}
 				// finalizeSession swallows the chat-only "Session not found" case
 				// itself; anything that reaches here is a real failure.

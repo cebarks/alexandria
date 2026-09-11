@@ -13,7 +13,7 @@ import {
 } from "@modelcontextprotocol/client";
 import { CONFIG } from "./config.js";
 import type { SessionArgs } from "./session-args.js";
-import { finalizeError } from "./finalize-result.js";
+import { finalizeError, storeError } from "./finalize-result.js";
 
 let clientPromise: Promise<Client> | null = null;
 
@@ -104,7 +104,9 @@ export async function storeMemory(
 	tags: string[],
 	session: SessionArgs,
 ): Promise<void> {
-	await callToolWithRetry("store_memory", { content, tags, ...session });
+	const result = await callToolWithRetry("store_memory", { content, tags, ...session });
+	const err = storeError(extractTextContent(result.content));
+	if (err) throw new Error(err);
 }
 
 export async function finalizeSession(
