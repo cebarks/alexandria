@@ -32,7 +32,8 @@ extraction) the `claude` CLI.
 
 `alexandria-extract.sh` is a `Stop` hook. After each assistant turn it serializes the transcript lines
 added since its last run (user text, assistant text, and the first 300 characters of each failed
-tool result as `[Tool error]:`, so a silent fix-and-retry still shows the model the root cause;
+tool result as `[Tool error]: <tool name> <first 120 chars of its input> -- <error>`, so a silent
+fix-and-retry still shows the model the root cause and which call produced it;
 successful tool output, `<tool_use_error>` harness refusals, thinking, and injected system lines are
 dropped), and once at least `ALEXANDRIA_EXTRACT_MIN_CHARS` of new text exists it
 asks `claude -p --model haiku` for standalone durable facts using the Pi extraction prompt, with the

@@ -60,15 +60,20 @@ total=$(wc -l <"$transcript")
 
 # user (string or text blocks; skip injected/system lines) + assistant text + failed tool results.
 # Errors go in so a silent fix-and-retry still shows the LLM the root cause; <tool_use_error> is the
-# harness refusing a call (file not read, old_string missing), never durable knowledge.
-text=$(tail -n +"$((done_lines + 1))" "$transcript" | jq -rR '
+# harness refusing a call (file not read, old_string missing), never durable knowledge. Each error is
+# attributed to its tool_use (name + input, cut short) via tool_use_id: the call and its result land
+# in the same turn, so the chunk is slurped and the id map built from its assistant lines.
+text=$(tail -n +"$((done_lines + 1))" "$transcript" | jq -nrR '
   def txt: if type == "string" then . else [.[]? | select(.type == "text") | .text] | join("\n") end;
-  fromjson? | select(.type == "user" or .type == "assistant") | .type as $role | (.message.content // "")
+  [inputs | fromjson?] as $lines
+  | ([$lines[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use")
+      | {key: .id, value: (.name + " " + (.input | tostring)[:120] + " -- ")}] | from_entries) as $tools
+  | $lines[] | select(.type == "user" or .type == "assistant") | .type as $role | (.message.content // "")
   | ((txt | select(length > 0)
       | select(startswith("<local-command") or startswith("<command-") or startswith("<system-reminder") | not)
       | (if $role == "user" then "[User]: " else "[Assistant]: " end) + .),
-     (.[]? | select(.type == "tool_result" and .is_error == true) | .content | txt
-      | select(startswith("<tool_use_error>") | not) | "[Tool error]: " + .[:300]))
+     (.[]? | select(.type == "tool_result" and .is_error == true) | ($tools[.tool_use_id] // "") as $tool
+      | .content | txt | select(startswith("<tool_use_error>") | not) | "[Tool error]: " + $tool + .[:300]))
   | . + "\n"')
 [ ${#text} -ge "$MIN_CHARS" ] || exit 0
 [ ${#text} -le 64000 ] || text=${text: -64000}
