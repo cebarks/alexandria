@@ -1,5 +1,5 @@
 use alexandria_mcp::migrate::{ReembedOutcome, reembed};
-use alexandria_pipeline::embedding::EmbeddingProvider;
+use alexandria_pipeline::embedding::{EmbeddingProvider, MAX_TOKENS};
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{Database, system_config};
 
@@ -114,6 +114,40 @@ async fn reembed_rewrites_facts_centroids_and_lock() {
             .as_deref(),
         Some("3")
     );
+    assert_eq!(
+        system_config::get_config(db.inner(), "embedding_max_tokens")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(MAX_TOKENS.to_string().as_str())
+    );
+}
+
+/// Same model but no token lock: the corpus was embedded at the old 128-token limit,
+/// so this is a real re-embed, not a no-op.
+#[tokio::test]
+async fn reembed_runs_when_only_token_lock_differs() {
+    let (db, live1, _, _, _) = seed().await;
+    system_config::set_config(db.inner(), "embedding_model", "b")
+        .await
+        .unwrap();
+
+    let outcome = reembed(&db, &ModelB, 2).await.unwrap();
+    assert!(matches!(outcome, ReembedOutcome::Done { facts: 3, .. }));
+
+    let fact = MemoryRepo::new(db.inner())
+        .get_fact(&live1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fact.embedding, embed_b("one"));
+    assert_eq!(
+        system_config::get_config(db.inner(), "embedding_max_tokens")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(MAX_TOKENS.to_string().as_str())
+    );
 }
 
 /// The HNSW index rejects vectors of any other dimension, so reembed must drop
@@ -140,6 +174,9 @@ async fn reembed_drops_vector_index_before_changing_dimension() {
 async fn reembed_is_noop_when_lock_matches() {
     let (db, live1, _, _, _) = seed().await;
     system_config::set_config(db.inner(), "embedding_model", "b")
+        .await
+        .unwrap();
+    system_config::set_config(db.inner(), "embedding_max_tokens", &MAX_TOKENS.to_string())
         .await
         .unwrap();
 

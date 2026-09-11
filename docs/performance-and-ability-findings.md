@@ -12,8 +12,8 @@ length of the live corpus, which drives finding A1.
 
 | ID | Finding | Severity | Effort |
 |---|---|---|---|
-| [A1](#a1-every-embedding-is-truncated-to-128-tokens) | Every embedding is truncated to 128 tokens | High | small, plus a re-embed |
-| [P1](#p1-every-embedding-pays-a-128-token-forward-pass) | Every embedding pays a 128-token forward pass | Medium | trivial |
+| [A1](#a1-every-embedding-is-truncated-to-128-tokens) | Every embedding is truncated to 128 tokens | High | **fixed 2026-09-10** |
+| [P1](#p1-every-embedding-pays-a-128-token-forward-pass) | Every embedding pays a 128-token forward pass | Medium | **fixed 2026-09-10** |
 | [P2](#p2-cluster-member-counting-is-on-per-store-and-per-broad-recall) | Cluster member counting is O(N) per store and per broad recall | Medium | small |
 | [A2](#a2-the-heat-model-is-inert) | The heat model is inert | Medium, decision needed | small either way |
 | [P3](#p3-inference-runs-inline-on-the-async-runtime-and-never-batches) | Inference runs inline on the async runtime and never batches | Medium | medium |
@@ -50,6 +50,14 @@ How it was measured, so it can be rerun after a fix:
 ### A1. Every embedding is truncated to 128 tokens
 
 **Severity:** High. **Effort:** small code change, then a forced re-embed.
+
+**Fixed 2026-09-10.** `candle.rs` now sets truncation to `MAX_TOKENS = 256` and no padding after
+loading the tokenizer, warns per call when a text overflows, and the limit is locked in
+`system_config` as `embedding_max_tokens` beside the model id. A lock without that key is read as
+128, so an upgraded database refuses to boot until `alexandria migrate-embeddings` re-embeds it.
+The `fixed_size` chunk dropped from 1000 to 800 characters. The `truncated: true` return flag and a
+token-aware chunker were not done: the log warning covers the first, and the second would pull the
+tokenizer into the engine crate. Bench before/after is in `docs/minilm-test-data.md`.
 
 **Where.**
 
@@ -161,7 +169,8 @@ pango markup on a text block"). Those are the cases where an exact token match s
 
 ### P1. Every embedding pays a 128-token forward pass
 
-**Severity:** Medium. **Effort:** trivial. Same root cause as A1.
+**Severity:** Medium. **Effort:** trivial. Same root cause as A1. **Fixed 2026-09-10** with A1:
+`tokenizer.with_padding(None)`. Batched calls (P3) still need `BatchLongest` when they land.
 
 **Where.** `padding.strategy = Fixed(128)` in the loaded `tokenizer.json`; the attention mask keeps
 mean pooling correct (`candle.rs:148-158`), so the result is right, but the compute is not.

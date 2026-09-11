@@ -34,6 +34,18 @@ pub async fn set_config(db: &Surreal<Any>, key: &str, value: &str) -> Result<()>
     Ok(())
 }
 
+/// Token limit a corpus was embedded at when its lock predates `embedding_max_tokens`:
+/// the tokenizer's shipped default, which was applied unchanged until the key existed.
+pub const PRE_LOCK_MAX_TOKENS: usize = 128;
+
+/// Stored `embedding_max_tokens`, or [`PRE_LOCK_MAX_TOKENS`] when the key is absent.
+pub async fn stored_max_tokens(db: &Surreal<Any>) -> Result<usize> {
+    Ok(get_config(db, "embedding_max_tokens")
+        .await?
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(PRE_LOCK_MAX_TOKENS))
+}
+
 /// Check if the configured embedding model matches what's stored in the database.
 /// On first boot, stores the current model info. On subsequent boots, compares.
 ///
@@ -42,6 +54,7 @@ pub async fn check_embedding_model(
     db: &Surreal<Any>,
     model: &str,
     dimensions: usize,
+    max_tokens: usize,
 ) -> Result<()> {
     let stored_model = get_config(db, "embedding_model").await?;
     let stored_dims = get_config(db, "embedding_dimensions").await?;
@@ -60,7 +73,10 @@ pub async fn check_embedding_model(
             }
             set_config(db, "embedding_model", model).await?;
             set_config(db, "embedding_dimensions", &dimensions.to_string()).await?;
-            tracing::info!("Stored embedding config: model={model}, dimensions={dimensions}");
+            set_config(db, "embedding_max_tokens", &max_tokens.to_string()).await?;
+            tracing::info!(
+                "Stored embedding config: model={model}, dimensions={dimensions}, max_tokens={max_tokens}"
+            );
             Ok(())
         }
         (Some(stored_m), Some(stored_d)) => {
@@ -88,7 +104,20 @@ pub async fn check_embedding_model(
                      This likely means the model changed without updating system_config."
                 );
             }
-            tracing::debug!("Embedding model check passed: {model} ({dimensions} dims)");
+            let stored_t = stored_max_tokens(db).await?;
+            if stored_t != max_tokens {
+                anyhow::bail!(
+                    "Embedding token limit mismatch!\n\
+                     Stored: {stored_t}\n\
+                     Configured: {max_tokens}\n\
+                     \n\
+                     Facts longer than {stored_t} tokens were embedded on a prefix.\n\
+                     Run `alexandria migrate-embeddings` with the server stopped to re-embed everything at {max_tokens} tokens."
+                );
+            }
+            tracing::debug!(
+                "Embedding model check passed: {model} ({dimensions} dims, {max_tokens} tokens)"
+            );
             Ok(())
         }
     }

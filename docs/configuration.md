@@ -77,7 +77,7 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 
 **Switching models on an existing database:** stop the server, set the new `model`, run `alexandria migrate-embeddings` (re-embeds every memory and cluster centroid, then updates the lock), and start the server again. Thresholds (`[cluster]`, `[retrieve] min_similarity`, and the client's `[recall] min_similarity`) are tuned to the default model; retune them if you switch. `alexandria bench-retrieval` derives the latter two from the new model's own output — see [docs/minilm-test-data.md](minilm-test-data.md). The migration is not transactional: if it fails partway, rerun it. Do not revert `model` in config afterwards, the database may hold a mix of old and new vectors.
 
-**Model locking:** On first boot, the model name and dimension count are stored in the database. Changing the model in config without wiping the database will cause a startup error with instructions to either revert the model or run `alexandria migrate-embeddings`.
+**Model locking:** On first boot, the model name, dimension count, and token limit (256 wordpiece tokens per text; longer texts embed on their first 256 and log a warning) are stored in the database. Changing the model in config without wiping the database will cause a startup error with instructions to either revert the model or run `alexandria migrate-embeddings`. A database locked before the token limit was recorded was embedded at 128 tokens; the server refuses to boot on it until `alexandria migrate-embeddings` re-embeds everything at 256.
 
 **First run:** The model weights (~80MB for all-MiniLM-L6-v2) are downloaded from HuggingFace Hub and cached in `~/.cache/huggingface/`.
 

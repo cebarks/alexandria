@@ -379,6 +379,41 @@ on the exact scan and so is not in the set the index could have delivered; it is
 miss. The index is defined with SurrealDB's default `EFC`/`M`, and this line is where a change
 to either would show.
 
+### 256-token re-embed (1139 facts)
+
+Finding A1 in `docs/performance-and-ability-findings.md`: the tokenizer shipped a 128-token
+truncation, so every fact longer than that was embedded on its opening. On 2026-09-10 the limit
+went to 256 and the whole corpus was re-embedded (`alexandria migrate-embeddings`, 1834 facts
+including deleted ones, 998 centroids, 68 s). Two snapshots of the same 1139-fact corpus, taken
+minutes apart with the server stopped, one before and one after the re-embed. Both rows are
+`limit = 10`.
+
+| corpus | mean_rank | top1 | mean_gap | hit_min | hit_max | nonhit_p50 | nonhit_p90 | nonhit_p99 | ff_p50 | ff_p90 | ff_p99 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| before (128 tokens) | 2.95 | 12/20 | +0.076 | 0.338 | 0.828 | 0.079 | 0.198 | 0.338 | 0.131 | 0.288 | 0.491 |
+| after (256 tokens) | 2.90 | 12/20 | +0.076 | 0.338 | 0.828 | 0.080 | 0.200 | 0.339 | 0.133 | 0.291 | 0.493 |
+
+**Nothing moved, and that is the expected result, not a null one.** Every bench target is a
+short fact, so none of the 20 target vectors changed; `hit_min`, `hit_max`, `mean_gap` and
+`top1` are identical to the digit. The only rank change is q11, 10 -> 9: one long non-target
+that used to sit above it now embeds on its full text and scores lower against that question.
+The noise and fact-fact percentiles rose by one to three thousandths, which is the long facts
+becoming slightly more similar to everything once their tails count. The threshold sweep and
+the limit grid reproduce the 965-fact grid cell for cell at `T >= 0.40`; at `0.30`/`0.35`
+`noise_per_q` moves by 0.05. The shipped pair stays. HNSW overlap is still 200/200, target
+delivered 19/19. The floor rule still gives 0.08.
+
+**What this pass cannot show.** The benefit of the change is that the 100-odd facts past 128
+tokens are now searchable by their second half. No frozen question targets one of them, so
+the bench has no way to register that. A question aimed at the tail of a long fact would.
+
+**The baseline row is no longer byte-identical to 2026-09-08, on three columns.** `ff_p50`,
+`ff_p90`, `ff_p99` went 0.130/0.298/0.560 -> 0.132/0.303/0.569 because some of the 143 oldest
+facts were over 128 tokens and now have different vectors. Every other column and every
+per-question rank reproduces, and the before-snapshot run reproduced all of them exactly, so
+the metric definitions are unchanged; the fact-fact columns of the baseline are simply
+measured on new vectors from here on.
+
 ## Metric definitions
 
 - **rank** — position of the target fact when the whole corpus is sorted by cosine descending

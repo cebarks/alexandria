@@ -54,13 +54,13 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Sessions are created implicitly by `store_memory(session_id)` — there is no create tool. `SessionRepo::touch()` bumps `memory_count` **and** `ended_at`, so `ended_at` means last-activity; only a non-null `summary` distinguishes a finalized session. See `docs/session-memory.md`.
 - Known inconsistency: session-scoped retrieval walks edges through `SessionRepo::get_memories()` → `MemoryRepo::get_fact()`, which does **not** filter `deleted = false` the way the unscoped path does. Soft-deleted memories therefore still surface in `get_session` and `retrieve_memories(session_id: ...)`. Not yet fixed — don't document it as intended behavior.
 - Schema migrations are forward-only, numbered (`v001`, `v002`, ...), tracked in `system_config` table. Current head is `v005_session.surql`.
-- Embedding model is locked on first boot — changing `config.toml` model without wiping data will refuse to start.
+- Embedding model is locked on first boot — changing `config.toml` model without wiping data will refuse to start. The truncation limit (`MAX_TOKENS` in `candle.rs`, 256) is locked the same way as `embedding_max_tokens`; a lock without that key means the corpus was embedded at the tokenizer's shipped 128, and boot refuses until `alexandria migrate-embeddings` re-embeds it.
 
 ## Testing
 
 - The repo intentionally carries no `rust-toolchain.toml` and no `.cargo/config.toml` — `rust-version = "1.98"` + edition 2024 are the only compiler statement; mold/`target-cpu` live in each dev's `~/.cargo/config.toml` (see TODO-misc "Build / toolchain"). Don't re-add them to the repo.
 - Use the `just` recipes (they match CI): `just test`, `just lint`, `just fmt`, `just ci` (fmt + lint + test + `cargo deny`). `just install-hooks` wires `.githooks/pre-commit`.
-- Run tests on **stable**, not nightly: `diskann-wide` (SurrealDB transitive dep) fails trait inference on its NEON intrinsics under recent nightlies on aarch64, and the failure looks like it originates in this workspace. Current suite: 159 tests, all green.
+- Run tests on **stable**, not nightly: `diskann-wide` (SurrealDB transitive dep) fails trait inference on its NEON intrinsics under recent nightlies on aarch64, and the failure looks like it originates in this workspace. Current suite: 164 tests, all green.
 - All integration tests use `Database::connect_embedded()` (in-memory SurrealDB) — no disk state between tests.
 - `CandleProvider` tests download the real model on first run (~80MB) — they're slow the first time.
 - Test helpers in `alexandria-storage/src/connection.rs`: `connect_embedded()` for quick in-memory DB.

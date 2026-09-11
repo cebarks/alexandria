@@ -351,7 +351,8 @@ impl AlexandriaServer {
                         .into_iter()
                         .map(|c| c.content)
                         .collect(),
-                    "fixed_size" => chunk_by_fixed_size(&params.content, 1000, 100)
+                    // 800 chars stays under the 256-token embedding limit even for code-dense text.
+                    "fixed_size" => chunk_by_fixed_size(&params.content, 800, 100)
                         .into_iter()
                         .map(|c| c.content)
                         .collect(),
