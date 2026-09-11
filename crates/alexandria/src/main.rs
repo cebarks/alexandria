@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
 async fn migrate_embeddings() -> anyhow::Result<()> {
     use alexandria_mcp::migrate::{ReembedOutcome, reembed};
 
+    tracing::info!("Alexandria v0.2 migrate-embeddings starting...");
     let config = Config::load()?;
     let db = Database::connect(&config.database.data_dir).await?;
     schema::migrate(db.inner()).await?;
