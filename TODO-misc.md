@@ -83,13 +83,24 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
 
 ## Build / toolchain
 
-- [ ] **Windows `rustflags` (msvc/gnu/gnullvm targets) added 2026-09-08 but unverified.** `.cargo/config.toml`
-  sets `target-cpu=x86-64-v2` for the three Windows targets alongside the Linux `mold` target; there's
-  no Windows toolchain in this environment to cross-compile and confirm they take effect.
+- [ ] **`.cargo/config.toml` and `rust-toolchain.toml` were dropped when this branch was integrated
+  into main (2026-09-09).** Decision: linker/CPU flags are per-machine developer preference, not
+  repo policy — the file only ever affected local x86-64 Linux gnu builds (CI's ubuntu jobs would
+  have broken on the missing `mold`, and the Docker build already overrides `rustflags` via
+  `RUSTFLAGS`, so neither `target-cpu` nor mold applied there). Dev boxes wanting it keep
+  `-C target-cpu=native` + mold in `~/.cargo/config.toml`. Windows `target-cpu` verification is
+  moot. Repo keeps `rust-version = "1.98"` + edition 2024 as the only compiler floor statement.
 - [ ] **`[profile.release]` (lto = "thin", codegen-units = 1, strip) added 2026-09-08, never built.**
   Only `cargo build --workspace` (dev profile) has been run since the toolchain/profile changes,
   and the 2026-09-08 dependency major bumps (notably `hf-hub` 1.0 / `hf-xet`) were likewise only
   dev-built and tested; do a `cargo build --release` smoke test before shipping a release artifact.
+- [ ] **Dockerfile base bumped to `rust:1.98.1-alpine3.22` and OpenSSL stripped, container build
+  not yet exercised.** After the hf-hub 1.0 port, `cargo tree` shows no `openssl`/`openssl-sys`
+  left (network is rustls + `aws-lc-sys`); the builder's `openssl-dev`/`pkgconfig` and the
+  runtime's `libssl3`/`libcrypto3` were removed on 2026-09-09 based on that, not on a real
+  `docker build`. `aws-lc-sys`'s build script normally needs only a C compiler on x86_64-musl,
+  but if the container build starts failing, `cmake` is the first suspect to add to the builder
+  apk line.
 
 - [ ] **Startup memory doubled during model load (2026-09-08).** `candle.rs` now reads the safetensors
   file into a `Vec<u8>` (`from_buffered_safetensors`) instead of mmap, so the workspace can carry
