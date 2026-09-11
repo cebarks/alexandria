@@ -20,8 +20,8 @@
  * Config (env vars, all optional):
  *   ALEXANDRIA_URL                          default: http://127.0.0.1:3000/mcp
  *   ALEXANDRIA_AUTO_RECALL                  set to "off" to disable recall
- *   ALEXANDRIA_AUTO_RECALL_LIMIT            default: 5
- *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.35 (measured; see docs/minilm-test-data.md)
+ *   ALEXANDRIA_AUTO_RECALL_LIMIT            default: 10 (measured with MIN_SIMILARITY; see docs/minilm-test-data.md)
+ *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.45 (measured; only valid at LIMIT=10)
  *   ALEXANDRIA_AUTO_STORE                   set to "off" to disable all store behavior
  *   ALEXANDRIA_EXTRACT_MODEL                default: vertex/claude-haiku-4-5
  *   ALEXANDRIA_EXTRACT_TIMEOUT_MS           default: 5000
