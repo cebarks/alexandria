@@ -11,7 +11,7 @@
 # always exits 0.
 #
 # Env (all optional):
-#   ALEXANDRIA_AUTO_STORE          "off" disables; "on" enables in headless (sdk-*) sessions, where the default is off
+#   ALEXANDRIA_AUTO_STORE          "off" disables; "on" enables in headless sessions (see the entrypoint gate below), where the default is off
 #   ALEXANDRIA_EXTRACT_MODEL       default haiku
 #   ALEXANDRIA_EXTRACT_MIN_CHARS   default 1500; new text below this is deferred to a later turn
 #   ALEXANDRIA_EXTRACT_FLUSH_WAIT  default 1; seconds to wait for the transcript to flush before reading it (tests set 0)
@@ -22,9 +22,11 @@
 set -uo pipefail
 input=$(cat)   # before any guard: exiting with stdin unread can SIGPIPE the writer (test.sh pipes jq in)
 [ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
-# Headless sessions (`claude -p`, Agent SDK) inherit CLAUDE_CODE_ENTRYPOINT=sdk-*: auto-store is off
-# there unless ALEXANDRIA_AUTO_STORE=on, so scripted experiments never land in the real database.
-store=${ALEXANDRIA_AUTO_STORE:-}; [ -n "$store" ] || case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*) store=off;; esac
+# Sessions with no human at the prompt (`claude -p`, Agent SDK, `claude mcp serve`, bench, GitHub Action,
+# triggers) and Cowork carry a CLAUDE_CODE_ENTRYPOINT the binary reserves for them: auto-store is off there
+# unless ALEXANDRIA_AUTO_STORE=on, so scripted experiments never land in the real database. Everything else
+# (cli, desktop, vscode, the remote family) stays on.
+store=${ALEXANDRIA_AUTO_STORE:-}; [ -n "$store" ] || case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*|mcp|bench|claude-code-github-action|claude-security|*_trigger|local-agent|claude-coworker*|remote_cowork) store=off;; esac
 [ "$store" != off ] || exit 0
 
 MCP="$(dirname "$(readlink -f "$0")")/alexandria-recall.sh"   # debug CLI mode = one-shot tool calls

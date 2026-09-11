@@ -16,7 +16,7 @@
 #   ALEXANDRIA_AUTO_RECALL                 "off" disables recall
 #   ALEXANDRIA_AUTO_RECALL_LIMIT           default 5
 #   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY  default 0.35
-#   ALEXANDRIA_AUTO_STORE                  "off" disables the detectors; "on" enables them in headless (sdk-*) sessions, where the default is off
+#   ALEXANDRIA_AUTO_STORE                  "off" disables the detectors; "on" enables them in headless sessions (see the entrypoint gate below), where the default is off
 #   ALEXANDRIA_MARKER_MAX_AGE_DAYS         default 7; per-session markers idle longer than this are pruned
 #   ALEXANDRIA_HOOK_CHILD                  set by hooks that shell out to `claude -p`; exits at once
 set -uo pipefail
@@ -104,9 +104,11 @@ detect() { # <prefix> <patterns...> → prints "<prefix>: <statement>" for the f
     echo "$prefix: $stmt"; return
   done
 }
-# Headless sessions (`claude -p`, Agent SDK) inherit CLAUDE_CODE_ENTRYPOINT=sdk-*: auto-store is off
-# there unless ALEXANDRIA_AUTO_STORE=on, so scripted experiments never land in the real database.
-store=${ALEXANDRIA_AUTO_STORE:-}; [ -n "$store" ] || case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*) store=off;; esac
+# Sessions with no human at the prompt (`claude -p`, Agent SDK, `claude mcp serve`, bench, GitHub Action,
+# triggers) and Cowork carry a CLAUDE_CODE_ENTRYPOINT the binary reserves for them: auto-store is off there
+# unless ALEXANDRIA_AUTO_STORE=on, so scripted experiments never land in the real database. Everything else
+# (cli, desktop, vscode, the remote family) stays on.
+store=${ALEXANDRIA_AUTO_STORE:-}; [ -n "$store" ] || case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*|mcp|bench|claude-code-github-action|claude-security|*_trigger|local-agent|claude-coworker*|remote_cowork) store=off;; esac
 detections=()
 if [ "$store" != off ] && [ -n "$session" ]; then
   p=$(trim "$prompt")
