@@ -108,7 +108,8 @@ your last turn (verified 2026-09-08: a 10 s stub completed 11 s after the headle
 The script's own 80 s budget bounds a wedged `claude -p`. No `"async": true` is needed. Its stderr
 goes to `$XDG_STATE_HOME/alexandria/extract.log` (default `~/.local/state/alexandria/`), rotated to
 `extract.log.1` once it passes 1 MiB; marker files in the same directory idle for over
-`ALEXANDRIA_MARKER_MAX_AGE_DAYS` days (default 7) are pruned at the same time.
+`ALEXANDRIA_MARKER_MAX_AGE_DAYS` days (default 7) are pruned at the same time, and by the recall hook on
+every prompt.
 
 **Config (env vars, all optional):**
 
@@ -123,7 +124,7 @@ goes to `$XDG_STATE_HOME/alexandria/extract.log` (default `~/.local/state/alexan
 | `ALEXANDRIA_EXTRACT_MIN_CHARS` | `1500` | New transcript text required before an extraction call |
 | `ALEXANDRIA_EXTRACT_FLUSH_WAIT` | `1` | Seconds to wait before reading the transcript; Stop fires ~50 ms before the last assistant message is flushed (tests set `0`) |
 | `ALEXANDRIA_EXTRACT_CMD` | (unset) | Replace the `claude -p ...` command (prompt on stdin, JSON on stdout); used by tests |
-| `ALEXANDRIA_MARKER_MAX_AGE_DAYS` | `7` | Per-session marker files idle longer than this are pruned by the extract hook |
+| `ALEXANDRIA_MARKER_MAX_AGE_DAYS` | `7` | Per-session marker files idle longer than this are pruned by either hook |
 | `ALEXANDRIA_HOOK_CHILD` | (unset) | Set by the extract hook on its `claude -p` child; every hook exits immediately when set |
 | `ALEXANDRIA_DETACHED` | (unset) | Set by the extract hook on its detached copy; set it yourself to run the hook inline (tests do) |
 
