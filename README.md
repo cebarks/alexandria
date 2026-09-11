@@ -255,17 +255,7 @@ model download is the only thing that still needs the internet).
 
 ### MCP client configuration
 
-**Claude Code:**
-
-```bash
-claude mcp add --transport http --scope user alexandria http://127.0.0.1:3000/mcp
-# optional: client-side skill (same as contrib/pi, with Claude Code's mcp__alexandria__<tool> names)
-cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
-# optional: auto-recall hook (see contrib/claude/README.md for the settings.json snippet)
-cp contrib/claude/hooks/alexandria-recall.sh ~/.claude/hooks/
-```
-
-**Generic (any MCP client):**
+#### Generic (any MCP client)
 
 ```json
 {
@@ -285,6 +275,16 @@ Or via stdio (for single-session use):
     "args": []
   }
 }
+```
+
+#### In Claude Code
+
+```bash
+claude mcp add --transport http --scope user alexandria http://127.0.0.1:3000/mcp
+# optional: client-side skill (same as contrib/pi, with Claude Code's mcp__alexandria__<tool> names)
+cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
+# optional: auto-recall hook (see contrib/claude/README.md for the settings.json snippet)
+cp contrib/claude/hooks/alexandria-recall.sh ~/.claude/hooks/
 ```
 
 #### In pi

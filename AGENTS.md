@@ -11,7 +11,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `RELATE` needs pre-parsed `RecordId` via `.bind()` — inline `type::record()` in RELATE fails
 - `type::record()` replaces `type::thing()` (removed in 3.x)
 - Query result structs need `#[derive(SurrealValue)]` from `surrealdb::types`
-- `RecordId` formatting: use `record_id_to_string()` helper, not `.to_string()`
+- `RecordId` formatting: use `record_id_to_string()` helper (in `alexandria-storage/src/lib.rs`, re-exported by `alexandria-mcp/src/server.rs`), not `.to_string()`
 - Connection: `surrealdb::engine::any::connect("mem://")` with `kv-mem` feature; `surrealkv://path` with `kv-surrealkv`
 - To count filtered records reached by a graph traversal *inline in a SELECT*, the `WHERE` goes **inside** the traversal target's parentheses: `(->contains_session_memory->(fact WHERE deleted = false)).len()`. The obvious `(->edge->fact WHERE ...).len()` fails with `Unexpected token WHERE expected delimiter )`, and so do the `array::len(...)` and `count(...)` spellings — no N+1 fallback is needed once you find this.
 - An absent `option<T>` field is `NONE`, and **`IS NOT NULL` and `!= NULL` are both satisfied by `NONE`** — they filter nothing; only `field != NONE` (or `NOT (field = NONE)`, or `type::is_none(field) = false`) excludes it. Verified against the pinned 3.2.4 engine: with one `NONE` and one set row, `WHERE next_due_at IS NOT NULL` returned both and `WHERE next_due_at != NONE` returned one. This bites ordering too, because `NONE` sorts below every datetime: such a row wins the head of an `ORDER BY next_due_at ASC LIMIT n` page.
@@ -106,6 +106,15 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Record ids in an `href` (or any URL) use `|urlencode`; HTML text uses plain `{{ }}`. In `graph.html` the id is interpolated **inside a JavaScript string literal**, where browsers do not decode character references — `|urlencode` is what makes that safe, since its output alphabet is `[A-Za-z0-9_.-~/]` plus `%XX` and so cannot produce a quote, backslash, `<` or newline that would terminate the literal or the `<script>` element.
 - Adding a vendored asset means three edits: `assets.rs` (the closed `match` allowlist), `assets/SHA256SUMS`, and `just vendor-assets`. The allowlist is a `match` over literal filenames with `include_bytes!`, so there is no filesystem read or path parsing at request time — traversal is impossible by construction, and the 404 tests exist to keep it that way. Filenames pin the bytes because they are served `max-age=31536000, immutable`; `just verify-assets` is what makes `SHA256SUMS` machine-enforced rather than decorative.
 
+## Build Gate
+
+Before any `cargo check`, `cargo run`, or `cargo build`, run these in order and fix what they report:
+
+1. `cargo fmt --all -- --check` (or `just fmt`)
+2. `cargo clippy --workspace --all-targets --all-features -- -D warnings` (or just `just lint`)
+
+Both must pass clean first. Do not skip the gate to "just see if it compiles".
+
 ## Testing
 
 - The repo intentionally carries no `rust-toolchain.toml` and no `.cargo/config.toml` — `rust-version = "1.98"` + edition 2024 are the only compiler statement; mold/`target-cpu` live in each dev's `~/.cargo/config.toml` (see TODO-misc "Build / toolchain"). Don't re-add them to the repo.
@@ -170,6 +179,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `contrib/pi/README.md` — how the pi skill and extension differ and install
 - `AGENTS.md` — this file. It was named `CLAUDE.md` until the docs sweep that added session memory
   and the pi extension docs, so older `docs/plans/*` references to `CLAUDE.md` point here.
+  `CLAUDE.md` still exists as a one-line `@AGENTS.md` import so Claude Code auto-loads this file.
 
 ## Config Precedence
 
