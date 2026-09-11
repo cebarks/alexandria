@@ -30,8 +30,9 @@ URL="${ALEXANDRIA_URL:-http://127.0.0.1:3000/mcp}"
 # comments together before changing either.
 LIMIT="${ALEXANDRIA_AUTO_RECALL_LIMIT:-10}"
 # 0.45 from the same grid. At LIMIT=10 it delivers 8 of 12 targets at ~1.0 non-targets per
-# prompt, where the previous 5/0.35 pair delivered the same 8 at ~3.2. 0.40 is still dominated
-# (same 8 hits, ~2.2 noise), but 0.50 no longer dominates 0.45 the way it did at LIMIT=5 — it
+# prompt, where the previous 5/0.35 pair delivered the same 8 at ~3.2. 0.40 was dominated on
+# that grid (same 8 hits, ~2.2 noise) and is a trade on the 20-question one (+2 hits, +1.3
+# noise); 0.50 no longer dominates 0.45 the way it did at LIMIT=5 — it
 # drops to 7 hits for 0.5 noise. Widening the limit is what moved 0.45 onto the frontier, so do
 # not lower LIMIT without revisiting this. See docs/minilm-test-data.md "Result limit".
 MIN_SIM="${ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY:-0.45}"
