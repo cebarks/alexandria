@@ -64,6 +64,9 @@ pub struct DatabaseConfig {
 pub struct EmbeddingConfig {
     pub model: String,
     pub device: String,
+    /// Facts per `embed()` call during `alexandria migrate-embeddings`. Bounds peak
+    /// memory for large corpora; the server itself embeds one text at a time. Default 32.
+    pub batch_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +94,14 @@ pub struct RetrieveConfig {
     /// results. A noise cutoff only: with all-MiniLM-L6-v2 a natural-language
     /// question against a stored statement scores ~0.2 and unrelated text
     /// ~0.0, so this must stay low. Default 0.10.
+    ///
+    /// Derived by the retrieve-floor rule, which `alexandria bench-retrieval`
+    /// computes from the model's own output: the median non-hit score rounded
+    /// to two decimals, valid only if it sits below the weakest correct hit.
+    /// The result is a property of the model *and* the corpus and drifts down
+    /// as the corpus grows — 0.08 at 143 facts, 0.07 at 807. 0.10 is kept
+    /// regardless: the weakest true hit scores 0.338, so every candidate sits
+    /// far below it. See `docs/minilm-test-data.md`.
     pub min_similarity: f32,
 }
 
@@ -134,6 +145,7 @@ impl Default for EmbeddingConfig {
         Self {
             model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             device: "cpu".to_string(),
+            batch_size: 32,
         }
     }
 }
@@ -256,6 +268,15 @@ impl Config {
         if let Some(device) = env("ALEXANDRIA_EMBEDDING_DEVICE") {
             config.embedding.device = device;
         }
+        if let Some(batch) = env("ALEXANDRIA_EMBEDDING_BATCH_SIZE") {
+            config.embedding.batch_size = batch.parse().map_err(|e| {
+                anyhow::anyhow!("invalid ALEXANDRIA_EMBEDDING_BATCH_SIZE `{batch}`: {e}")
+            })?;
+        }
+        anyhow::ensure!(
+            config.embedding.batch_size > 0,
+            "embedding.batch_size must be at least 1"
+        );
 
         Ok(config)
     }
@@ -332,7 +353,14 @@ mod tests {
         assert_eq!(config.embedding.model, "other-model");
         // Everything else is default
         assert_eq!(config.embedding.device, "cpu");
+        assert_eq!(config.embedding.batch_size, 32);
         assert_eq!(config.cluster.join_threshold, 0.75);
+    }
+
+    #[test]
+    fn test_embedding_batch_size() {
+        let config = Config::from_toml("[embedding]\nbatch_size = 8\n").unwrap();
+        assert_eq!(config.embedding.batch_size, 8);
     }
 
     #[test]
@@ -412,12 +440,43 @@ mod tests {
             ("ALEXANDRIA_DATA_DIR", "/tmp/env-test"),
             ("ALEXANDRIA_EMBEDDING_MODEL", "env-model"),
             ("ALEXANDRIA_EMBEDDING_DEVICE", "env-device"),
+            ("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "8"),
         ]);
 
         let config = Config::load_from(&env).unwrap();
         assert_eq!(config.database.data_dir, PathBuf::from("/tmp/env-test"));
         assert_eq!(config.embedding.model, "env-model");
         assert_eq!(config.embedding.device, "env-device");
+        assert_eq!(config.embedding.batch_size, 8);
+    }
+
+    #[test]
+    fn test_embedding_env_invalid_batch_size() {
+        let env = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "lots")]);
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("ALEXANDRIA_EMBEDDING_BATCH_SIZE"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_embedding_env_zero_batch_size() {
+        let env = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "0")]);
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("batch_size"), "{err}");
+    }
+
+    #[test]
+    fn test_embedding_toml_zero_batch_size() {
+        let path =
+            std::env::temp_dir().join(format!("alexandria-batch0-{}.toml", std::process::id()));
+        std::fs::write(&path, "[embedding]\nbatch_size = 0\n").unwrap();
+        let vars = [("ALEXANDRIA_CONFIG", path.to_str().unwrap())];
+        let env = env(&vars);
+        let err = Config::load_from(&env).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.to_string().contains("batch_size"), "{err}");
     }
 
     #[test]
