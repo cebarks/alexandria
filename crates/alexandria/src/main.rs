@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
     let embedding = CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
     let dims = embedding.dimensions();
     system_config::check_embedding_model(db.inner(), &config.embedding.model, dims).await?;
+    schema::ensure_vector_index(db.inner(), dims).await?;
     tracing::info!("Embedding model loaded ({dims} dimensions)");
 
     // 4. Create MCP server

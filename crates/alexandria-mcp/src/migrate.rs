@@ -1,7 +1,9 @@
 //! Re-embed every fact and cluster centroid with a new model, then move the lock.
 //! Not transactional: a failure mid-way leaves the lock on the old model. While
 //! config still names the new model the server refuses to boot; rerun the migration
-//! to finish, or revert config to go back to the old model.
+//! to finish, or revert config to go back to the old model. The HNSW index is
+//! dropped first (it rejects vectors of another dimension); the next server boot
+//! redefines it.
 
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
@@ -47,6 +49,8 @@ pub async fn reembed(
         }
         Some(stored) => tracing::info!("Re-embedding {stored} -> {new_model}"),
     }
+
+    alexandria_storage::schema::drop_vector_index(db.inner()).await?;
 
     // 1. Facts, deleted ones included.
     let rows = memories.all_ids_and_content().await?;

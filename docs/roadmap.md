@@ -180,7 +180,7 @@ The goal: memories should organize themselves without manual curation.
 
 **Performance**
 
-- SurrealDB vector index for DB-side cosine similarity (matters at >10k memories)
+- ~~SurrealDB vector index for DB-side cosine similarity~~ Done 2026-09-09 (HNSW, defined at boot)
 - Full-text search index for keyword matching alongside semantic search
 - Cluster heat caching with TTL
 - Bulk heat maintenance sweep for untouched records

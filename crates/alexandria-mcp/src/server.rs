@@ -442,17 +442,23 @@ impl AlexandriaServer {
         let query_vecs = self.embedding.embed(&[&params.query]).await?;
         let query_emb = &query_vecs[0];
 
-        // 2. Load facts (scoped to session if provided, otherwise all non-deleted)
+        // 2. Load candidates: the session's facts if scoped, otherwise the `limit`
+        // nearest live facts. `<|k,COSINE|>` goes through the HNSW index when
+        // `schema::ensure_vector_index` has defined it and falls back to a
+        // brute-force scan inside the database when it has not.
         let facts: Vec<alexandria_storage::models::Fact> =
             if let Some(ref session_id) = params.session_id {
                 let session_repo = SessionRepo::new(self.db.inner());
                 session_repo.get_memories(session_id).await?
             } else {
                 let mut response = self
-                    .db
-                    .inner()
-                    .query("SELECT * FROM fact WHERE deleted = false")
-                    .await?;
+                .db
+                .inner()
+                .query(format!(
+                    "SELECT * FROM fact WHERE deleted = false AND embedding <|{limit},COSINE|> $q"
+                ))
+                .bind(("q", query_emb.clone()))
+                .await?;
                 response.take(0)?
             };
 
@@ -928,6 +934,49 @@ mod get_info_tests {
         assert_eq!(results.len(), 1, "floor should drop the orthogonal memory");
         assert!(results[0]["content"].as_str().unwrap().contains("near"));
         assert!(results[0]["similarity"].as_f64().unwrap() >= 0.30);
+    }
+
+    /// Same retrieval through the HNSW index: the query asks the database for
+    /// `limit` neighbours, so the count is bounded before the engine ranks.
+    #[tokio::test]
+    async fn retrieve_memories_serves_from_vector_index() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        alexandria_storage::schema::ensure_vector_index(db.inner(), 2)
+            .await
+            .unwrap();
+        let server =
+            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0);
+        for content in ["near one", "near two", "far away"] {
+            server
+                .do_store_memory(StoreMemoryParams {
+                    content: content.to_string(),
+                    tags: None,
+                    session_id: None,
+                    agent_id: None,
+                    model: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let retrieve = |limit| {
+            server.do_retrieve_memories(RetrieveMemoriesParams {
+                query: "anything".to_string(),
+                limit: Some(limit),
+                session_id: None,
+            })
+        };
+        let results = retrieve(2).await.unwrap();
+        let results = results["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        for r in results {
+            assert!(r["content"].as_str().unwrap().contains("near"));
+        }
+        let results = retrieve(0).await.unwrap();
+        assert_eq!(results["results"].as_array().unwrap().len(), 0);
     }
 
     /// Stub producing vectors with exact cosine similarity to the query [1, 0]:
