@@ -20,5 +20,5 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tempfile = "3"
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 serde_json = { workspace = true }

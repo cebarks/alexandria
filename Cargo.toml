@@ -31,28 +31,41 @@ codegen-units = 16
 opt-level = 3
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-surrealdb = { version = "3.2", features = ["kv-mem", "kv-surrealkv"] }
-rmcp = { version = "3.1", features = [
+tokio = { version = "1", default-features = false, features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "sync",
+  "time",
+  "net",
+] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# Embedded-only: add "protocol-ws" and "rustls" if SurrealDB is ever not on localhost.
+surrealdb = { version = "3.2", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
+rmcp = { version = "3.1", default-features = false, features = [
   "server",
   "transport-io",
   "transport-streamable-http-server",
   "macros",
   "schemars",
 ] }
-schemars = "1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-thiserror = "2"
-anyhow = "1"
-dirs = "7"
-toml = "1"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-base64 = "0.23"
-candle-core = "0.11"
-candle-nn = "0.11"
-candle-transformers = "0.11"
-tokenizers = "0.22"
+schemars = { version = "1", default-features = false, features = ["std", "derive"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "std",
+  "fmt",
+  "ansi",
+  "tracing-log",
+] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+anyhow = { version = "1", default-features = false, features = ["std"] }
+dirs = { version = "7", default-features = false }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+uuid = { version = "1", default-features = false, features = ["std", "v4", "serde"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+candle-core = { version = "0.11", default-features = false }
+candle-nn = { version = "0.11", default-features = false }
+candle-transformers = { version = "0.11", default-features = false }
+tokenizers = { version = "0.22", default-features = false }
