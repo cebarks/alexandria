@@ -16,6 +16,7 @@
 #   ALEXANDRIA_EXTRACT_MIN_CHARS   default 1500; new text below this is deferred to a later turn
 #   ALEXANDRIA_EXTRACT_FLUSH_WAIT  default 1; seconds to wait for the transcript to flush before reading it (tests set 0)
 #   ALEXANDRIA_EXTRACT_CMD         override the LLM command (reads prompt on stdin, prints JSON); tests use a stub
+#   ALEXANDRIA_MARKER_MAX_AGE_DAYS default 7; per-session markers idle longer than this are pruned
 #   ALEXANDRIA_HOOK_CHILD          set by this hook on the `claude -p` child; every hook exits at once
 #   ALEXANDRIA_DETACHED            set by this hook on its detached copy; tests set it to run inline
 set -uo pipefail
@@ -34,14 +35,14 @@ CMD="${ALEXANDRIA_EXTRACT_CMD:-claude -p --model ${ALEXANDRIA_EXTRACT_MODEL:-hai
 # extraction (15-80 s of LLM call). Re-exec detached: own session and process group, no inherited
 # pipes, so neither a group kill nor pipe closure reaches it. The caller returns at once.
 # Log and per-session markers live in the XDG state dir, so both outlive the login session; the log is
-# rotated by size (one previous generation) and markers idle for over 7 days are pruned before each
-# re-exec. A detached copy already writing keeps its handle on the renamed file, so nothing interleaves.
+# rotated by size (one previous generation) and markers idle for over ALEXANDRIA_MARKER_MAX_AGE_DAYS
+# (default 7) days are pruned before each re-exec. A detached copy already writing keeps its handle on the renamed file, so nothing interleaves.
 state="${XDG_STATE_HOME:-$HOME/.local/state}/alexandria"
 log="$state/extract.log"
 [ -n "${ALEXANDRIA_DETACHED:-}" ] || {
   mkdir -p "$state"
   [ "$(stat -c %s "$log" 2>/dev/null || echo 0)" -lt 1048576 ] || mv -f "$log" "$log.1"
-  find "$state" -maxdepth 1 \( -name '*.extracted' -o -name '*.stored' \) -mtime +7 -delete
+  find "$state" -maxdepth 1 \( -name '*.extracted' -o -name '*.stored' \) -mtime "+${ALEXANDRIA_MARKER_MAX_AGE_DAYS:-7}" -delete
   ALEXANDRIA_DETACHED=1 setsid -f "$0" <<<"$input" >/dev/null 2>>"$log"; exit 0; }
 [ "$(jq -r '.stop_hook_active // false' <<<"$input")" = false ] || exit 0
 session=$(jq -r '.session_id // ""' <<<"$input")

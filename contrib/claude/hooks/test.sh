@@ -147,5 +147,9 @@ jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,
 touch -d '8 days ago' "$XDG_STATE_HOME/alexandria/old.extracted" "$XDG_STATE_HOME/alexandria/old.stored"
 jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ALEXANDRIA_DETACHED='' ./alexandria-extract.sh
 [ ! -e "$XDG_STATE_HOME/alexandria/old.extracted" ]; [ ! -e "$XDG_STATE_HOME/alexandria/old.stored" ]
+# ALEXANDRIA_MARKER_MAX_AGE_DAYS overrides the window.
+touch -d '2 days ago' "$XDG_STATE_HOME/alexandria/old2.extracted"
+jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ALEXANDRIA_DETACHED='' ALEXANDRIA_MARKER_MAX_AGE_DAYS=1 ./alexandria-extract.sh
+[ ! -e "$XDG_STATE_HOME/alexandria/old2.extracted" ]
 [ -f "$XDG_STATE_HOME/alexandria/$sess.extracted" ]
 echo OK
