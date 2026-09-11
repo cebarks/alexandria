@@ -35,7 +35,7 @@ pub struct SetReminderParams {
     )]
     pub cron: Option<String>,
     #[schemars(
-        description = "Optional project name to target delivery (e.g. 'alexandria'). Omit for a global reminder. Project reminders escalate to global delivery if overdue too long, so they are never silently lost."
+        description = "Optional project name to target delivery (e.g. 'alexandria'). Omit for a global reminder. Project reminders escalate to global delivery if overdue too long, so they are never silently lost. Matching is exact and case-sensitive."
     )]
     pub target_project: Option<String>,
     #[schemars(

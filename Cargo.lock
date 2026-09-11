@@ -77,6 +77,7 @@ dependencies = [
  "alexandria-pipeline",
  "alexandria-storage",
  "anyhow",
+ "async-trait",
  "axum",
  "chrono-tz",
  "dirs",

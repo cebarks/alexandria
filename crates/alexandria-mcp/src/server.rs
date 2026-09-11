@@ -14,11 +14,31 @@ use alexandria_engine::search::rank_by_similarity;
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo, SessionRepo};
 use alexandria_storage::Database;
+use chrono::{DateTime, SecondsFormat, Utc, Weekday};
 
 use crate::tools::{
     DeleteMemoryParams, FinalizeSessionParams, GetSessionParams, ImportDocumentParams,
-    RecallParams, RetrieveMemoriesParams, StoreMemoryParams, UpdateMemoryParams,
+    RecallParams, RetrieveMemoriesParams, SetReminderParams, StoreMemoryParams, UpdateMemoryParams,
 };
+
+/// Z-suffixed UTC RFC 3339 spelling — single source of truth for every datetime
+/// in reminder tool responses (`to_rfc3339()` would emit `+00:00` instead).
+/// Seconds precision is fixed (`Secs`, not `AutoSi`) so the shape never varies
+/// with sub-second content: reminder wall-clock granularity is the minute.
+fn rfc3339_utc(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// One-line rendering of a whole error chain for tool responses. `{e:#}` keeps
+/// the underlying cause (e.g. the cron crate's "Minutes must be less than 59"
+/// rather than a bare "invalid cron expression"); whitespace is collapsed
+/// because a cause may render across lines and the JSON response should not.
+fn error_message(e: &anyhow::Error) -> String {
+    format!("{e:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Reminder delivery settings resolved from server config at startup.
 #[derive(Debug, Clone)]
@@ -192,6 +212,18 @@ impl AlexandriaServer {
             Ok(result) => result,
             Err(e) => {
                 serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
+            }
+        }
+    }
+
+    #[tool(
+        description = "Schedule a reminder to be delivered on a future interaction — one-shot (due_at) or recurring (pattern/cron). Use this when the user asks to be reminded of something later, when they say 'remind me', 'don't let me forget', or when a follow-up action will be needed at a specific time ('check the deploy at 3pm', 'ping me about this tomorrow morning'). Reminders are delivered to both the agent context and the user on the next interaction after they come due; project-targeted reminders escalate to global delivery if they stay overdue, so they are never silently lost. The response includes the next fire times — confirm them with the user when the schedule was parsed from natural language."
+    )]
+    async fn set_reminder(&self, Parameters(params): Parameters<SetReminderParams>) -> String {
+        match self.do_set_reminder(params).await {
+            Ok(result) => result,
+            Err(e) => {
+                serde_json::json!({ "status": "error", "message": error_message(&e) }).to_string()
             }
         }
     }
@@ -604,6 +636,213 @@ impl AlexandriaServer {
         .to_string())
     }
 
+    /// Create a reminder row from validated tool params. All schedule parsing and
+    /// validation happens here (set-time, not delivery-time) so a bad cron or an
+    /// impossible local time is rejected while the user is still in the loop.
+    pub async fn do_set_reminder(&self, params: SetReminderParams) -> anyhow::Result<String> {
+        use alexandria_engine::reminders as sched;
+        use alexandria_storage::models::schedule_kind;
+        use alexandria_storage::repos::{NewReminder, ReminderRepo};
+        use anyhow::Context;
+        use chrono::Timelike;
+
+        /// Flat storage columns for one schedule kind. A named struct instead of
+        /// the positional 6-tuple keeps the branches readable and
+        /// `clippy::type_complexity` quiet.
+        struct RowFields {
+            due_at: Option<DateTime<Utc>>,
+            freq: Option<String>,
+            time_of_day: Option<String>,
+            weekdays: Vec<String>,
+            day_of_month: Option<i64>,
+            cron_expr: Option<String>,
+        }
+
+        let tz = self.reminders.tz;
+        let now = Utc::now();
+
+        // Exactly one schedule kind must be given. The failure names the
+        // offending fields so a caller can fix the request without guessing.
+        let given: Vec<&str> = [
+            ("due_at", params.due_at.is_some()),
+            ("pattern", params.pattern.is_some()),
+            ("cron", params.cron.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, is_some)| *is_some)
+        .map(|(name, _)| name)
+        .collect();
+        if given.len() != 1 {
+            let got = if given.is_empty() {
+                "none".to_string()
+            } else {
+                given.join(" + ")
+            };
+            anyhow::bail!("provide exactly one of due_at, pattern, or cron (got {got})");
+        }
+
+        let (spec, kind, row): (sched::ScheduleSpec, &'static str, RowFields) =
+            if let Some(due) = params.due_at.as_deref() {
+                let due_at = sched::parse_datetime(due, tz)?;
+                (
+                    sched::ScheduleSpec::Once { due_at },
+                    schedule_kind::ONCE,
+                    RowFields {
+                        due_at: Some(due_at),
+                        freq: None,
+                        time_of_day: None,
+                        weekdays: Vec::new(),
+                        day_of_month: None,
+                        cron_expr: None,
+                    },
+                )
+            } else if let Some(pat) = params.pattern.as_ref() {
+                let freq = sched::parse_freq(&pat.freq)?;
+                let time = sched::parse_time_of_day(&pat.time)?;
+                // Parse once, dedupe, and derive both the stored strings and the
+                // cron expression from the parsed values: `['fri','FRI','friday']`
+                // would otherwise leak "every Friday, Friday, Friday" into the
+                // user-facing schedule string and mixed spellings into the row.
+                let mut weekdays: Vec<Weekday> = Vec::new();
+                if let Some(named) = &pat.weekdays {
+                    for w in named {
+                        let day = sched::parse_weekday(w)?;
+                        if !weekdays.contains(&day) {
+                            weekdays.push(day);
+                        }
+                    }
+                }
+                let weekday_names: Vec<String> = weekdays
+                    .iter()
+                    .map(|w| w.to_string().to_ascii_lowercase())
+                    .collect();
+                // `ScheduleSpec::Pattern` requires a concrete u32, so 1 is a
+                // type-level filler, not a semantic default: the validation below
+                // bails for Monthly without day_of_month (the engine refuses to
+                // guess "the 1st"), so the filler is only reachable for
+                // Daily/Weekly, where the field is unused.
+                let dom = pat.day_of_month.unwrap_or(1);
+                // Validate the field combination before storing anything. The
+                // asymmetry is deliberate: validation takes the RAW user Option
+                // (so monthly-without-day and weekly/daily-with-day both fail via
+                // the engine's messages), while the stored column is masked to
+                // Monthly only — the other freqs store NULL, the reader's contract.
+                let dom_for_cron = pat.day_of_month;
+                let stored_dom = (freq == sched::Freq::Monthly).then_some(i64::from(dom));
+                // Result discarded on purpose: this call is validation-only
+                // (next_fire/upcoming recompile the expression themselves).
+                let _validated_cron = sched::pattern_to_cron(freq, time, &weekdays, dom_for_cron)?;
+                (
+                    sched::ScheduleSpec::Pattern {
+                        freq,
+                        time,
+                        weekdays,
+                        day_of_month: dom,
+                    },
+                    schedule_kind::PATTERN,
+                    RowFields {
+                        due_at: None,
+                        freq: Some(pat.freq.to_ascii_lowercase()),
+                        time_of_day: Some(format!("{:02}:{:02}", time.hour(), time.minute())),
+                        weekdays: weekday_names,
+                        day_of_month: stored_dom,
+                        cron_expr: None,
+                    },
+                )
+            } else {
+                // `params.cron` is Some here: the exactly-one check above ruled
+                // out the other two. The context names that invariant instead of
+                // an `unwrap()` (repo convention: no panics in production paths).
+                let raw = params
+                    .cron
+                    .as_deref()
+                    .context("cron schedule missing despite exactly-one check")?;
+                let expr = sched::normalize_cron(raw)?;
+                (
+                    sched::ScheduleSpec::Cron { expr: expr.clone() },
+                    schedule_kind::CRON,
+                    RowFields {
+                        due_at: None,
+                        freq: None,
+                        time_of_day: None,
+                        weekdays: Vec::new(),
+                        day_of_month: None,
+                        cron_expr: Some(expr),
+                    },
+                )
+            };
+
+        // Next fire + preview; recurring specs are evaluated in the configured
+        // timezone (wall-clock semantics — cron/chrono-tz handle DST).
+        let next = sched::next_fire(&spec, now, tz)?;
+        let preview = sched::upcoming(&spec, now, tz, 3)?;
+        // A recurring schedule with no future fire would be stored with
+        // next_due_at = NULL, and `list_due` filters on `next_due_at <= $now`, so
+        // such a row can never be delivered or escalated — a silent loss.
+        // Reject at set time instead. (A past one-shot is different: it stores
+        // next_due_at = due_at and fires on the very next check.)
+        if let (sched::ScheduleSpec::Pattern { .. } | sched::ScheduleSpec::Cron { .. }, None) =
+            (&spec, next)
+        {
+            anyhow::bail!(
+                "schedule {} never fires again (check year fields or impossible dates like Feb 30); no reminder created",
+                sched::human_readable(&spec)
+            );
+        }
+        let warning = match (&spec, next) {
+            (sched::ScheduleSpec::Once { due_at }, None) => Some(format!(
+                "due_at {} is in the past; this reminder will fire on the very next check",
+                rfc3339_utc(*due_at)
+            )),
+            _ => None,
+        };
+        // A past one-shot still stores next_due_at = due_at so list_due catches it.
+        let next_due_at = match &spec {
+            sched::ScheduleSpec::Once { due_at } => Some(*due_at),
+            _ => next,
+        };
+
+        let repo = ReminderRepo::new(self.db.inner());
+        let id = repo
+            .create(&NewReminder {
+                message: params.message.clone(),
+                target_project: params.target_project.clone(),
+                prov_project: params.prov_project.clone(),
+                prov_session_id: params.session_id.clone(),
+                note: params.note.clone(),
+                schedule_kind: kind.to_string(),
+                due_at: row.due_at,
+                freq: row.freq,
+                time_of_day: row.time_of_day,
+                weekdays: row.weekdays,
+                day_of_month: row.day_of_month,
+                cron_expr: row.cron_expr,
+                next_due_at,
+            })
+            .await?;
+
+        // `schedule` renders a one-shot in UTC but a pattern in local wall-clock,
+        // so also spell out next_due_at in the configured timezone: the tool
+        // description asks the LLM to confirm these times with the user, who is
+        // thinking in local time.
+        let next_due_at_local =
+            next_due_at.map(|d| d.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z").to_string());
+
+        let mut out = serde_json::json!({
+            "status": "ok",
+            "id": id,
+            "schedule": sched::human_readable(&spec),
+            "next_due_at": next_due_at.map(rfc3339_utc),
+            "next_due_at_local": next_due_at_local,
+            "next_fire_preview": preview.iter().map(|d| rfc3339_utc(*d)).collect::<Vec<_>>(),
+            "timezone": tz.name().to_string(),
+        });
+        if let Some(w) = warning {
+            out["warning"] = serde_json::Value::String(w);
+        }
+        Ok(out.to_string())
+    }
+
     // --- Internal helpers ---
 
     /// Assign a fact to a cluster, creating a new one if needed. Updates centroids.
@@ -756,6 +995,39 @@ impl AlexandriaServer {
             });
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod error_message_tests {
+    use super::error_message;
+
+    /// `{e:#}` keeps the underlying cause — here the cron crate's field-range
+    /// complaint, which `e.to_string()` drops — and the whitespace collapse
+    /// keeps the JSON tool response on one line (the cause renders a caret
+    /// diagram across several lines).
+    #[test]
+    fn flattens_chain_and_collapses_whitespace() {
+        let err = alexandria_engine::reminders::normalize_cron("61 99 * * *").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid cron expression \"61 99 * * *\"",
+            "top-level context alone must not be what the user sees"
+        );
+
+        let msg = error_message(&err);
+        assert!(
+            msg.contains("invalid cron expression \"61 99 * * *\""),
+            "message lost its context: {msg}"
+        );
+        assert!(
+            msg.contains("Minutes must be less than 59"),
+            "message lost the underlying cause: {msg}"
+        );
+        assert!(
+            !msg.contains('\n') && !msg.contains("  "),
+            "message must stay on one line: {msg:?}"
+        );
     }
 }
 

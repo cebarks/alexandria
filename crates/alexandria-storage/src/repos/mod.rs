@@ -9,5 +9,5 @@ pub use cluster_repo::ClusterRepo;
 pub use edge_repo::EdgeRepo;
 pub use heat_repo::HeatRepo;
 pub use memory_repo::MemoryRepo;
-pub use reminder_repo::ReminderRepo;
+pub use reminder_repo::{NewReminder, ReminderRepo};
 pub use session_repo::SessionRepo;

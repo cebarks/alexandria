@@ -70,9 +70,14 @@ pub fn parse_time_of_day(s: &str) -> Result<NaiveTime> {
     let (h, m) = s
         .split_once(':')
         .with_context(|| format!("time must be HH:MM, got {s:?}"))?;
+    // Name the field and echo the input: callers surface only the top-level
+    // context, so "invalid minute" alone leaves the user guessing which of
+    // HH:MM was rejected (or what was passed).
     let (h, m): (u32, u32) = (
-        h.parse().context("invalid hour")?,
-        m.parse().context("invalid minute")?,
+        h.parse()
+            .with_context(|| format!("invalid hour in time {s:?}"))?,
+        m.parse()
+            .with_context(|| format!("invalid minute in time {s:?}"))?,
     );
     if h > 23 || m > 59 {
         bail!("time out of range: {s:?}");
@@ -87,7 +92,7 @@ pub fn normalize_cron(expr: &str) -> Result<String> {
     let normalized = match fields {
         5 => format!("0 {expr}"),
         6 | 7 => expr.trim().to_string(),
-        n => bail!("cron expression must have 5-7 fields, got {n}"),
+        n => bail!("cron expression must have 5-7 fields, got {n}: {expr:?}"),
     };
     Schedule::from_str(&normalized).with_context(|| format!("invalid cron expression {expr:?}"))?;
     Ok(normalized)
