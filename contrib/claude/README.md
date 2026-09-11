@@ -105,7 +105,7 @@ kills hooks still running when the session ends, so the script re-execs itself w
 does the 15–80 s LLM call, never holds your next turn, and finishes even if you quit right after
 your last turn (verified 2026-09-08: a 10 s stub completed 11 s after the headless session exited).
 The script's own 80 s budget bounds a wedged `claude -p`. No `"async": true` is needed. Its stderr
-goes to `$XDG_RUNTIME_DIR/alexandria/extract.log`.
+goes to `~/.cargo/logs/alexandria/extract.log`, rotated to `extract.log.1` once it passes 1 MiB.
 
 **Config (env vars, all optional):**
 
