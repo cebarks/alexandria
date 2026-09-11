@@ -70,6 +70,8 @@ jq -cn '{type:"user",message:{content:"<local-command-caveat>ignore me</local-co
         ,{type:"user",message:{content:[{type:"tool_result",content:"ok"}]}}
         ,{type:"user",message:{content:[{type:"tool_result",is_error:true,content:"<tool_use_error>File has not been read yet.</tool_use_error>"}]}}
         ,{type:"user",message:{content:[{type:"tool_result",is_error:true,content:[{type:"text",text:"Exit code 101\nerror[E0433]: failed to resolve: use of undeclared crate"}]}]}}
+        ,{type:"attachment",attachment:{type:"hook_additional_context",hookEvent:"UserPromptSubmit",content:["Relevant memories retrieved automatically from Alexandria for this prompt:\n- (similarity 0.61, id fact:abc) [hook-test] Recalled from another session: storage engines are compared on process count\n\nThese are surfaced proactively; verify relevance before relying on them, and use update_memory if any is stale."]}}
+        ,{type:"attachment",attachment:{type:"hook_additional_context",hookEvent:"SessionStart",content:["PONYTAIL MODE ACTIVE"]}}
         ,{type:"assistant",message:{content:[{type:"text",text:"We decided to use SurrealKV because it needs no external process."}]}}' >"$td/t.jsonl"
 cat >"$td/stub.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -86,19 +88,23 @@ grep -q 'ignore me\|hmm\|tool_result' "$td/prompt.txt" && exit 1   # `! cmd` nev
 grep -q '^\[Tool error\]: Exit code 101' "$td/prompt.txt"   # is_error results are fed in; harness <tool_use_error> ones are not
 grep -q 'tool_use_error\|has not been read' "$td/prompt.txt" && exit 1
 grep -q 'User correction: jj instead of git' "$td/prompt.txt"   # already-stored block
+# Auto-recall hits from the transcript's attachment lines join the already-stored block, never the conversation.
+sed -n '/<already_stored>/,/<\/already_stored>/p' "$td/prompt.txt" | grep -q '^- (id fact:abc) \[hook-test\] Recalled from another session'
+sed -n '/<conversation>/,/<\/conversation>/p' "$td/prompt.txt" | grep -q 'Recalled from another session\|PONYTAIL\|surfaced proactively' && exit 1
+grep -q 'PONYTAIL' "$td/prompt.txt" && exit 1
 got=$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq -c '[.memories[] | select(.tags|index("extracted")) | {content,tags}]')
 echo "$got"
 [ "$got" = '[{"content":"We decided to use SurrealKV because it needs no external process","tags":["decision","extracted"]}]' ]
 # No new transcript lines: LLM not called again. New short line: deferred (marker unchanged).
 stop; [ "$(cat "$td/calls")" = 1 ]
 jq -cn '{type:"user",message:{content:"ok"}}' >>"$td/t.jsonl"
-ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 7 ]
+ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 9 ]
 # stop_hook_active / child guard: no call.
 jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ./alexandria-extract.sh
 [ "$(cat "$td/calls")" = 1 ]
 # Headless session: no call, marker untouched.
 jq -cn '{type:"user",message:{content:"headless chatter that must not be extracted"}}' >>"$td/t.jsonl"
-CLAUDE_CODE_ENTRYPOINT=sdk-py stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 7 ]
+CLAUDE_CODE_ENTRYPOINT=sdk-py stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 9 ]
 # Empty result: exactly one call, nothing stored.
 cat >"$td/empty.sh" <<'STUB'
 #!/usr/bin/env bash
