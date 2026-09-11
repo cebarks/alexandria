@@ -108,7 +108,7 @@ detect() { # <prefix> <patterns...> → prints "<prefix>: <statement>" for the f
     # Pi's "use X instead of Y" preference keeps both sides.
     [[ $prefix = "User preference" && $g -eq 2 && -n ${BASH_REMATCH[3]:-} && $p == *instead* ]] &&
       stmt="Use $stmt instead of $(trim "${BASH_REMATCH[3]}")"
-    [ ${#stmt} -ge 5 ] || continue
+    [[ ${#stmt} -ge 5 && $stmt == *[[:space:]]* ]] || continue   # one word ("no, it's completed") is a state report
     echo "$prefix: $stmt"; return
   done
 }
