@@ -20,6 +20,22 @@ use crate::tools::{
     RecallParams, RetrieveMemoriesParams, StoreMemoryParams, UpdateMemoryParams,
 };
 
+/// Reminder delivery settings resolved from server config at startup.
+#[derive(Debug, Clone)]
+pub struct RemindersSettings {
+    pub tz: chrono_tz::Tz,
+    pub escalation_hours: u64,
+}
+
+impl Default for RemindersSettings {
+    fn default() -> Self {
+        Self {
+            tz: chrono_tz::Tz::UTC,
+            escalation_hours: 48,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AlexandriaServer {
     pub db: Arc<Database>,
@@ -30,6 +46,7 @@ pub struct AlexandriaServer {
     pub activation_top_n: usize,
     /// Hard floor on cosine similarity for retrieve_memories results.
     pub retrieve_min_similarity: f32,
+    pub reminders: RemindersSettings,
 }
 
 impl AlexandriaServer {
@@ -47,6 +64,7 @@ impl AlexandriaServer {
             activation_config: ActivationConfig::default(),
             activation_top_n: 3,
             retrieve_min_similarity: 0.30,
+            reminders: RemindersSettings::default(),
         }
     }
 
@@ -62,6 +80,11 @@ impl AlexandriaServer {
 
     pub fn with_retrieve_min_similarity(mut self, min_similarity: f32) -> Self {
         self.retrieve_min_similarity = min_similarity;
+        self
+    }
+
+    pub fn with_reminders_config(mut self, settings: RemindersSettings) -> Self {
+        self.reminders = settings;
         self
     }
 }

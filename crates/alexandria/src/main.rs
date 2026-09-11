@@ -54,6 +54,24 @@ async fn main() -> anyhow::Result<()> {
         propagation_factor: config.activation.propagation_factor,
         max_hops: config.activation.max_hops,
     };
+
+    // Resolve reminders timezone: config value, else system-local, else UTC
+    let tz_name = if config.reminders.timezone.is_empty() {
+        iana_time_zone::get_timezone().unwrap_or_else(|e| {
+            tracing::warn!("Could not detect system timezone ({e}); using UTC for reminders");
+            "UTC".to_string()
+        })
+    } else {
+        config.reminders.timezone.clone()
+    };
+    let tz: chrono_tz::Tz = tz_name.parse().map_err(|e| {
+        anyhow::anyhow!("invalid [reminders].timezone `{tz_name}` (expected IANA name like 'Europe/Stockholm'): {e}")
+    })?;
+    tracing::info!(
+        "Reminders timezone: {tz}, escalation: {}h",
+        config.reminders.escalation_hours
+    );
+
     let server = AlexandriaServer::new(
         Arc::new(db),
         Arc::new(embedding),
@@ -62,7 +80,11 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_activation_config(activation_config)
     .with_activation_top_n(config.activation.top_n)
-    .with_retrieve_min_similarity(config.retrieve.min_similarity);
+    .with_retrieve_min_similarity(config.retrieve.min_similarity)
+    .with_reminders_config(alexandria_mcp::server::RemindersSettings {
+        tz,
+        escalation_hours: config.reminders.escalation_hours,
+    });
 
     // 5. Serve based on transport config
     match config.server.transport.as_str() {
