@@ -443,23 +443,15 @@ impl AlexandriaServer {
         let query_emb = &query_vecs[0];
 
         // 2. Load candidates: the session's facts if scoped, otherwise the `limit`
-        // nearest live facts. `<|k,COSINE|>` goes through the HNSW index when
-        // `schema::ensure_vector_index` has defined it and falls back to a
-        // brute-force scan inside the database when it has not.
+        // nearest live facts (HNSW when the index is defined).
         let facts: Vec<alexandria_storage::models::Fact> =
             if let Some(ref session_id) = params.session_id {
                 let session_repo = SessionRepo::new(self.db.inner());
                 session_repo.get_memories(session_id).await?
             } else {
-                let mut response = self
-                .db
-                .inner()
-                .query(format!(
-                    "SELECT * FROM fact WHERE deleted = false AND embedding <|{limit},COSINE|> $q"
-                ))
-                .bind(("q", query_emb.clone()))
-                .await?;
-                response.take(0)?
+                MemoryRepo::new(self.db.inner())
+                    .nearest(query_emb, limit)
+                    .await?
             };
 
         if facts.is_empty() {
