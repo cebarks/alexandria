@@ -33,12 +33,15 @@ CMD="${ALEXANDRIA_EXTRACT_CMD:-claude -p --model ${ALEXANDRIA_EXTRACT_MODEL:-hai
 # Claude Code kills hooks still running at session teardown, which would drop the last turn's
 # extraction (15-80 s of LLM call). Re-exec detached: own session and process group, no inherited
 # pipes, so neither a group kill nor pipe closure reaches it. The caller returns at once.
-# Log outlives the login session; rotated by size (one previous generation) before each re-exec.
-# A detached copy already writing keeps its handle on the renamed file, so nothing interleaves.
-log="$HOME/.cargo/logs/alexandria/extract.log"
+# Log and per-session markers live in the XDG state dir, so both outlive the login session; the log is
+# rotated by size (one previous generation) and markers idle for over 7 days are pruned before each
+# re-exec. A detached copy already writing keeps its handle on the renamed file, so nothing interleaves.
+state="${XDG_STATE_HOME:-$HOME/.local/state}/alexandria"
+log="$state/extract.log"
 [ -n "${ALEXANDRIA_DETACHED:-}" ] || {
-  mkdir -p "${log%/*}"
+  mkdir -p "$state"
   [ "$(stat -c %s "$log" 2>/dev/null || echo 0)" -lt 1048576 ] || mv -f "$log" "$log.1"
+  find "$state" -maxdepth 1 \( -name '*.extracted' -o -name '*.stored' \) -mtime +7 -delete
   ALEXANDRIA_DETACHED=1 setsid -f "$0" <<<"$input" >/dev/null 2>>"$log"; exit 0; }
 [ "$(jq -r '.stop_hook_active // false' <<<"$input")" = false ] || exit 0
 session=$(jq -r '.session_id // ""' <<<"$input")
@@ -49,7 +52,7 @@ transcript=$(jq -r '.transcript_path // ""' <<<"$input")
 # behind); without this wait every extraction runs one assistant message late and a session's
 # last reply is never seen. Cheap: this copy is detached.
 sleep "${ALEXANDRIA_EXTRACT_FLUSH_WAIT:-1}"
-marker="${XDG_RUNTIME_DIR:-/tmp}/alexandria/$session.extracted"
+marker="$state/$session.extracted"
 done_lines=$(cat "$marker" 2>/dev/null || echo 0)
 total=$(wc -l <"$transcript")
 [ "$total" -gt "$done_lines" ] || exit 0

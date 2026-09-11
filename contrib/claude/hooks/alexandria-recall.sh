@@ -123,7 +123,7 @@ SID=$(mcp_open) || {
 }
 trap mcp_close EXIT
 
-stored="${XDG_RUNTIME_DIR:-/tmp}/alexandria/$session.stored"
+stored="${XDG_STATE_HOME:-$HOME/.local/state}/alexandria/$session.stored"
 for d in "${detections[@]}"; do
   norm=$(tr '[:upper:]' '[:lower:]' <<<"$d" | tr -s '[:space:]' ' ')
   mkdir -p "${stored%/*}"; touch "$stored"
