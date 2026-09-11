@@ -7,7 +7,7 @@ Alexandria loads server config with this precedence:
    - `ALEXANDRIA_CONFIG` env var (explicit path override)
    - `$XDG_CONFIG_HOME/alexandria/config.toml` (default: `~/.config/alexandria/config.toml` on Linux, `~/Library/Application Support/alexandria/config.toml` on macOS)
    - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
-3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`
+3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_EMBEDDING_BATCH_SIZE`
 
 ## Full Example
 
@@ -26,6 +26,7 @@ sse_keep_alive_secs = 15      # SSE keep-alive interval in seconds (default: 15)
 [embedding]
 model = "sentence-transformers/all-MiniLM-L6-v2"   # HuggingFace model ID (default shown; omit to use it)
 device = "cpu"                                       # "cpu" only for now (default: "cpu")
+batch_size = 32                                      # Facts per embed() call in migrate-embeddings (default: 32)
 
 [heat]
 spacing_halflife_secs = 86400.0   # Spaced repetition half-life in seconds (default: 86400 = 1 day)
@@ -72,6 +73,7 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 |-----|------|---------|-------------|
 | `model` | string | `"sentence-transformers/all-MiniLM-L6-v2"` | HuggingFace model ID. Must be a BERT-family model compatible with candle. Pooling mode (CLS or mean) is read from the model repo's `1_Pooling/config.json`; models without it use mean pooling. |
 | `device` | string | `"cpu"` | Compute device. Only `"cpu"` is currently supported. |
+| `batch_size` | usize | `32` | Facts per `embed()` call during `alexandria migrate-embeddings`. Bounds peak memory on large corpora; must be at least 1. The server itself embeds one text at a time. |
 
 **Switching models on an existing database:** stop the server, set the new `model`, run `alexandria migrate-embeddings` (re-embeds every memory and cluster centroid, then updates the lock), and start the server again. Thresholds (`[cluster]` and `[retrieve] min_similarity`) are tuned to the default model; retune them if you switch. The migration is not transactional: if it fails partway, rerun it. Do not revert `model` in config afterwards, the database may hold a mix of old and new vectors.
 
@@ -127,6 +129,7 @@ These env vars override individual config values after the TOML file is loaded:
 | `ALEXANDRIA_DATA_DIR` | `database.data_dir` |
 | `ALEXANDRIA_EMBEDDING_MODEL` | `embedding.model` |
 | `ALEXANDRIA_EMBEDDING_DEVICE` | `embedding.device` |
+| `ALEXANDRIA_EMBEDDING_BATCH_SIZE` | `embedding.batch_size` |
 
 The `ALEXANDRIA_SERVER_*` variables exist so a container can be configured entirely by environment
 (the bundled [Dockerfile](../Dockerfile) uses them to default to HTTP on `0.0.0.0:3000`) without

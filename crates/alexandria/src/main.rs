@@ -110,7 +110,7 @@ async fn migrate_embeddings() -> anyhow::Result<()> {
     tracing::info!("Loading embedding model: {}", config.embedding.model);
     let embedding = CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
 
-    match reembed(&db, &embedding).await? {
+    match reembed(&db, &embedding, config.embedding.batch_size).await? {
         ReembedOutcome::Skipped(why) => println!("Nothing to do: {why}"),
         ReembedOutcome::Done { facts, clusters } => println!(
             "Re-embedded {facts} facts and {clusters} cluster centroids with {} ({} dims). Restart the service.",

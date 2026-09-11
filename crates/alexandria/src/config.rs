@@ -64,6 +64,9 @@ pub struct DatabaseConfig {
 pub struct EmbeddingConfig {
     pub model: String,
     pub device: String,
+    /// Facts per `embed()` call during `alexandria migrate-embeddings`. Bounds peak
+    /// memory for large corpora; the server itself embeds one text at a time. Default 32.
+    pub batch_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,6 +143,7 @@ impl Default for EmbeddingConfig {
         Self {
             model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             device: "cpu".to_string(),
+            batch_size: 32,
         }
     }
 }
@@ -262,6 +266,11 @@ impl Config {
         if let Some(device) = env("ALEXANDRIA_EMBEDDING_DEVICE") {
             config.embedding.device = device;
         }
+        if let Some(batch) = env("ALEXANDRIA_EMBEDDING_BATCH_SIZE") {
+            config.embedding.batch_size = batch.parse().map_err(|e| {
+                anyhow::anyhow!("invalid ALEXANDRIA_EMBEDDING_BATCH_SIZE `{batch}`: {e}")
+            })?;
+        }
 
         Ok(config)
     }
@@ -338,7 +347,14 @@ mod tests {
         assert_eq!(config.embedding.model, "other-model");
         // Everything else is default
         assert_eq!(config.embedding.device, "cpu");
+        assert_eq!(config.embedding.batch_size, 32);
         assert_eq!(config.cluster.join_threshold, 0.75);
+    }
+
+    #[test]
+    fn test_embedding_batch_size() {
+        let config = Config::from_toml("[embedding]\nbatch_size = 8\n").unwrap();
+        assert_eq!(config.embedding.batch_size, 8);
     }
 
     #[test]
@@ -418,12 +434,24 @@ mod tests {
             ("ALEXANDRIA_DATA_DIR", "/tmp/env-test"),
             ("ALEXANDRIA_EMBEDDING_MODEL", "env-model"),
             ("ALEXANDRIA_EMBEDDING_DEVICE", "env-device"),
+            ("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "8"),
         ]);
 
         let config = Config::load_from(&env).unwrap();
         assert_eq!(config.database.data_dir, PathBuf::from("/tmp/env-test"));
         assert_eq!(config.embedding.model, "env-model");
         assert_eq!(config.embedding.device, "env-device");
+        assert_eq!(config.embedding.batch_size, 8);
+    }
+
+    #[test]
+    fn test_embedding_env_invalid_batch_size() {
+        let env = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "lots")]);
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("ALEXANDRIA_EMBEDDING_BATCH_SIZE"),
+            "{err}"
+        );
     }
 
     #[test]
