@@ -41,10 +41,12 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - There are **13 MCP tools**: `store_memory`, `retrieve_memories`, `recall`, `update_memory`, `import_document`, `delete_memory`, `get_session`, `list_sessions`, `finalize_session`, `set_reminder`, `check_reminders`, `list_reminders`, `cancel_reminder`. Adding one means a params struct in `alexandria-mcp/src/tools/`, a `#[tool]` method, a `do_*` impl, and a row in the README tool table. `do_retrieve_memories_dry` and `do_retrieve_memories_unfiltered` are **not** tools — they are non-`#[tool]` wrappers over `retrieve_core(params, options)` used only by the debug Query Tester. Do not count them as tools, advertise them, or add a `dry_run` field to `RetrieveMemoriesParams`: that struct is the public MCP schema every LLM client sees, and a debug-only knob there would be an affordance agents could set.
 - The HNSW index on `fact.embedding` is defined at boot by `schema::ensure_vector_index()`, not in a
   numbered migration, because HNSW needs `DIMENSION` at define time and the dimension comes from the
-  locked embedding model. `do_retrieve_memories` uses `embedding <|k,COSINE|> $q`, which goes
+  locked embedding model. `MemoryRepo::nearest()` issues `embedding <|k,COSINE|> $q`, which goes
   through the index when present and falls back to a brute-force scan inside SurrealDB when it is
-  not (tests never define it). `migrate-embeddings` drops the index before re-embedding because it
-  rejects vectors of any other dimension; the next boot redefines it.
+  not (most tests never define it). `do_retrieve_memories` and `bench-retrieval` both call it;
+  the bench defines the index on its snapshot so its overlap line measures the index, not the
+  fallback. `migrate-embeddings` drops the index before re-embedding because it rejects vectors of
+  any other dimension; the next boot redefines it.
 - Cluster `member_count` is queried live (not cached) — `load_cluster_infos()` calls `get_members()` per cluster, so it is one query per cluster. Fine at current scale, the first thing to revisit if cluster counts grow.
 - The dashboard's cluster-health rollup costs **~2 queries per cluster per render** (`get_members` + the stored centroid from `list_with_counts`), and is flagged `TODO(debt)` in code. Same revisit trigger as above.
 - `update_memory` with content change: creates a soft-deleted snapshot of old content, then links via `derived_from` edge. The old version is hidden from search but preserved for lineage.
