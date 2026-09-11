@@ -374,11 +374,16 @@ fn report(label: &str, m: &Metrics, model: &str) {
     );
 
     println!("\nper-question rank:");
-    for (i, ((q, _), rank)) in QUESTIONS.iter().zip(&m.ranks).enumerate() {
+    for (i, (((q, _), rank), score)) in QUESTIONS
+        .iter()
+        .zip(&m.ranks)
+        .zip(&m.hit_scores)
+        .enumerate()
+    {
         let short: String = q.chars().take(64).collect();
-        match rank {
-            Some(r) => println!("  {:>2}. rank {r:<4} {short}", i + 1),
-            None => println!("  {:>2}. absent    {short}", i + 1),
+        match rank.zip(*score) {
+            Some((r, s)) => println!("  {:>2}. rank {r:<4} score {s:.2}  {short}", i + 1),
+            None => println!("  {:>2}. absent                {short}", i + 1),
         }
     }
 
