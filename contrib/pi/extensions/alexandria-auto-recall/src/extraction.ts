@@ -8,7 +8,13 @@
  */
 
 import { CONFIG } from "./config.js";
-import type { SessionDedupBuffer, DetectedMemory } from "./detectors/types.js";
+import type { SessionDedupBuffer } from "./detectors/types.js";
+import {
+	type ExtractionResult,
+	extractText,
+	parseExtractionResponse,
+	serializeEntries,
+} from "./extraction-parse.js";
 
 const EXTRACTION_PROMPT = `You are a memory extraction system. Given a conversation between a user and an AI coding assistant, extract durable facts worth remembering across sessions.
 
@@ -27,73 +33,19 @@ Do NOT extract:
 
 Each extracted memory must be a standalone statement that makes sense without this conversation. No "as discussed above", no pronouns without antecedents.
 
+Also summarize the session itself: one or two sentences on what was worked on and what the outcome was, plus a few lowercase tags for the session as a whole.
+
 Respond with JSON only:
 {
   "memories": [
     {"content": "standalone statement", "tags": ["relevant", "tags"]},
     ...
-  ]
+  ],
+  "summary": "what the session accomplished",
+  "tags": ["session", "tags"]
 }
 
-If nothing is worth extracting, respond with: {"memories": []}`;
-
-interface ExtractionResult {
-	memories: DetectedMemory[];
-}
-
-/**
- * Serialize session entries into a text representation for the extraction prompt.
- * Strips tool call details, keeps user/assistant text + compaction summaries.
- */
-function serializeEntries(entries: unknown[]): string {
-	const lines: string[] = [];
-	let turnNum = 0;
-
-	for (const entry of entries) {
-		const e = entry as Record<string, unknown>;
-		if (e.type === "message") {
-			const msg = e.message as Record<string, unknown> | undefined;
-			if (!msg) continue;
-
-			const role = msg.role as string;
-			const content = msg.content;
-
-			if (role === "user") {
-				turnNum++;
-				const text = extractText(content);
-				if (text) lines.push(`[Turn ${turnNum} - User]: ${text}`);
-			} else if (role === "assistant") {
-				const text = extractText(content);
-				if (text) lines.push(`[Turn ${turnNum} - Assistant]: ${text}`);
-			}
-		} else if (e.type === "compaction") {
-			const summary =
-				(e as Record<string, unknown>).summary ??
-				(
-					(e as Record<string, unknown>).compaction as
-						| Record<string, unknown>
-						| undefined
-				)?.summary;
-			if (typeof summary === "string") {
-				lines.push(`[Session Summary]: ${summary}`);
-			}
-		}
-	}
-
-	return lines.join("\n\n");
-}
-
-/** Extract plain text from a message content field (string or content blocks). */
-function extractText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (Array.isArray(content)) {
-		return content
-			.filter((b: Record<string, unknown>) => b?.type === "text")
-			.map((b: Record<string, unknown>) => b.text as string)
-			.join("\n");
-	}
-	return "";
-}
+If nothing is worth extracting, leave "memories" empty but still fill in "summary" and "tags".`;
 
 /**
  * Build the full extraction prompt with conversation and "already stored" context.
@@ -142,12 +94,12 @@ interface ExtractionContext {
 export async function runExtraction(
 	ctx: ExtractionContext,
 	buffer: SessionDedupBuffer,
-): Promise<DetectedMemory[]> {
+): Promise<ExtractionResult> {
 	const entries = ctx.sessionManager.buildContextEntries();
 	const serialized = serializeEntries(entries);
 
 	// Skip extraction if conversation is trivially short
-	if (serialized.length < 100) return [];
+	if (serialized.length < 100) return { memories: [] };
 
 	// Cap serialized conversation at ~16k tokens (~64k chars)
 	const maxChars = 64_000;
@@ -169,7 +121,7 @@ export async function runExtraction(
 			"warning",
 		);
 		model = ctx.model;
-		if (!model) return [];
+		if (!model) return { memories: [] };
 	}
 
 	// Call model with timeout via Promise.race — ctx.modelRegistry.complete()
@@ -189,32 +141,12 @@ export async function runExtraction(
 			timeoutPromise,
 		])) as Record<string, unknown>;
 
-		// Extract text from response
-		const responseText = extractText(response.content);
-		if (!responseText) return [];
-
-		// Parse JSON from response — handle markdown code fences
-		const jsonText = responseText
-			.replace(/^```(?:json)?\s*\n?/m, "")
-			.replace(/\n?```\s*$/m, "")
-			.trim();
-		const parsed = JSON.parse(jsonText) as ExtractionResult;
-
-		if (!Array.isArray(parsed.memories)) return [];
-
-		return parsed.memories
-			.filter((m) => typeof m.content === "string" && m.content.length > 0)
-			.map((m) => ({
-				content: m.content,
-				tags: Array.isArray(m.tags)
-					? m.tags.filter((t) => typeof t === "string")
-					: ["extracted"],
-			}));
+		return parseExtractionResponse(extractText(response.content));
 	} catch (err) {
 		if (err instanceof Error && err.message === "extraction_timeout") {
 			ctx.ui.notify("Alexandria extraction timed out; skipping.", "warning");
 		}
 		// Fail open
-		return [];
+		return { memories: [] };
 	}
 }

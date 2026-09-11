@@ -20,8 +20,8 @@
  * Config (env vars, all optional):
  *   ALEXANDRIA_URL                          default: http://127.0.0.1:3000/mcp
  *   ALEXANDRIA_AUTO_RECALL                  set to "off" to disable recall
- *   ALEXANDRIA_AUTO_RECALL_LIMIT            default: 5
- *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.58 (too high for MiniLM; 0.35 recommended, see config.ts)
+ *   ALEXANDRIA_AUTO_RECALL_LIMIT            default: 10 (measured with MIN_SIMILARITY; see docs/minilm-test-data.md)
+ *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.45 (measured; only valid at LIMIT=10)
  *   ALEXANDRIA_AUTO_STORE                   set to "off" to disable all store behavior
  *   ALEXANDRIA_EXTRACT_MODEL                default: vertex/claude-haiku-4-5
  *   ALEXANDRIA_EXTRACT_TIMEOUT_MS           default: 5000
@@ -33,6 +33,7 @@ import {
 	resetClient,
 	closeClient,
 	storeMemory,
+	finalizeSession,
 	extractTextContent,
 } from "./mcp-client.js";
 import { retrieveMemories, formatMemoriesBlock } from "./recall.js";
@@ -42,6 +43,7 @@ import { detectPreference } from "./detectors/preference.js";
 import { trackToolStore } from "./detectors/tool-tracker.js";
 import { ErrorTracker } from "./detectors/error-tracker.js";
 import { runExtraction } from "./extraction.js";
+import { sessionArgs } from "./session-args.js";
 
 /**
  * Extract readable text from a tool_execution_end result.
@@ -64,6 +66,16 @@ function extractResultText(result: unknown): string | null {
 	}
 
 	return null;
+}
+
+function notifyStoreFailed(
+	ctx: { ui: { notify(message: string, level: "warning"): void } },
+	err: unknown,
+): void {
+	ctx.ui.notify(
+		`Alexandria store_memory failed (${err instanceof Error ? err.message : String(err)})`,
+		"warning",
+	);
 }
 
 export default function alexandriaExtension(pi: ExtensionAPI) {
@@ -104,7 +116,7 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 	// ── Store: Heuristic detectors ──────────────────────────────────────
 	if (!CONFIG.storeDisabled) {
 		// Correction + preference detection on user prompts
-		pi.on("before_agent_start", async (event) => {
+		pi.on("before_agent_start", async (event, ctx) => {
 			const prompt = event.prompt?.trim();
 			if (!prompt) return;
 
@@ -117,7 +129,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 			for (const detection of detections) {
 				// storeMemory uses callToolWithRetry internally, so stale
 				// sessions are recovered automatically.
-				storeMemory(detection.content, detection.tags).catch(() => {});
+				storeMemory(detection.content, detection.tags, sessionArgs(ctx)).catch((err) =>
+					notifyStoreFailed(ctx, err),
+				);
 			}
 		});
 
@@ -152,10 +166,12 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 		});
 
 		// Flush error resolutions at agent_end
-		pi.on("agent_end", async () => {
+		pi.on("agent_end", async (_event, ctx) => {
 			const resolutions = errorTracker.flush();
 			for (const mem of resolutions) {
-				storeMemory(mem.content, mem.tags).catch(() => {});
+				storeMemory(mem.content, mem.tags, sessionArgs(ctx)).catch((err) =>
+					notifyStoreFailed(ctx, err),
+				);
 			}
 		});
 	}
@@ -165,12 +181,25 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 		// LLM extraction — skip on reload (no meaningful conversation boundary)
 		if (!CONFIG.storeDisabled && event.reason !== "reload") {
 			try {
+				const session = sessionArgs(ctx);
 				const extracted = await runExtraction(
 					ctx as Parameters<typeof runExtraction>[0],
 					dedupBuffer,
 				);
-				for (const mem of extracted) {
-					await storeMemory(mem.content, [...mem.tags, "extracted"]).catch(() => {});
+				for (const mem of extracted.memories) {
+					await storeMemory(mem.content, [...mem.tags, "extracted"], session).catch((err) =>
+						notifyStoreFailed(ctx, err),
+					);
+				}
+				// finalizeSession swallows the chat-only "Session not found" case
+				// itself; anything that reaches here is a real failure.
+				if (extracted.summary || extracted.tags) {
+					await finalizeSession(session, extracted.summary, extracted.tags).catch((err) => {
+						ctx.ui.notify(
+							`Alexandria finalize_session failed (${err instanceof Error ? err.message : String(err)})`,
+							"warning",
+						);
+					});
 				}
 			} catch (err) {
 				ctx.ui.notify(

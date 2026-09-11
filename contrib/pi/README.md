@@ -53,7 +53,8 @@ extension (package version 2.0). Four things happen:
    `update_memory` the extension observes on the way past `tool_result`, is buffered so the
    extraction pass below can be told what is already saved.
 4. **LLM extraction** — on `session_shutdown`, the conversation is serialized and a cheap model
-   (`store.extract_model`) extracts durable facts that layers 1–3 missed. Skipped on `reload`, since
+   (`store.extract_model`) extracts durable facts that layers 1–3 missed, plus a one-line summary
+   and tags for the session, which are written with `finalize_session`. Skipped on `reload`, since
    that is not a real conversation boundary.
 
 This mirrors the server's own design intent: the skill is highest-quality but depends on the agent
@@ -80,9 +81,13 @@ npm install
 Config file: `$XDG_CONFIG_HOME/alexandria/client.toml`, same precedence as the server
 (defaults → file → `ALEXANDRIA_CLIENT_CONFIG` → individual env vars). See
 [docs/configuration.md](../../docs/configuration.md) for the full reference. Every key is optional;
-the defaults work against a locally running server. Note: the extension default
-`min_similarity = 0.58` is measured too high for `all-MiniLM-L6-v2` — set `0.35`
-(see `[recall]` in docs/configuration.md).
+the defaults work against a locally running server.
+
+`limit` and `min_similarity` default to `10` and `0.45`, measured together for
+`all-MiniLM-L6-v2` (see `[recall]` in [docs/configuration.md](../../docs/configuration.md)).
+They are one setting in two keys: a memory ranked outside `limit` cannot be recovered by any
+threshold. The earlier `5`/`0.35` pair delivered the same 8 of 12 known targets at three times
+the injected noise, and the `0.58` default before that delivered only 4.
 
 ```toml
 [server]
@@ -90,8 +95,8 @@ url = "http://127.0.0.1:3000/mcp"
 
 [recall]
 enabled = true
-limit = 5
-min_similarity = 0.58
+limit = 10
+min_similarity = 0.45
 
 [store]
 enabled = true
@@ -110,10 +115,15 @@ client detects "Session not found", reconnects, and retries once before surfacin
 
 ### Limitations worth knowing
 
-- **No unit tests.** The detector and extraction-prompt logic has no test coverage in the repo, even
-  though the original design called for one. Regex changes are currently unguarded.
-- **No session memory integration.** The extension stores and retrieves without a `session_id`, so
-  its writes are ungrouped. See [docs/session-memory.md](../../docs/session-memory.md).
+- **Only the pure logic is tested.** `just test-pi` (or `npm test` in the extension directory)
+  runs `node:test` over the detectors, the dedup buffer, and the extraction serializer/parser.
+  The extraction prompt itself, recall, and the MCP client have no coverage.
+- **Sessions are finalized only if something was stored.** Every auto-store write carries pi's
+  session id as `session_id` (plus `agent_id="pi"` and the active model), so
+  `list_sessions(agent_id="pi")` and `get_session` see them. The server creates a session on its
+  first store, so a chat-only session has nothing to finalize and the shutdown `finalize_session`
+  call fails silently. Recall is not scoped to the session. See
+  [docs/session-memory.md](../../docs/session-memory.md).
 - **Recall ignores `recall`.** It uses `retrieve_memories`, never the two-phase `recall` tool, so
   broad "what do we know about X" exploration is not what auto-recall is tuned for.
 - **Extraction is end-of-session and best-effort.** It reads the tail of a long conversation (capped

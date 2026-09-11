@@ -12,6 +12,8 @@ import {
 	StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
 import { CONFIG } from "./config.js";
+import type { SessionArgs } from "./session-args.js";
+import { finalizeError, storeError } from "./finalize-result.js";
 
 let clientPromise: Promise<Client> | null = null;
 
@@ -100,6 +102,23 @@ export function extractTextContent(content: unknown): string | undefined {
 export async function storeMemory(
 	content: string,
 	tags: string[],
+	session: SessionArgs,
 ): Promise<void> {
-	await callToolWithRetry("store_memory", { content, tags });
+	const result = await callToolWithRetry("store_memory", { content, tags, ...session });
+	const err = storeError(extractTextContent(result.content));
+	if (err) throw new Error(err);
+}
+
+export async function finalizeSession(
+	session: SessionArgs,
+	summary?: string,
+	tags?: string[],
+): Promise<void> {
+	const result = await callToolWithRetry("finalize_session", {
+		session_id: session.session_id,
+		summary,
+		tags,
+	});
+	const err = finalizeError(extractTextContent(result.content));
+	if (err) throw new Error(err);
 }
