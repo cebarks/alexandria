@@ -17,6 +17,7 @@
 #   ALEXANDRIA_AUTO_RECALL_LIMIT           default 5
 #   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY  default 0.35
 #   ALEXANDRIA_AUTO_STORE                  "off" disables the detectors; "on" enables them in headless (sdk-*) sessions, where the default is off
+#   ALEXANDRIA_MARKER_MAX_AGE_DAYS         default 7; per-session markers idle longer than this are pruned
 #   ALEXANDRIA_HOOK_CHILD                  set by hooks that shell out to `claude -p`; exits at once
 set -uo pipefail
 [ $# -gt 0 ] || input=$(cat)   # before any guard: exiting with stdin unread can SIGPIPE the writer (test.sh pipes jq in)
@@ -115,6 +116,11 @@ if [ "$store" != off ] && [ -n "$session" ]; then
   fi
 fi
 
+stored="${XDG_STATE_HOME:-$HOME/.local/state}/alexandria/$session.stored"
+# Prune markers idle for over ALEXANDRIA_MARKER_MAX_AGE_DAYS here too, so a machine whose Stop hook
+# never fires does not accumulate them (same expression as alexandria-extract.sh).
+[ -d "${stored%/*}" ] && find "${stored%/*}" -maxdepth 1 \( -name '*.extracted' -o -name '*.stored' \) -mtime "+${ALEXANDRIA_MARKER_MAX_AGE_DAYS:-7}" -delete
+
 # ---- one MCP session for recall + stores
 SID=$(mcp_open) || {
   echo "alexandria-recall: $SID" >&2
@@ -123,7 +129,6 @@ SID=$(mcp_open) || {
 }
 trap mcp_close EXIT
 
-stored="${XDG_STATE_HOME:-$HOME/.local/state}/alexandria/$session.stored"
 for d in "${detections[@]}"; do
   norm=$(tr '[:upper:]' '[:lower:]' <<<"$d" | tr -s '[:space:]' ' ')
   mkdir -p "${stored%/*}"; touch "$stored"
