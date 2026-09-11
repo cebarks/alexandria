@@ -40,7 +40,8 @@ use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo, Ses
 
 use crate::tools::{
     DeleteMemoryParams, FinalizeSessionParams, GetSessionParams, ImportDocumentParams,
-    RecallParams, RetrieveMemoriesParams, StoreMemoryParams, UpdateMemoryParams,
+    ListSessionsParams, RecallParams, RetrieveMemoriesParams, StoreMemoryParams,
+    UpdateMemoryParams,
 };
 
 #[derive(Clone)]
@@ -183,6 +184,16 @@ impl AlexandriaServer {
     }
 
     #[tool(
+        description = "List sessions newest-first with their metadata and live memory count. Call this when you need to find a session whose id you don't have — 'the session from yesterday', 'what did the pi agent work on' — then pass its external_id to get_session. Filter by agent_id, tag, or finalized (true = has a summary)."
+    )]
+    async fn list_sessions(
+        &self,
+        Parameters(params): Parameters<ListSessionsParams>,
+    ) -> CallToolResult {
+        tool_json(self.do_list_sessions(params).await)
+    }
+
+    #[tool(
         description = "Finalize a session by setting its summary, tags, and ended_at timestamp. Call this when a session wraps up to capture a summary of what was accomplished."
     )]
     async fn finalize_session(
@@ -197,7 +208,7 @@ impl AlexandriaServer {
     instructions = "Alexandria is a persistent agent memory system — use it proactively, not just when explicitly asked to 'remember' or 'recall' something.\n\n\
 When to READ memory (retrieve_memories / recall): at the start of a task in a project or domain you've likely worked in before; whenever the user references past context ('last time', 'we decided', 'like before'); before re-deriving a decision or re-debugging something that may have been solved already. Use retrieve_memories for a specific lookup, recall for open-ended/broad exploration (call it once broad, then again with the returned scope_handle to narrow).\n\n\
 When to WRITE memory (store_memory): as soon as you learn a durable fact worth keeping past this conversation — a user preference, an architectural decision and its rationale, a bug's root cause, a non-obvious gotcha, a correction the user gives you. Do this unprompted; don't wait to be told to remember. Write standalone statements that make sense without today's conversation.\n\n\
-Session memory: pass session_id to store_memory or import_document to group memories by session. Use get_session to review all memories from a session. Use finalize_session at the end of a session to attach a summary and tags.\n\n\
+Session memory: pass session_id to store_memory or import_document to group memories by session. Use get_session to review all memories from a session, and list_sessions to find a session id you don't have. Use finalize_session at the end of a session to attach a summary and tags.\n\n\
 Use update_memory (not store_memory) when correcting something already stored — it preserves lineage. Use import_document for bulk reference material (specs, READMEs, notes). Use delete_memory only when the user wants something actually forgotten."
 )]
 impl ServerHandler for AlexandriaServer {}
@@ -555,6 +566,34 @@ impl AlexandriaServer {
             })
             .to_string())
         }
+    }
+
+    pub async fn do_list_sessions(&self, params: ListSessionsParams) -> anyhow::Result<String> {
+        let sessions = SessionRepo::new(self.db.inner())
+            .list(
+                params.agent_id.as_deref(),
+                params.tag.as_deref(),
+                params.finalized,
+                params.limit.unwrap_or(20),
+                params.offset.unwrap_or(0),
+            )
+            .await?;
+        let list: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "external_id": s.external_id,
+                    "agent_id": s.agent_id,
+                    "model": s.model,
+                    "started_at": s.started_at,
+                    "ended_at": s.ended_at,
+                    "summary": s.summary,
+                    "memory_count": s.memory_count,
+                    "tags": s.tags,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "sessions": list, "count": list.len() }).to_string())
     }
 
     pub async fn do_get_session(&self, params: GetSessionParams) -> anyhow::Result<String> {
@@ -973,6 +1012,70 @@ mod get_info_tests {
     }
 
     #[tokio::test]
+    async fn list_sessions_filters_and_counts() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        for (sess, agent) in [("sess-l1", "pi"), ("sess-l2", "claude-code")] {
+            server
+                .do_store_memory(StoreMemoryParams {
+                    content: format!("fact in {sess}"),
+                    tags: None,
+                    session_id: Some(sess.to_string()),
+                    agent_id: Some(agent.to_string()),
+                    model: None,
+                })
+                .await
+                .unwrap();
+        }
+        server
+            .do_finalize_session(FinalizeSessionParams {
+                session_id: "sess-l2".to_string(),
+                summary: Some("wrapped".to_string()),
+                tags: None,
+            })
+            .await
+            .unwrap();
+
+        let all: serde_json::Value = serde_json::from_str(
+            &server
+                .do_list_sessions(ListSessionsParams {
+                    agent_id: None,
+                    tag: None,
+                    finalized: None,
+                    limit: None,
+                    offset: None,
+                })
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(all["count"], 2);
+        assert_eq!(all["sessions"][0]["external_id"], "sess-l2");
+        assert_eq!(all["sessions"][0]["memory_count"], 1);
+        assert_eq!(all["sessions"][0]["summary"], "wrapped");
+
+        let open: serde_json::Value = serde_json::from_str(
+            &server
+                .do_list_sessions(ListSessionsParams {
+                    agent_id: Some("pi".to_string()),
+                    tag: None,
+                    finalized: Some(false),
+                    limit: None,
+                    offset: None,
+                })
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(open["count"], 1);
+        assert_eq!(open["sessions"][0]["external_id"], "sess-l1");
+    }
+
+    #[tokio::test]
     async fn get_session_hides_deleted_and_reports_live_count() {
         let db = Database::connect_embedded().await.unwrap();
         alexandria_storage::schema::migrate(db.inner())
@@ -1315,6 +1418,18 @@ mod get_info_tests {
             &server
                 .get_session(Parameters(GetSessionParams {
                     session_id: "sess-struct".to_string(),
+                }))
+                .await,
+        );
+        check_structured(
+            "list_sessions",
+            &server
+                .list_sessions(Parameters(ListSessionsParams {
+                    agent_id: None,
+                    tag: None,
+                    finalized: None,
+                    limit: None,
+                    offset: None,
                 }))
                 .await,
         );
