@@ -125,10 +125,25 @@ After=network.target
 ExecStart=%h/.cargo/bin/alexandria
 Restart=on-failure
 RestartSec=5
-Environment=RUST_LOG=info
+Environment=RUST_LOG=info,rmcp=warn
 
 [Install]
 WantedBy=default.target
+```
+
+`rmcp=warn` drops the per-request transport chatter (~6 lines per call at `info`) while keeping Alexandria's own logs.
+
+journald has no per-unit size cap, so bound the journal globally if you want to limit history:
+
+```ini
+# /etc/systemd/journald.conf.d/alexandria.conf
+[Journal]
+SystemMaxUse=200M
+MaxRetentionSec=1month
+```
+
+```bash
+sudo systemctl restart systemd-journald
 ```
 
 ```bash
