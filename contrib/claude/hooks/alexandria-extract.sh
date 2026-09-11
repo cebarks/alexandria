@@ -55,17 +55,21 @@ transcript=$(jq -r '.transcript_path // ""' <<<"$input")
 # behind); without this wait every extraction runs one assistant message late and a session's
 # last reply is never seen. Cheap: this copy is detached.
 sleep "${ALEXANDRIA_EXTRACT_FLUSH_WAIT:-1}"
+# The chunk ends at the last assistant line, not at end of file: a prompt queued during generation is
+# dispatched inside that wait and would otherwise be swallowed into this turn. Bookkeeping lines past
+# it (system, cost-state, queue-operation) are rescanned next time and filtered out anyway.
 marker="$state/$session.extracted"
 done_lines=$(cat "$marker" 2>/dev/null || echo 0)
-total=$(wc -l <"$transcript")
+total=$(awk '/"type":"assistant"/{n=NR} END{print n+0}' "$transcript")
 [ "$total" -gt "$done_lines" ] || exit 0
+chunk() { sed -n "$((done_lines + 1)),${total}p" "$transcript"; }
 
 # user (string or text blocks; skip injected/system lines) + assistant text + failed tool results.
 # Errors go in so a silent fix-and-retry still shows the LLM the root cause; <tool_use_error> is the
 # harness refusing a call (file not read, old_string missing), never durable knowledge. Each error is
 # attributed to its tool_use (name + input, cut short) via tool_use_id: the call and its result land
 # in the same turn, so the chunk is slurped and the id map built from its assistant lines.
-text=$(tail -n +"$((done_lines + 1))" "$transcript" | jq -nrR '
+text=$(chunk | jq -nrR '
   def txt: if type == "string" then . else [.[]? | select(.type == "text") | .text] | join("\n") end;
   [inputs | fromjson?] as $lines
   | ([$lines[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use")
@@ -89,7 +93,7 @@ mkdir -p "${marker%/*}"; echo "$total" >"$marker"
 # on all-MiniLM-L6-v2 (measured 2026-09-08) real duplicates score 0.64-0.76 against each other and
 # distinct neighbours 0.63-0.76. ponytail: covers only what the user's prompts recalled; a gotcha that
 # surfaces purely from tool output, or auto-recall off, still dedups within the session only.
-recalled=$(tail -n +"$((done_lines + 1))" "$transcript" | jq -rR '
+recalled=$(chunk | jq -rR '
   fromjson? | select(.type == "attachment") | .attachment
   | select(.type == "hook_additional_context" and .hookEvent == "UserPromptSubmit")
   | .content[]? | strings | select(startswith("Relevant memories retrieved automatically"))
