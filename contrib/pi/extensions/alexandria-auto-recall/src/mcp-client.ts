@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/client";
 import { CONFIG } from "./config.js";
 import type { SessionArgs } from "./session-args.js";
+import { finalizeError } from "./finalize-result.js";
 
 let clientPromise: Promise<Client> | null = null;
 
@@ -111,5 +112,11 @@ export async function finalizeSession(
 	summary?: string,
 	tags?: string[],
 ): Promise<void> {
-	await callToolWithRetry("finalize_session", { session_id: session.session_id, summary, tags });
+	const result = await callToolWithRetry("finalize_session", {
+		session_id: session.session_id,
+		summary,
+		tags,
+	});
+	const err = finalizeError(extractTextContent(result.content));
+	if (err) throw new Error(err);
 }

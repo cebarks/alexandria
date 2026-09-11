@@ -177,11 +177,15 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 				for (const mem of extracted.memories) {
 					await storeMemory(mem.content, [...mem.tags, "extracted"], session).catch(() => {});
 				}
-				// Sessions exist only once something was stored under them, so a
-				// chat-only session makes this fail with "Session not found"; that
-				// is the expected case, not a fault worth surfacing.
+				// finalizeSession swallows the chat-only "Session not found" case
+				// itself; anything that reaches here is a real failure.
 				if (extracted.summary || extracted.tags) {
-					await finalizeSession(session, extracted.summary, extracted.tags).catch(() => {});
+					await finalizeSession(session, extracted.summary, extracted.tags).catch((err) => {
+						ctx.ui.notify(
+							`Alexandria finalize_session failed (${err instanceof Error ? err.message : String(err)})`,
+							"warning",
+						);
+					});
 				}
 			} catch (err) {
 				ctx.ui.notify(
