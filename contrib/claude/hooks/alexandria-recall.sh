@@ -16,7 +16,7 @@
 #   ALEXANDRIA_AUTO_RECALL                 "off" disables recall
 #   ALEXANDRIA_AUTO_RECALL_LIMIT           default 5
 #   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY  default 0.35
-#   ALEXANDRIA_AUTO_STORE                  "off" disables the detectors
+#   ALEXANDRIA_AUTO_STORE                  "off" disables the detectors; "on" enables them in headless (sdk-*) sessions, where the default is off
 #   ALEXANDRIA_HOOK_CHILD                  set by hooks that shell out to `claude -p`; exits at once
 set -uo pipefail
 [ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
@@ -103,8 +103,11 @@ detect() { # <prefix> <patterns...> → prints "<prefix>: <statement>" for the f
     echo "$prefix: $stmt"; return
   done
 }
+# Headless sessions (`claude -p`, Agent SDK) inherit CLAUDE_CODE_ENTRYPOINT=sdk-*: auto-store is off
+# there unless ALEXANDRIA_AUTO_STORE=on, so scripted experiments never land in the real database.
+store=${ALEXANDRIA_AUTO_STORE:-}; [ -n "$store" ] || case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*) store=off;; esac
 detections=()
-if [ "${ALEXANDRIA_AUTO_STORE:-}" != "off" ] && [ -n "$session" ]; then
+if [ "$store" != off ] && [ -n "$session" ]; then
   p=$(trim "$prompt")
   if [ ${#p} -ge 8 ] && [ ${#p} -le 500 ]; then
     c=$(detect "User correction" "${CORRECTION[@]}"); [ -n "$c" ] && detections+=("$c")
