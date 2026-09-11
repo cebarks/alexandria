@@ -74,9 +74,10 @@ These are real gaps in the shipped implementation, not usage advice:
   finding a session by what its summary says means paging through the list.
 - **No debug UI page for sessions.** The `/debug` views cover memories, clusters, the graph, and
   the maintenance log; sessions are reachable only through the MCP tools or a direct query.
-- **The pi extension does not populate sessions.** `contrib/pi/` stores and retrieves memories
-  without a `session_id`, so auto-store/auto-recall traffic is ungrouped. Session tools are for
-  agents that decide to use them explicitly.
+- **The pi extension finalizes only sessions that stored something.** `contrib/pi/` groups every
+  auto-store write under pi's session id (with `agent_id="pi"` and the active model) and calls
+  `finalize_session` at shutdown with an LLM-written summary and tags. A session with no stores was
+  never created, so that call fails and is ignored. Auto-recall is still unscoped.
 
 ## SurrealDB 3.2 gotchas in this code path
 

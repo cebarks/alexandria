@@ -135,10 +135,12 @@ milestone:
   clusters rather than sessions.
 - ~~**`session.agent_id` / `session.model` are dead columns.**~~ Done: optional `agent_id` / `model`
   on `store_memory` and `import_document`, recorded on the session when first seen.
-- **No tests for the pi extension.** The detector regexes and extraction prompt have no coverage, so
-  a pattern edit is unguarded.
-- **Extension does not use sessions.** Auto-store writes are ungrouped.
-- **README said MIT.** Corrected to AGPL-3.0-or-later to match `LICENSE` and
+- ~~**No tests for the pi extension.**~~ Done 2026-09-10 (`baafa76`): `just test-pi` runs `node:test`
+  over the detectors, the dedup buffer, and the extraction serializer/parser.
+- ~~**Extension does not use sessions.**~~ Done 2026-09-10: every auto-store write carries pi's
+  session id as `session_id`, plus `agent_id="pi"` and the active model. Sessions are never
+  finalized by the extension; `list_sessions(agent_id="pi")` finds them.
+- ~~**README said MIT.**~~ Done: corrected to AGPL-3.0-or-later to match `LICENSE` and
   `license.workspace`; verified nothing else in-tree still claims MIT (`deny.toml`'s MIT entries are
   third-party license allow-listing, which is unrelated). If the GitHub repo's advertised license
   badge still reads MIT, that is an API-side setting, not a file.
