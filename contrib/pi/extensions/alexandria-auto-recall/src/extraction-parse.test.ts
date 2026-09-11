@@ -32,8 +32,7 @@ test("skips unknown entries, missing messages, and empty text", () => {
 		msg("assistant", [{ type: "tool_use" }]),
 		msg("user", "kept"),
 	]);
-	// An empty user message still advances the turn counter.
-	assert.equal(out, "[Turn 2 - User]: kept");
+	assert.equal(out, "[Turn 1 - User]: kept");
 });
 
 test("parses bare and fenced JSON", () => {

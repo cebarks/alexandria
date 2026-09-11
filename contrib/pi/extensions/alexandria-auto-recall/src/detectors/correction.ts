@@ -17,7 +17,6 @@ const CORRECTION_PATTERNS: RegExp[] = [
 	/\bi\s+meant\s+(.+)/i,
 	/\bnot\s+.{2,30}[,;]\s*(?:use|it'?s)\s+(.+)/i,
 	/\bdon'?t\s+use\s+.{2,30}[,;]\s*use\s+(.+)/i,
-	/\buse\s+(.+?)\s+instead\s+of\s+.+/i,
 	/\bwrong\s*[—–-]\s*(.+)/i,
 	/\bincorrect\s*[—–-]\s*(.+)/i,
 ];

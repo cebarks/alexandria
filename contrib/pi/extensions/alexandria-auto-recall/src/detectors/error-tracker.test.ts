@@ -25,6 +25,14 @@ test("a paired error is consumed", () => {
 	assert.equal(t.flush().length, 1);
 });
 
+test("an empty success does not consume the error", () => {
+	const t = new ErrorTracker();
+	t.recordError("Bash", ERR);
+	t.recordSuccess("Bash", "   ");
+	t.recordSuccess("Bash", "fixed");
+	assert.equal(t.flush().length, 1);
+});
+
 test("success on a different tool does not pair", () => {
 	const t = new ErrorTracker();
 	t.recordError("Bash", ERR);

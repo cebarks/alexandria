@@ -14,7 +14,6 @@ test("each correction pattern captures the corrected statement", () => {
 		["I meant the storage crate.", "the storage crate"],
 		["Not sqlite, use surrealdb please.", "surrealdb please"],
 		["Don't use tabs, use spaces for indent.", "spaces for indent"],
-		["Use ripgrep instead of grep.", "ripgrep"],
 		["Wrong - the default is 300 seconds.", "the default is 300 seconds"],
 		["Incorrect — retries are off by default!", "retries are off by default"],
 	];
@@ -29,6 +28,7 @@ test("each correction pattern captures the corrected statement", () => {
 
 test("returns null when nothing matches", () => {
 	assert.equal(detect("Please add a test for the parser."), null);
+	assert.equal(detect("Use ripgrep instead of grep."), null);
 });
 
 test("skips prompts under 8 or over 500 characters", () => {

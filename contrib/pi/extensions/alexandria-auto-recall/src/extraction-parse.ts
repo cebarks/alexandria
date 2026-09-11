@@ -24,9 +24,11 @@ export function serializeEntries(entries: unknown[]): string {
 			const content = msg.content;
 
 			if (role === "user") {
-				turnNum++;
 				const text = extractText(content);
-				if (text) lines.push(`[Turn ${turnNum} - User]: ${text}`);
+				if (text) {
+					turnNum++;
+					lines.push(`[Turn ${turnNum} - User]: ${text}`);
+				}
 			} else if (role === "assistant") {
 				const text = extractText(content);
 				if (text) lines.push(`[Turn ${turnNum} - Assistant]: ${text}`);

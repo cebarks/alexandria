@@ -44,10 +44,10 @@ test("dedups repeated preferences within a session", () => {
 	assert.equal(detectPreference("ALWAYS run  the tests", buffer), null);
 });
 
-test("'use X instead of Y' fires both detectors", () => {
+test("'use X instead of Y' is a preference, not a correction", () => {
 	const buffer = new SessionDedupBuffer();
 	const prompt = "Use ripgrep instead of grep.";
-	assert.equal(detectCorrection(prompt, buffer)?.content, "User correction: ripgrep");
+	assert.equal(detectCorrection(prompt, buffer), null);
 	assert.equal(
 		detectPreference(prompt, buffer)?.content,
 		"User preference: Use ripgrep instead of grep",
