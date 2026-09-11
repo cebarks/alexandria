@@ -37,7 +37,8 @@ export function detectCorrection(
 		const match = trimmed.match(pattern);
 		if (match?.[1]) {
 			const correctedFact = match[1].replace(/[.!]+$/, "").trim();
-			if (correctedFact.length < 5) continue; // too short to be useful
+			// One word ("no, it's completed") is a state report, not a fact.
+			if (correctedFact.length < 5 || !/\s/.test(correctedFact)) continue;
 
 			const content = `User correction: ${correctedFact}`;
 

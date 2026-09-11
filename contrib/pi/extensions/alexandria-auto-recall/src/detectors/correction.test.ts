@@ -40,6 +40,12 @@ test("skips a corrected statement shorter than 5 characters", () => {
 	assert.equal(detect("No, use tabs"), null);
 });
 
+test("skips a one-word corrected statement", () => {
+	// "no, it's completed" is the user reporting state, not a fact worth keeping;
+	// the live corpus had 14 copies of "User correction: completed" (A3 probe).
+	assert.equal(detect("No, it's completed."), null);
+});
+
 test("dedups repeated corrections within a session", () => {
 	const buffer = new SessionDedupBuffer();
 	assert.notEqual(detectCorrection("Actually, the port is 8080.", buffer), null);
