@@ -220,26 +220,3 @@ async fn reembed_moves_lock_over_empty_corpus() {
         Some("b")
     );
 }
-
-#[tokio::test]
-async fn reembed_rejects_zero_batch_size() {
-    let (db, live1, _, _, _) = seed().await;
-
-    let err = reembed(&db, &ModelB, 0).await.unwrap_err();
-    assert!(err.to_string().contains("batch_size"), "{err}");
-
-    let fact = MemoryRepo::new(db.inner())
-        .get_fact(&live1)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(fact.embedding, vec![0.6, 0.8], "untouched");
-    assert_eq!(
-        system_config::get_config(db.inner(), "embedding_model")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("a"),
-        "lock untouched"
-    );
-}

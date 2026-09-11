@@ -19,12 +19,12 @@ pub enum ReembedOutcome {
 }
 
 /// `batch_size` is facts per `embed()` call; it bounds peak memory for large corpora.
+/// Must be at least 1; `Config::load` rejects 0 before this is reached.
 pub async fn reembed(
     db: &Database,
     provider: &dyn EmbeddingProvider,
     batch_size: usize,
 ) -> anyhow::Result<ReembedOutcome> {
-    ensure!(batch_size > 0, "embedding.batch_size must be at least 1");
     let new_model = provider.model_id();
     let memories = MemoryRepo::new(db.inner());
     match system_config::get_config(db.inner(), "embedding_model").await? {
