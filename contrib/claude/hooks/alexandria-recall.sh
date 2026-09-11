@@ -19,6 +19,7 @@
 #   ALEXANDRIA_AUTO_STORE                  "off" disables the detectors; "on" enables them in headless (sdk-*) sessions, where the default is off
 #   ALEXANDRIA_HOOK_CHILD                  set by hooks that shell out to `claude -p`; exits at once
 set -uo pipefail
+[ $# -gt 0 ] || input=$(cat)   # before any guard: exiting with stdin unread can SIGPIPE the writer (test.sh pipes jq in)
 [ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
 
 URL="${ALEXANDRIA_URL:-http://127.0.0.1:3000/mcp}"
@@ -54,7 +55,6 @@ if [ $# -gt 0 ]; then
   echo "$out"; exit
 fi
 
-input=$(cat)
 prompt=$(jq -r '.prompt // ""' <<<"$input" 2>/dev/null) || exit 0
 [ -n "${prompt// /}" ] || exit 0
 session=$(jq -r '.session_id // ""' <<<"$input")
@@ -129,7 +129,7 @@ for d in "${detections[@]}"; do
   mkdir -p "${stored%/*}"; touch "$stored"
   grep -qxF "$norm" "$stored" && continue
   tag=$([[ $d == "User correction"* ]] && echo correction || echo preference)
-  out=$(mcp_tool store_memory "$(jq -cn --arg c "$d" --arg t "$tag" --arg s "$session" '{content:$c,tags:[$t,"auto-detected"],session_id:$s}')") \
+  out=$(mcp_tool store_memory "$(jq -cn --arg c "$d" --arg t "$tag" --arg s "$session" '{content:$c,tags:[$t,"auto-detected"],session_id:$s,agent_id:"claude-code"}')") \
     && echo "$norm" >>"$stored" || echo "alexandria-recall: store failed: $out" >&2
 done
 
