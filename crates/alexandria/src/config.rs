@@ -19,6 +19,7 @@ pub struct Config {
     pub activation: ActivationConfig,
     pub cluster: ClusterConfig,
     pub retrieve: RetrieveConfig,
+    pub reminders: RemindersConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,6 +108,17 @@ pub struct ClusterConfig {
     pub maintenance_interval_secs: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RemindersConfig {
+    /// IANA timezone for naive datetime input and pattern/cron evaluation.
+    /// Empty string = system-local (resolved via iana-time-zone at startup).
+    pub timezone: String,
+    /// Project-targeted reminders escalate to global delivery after being
+    /// overdue this long. Default 48.
+    pub escalation_hours: u64,
+}
+
 // --- Defaults ---
 
 fn default_data_dir() -> PathBuf {
@@ -171,6 +183,15 @@ impl Default for ClusterConfig {
             merge_threshold: 0.9,
             cohesion_floor: 0.6,
             maintenance_interval_secs: 300,
+        }
+    }
+}
+
+impl Default for RemindersConfig {
+    fn default() -> Self {
+        Self {
+            timezone: String::new(),
+            escalation_hours: 48,
         }
     }
 }
@@ -251,6 +272,14 @@ impl Config {
         }
         if let Ok(device) = std::env::var("ALEXANDRIA_EMBEDDING_DEVICE") {
             config.embedding.device = device;
+        }
+        if let Ok(tz) = std::env::var("ALEXANDRIA_REMINDERS_TIMEZONE") {
+            config.reminders.timezone = tz;
+        }
+        if let Ok(h) = std::env::var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS") {
+            config.reminders.escalation_hours = h.parse().map_err(|e| {
+                anyhow::anyhow!("invalid ALEXANDRIA_REMINDERS_ESCALATION_HOURS `{h}`: {e}")
+            })?;
         }
 
         Ok(config)
@@ -445,5 +474,47 @@ mod tests {
             .contains("ALEXANDRIA_SERVER_PORT"));
 
         std::env::remove_var("ALEXANDRIA_SERVER_PORT");
+    }
+
+    #[test]
+    fn test_reminders_defaults() {
+        let config = Config::default();
+        assert_eq!(config.reminders.timezone, ""); // empty = system-local, resolved at startup
+        assert_eq!(config.reminders.escalation_hours, 48);
+    }
+
+    #[test]
+    fn test_reminders_from_toml() {
+        let toml = r#"
+            [reminders]
+            timezone = "Europe/Stockholm"
+            escalation_hours = 24
+        "#;
+        let config = Config::from_toml(toml).unwrap();
+        assert_eq!(config.reminders.timezone, "Europe/Stockholm");
+        assert_eq!(config.reminders.escalation_hours, 24);
+    }
+
+    #[test]
+    #[serial]
+    fn test_reminders_env_overrides() {
+        std::env::set_var("ALEXANDRIA_REMINDERS_TIMEZONE", "America/New_York");
+        std::env::set_var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS", "12");
+
+        let config = Config::load().unwrap();
+        assert_eq!(config.reminders.timezone, "America/New_York");
+        assert_eq!(config.reminders.escalation_hours, 12);
+
+        std::env::remove_var("ALEXANDRIA_REMINDERS_TIMEZONE");
+        std::env::remove_var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_reminders_env_invalid_hours() {
+        std::env::set_var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS", "soon");
+        let result = Config::load();
+        assert!(result.is_err());
+        std::env::remove_var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS");
     }
 }
