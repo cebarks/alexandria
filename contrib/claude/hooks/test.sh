@@ -71,10 +71,11 @@ out=$(jq -cn '{session_id:"sess-test-123",tool_name:"mcp__alexandria__import_doc
 td=$(mktemp -d); trap 'cleanup; rm -rf "$XDG_STATE_HOME" "$td"' EXIT
 jq -cn '{type:"user",message:{content:"<local-command-caveat>ignore me</local-command-caveat>"}}
         ,{type:"user",message:{content:"which storage engine should we pick?"}}
-        ,{type:"assistant",message:{content:[{type:"thinking",thinking:"hmm"},{type:"tool_use",name:"Bash"}]}}
-        ,{type:"user",message:{content:[{type:"tool_result",content:"ok"}]}}
-        ,{type:"user",message:{content:[{type:"tool_result",is_error:true,content:"<tool_use_error>File has not been read yet.</tool_use_error>"}]}}
-        ,{type:"user",message:{content:[{type:"tool_result",is_error:true,content:[{type:"text",text:"Exit code 101\nerror[E0433]: failed to resolve: use of undeclared crate"}]}]}}
+        ,{type:"assistant",message:{content:[{type:"thinking",thinking:"hmm"},{type:"tool_use",id:"toolu_1",name:"Bash",input:{command:"cargo test",description:"Run tests"}}]}}
+        ,{type:"user",message:{content:[{type:"tool_result",tool_use_id:"toolu_1",content:"ok"}]}}
+        ,{type:"user",message:{content:[{type:"tool_result",tool_use_id:"toolu_1",is_error:true,content:"<tool_use_error>File has not been read yet.</tool_use_error>"}]}}
+        ,{type:"user",message:{content:[{type:"tool_result",tool_use_id:"toolu_1",is_error:true,content:[{type:"text",text:"Exit code 101\nerror[E0433]: failed to resolve: use of undeclared crate"}]}]}}
+        ,{type:"user",message:{content:[{type:"tool_result",tool_use_id:"toolu_unknown",is_error:true,content:"orphan error"}]}}
         ,{type:"attachment",attachment:{type:"hook_additional_context",hookEvent:"UserPromptSubmit",content:["Relevant memories retrieved automatically from Alexandria for this prompt:\n- (similarity 0.61, id fact:abc) [hook-test] Recalled from another session: storage engines are compared on process count\n\nThese are surfaced proactively; verify relevance before relying on them, and use update_memory if any is stale."]}}
         ,{type:"attachment",attachment:{type:"hook_additional_context",hookEvent:"SessionStart",content:["PONYTAIL MODE ACTIVE"]}}
         ,{type:"assistant",message:{content:[{type:"text",text:"We decided to use SurrealKV because it needs no external process."}]}}' >"$td/t.jsonl"
@@ -90,7 +91,8 @@ stop
 grep -q '^\[User\]: which storage engine' "$td/prompt.txt"
 grep -q '^\[Assistant\]: We decided' "$td/prompt.txt"
 grep -q 'ignore me\|hmm\|tool_result' "$td/prompt.txt" && exit 1   # `! cmd` never trips set -e
-grep -q '^\[Tool error\]: Exit code 101' "$td/prompt.txt"   # is_error results are fed in; harness <tool_use_error> ones are not
+grep -q '^\[Tool error\]: Bash {"command":"cargo test","description":"Run tests"} -- Exit code 101' "$td/prompt.txt"   # is_error results are fed in, attributed to their tool_use; harness <tool_use_error> ones are not
+grep -q '^\[Tool error\]: orphan error' "$td/prompt.txt"   # unknown tool_use_id keeps the bare form
 grep -q 'tool_use_error\|has not been read' "$td/prompt.txt" && exit 1
 grep -q 'User correction: jj instead of git' "$td/prompt.txt"   # already-stored block
 # Auto-recall hits from the transcript's attachment lines join the already-stored block, never the conversation.
@@ -103,13 +105,13 @@ echo "$got"
 # No new transcript lines: LLM not called again. New short line: deferred (marker unchanged).
 stop; [ "$(cat "$td/calls")" = 1 ]
 jq -cn '{type:"user",message:{content:"ok"}}' >>"$td/t.jsonl"
-ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 9 ]
+ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 10 ]
 # stop_hook_active / child guard: no call.
 jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ./alexandria-extract.sh
 [ "$(cat "$td/calls")" = 1 ]
 # Headless session: no call, marker untouched.
 jq -cn '{type:"user",message:{content:"headless chatter that must not be extracted"}}' >>"$td/t.jsonl"
-CLAUDE_CODE_ENTRYPOINT=sdk-py stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 9 ]
+CLAUDE_CODE_ENTRYPOINT=sdk-py stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 10 ]
 # Empty result: exactly one call, nothing stored.
 cat >"$td/empty.sh" <<'STUB'
 #!/usr/bin/env bash
