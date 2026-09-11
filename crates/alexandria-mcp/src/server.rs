@@ -362,9 +362,8 @@ impl AlexandriaServer {
         };
 
         // Create a raw record for the full document (source for extracted_from edges)
-        let raw_id = self.create_raw_record(&params.content).await?;
-
         let repo = MemoryRepo::new(self.db.inner());
+        let raw_id = repo.create_raw(&params.content).await?;
         let heat_repo = HeatRepo::new(self.db.inner());
         let edge_repo = EdgeRepo::new(self.db.inner());
         let mut created_ids = Vec::new();
@@ -675,13 +674,7 @@ impl AlexandriaServer {
                 cluster_repo.add_member(&cid, fact_id).await?;
                 if let Some(old) = clusters.iter().find(|c| c.id == cid) {
                     let new_centroid = update_centroid(&old.centroid, embedding, old.member_count);
-                    self.db
-                        .inner()
-                        .query("UPDATE type::record($id) SET centroid = $centroid")
-                        .bind(("id", cid))
-                        .bind(("centroid", new_centroid))
-                        .await?
-                        .check()?;
+                    cluster_repo.update_centroid(&cid, &new_centroid).await?;
                 }
             }
             alexandria_engine::clusters::ClusterAssignment::NewCluster => {
@@ -725,44 +718,16 @@ impl AlexandriaServer {
         Ok(())
     }
 
-    /// Create a raw record for document import.
-    async fn create_raw_record(&self, content: &str) -> anyhow::Result<String> {
-        let mut response = self
-            .db
-            .inner()
-            .query("CREATE raw SET content = $content, deleted = false")
-            .bind(("content", content.to_string()))
-            .await?;
-        let created: Option<alexandria_storage::models::RawRecord> = response.take(0)?;
-        let raw = created.ok_or_else(|| anyhow::anyhow!("Failed to create raw record"))?;
-        let id = raw
-            .id
-            .ok_or_else(|| anyhow::anyhow!("Raw record has no id"))?;
-        Ok(record_id_to_string(&id))
-    }
-
     async fn load_cluster_infos(&self) -> anyhow::Result<Vec<ClusterInfo>> {
-        let mut response = self.db.inner().query("SELECT * FROM cluster").await?;
-        let clusters: Vec<alexandria_storage::models::Cluster> = response.take(0)?;
-
-        let cluster_repo = ClusterRepo::new(self.db.inner());
-        let mut infos = Vec::with_capacity(clusters.len());
-
-        for c in clusters {
-            let id = c.id.map(|r| record_id_to_string(&r)).unwrap_or_default();
-            let member_count = cluster_repo
-                .get_members(&id)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            infos.push(ClusterInfo {
-                id,
+        let clusters = ClusterRepo::new(self.db.inner()).list_with_counts().await?;
+        Ok(clusters
+            .into_iter()
+            .map(|(c, member_count)| ClusterInfo {
+                id: c.id.map(|r| record_id_to_string(&r)).unwrap_or_default(),
                 centroid: c.centroid,
                 member_count,
-            });
-        }
-
-        Ok(infos)
+            })
+            .collect())
     }
 
     async fn load_cluster_with_members(

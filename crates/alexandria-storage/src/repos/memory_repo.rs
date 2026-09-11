@@ -3,7 +3,7 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue, ToSql};
 
-use crate::models::Fact;
+use crate::models::{Fact, RawRecord};
 use crate::record_id_to_string;
 
 pub struct MemoryRepo<'a> {
@@ -44,6 +44,22 @@ impl<'a> MemoryRepo<'a> {
             .id
             .ok_or_else(|| anyhow::anyhow!("Created fact has no id"))?;
         Ok(id.to_sql())
+    }
+
+    /// Create a `raw` record holding a full source document for `import_document`.
+    pub async fn create_raw(&self, content: &str) -> Result<String> {
+        let mut response = self
+            .db
+            .query("CREATE raw SET content = $content, deleted = false")
+            .bind(("content", content.to_string()))
+            .await?;
+
+        let created: Option<RawRecord> = response.take(0)?;
+        let raw = created.ok_or_else(|| anyhow::anyhow!("Failed to create raw record"))?;
+        let id = raw
+            .id
+            .ok_or_else(|| anyhow::anyhow!("Raw record has no id"))?;
+        Ok(record_id_to_string(&id))
     }
 
     pub async fn get_fact(&self, id: &str) -> Result<Option<Fact>> {
@@ -262,6 +278,27 @@ impl<'a> MemoryRepo<'a> {
 mod tests {
     use super::*;
     use crate::connection::Database;
+
+    #[tokio::test]
+    async fn test_create_raw() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let id = repo.create_raw("full document").await.unwrap();
+        assert!(id.starts_with("raw:"), "unexpected id {id}");
+
+        let mut response = db
+            .inner()
+            .query("SELECT * FROM type::record($id)")
+            .bind(("id", id.clone()))
+            .await
+            .unwrap();
+        let raw: Option<RawRecord> = response.take(0).unwrap();
+        let raw = raw.expect("raw record round-trips");
+        assert_eq!(raw.content, "full document");
+        assert!(!raw.deleted);
+    }
 
     #[tokio::test]
     async fn test_list_and_count_facts() {
