@@ -42,6 +42,7 @@ import { detectPreference } from "./detectors/preference.js";
 import { trackToolStore } from "./detectors/tool-tracker.js";
 import { ErrorTracker } from "./detectors/error-tracker.js";
 import { runExtraction } from "./extraction.js";
+import { sessionArgs } from "./session-args.js";
 
 /**
  * Extract readable text from a tool_execution_end result.
@@ -104,7 +105,7 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 	// ── Store: Heuristic detectors ──────────────────────────────────────
 	if (!CONFIG.storeDisabled) {
 		// Correction + preference detection on user prompts
-		pi.on("before_agent_start", async (event) => {
+		pi.on("before_agent_start", async (event, ctx) => {
 			const prompt = event.prompt?.trim();
 			if (!prompt) return;
 
@@ -117,7 +118,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 			for (const detection of detections) {
 				// storeMemory uses callToolWithRetry internally, so stale
 				// sessions are recovered automatically.
-				storeMemory(detection.content, detection.tags).catch(() => {});
+				storeMemory(detection.content, detection.tags, sessionArgs(ctx)).catch(
+					() => {},
+				);
 			}
 		});
 
@@ -152,10 +155,10 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 		});
 
 		// Flush error resolutions at agent_end
-		pi.on("agent_end", async () => {
+		pi.on("agent_end", async (_event, ctx) => {
 			const resolutions = errorTracker.flush();
 			for (const mem of resolutions) {
-				storeMemory(mem.content, mem.tags).catch(() => {});
+				storeMemory(mem.content, mem.tags, sessionArgs(ctx)).catch(() => {});
 			}
 		});
 	}
@@ -170,7 +173,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 					dedupBuffer,
 				);
 				for (const mem of extracted) {
-					await storeMemory(mem.content, [...mem.tags, "extracted"]).catch(() => {});
+					await storeMemory(mem.content, [...mem.tags, "extracted"], sessionArgs(ctx)).catch(
+						() => {},
+					);
 				}
 			} catch (err) {
 				ctx.ui.notify(

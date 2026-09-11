@@ -12,6 +12,7 @@ import {
 	StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
 import { CONFIG } from "./config.js";
+import type { SessionArgs } from "./session-args.js";
 
 let clientPromise: Promise<Client> | null = null;
 
@@ -100,6 +101,7 @@ export function extractTextContent(content: unknown): string | undefined {
 export async function storeMemory(
 	content: string,
 	tags: string[],
+	session: SessionArgs,
 ): Promise<void> {
-	await callToolWithRetry("store_memory", { content, tags });
+	await callToolWithRetry("store_memory", { content, tags, ...session });
 }

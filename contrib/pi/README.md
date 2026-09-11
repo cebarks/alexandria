@@ -117,8 +117,10 @@ client detects "Session not found", reconnects, and retries once before surfacin
 - **Only the pure logic is tested.** `just test-pi` (or `npm test` in the extension directory)
   runs `node:test` over the detectors, the dedup buffer, and the extraction serializer/parser.
   The extraction prompt itself, recall, and the MCP client have no coverage.
-- **No session memory integration.** The extension stores and retrieves without a `session_id`, so
-  its writes are ungrouped. See [docs/session-memory.md](../../docs/session-memory.md).
+- **Sessions are grouped but never finalized.** Every auto-store write carries pi's session id as
+  `session_id` (plus `agent_id="pi"` and the active model), so `list_sessions(agent_id="pi")` and
+  `get_session` see them. The extension does not call `finalize_session`, and recall is not scoped
+  to the session. See [docs/session-memory.md](../../docs/session-memory.md).
 - **Recall ignores `recall`.** It uses `retrieve_memories`, never the two-phase `recall` tool, so
   broad "what do we know about X" exploration is not what auto-recall is tuned for.
 - **Extraction is end-of-session and best-effort.** It reads the tail of a long conversation (capped
