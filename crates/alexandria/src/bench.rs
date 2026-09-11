@@ -98,6 +98,11 @@ const RECALL_LIMIT: usize = 10;
 /// single-limit table still reproduces from the same run.
 const LIMITS: [usize; 6] = [3, 5, 8, 10, 15, 20];
 
+/// Most facts read from the corpus in one `list` call. `MemoryRepo::list` orders newest-first,
+/// so a corpus at or past this size would silently drop the *oldest* facts — the baseline
+/// window and every frozen `QUESTIONS` target — and `run()` bails instead.
+const CORPUS_CAP: usize = 100_000;
+
 /// One (limit, threshold) cell of the client-filter simulation.
 struct Sweep {
     limit: usize,
@@ -319,6 +324,25 @@ fn report(label: &str, m: &Metrics, model: &str) {
         println!("  {:>2}. rank {:<4} {short}", i + 1, rank);
     }
 
+    // `RECALL_LIMIT` was set where delivery saturates, which is a property of the corpus, not
+    // the model: rank inflates as the corpus grows, and a target past the limit clears every
+    // threshold on score and is never delivered, with no other signal. A rank equal to the
+    // limit is still delivered.
+    let worst = m.ranks.iter().copied().max().unwrap_or(0);
+    let hidden = m.ranks.iter().filter(|&&r| r > RECALL_LIMIT).count();
+    if hidden == 0 {
+        println!(
+            "\nrecall limit headroom: worst rank {worst} of limit {RECALL_LIMIT} ({} positions)",
+            RECALL_LIMIT - worst
+        );
+    } else {
+        println!(
+            "\nrecall limit headroom WARN: worst rank {worst} exceeds limit {RECALL_LIMIT}; {hidden} \
+             target(s) clear the threshold on score but are never delivered — re-run the grid \
+             below and revisit the client default"
+        );
+    }
+
     // The rule from docs/plans/2026-09-08-embedding-model-swap-design.md: the floor is
     // the median non-hit score, and it is only usable if it sits below the weakest hit.
     let floor = (m.nonhit[0] * 100.0).round() / 100.0;
@@ -373,7 +397,7 @@ pub async fn run() -> anyhow::Result<()> {
     let db = Database::connect(&config.database.data_dir).await?;
 
     let all: Vec<(String, Vec<f32>, Option<DateTime<Utc>>)> = MemoryRepo::new(db.inner())
-        .list(None, None, false, 100_000, 0)
+        .list(None, None, false, CORPUS_CAP, 0)
         .await?
         .into_iter()
         .filter_map(|f| {
@@ -382,6 +406,12 @@ pub async fn run() -> anyhow::Result<()> {
         })
         .collect();
     anyhow::ensure!(!all.is_empty(), "no active facts in the corpus");
+    anyhow::ensure!(
+        all.len() < CORPUS_CAP,
+        "corpus hit the {CORPUS_CAP}-fact read cap; the read is newest-first, so the oldest facts \
+         (the baseline window and the frozen QUESTIONS targets) are missing and every metric would \
+         be wrong without saying so. Raise CORPUS_CAP in crates/alexandria/src/bench.rs."
+    );
     let oldest = all.iter().filter_map(|(_, _, c)| *c).min();
     let newest = all.iter().filter_map(|(_, _, c)| *c).max();
     if let (Some(o), Some(n)) = (oldest, newest) {
