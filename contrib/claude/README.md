@@ -119,7 +119,7 @@ every prompt.
 | `ALEXANDRIA_AUTO_RECALL_LIMIT` | `5` | Max memories retrieved per prompt |
 | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.35` | Minimum similarity to inject a hit (measured; see `[recall]` in [docs/configuration.md](../../docs/configuration.md)) |
 | `ALEXANDRIA_AUTO_RECALL` | (unset) | Set to `off` to disable recall |
-| `ALEXANDRIA_AUTO_STORE` | (unset) | Set to `off` to disable the detectors and extraction. Headless sessions (`claude -p`, Agent SDK; `CLAUDE_CODE_ENTRYPOINT=sdk-*`) default to off so scripted experiments never land in the real database; set `on` to enable there |
+| `ALEXANDRIA_AUTO_STORE` | (unset) | Set to `off` to disable the detectors and extraction. Sessions with no human at the prompt (`claude -p`, Agent SDK, `claude mcp serve`, bench, GitHub Action, triggers, Cowork; see `CLAUDE_CODE_ENTRYPOINT` below) default to off so scripted experiments never land in the real database; set `on` to enable there |
 | `ALEXANDRIA_EXTRACT_MODEL` | `haiku` | Model passed to `claude -p --model` for extraction |
 | `ALEXANDRIA_EXTRACT_MIN_CHARS` | `1500` | New transcript text required before an extraction call |
 | `ALEXANDRIA_EXTRACT_FLUSH_WAIT` | `1` | Seconds to wait before reading the transcript; Stop fires ~50 ms before the last assistant message is flushed (tests set `0`) |
@@ -129,9 +129,12 @@ every prompt.
 | `ALEXANDRIA_DETACHED` | (unset) | Set by the extract hook on its detached copy; set it yourself to run the hook inline (tests do) |
 
 `CLAUDE_CODE_ENTRYPOINT` is an internal Claude Code variable, not in the documented settings list. The
-`sdk-*` gate matches the binary's own "running under an SDK" check (`sdk-cli` for `claude -p`, `sdk-ts` and
-`sdk-py` for the Agent SDKs; confirmed on 2.1.263 from the bundled JS and the Python SDK source; interactive
-is `cli`). If a release renames it, the hooks silently fall back to always-on. After upgrading, re-check with
+gate turns auto-store off for `sdk-*` (`sdk-cli` for `claude -p`, `sdk-ts` and `sdk-py` for the Agent SDKs),
+`mcp` (`claude mcp serve`), `bench`, `claude-code-github-action`, `claude-security`, `*_trigger`, and Cowork
+(`local-agent`, `claude-coworker*`, `remote_cowork`), and leaves every other value on: `cli`, `claude-vscode`,
+`claude-desktop`, and the `remote*` / Slack / Teams family (the remote ones cannot reach a local server
+anyway). The list is the validator table in the 2.1.263 bundle, which knows 26 values. If a release renames
+one, the hooks silently fall back to always-on. After upgrading, re-check with
 
 ```bash
 claude -p 'Run with the Bash tool and reply with only its output: echo ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT' --allowedTools Bash
