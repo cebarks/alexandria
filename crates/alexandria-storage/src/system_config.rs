@@ -1,3 +1,4 @@
+use crate::repos::MemoryRepo;
 use anyhow::Result;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
@@ -47,7 +48,16 @@ pub async fn check_embedding_model(
 
     match (stored_model, stored_dims) {
         (None, _) | (_, None) => {
-            // First boot — store the config
+            // First boot — store the config. A database from before the lock existed
+            // has facts but no lock; we can't verify which model produced them, so
+            // warn rather than refuse (migrate-embeddings tells the user to boot once
+            // to stamp the lock, so refusing here would leave no recovery path).
+            let facts = MemoryRepo::new(db).count(None, None, true).await?;
+            if facts > 0 {
+                tracing::warn!(
+                    "{facts} fact(s) exist but no embedding lock; assuming they were embedded                      with {model}. If not, run `alexandria migrate-embeddings` after fixing config."
+                );
+            }
             set_config(db, "embedding_model", model).await?;
             set_config(db, "embedding_dimensions", &dimensions.to_string()).await?;
             tracing::info!("Stored embedding config: model={model}, dimensions={dimensions}");
