@@ -25,8 +25,9 @@ set -uo pipefail
 
 URL="${ALEXANDRIA_URL:-http://127.0.0.1:3000/mcp}"
 LIMIT="${ALEXANDRIA_AUTO_RECALL_LIMIT:-5}"
-# 0.35 measured 2026-09-08 on all-MiniLM-L6-v2: question-vs-matching-statement
-# scores 0.40-0.65, unrelated memories 0.07-0.40. See docs/configuration.md [recall].
+# 0.35 measured on all-MiniLM-L6-v2 by the bench-retrieval threshold sweep: of 12 known
+# targets it delivers 9, against 7 at 0.50 and 4 at 0.58. Do not raise it to 0.40 or 0.45 —
+# both are dominated by 0.50. See docs/minilm-test-data.md and docs/configuration.md [recall].
 MIN_SIM="${ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY:-0.35}"
 CURL=(curl -sS --max-time 5 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
 
