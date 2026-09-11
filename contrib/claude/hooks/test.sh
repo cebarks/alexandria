@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 export ALEXANDRIA_URL="${ALEXANDRIA_URL:-http://127.0.0.1:3000/mcp}"
 export ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY=0.0
+unset CLAUDE_CODE_ENTRYPOINT ALEXANDRIA_AUTO_STORE   # hermetic: the harness running this script may be headless
 XDG_RUNTIME_DIR=$(mktemp -d); export XDG_RUNTIME_DIR
 trap 'rm -rf "$XDG_RUNTIME_DIR"' EXIT
 sess="sess-test-$$"
@@ -44,6 +45,11 @@ echo "$got"
 # Auto-store off: nothing new.
 ALEXANDRIA_AUTO_STORE=off hook "never use tabs"
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 3 ]
+# Headless session (CLAUDE_CODE_ENTRYPOINT=sdk-*): detectors off by default, on with ALEXANDRIA_AUTO_STORE=on.
+CLAUDE_CODE_ENTRYPOINT=sdk-cli hook "never use spaces"
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 3 ]
+CLAUDE_CODE_ENTRYPOINT=sdk-cli ALEXANDRIA_AUTO_STORE=on hook "never use spaces"
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 4 ]
 
 # Session hook: injects session_id when missing, silent when present.
 out=$(jq -cn '{session_id:"sess-test-123",tool_name:"mcp__alexandria__store_memory",tool_input:{content:"x"}}' | ./alexandria-session.sh)
@@ -87,6 +93,9 @@ ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 2 ]; [ "$(cat "
 # stop_hook_active / child guard: no call.
 jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ./alexandria-extract.sh
 [ "$(cat "$td/calls")" = 2 ]
+# Headless session: no call, marker untouched.
+jq -cn '{type:"user",message:{content:"headless chatter that must not be extracted"}}' >>"$td/t.jsonl"
+CLAUDE_CODE_ENTRYPOINT=sdk-py stop; [ "$(cat "$td/calls")" = 2 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 5 ]
 # Empty twice: exactly two calls, nothing stored.
 cat >"$td/empty.sh" <<'STUB'
 #!/usr/bin/env bash
