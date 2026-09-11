@@ -14,8 +14,8 @@
 # Env (all optional):
 #   ALEXANDRIA_URL                         default http://127.0.0.1:3000/mcp
 #   ALEXANDRIA_AUTO_RECALL                 "off" disables recall
-#   ALEXANDRIA_AUTO_RECALL_LIMIT           default 5
-#   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY  default 0.35
+#   ALEXANDRIA_AUTO_RECALL_LIMIT           default 10
+#   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY  default 0.45
 #   ALEXANDRIA_AUTO_STORE                  "off" disables the detectors; "on" enables them in headless sessions (see the entrypoint gate below), where the default is off
 #   ALEXANDRIA_MARKER_MAX_AGE_DAYS         default 7; per-session markers idle longer than this are pruned
 #   ALEXANDRIA_HOOK_CHILD                  set by hooks that shell out to `claude -p`; exits at once
@@ -24,11 +24,17 @@ set -uo pipefail
 [ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
 
 URL="${ALEXANDRIA_URL:-http://127.0.0.1:3000/mcp}"
-LIMIT="${ALEXANDRIA_AUTO_RECALL_LIMIT:-5}"
-# 0.35 measured on all-MiniLM-L6-v2 by the bench-retrieval threshold sweep: of 12 known
-# targets it delivers 9, against 7 at 0.50 and 4 at 0.58. Do not raise it to 0.40 or 0.45 —
-# both are dominated by 0.50. See docs/minilm-test-data.md and docs/configuration.md [recall].
-MIN_SIM="${ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY:-0.35}"
+# 10 measured on all-MiniLM-L6-v2 by the bench-retrieval limit x threshold grid, 2026-09-09 on
+# an 880-fact corpus: delivery saturates at 10 because the worst of the 12 known target ranks is
+# 9, so 15 and 20 add non-targets and no hits. The two levers are not independent — read both
+# comments together before changing either.
+LIMIT="${ALEXANDRIA_AUTO_RECALL_LIMIT:-10}"
+# 0.45 from the same grid. At LIMIT=10 it delivers 8 of 12 targets at ~1.0 non-targets per
+# prompt, where the previous 5/0.35 pair delivered the same 8 at ~3.2. 0.40 is still dominated
+# (same 8 hits, ~2.2 noise), but 0.50 no longer dominates 0.45 the way it did at LIMIT=5 — it
+# drops to 7 hits for 0.5 noise. Widening the limit is what moved 0.45 onto the frontier, so do
+# not lower LIMIT without revisiting this. See docs/minilm-test-data.md "Result limit".
+MIN_SIM="${ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY:-0.45}"
 CURL=(curl -sS --max-time 5 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
 
 # post JSON-RPC body; prints the SSE data payload.
