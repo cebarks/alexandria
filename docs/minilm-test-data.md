@@ -29,7 +29,7 @@ the corpus was actually embedded with. Only the 12 questions are embedded at run
 
 ## Results (2026-09-09)
 
-Corpus `created_at` spans 2026-09-08 12:30:01 UTC .. 2026-09-09 20:33:50 UTC. The baseline
+Corpus `created_at` spans 2026-09-08 12:30:01 UTC .. 2026-09-10 00:44:21 UTC. The baseline
 subset runs through 2026-09-08 16:26:33 UTC.
 
 | corpus | facts | mean_rank | top1 | mean_gap | hit_min | hit_max | nonhit_p50 | nonhit_p90 | nonhit_p99 | ff_p50 | ff_p90 | ff_p99 |
@@ -38,6 +38,7 @@ subset runs through 2026-09-08 16:26:33 UTC.
 | live | 743 | 2.75 | 7/12 | +0.077 | 0.338 | 0.667 | 0.074 | 0.198 | 0.341 | 0.128 | 0.287 | 0.507 |
 | live (threshold sweep run) | 807 | 2.83 | 7/12 | +0.077 | 0.338 | 0.667 | 0.074 | 0.197 | 0.339 | 0.128 | 0.287 | 0.506 |
 | live (limit sweep run) | 880 | 3.25 | 7/12 | +0.065 | 0.338 | 0.667 | 0.075 | 0.197 | 0.341 | 0.129 | 0.286 | 0.501 |
+| live (headroom guard run) | 927 | 3.42 | 7/12 | +0.064 | 0.338 | 0.667 | 0.075 | 0.198 | 0.341 | 0.129 | 0.286 | 0.497 |
 
 Per-question rank:
 
@@ -83,6 +84,14 @@ per-question rank change (q12, 6 -> 7), and the noise tail one thousandth tighte
 `mean_gap`, `hit_min` and `hit_max` are unchanged. Two live rows 64 facts apart are not a
 trend, but they do bound the short-term jitter: it is smaller than the 143 -> 743 move by
 more than an order of magnitude.
+
+The fifth row (927 facts, 2026-09-10, taken with the server stopped) is the first pass after
+`bench-retrieval` started printing its own recall-limit headroom. Same shape as before —
+`hit_min`/`hit_max` unchanged, `mean_rank` 3.25 -> 3.42 — but the worst target rank is now 10
+(q12, 6 -> 7 -> 9 -> 10 across the live passes), which is exactly `RECALL_LIMIT`. Headroom is
+zero: q12 is still delivered, and the next fact that outscores it on that question is not. The
+`limit = 10` grid row at 927 matches the 880 grid on every hit count; only `noise_per_q` moved,
+by at most 0.2.
 
 ### Floor
 
