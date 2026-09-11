@@ -67,7 +67,7 @@ text=$(tail -n +"$((done_lines + 1))" "$transcript" | jq -nrR '
   def txt: if type == "string" then . else [.[]? | select(.type == "text") | .text] | join("\n") end;
   [inputs | fromjson?] as $lines
   | ([$lines[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use")
-      | {key: .id, value: (.name + " " + (.input | tostring)[:120] + " -- ")}] | from_entries) as $tools
+      | {key: .id, value: (.name + " " + (.input | .command // .file_path // tostring | .[:120]) + " -- ")}] | from_entries) as $tools
   | $lines[] | select(.type == "user" or .type == "assistant") | .type as $role | (.message.content // "")
   | ((txt | select(length > 0)
       | select(startswith("<local-command") or startswith("<command-") or startswith("<system-reminder") | not)
