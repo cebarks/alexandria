@@ -105,3 +105,11 @@ export async function storeMemory(
 ): Promise<void> {
 	await callToolWithRetry("store_memory", { content, tags, ...session });
 }
+
+export async function finalizeSession(
+	session: SessionArgs,
+	summary?: string,
+	tags?: string[],
+): Promise<void> {
+	await callToolWithRetry("finalize_session", { session_id: session.session_id, summary, tags });
+}

@@ -8,8 +8,9 @@
  */
 
 import { CONFIG } from "./config.js";
-import type { SessionDedupBuffer, DetectedMemory } from "./detectors/types.js";
+import type { SessionDedupBuffer } from "./detectors/types.js";
 import {
+	type ExtractionResult,
 	extractText,
 	parseExtractionResponse,
 	serializeEntries,
@@ -32,15 +33,19 @@ Do NOT extract:
 
 Each extracted memory must be a standalone statement that makes sense without this conversation. No "as discussed above", no pronouns without antecedents.
 
+Also summarize the session itself: one or two sentences on what was worked on and what the outcome was, plus a few lowercase tags for the session as a whole.
+
 Respond with JSON only:
 {
   "memories": [
     {"content": "standalone statement", "tags": ["relevant", "tags"]},
     ...
-  ]
+  ],
+  "summary": "what the session accomplished",
+  "tags": ["session", "tags"]
 }
 
-If nothing is worth extracting, respond with: {"memories": []}`;
+If nothing is worth extracting, leave "memories" empty but still fill in "summary" and "tags".`;
 
 /**
  * Build the full extraction prompt with conversation and "already stored" context.
@@ -89,12 +94,12 @@ interface ExtractionContext {
 export async function runExtraction(
 	ctx: ExtractionContext,
 	buffer: SessionDedupBuffer,
-): Promise<DetectedMemory[]> {
+): Promise<ExtractionResult> {
 	const entries = ctx.sessionManager.buildContextEntries();
 	const serialized = serializeEntries(entries);
 
 	// Skip extraction if conversation is trivially short
-	if (serialized.length < 100) return [];
+	if (serialized.length < 100) return { memories: [] };
 
 	// Cap serialized conversation at ~16k tokens (~64k chars)
 	const maxChars = 64_000;
@@ -116,7 +121,7 @@ export async function runExtraction(
 			"warning",
 		);
 		model = ctx.model;
-		if (!model) return [];
+		if (!model) return { memories: [] };
 	}
 
 	// Call model with timeout via Promise.race — ctx.modelRegistry.complete()
@@ -142,6 +147,6 @@ export async function runExtraction(
 			ctx.ui.notify("Alexandria extraction timed out; skipping.", "warning");
 		}
 		// Fail open
-		return [];
+		return { memories: [] };
 	}
 }

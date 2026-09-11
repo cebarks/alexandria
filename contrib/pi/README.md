@@ -53,7 +53,8 @@ extension (package version 2.0). Four things happen:
    `update_memory` the extension observes on the way past `tool_result`, is buffered so the
    extraction pass below can be told what is already saved.
 4. **LLM extraction** — on `session_shutdown`, the conversation is serialized and a cheap model
-   (`store.extract_model`) extracts durable facts that layers 1–3 missed. Skipped on `reload`, since
+   (`store.extract_model`) extracts durable facts that layers 1–3 missed, plus a one-line summary
+   and tags for the session, which are written with `finalize_session`. Skipped on `reload`, since
    that is not a real conversation boundary.
 
 This mirrors the server's own design intent: the skill is highest-quality but depends on the agent
@@ -117,10 +118,12 @@ client detects "Session not found", reconnects, and retries once before surfacin
 - **Only the pure logic is tested.** `just test-pi` (or `npm test` in the extension directory)
   runs `node:test` over the detectors, the dedup buffer, and the extraction serializer/parser.
   The extraction prompt itself, recall, and the MCP client have no coverage.
-- **Sessions are grouped but never finalized.** Every auto-store write carries pi's session id as
-  `session_id` (plus `agent_id="pi"` and the active model), so `list_sessions(agent_id="pi")` and
-  `get_session` see them. The extension does not call `finalize_session`, and recall is not scoped
-  to the session. See [docs/session-memory.md](../../docs/session-memory.md).
+- **Sessions are finalized only if something was stored.** Every auto-store write carries pi's
+  session id as `session_id` (plus `agent_id="pi"` and the active model), so
+  `list_sessions(agent_id="pi")` and `get_session` see them. The server creates a session on its
+  first store, so a chat-only session has nothing to finalize and the shutdown `finalize_session`
+  call fails silently. Recall is not scoped to the session. See
+  [docs/session-memory.md](../../docs/session-memory.md).
 - **Recall ignores `recall`.** It uses `retrieve_memories`, never the two-phase `recall` tool, so
   broad "what do we know about X" exploration is not what auto-recall is tuned for.
 - **Extraction is end-of-session and best-effort.** It reads the tail of a long conversation (capped

@@ -37,7 +37,7 @@ test("skips unknown entries, missing messages, and empty text", () => {
 
 test("parses bare and fenced JSON", () => {
 	const json = '{"memories":[{"content":"a","tags":["t"]}]}';
-	const expected = [{ content: "a", tags: ["t"] }];
+	const expected = { memories: [{ content: "a", tags: ["t"] }] };
 	assert.deepEqual(parseExtractionResponse(json), expected);
 	assert.deepEqual(parseExtractionResponse(`\`\`\`json\n${json}\n\`\`\``), expected);
 	assert.deepEqual(parseExtractionResponse(`\`\`\`\n${json}\n\`\`\`\n`), expected);
@@ -47,15 +47,32 @@ test("defaults missing tags, filters non-string tags, drops empty content", () =
 	const out = parseExtractionResponse(
 		'{"memories":[{"content":"a"},{"content":"b","tags":["x",1]},{"content":""},{"tags":["y"]}]}',
 	);
-	assert.deepEqual(out, [
-		{ content: "a", tags: ["extracted"] },
-		{ content: "b", tags: ["x"] },
-	]);
+	assert.deepEqual(out, {
+		memories: [
+			{ content: "a", tags: ["extracted"] },
+			{ content: "b", tags: ["x"] },
+		],
+	});
 });
 
-test("returns [] for empty, malformed, or wrongly shaped responses", () => {
-	assert.deepEqual(parseExtractionResponse(""), []);
-	assert.deepEqual(parseExtractionResponse("not json"), []);
-	assert.deepEqual(parseExtractionResponse('{"memories":"x"}'), []);
-	assert.deepEqual(parseExtractionResponse("[]"), []);
+test("carries a session summary and tags when present", () => {
+	const out = parseExtractionResponse(
+		'{"memories":[],"summary":"Fixed the build.","tags":["build",2,"ci"]}',
+	);
+	assert.deepEqual(out, { memories: [], summary: "Fixed the build.", tags: ["build", "ci"] });
+});
+
+test("drops a summary that is empty or not a string, and tags that are not an array", () => {
+	assert.deepEqual(parseExtractionResponse('{"memories":[],"summary":"","tags":"x"}'), {
+		memories: [],
+	});
+	assert.deepEqual(parseExtractionResponse('{"memories":[],"summary":7}'), { memories: [] });
+});
+
+test("returns no memories for empty, malformed, or wrongly shaped responses", () => {
+	const empty = { memories: [] };
+	assert.deepEqual(parseExtractionResponse(""), empty);
+	assert.deepEqual(parseExtractionResponse("not json"), empty);
+	assert.deepEqual(parseExtractionResponse('{"memories":"x"}'), empty);
+	assert.deepEqual(parseExtractionResponse("[]"), empty);
 });

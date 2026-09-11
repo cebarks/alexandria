@@ -6,6 +6,16 @@
 
 import type { DetectedMemory } from "./detectors/types.js";
 
+export interface ExtractionResult {
+	memories: DetectedMemory[];
+	/** One or two sentences on what the session accomplished, for finalize_session. */
+	summary?: string;
+	tags?: string[];
+}
+
+const stringsOnly = (v: unknown): string[] | undefined =>
+	Array.isArray(v) ? v.filter((t: unknown): t is string => typeof t === "string") : undefined;
+
 /**
  * Serialize session entries into a text representation for the extraction prompt.
  * Strips tool call details, keeps user/assistant text + compaction summaries.
@@ -63,32 +73,40 @@ export function extractText(content: unknown): string {
 }
 
 /**
- * Parse the model's response text into memories. Tolerates markdown code
- * fences; anything unparseable or wrongly shaped yields [] (fail open).
+ * Parse the model's response text into memories plus an optional session
+ * summary/tags. Tolerates markdown code fences; anything unparseable or
+ * wrongly shaped yields no memories (fail open).
  */
-export function parseExtractionResponse(responseText: string): DetectedMemory[] {
-	if (!responseText) return [];
+export function parseExtractionResponse(responseText: string): ExtractionResult {
+	const empty: ExtractionResult = { memories: [] };
+	if (!responseText) return empty;
 
 	const jsonText = responseText
 		.replace(/^```(?:json)?\s*\n?/m, "")
 		.replace(/\n?```\s*$/m, "")
 		.trim();
 
-	let parsed: { memories?: unknown };
+	let parsed: { memories?: unknown; summary?: unknown; tags?: unknown };
 	try {
 		parsed = JSON.parse(jsonText);
 	} catch {
-		return [];
+		return empty;
 	}
 
-	if (!Array.isArray(parsed?.memories)) return [];
+	if (!Array.isArray(parsed?.memories)) return empty;
 
-	return parsed.memories
-		.filter((m) => typeof m?.content === "string" && m.content.length > 0)
-		.map((m) => ({
-			content: m.content as string,
-			tags: Array.isArray(m.tags)
-				? m.tags.filter((t: unknown): t is string => typeof t === "string")
-				: ["extracted"],
-		}));
+	const result: ExtractionResult = {
+		memories: parsed.memories
+			.filter((m) => typeof m?.content === "string" && m.content.length > 0)
+			.map((m) => ({
+				content: m.content as string,
+				tags: stringsOnly(m.tags) ?? ["extracted"],
+			})),
+	};
+	if (typeof parsed.summary === "string" && parsed.summary.length > 0) {
+		result.summary = parsed.summary;
+	}
+	const tags = stringsOnly(parsed.tags);
+	if (tags) result.tags = tags;
+	return result;
 }

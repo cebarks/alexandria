@@ -33,6 +33,7 @@ import {
 	resetClient,
 	closeClient,
 	storeMemory,
+	finalizeSession,
 	extractTextContent,
 } from "./mcp-client.js";
 import { retrieveMemories, formatMemoriesBlock } from "./recall.js";
@@ -168,14 +169,19 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 		// LLM extraction — skip on reload (no meaningful conversation boundary)
 		if (!CONFIG.storeDisabled && event.reason !== "reload") {
 			try {
+				const session = sessionArgs(ctx);
 				const extracted = await runExtraction(
 					ctx as Parameters<typeof runExtraction>[0],
 					dedupBuffer,
 				);
-				for (const mem of extracted) {
-					await storeMemory(mem.content, [...mem.tags, "extracted"], sessionArgs(ctx)).catch(
-						() => {},
-					);
+				for (const mem of extracted.memories) {
+					await storeMemory(mem.content, [...mem.tags, "extracted"], session).catch(() => {});
+				}
+				// Sessions exist only once something was stored under them, so a
+				// chat-only session makes this fail with "Session not found"; that
+				// is the expected case, not a fault worth surfacing.
+				if (extracted.summary || extracted.tags) {
+					await finalizeSession(session, extracted.summary, extracted.tags).catch(() => {});
 				}
 			} catch (err) {
 				ctx.ui.notify(
