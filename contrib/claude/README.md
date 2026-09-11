@@ -117,7 +117,7 @@ every prompt.
 | --- | --- | --- |
 | `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | Alexandria MCP server URL |
 | `ALEXANDRIA_AUTO_RECALL_LIMIT` | `5` | Max memories retrieved per prompt |
-| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.35` | Minimum similarity to inject a hit (measured; see `[recall]` in [docs/configuration.md](../../docs/configuration.md)) |
+| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.35` | Minimum similarity to inject a hit (measured — see [docs/minilm-test-data.md](../../docs/minilm-test-data.md) and `[recall]` in [docs/configuration.md](../../docs/configuration.md)) |
 | `ALEXANDRIA_AUTO_RECALL` | (unset) | Set to `off` to disable recall |
 | `ALEXANDRIA_AUTO_STORE` | (unset) | Set to `off` to disable the detectors and extraction. Sessions with no human at the prompt (`claude -p`, Agent SDK, `claude mcp serve`, bench, GitHub Action, triggers, Cowork; see `CLAUDE_CODE_ENTRYPOINT` below) default to off so scripted experiments never land in the real database; set `on` to enable there |
 | `ALEXANDRIA_EXTRACT_MODEL` | `haiku` | Model passed to `claude -p --model` for extraction |
