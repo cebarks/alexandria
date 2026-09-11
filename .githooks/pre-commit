@@ -13,7 +13,7 @@ fi
 
 # 2. Clippy (warnings as errors)
 echo "  → cargo clippy"
-if ! RUSTFLAGS="-Dwarnings" cargo clippy --all-targets --all-features 2>&1; then
+if ! RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets --all-features 2>&1; then
     echo ""
     echo "❌ Clippy check failed. Fix the warnings above."
     exit 1
