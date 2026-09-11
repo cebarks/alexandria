@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationParams};
 
 use super::hub;
 use super::provider::EmbeddingProvider;
@@ -18,6 +18,12 @@ fn cls_pooling_from_json(s: &str) -> bool {
         .and_then(|v| v.get("pooling_mode_cls_token")?.as_bool())
         .unwrap_or(false)
 }
+
+/// Longest input, in wordpiece tokens including `[CLS]`/`[SEP]`, that one embedding sees.
+/// The cached `tokenizer.json` ships 128; sentence-transformers serves this model at 256 and
+/// the live corpus p99 is 284 (docs/performance-and-ability-findings.md, A1). Locked in
+/// `system_config` beside the model id, so changing it forces a re-embed.
+pub const MAX_TOKENS: usize = 256;
 
 pub struct CandleProvider {
     model: BertModel,
@@ -101,7 +107,17 @@ impl CandleProvider {
         let config: BertConfig = serde_json::from_str(&config_str)?;
         let dimensions = config.hidden_size;
 
-        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut tokenizer =
+            Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_TOKENS,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // No padding: inputs go through one at a time and the attention mask makes
+        // padding a no-op for the result, so the fixed 128 in the file was pure cost.
+        tokenizer.with_padding(None);
 
         // Read into a Vec rather than mmap so the workspace can keep `unsafe_code = "forbid"`.
         // Costs a ~90 MB peak (buffer + built tensors) until `BertModel::load` returns; mmap
@@ -125,6 +141,12 @@ impl CandleProvider {
                 .tokenizer
                 .encode(*text, true)
                 .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+            if !encoding.get_overflowing().is_empty() {
+                tracing::warn!(
+                    chars = text.chars().count(),
+                    "text exceeds {MAX_TOKENS} tokens; only its first {MAX_TOKENS} are embedded"
+                );
+            }
 
             let input_ids = encoding.get_ids().to_vec();
             let attention_mask = encoding.get_attention_mask().to_vec();
