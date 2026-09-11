@@ -4,7 +4,7 @@ mod config;
 use std::sync::Arc;
 
 use alexandria_mcp::AlexandriaServer;
-use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
+use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider, MAX_TOKENS};
 use alexandria_storage::record_id_to_string;
 use alexandria_storage::{Database, schema, system_config};
 use config::Config;
@@ -71,7 +71,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Loading embedding model: {}", config.embedding.model);
     let embedding = CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
     let dims = embedding.dimensions();
-    system_config::check_embedding_model(db.inner(), &config.embedding.model, dims).await?;
+    system_config::check_embedding_model(db.inner(), &config.embedding.model, dims, MAX_TOKENS)
+        .await?;
     // A failed define must not stop boot: the brute-force KNN form returns the same rows, and
     // the backfill aborts on any row of another dimension — which is exactly the state a
     // reverted, half-finished `migrate-embeddings` leaves behind.
@@ -175,7 +176,7 @@ async fn migrate_embeddings() -> anyhow::Result<()> {
     match reembed(&db, &embedding, config.embedding.batch_size).await? {
         ReembedOutcome::Skipped(why) => println!("Nothing to do: {why}"),
         ReembedOutcome::Done { facts, clusters } => println!(
-            "Re-embedded {facts} facts and {clusters} cluster centroids with {} ({} dims). Restart the service.",
+            "Re-embedded {facts} facts and {clusters} cluster centroids with {} ({} dims, {MAX_TOKENS} tokens). Restart the service.",
             embedding.model_id(),
             embedding.dimensions()
         ),

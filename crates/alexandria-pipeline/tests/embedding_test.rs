@@ -74,3 +74,27 @@ async fn test_candle_cls_and_mean_pooling_differ() {
     assert_eq!(mean.len(), cls.len());
     assert_ne!(mean, cls);
 }
+
+/// The cached tokenizer.json truncates at 128 tokens. A ~200-token text and the same text
+/// with a tail appended must embed differently; under 128-token truncation they are the
+/// same prefix and produce identical vectors.
+#[tokio::test]
+async fn test_candle_embeds_past_128_tokens() {
+    let provider = CandleProvider::new("sentence-transformers/all-MiniLM-L6-v2", "cpu")
+        .await
+        .unwrap();
+
+    // 40 x 5 words = 200 words, one wordpiece each -> ~202 tokens with [CLS]/[SEP].
+    let body = "the cat sat down quietly ".repeat(40);
+    let tailed = format!("{body} zebra kangaroo volcano");
+    let vectors = provider
+        .embed(&[body.as_str(), tailed.as_str()])
+        .await
+        .unwrap();
+    assert_ne!(vectors[0], vectors[1], "tail past token 128 was ignored");
+
+    // Past the new limit still embeds (truncated), no error.
+    let huge = "word ".repeat(2000);
+    let v = provider.embed(&[huge.as_str()]).await.unwrap();
+    assert_eq!(v[0].len(), 384);
+}

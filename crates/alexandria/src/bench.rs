@@ -12,7 +12,7 @@
 //! embedded with — only the questions are embedded here.
 
 use alexandria_engine::search::cosine_similarity;
-use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
+use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider, MAX_TOKENS};
 use alexandria_storage::repos::{FactListQuery, MemoryRepo};
 use alexandria_storage::{Database, record_id_to_string, schema, system_config};
 use chrono::{DateTime, Utc};
@@ -598,6 +598,7 @@ pub async fn run() -> anyhow::Result<()> {
         db.inner(),
         &config.embedding.model,
         provider.dimensions(),
+        MAX_TOKENS,
     )
     .await?;
     schema::ensure_vector_index(db.inner(), provider.dimensions()).await?;
