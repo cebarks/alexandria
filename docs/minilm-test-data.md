@@ -37,6 +37,7 @@ subset runs through 2026-09-08 16:26:33 UTC.
 | baseline (143 oldest active) | 143 | 1.42 | 9/12 | +0.148 | 0.338 | 0.667 | 0.078 | 0.212 | 0.372 | 0.130 | 0.298 | 0.560 |
 | live | 743 | 2.75 | 7/12 | +0.077 | 0.338 | 0.667 | 0.074 | 0.198 | 0.341 | 0.128 | 0.287 | 0.507 |
 | live (threshold sweep run) | 807 | 2.83 | 7/12 | +0.077 | 0.338 | 0.667 | 0.074 | 0.197 | 0.339 | 0.128 | 0.287 | 0.506 |
+| live (limit sweep run) | 880 | 3.25 | 7/12 | +0.065 | 0.338 | 0.667 | 0.075 | 0.197 | 0.341 | 0.129 | 0.286 | 0.501 |
 
 Per-question rank:
 
@@ -101,9 +102,15 @@ model *and the corpus*, not of the model alone — it drifts down as the corpus 
 
 The floor above is the server's noise cutoff. The number that decides what a user actually
 sees is the *client* threshold — `[recall] min_similarity`, applied by the auto-recall hook
-to what `retrieve_memories(limit=5)` returned. The sweep simulates that filter: for each
+to what `retrieve_memories(limit=N)` returned. The sweep simulates that filter: for each
 candidate threshold, how many of the 12 targets survive, how many of those the limit would
 have delivered anyway, and how many non-targets ride along.
+
+> **These two tables hold `limit` at 5**, the value shipped when they were measured. The
+> default is now `10` and the shipped threshold is `0.45`, decided in [Result
+> limit](#result-limit) below — the reasoning in this subsection is the argument as it stood
+> at `limit = 5`, kept because it is what the grid had to overturn. Do not read a
+> recommendation out of it; the bolded `0.35` rows mark the then-default, not the current one.
 
 Live corpus, 807 facts:
 
@@ -138,16 +145,20 @@ not accurate to say `0.35` keeps every real hit; it keeps 11 of 12 by score and 
 **`0.40` is strictly dominated on both corpora** — the same `hits_delivered` as `0.45` at
 roughly double the noise. It is never the right pick, whatever else is being traded off.
 
-**The remaining choice is `0.35` against `0.50`:** 9 hits at 3.00 injected non-targets, or 7
-hits at 0.33. Nine times the injection for two more hits out of twelve. `0.35` is kept
-because `noise_per_q` is an upper bound in a way `hits_delivered` is not — see the limits
-below — and because a memory that never surfaces is the failure auto-recall exists to
-prevent, while an extra adjacent memory costs a few hundred prompt tokens.
+**At `limit = 5` the remaining choice was `0.35` against `0.50`:** 9 hits at 3.00 injected
+non-targets, or 7 hits at 0.33. Nine times the injection for two more hits out of twelve.
+`0.35` was taken, because `noise_per_q` is an upper bound in a way `hits_delivered` is not —
+see the limits below — and because a memory that never surfaces is the failure auto-recall
+exists to prevent, while an extra adjacent memory costs a few hundred prompt tokens. That
+choice was superseded once the limit was measured: it is a bad exchange rate, and the grid
+below finds a better one rather than picking a side of it. Note what it forced — with the
+limit fixed at 5, `0.40` and `0.45` both delivered 7, the same as `0.50` at more noise, so the
+whole middle of the range was dominated and the decision really was `0.35`-or-`0.50`.
 
 **`0.30` shows the threshold is not always the binding constraint.** Even admitting every
 target by score, the live row delivers 10/12: two targets rank 8th and 7th, outside
 `limit=5`, so no threshold reaches them. For those questions the lever is
-`ALEXANDRIA_AUTO_RECALL_LIMIT`, which no document currently discusses as one.
+`ALEXANDRIA_AUTO_RECALL_LIMIT` — measured in the next section.
 
 Limits on how far to read this table:
 
@@ -160,6 +171,74 @@ Limits on how far to read this table:
 - Every target predates 2026-09-08 16:26 UTC, so the 664 facts added since can only ever be
   noise here. That inflates `noise_per_q` and cannot deflate it.
 
+### Result limit
+
+The threshold tables above are one row of a grid: they hold `limit` at 5 — the then-default —
+and vary `T`. Both levers gate the same delivery, so neither is readable alone. This pass (880
+facts, a superset of the 807 above — the threshold numbers here are the same measurement at a
+larger corpus, not a revision of it) sweeps both. Cells are `hits_delivered` out of 12, with
+`noise_per_q` in parentheses. **`limit = 10, T = 0.45` is the pair now shipped**, set in both
+clients on 2026-09-09 off this table.
+
+Live corpus, 880 facts:
+
+| limit | T=0.30 | T=0.35 | T=0.40 | T=0.45 | T=0.50 | T=0.58 |
+|---|---|---|---|---|---|---|
+| 3 | 8 (2.3) | 8 (2.1) | 7 (1.2) | 7 (0.7) | 7 (0.4) | 4 (0.2) |
+| 5 (was) | 8 (4.2) | 8 (3.2) | 7 (1.7) | 7 (0.8) | 7 (0.5) | 4 (0.2) |
+| 8 | 11 (5.8) | 10 (4.2) | 8 (2.0) | 8 (1.0) | 7 (0.5) | 4 (0.2) |
+| **10** (shipped) | 12 (6.7) | 11 (4.7) | 8 (2.2) | **8 (1.0)** | 7 (0.5) | 4 (0.2) |
+| 15 | 12 (8.9) | 11 (5.8) | 8 (2.6) | 8 (1.0) | 7 (0.5) | 4 (0.2) |
+| 20 | 12 (10.5) | 11 (6.6) | 8 (2.7) | 8 (1.0) | 7 (0.5) | 4 (0.2) |
+
+Baseline corpus, 143 facts:
+
+| limit | T=0.30 | T=0.35 | T=0.40 | T=0.45 | T=0.50 | T=0.58 |
+|---|---|---|---|---|---|---|
+| 3 | 11 (1.6) | 10 (0.9) | 7 (0.7) | 7 (0.3) | 7 (0.0) | 4 (0.0) |
+| 5 (was) | 12 (2.3) | 11 (1.4) | 8 (0.8) | 8 (0.3) | 7 (0.0) | 4 (0.0) |
+| 8 | 12 (2.8) | 11 (1.8) | 8 (0.9) | 8 (0.3) | 7 (0.0) | 4 (0.0) |
+| **10** (shipped) | 12 (3.2) | 11 (2.0) | 8 (0.9) | **8 (0.3)** | 7 (0.0) | 4 (0.0) |
+| 15 | 12 (3.6) | 11 (2.0) | 8 (0.9) | 8 (0.3) | 7 (0.0) | 4 (0.0) |
+| 20 | 12 (3.6) | 11 (2.0) | 8 (0.9) | 8 (0.3) | 7 (0.0) | 4 (0.0) |
+
+**The previous pair was strictly dominated, which is why it changed.** From `limit=5, T=0.35`
+(8 delivered, 3.2 noise), `limit=10, T=0.45` delivers the same 8 at 1.0 — a third of the
+injection for identical recall. There was no trade to weigh in that move: the old setting was
+simply off the frontier, so taking it needed no view on how recall and noise should be priced.
+That is the whole reason this pair was picked over `limit=10, T=0.35` (11 delivered at 4.7),
+which is a genuine trade and would have needed one.
+
+**The limit is the stronger lever, and by a wide margin.** From the same starting cell,
+lowering `T` to 0.30 buys **zero** hits for +1.05 noise, because the targets it admits by score
+are the ones rank is hiding. Raising the limit to 10 buys **three** hits for +1.5 noise. The
+threshold discussion above settled `0.35` against `0.50` as "nine times the injection for two
+more hits"; the limit's exchange rate is better than that by an order of magnitude.
+
+**Delivery saturates at `limit=10`, and the mechanism is visible.** The worst target rank in
+this pass is 9 (`how fast is memory lookup supposed to be`), with 8 and 7 behind it — so a
+window of 10 contains every target, and `hits_delivered` reaches `hits_kept` in every column.
+Rows 15 and 20 are pure cost: +1.9 noise at `T=0.35` for no additional hit. This is not a
+property of the model, it is the rank distribution of *this* corpus, so it moves as the corpus
+grows — which is exactly how rank inflation reaches a user.
+
+**The baseline corpus could not have shown any of this.** At 143 facts the worst rank is 4, so
+`limit=5` already saturates and every row below it is flat. The limit only became the binding
+constraint as the corpus grew 143 -> 880; measuring it on the original install would have
+returned "5 is fine" correctly and uselessly.
+
+Limits on how far to read the grid, beyond the three that apply to the threshold tables:
+
+- `noise_per_q` is the only column that keeps rising past saturation, and it is an upper bound
+  (a non-target can still be the memory the prompt needed). So the real cost of `limit=10` over
+  `limit=5` is somewhere below +1.5 memories per prompt, by an unmeasured amount — while the +3
+  hits have no such slack.
+- The `limit=3` row is not a recommendation without a second check: `activation.top_n` defaults
+  to 3 and fires on an already-limit-truncated list, so at `limit=3` the two couple and below it
+  spreading activation silently narrows. Every row at 3 or above leaves activation untouched.
+- Nothing here says what happens between 10 and 15, or whether 10 still saturates at 2000 facts.
+  The grid is six points chosen to bracket the shipped value, not a curve.
+
 ## Metric definitions
 
 - **rank** — position of the target fact when the whole corpus is sorted by cosine descending
@@ -171,10 +250,11 @@ Limits on how far to read this table:
 - **nonhit_pN** — percentiles over every question-to-non-target score (12 × corpus).
 - **ff_pN** — percentiles over every fact-to-fact pair.
 - **hits_kept** — targets scoring at or above the client threshold, ignoring rank.
-- **hits_delivered** — targets that clear the threshold *and* rank within `RECALL_LIMIT` (5,
-  the auto-recall hook's default `limit`), so a client would actually be shown them. The
-  honest recall number; `hits_kept` alone only restates whether the threshold sits below a
-  target's score.
+- **hits_delivered** — targets that clear the threshold *and* rank within the row's `limit`, so
+  a client would actually be shown them. The threshold tables hold this at `RECALL_LIMIT` (5,
+  the auto-recall hook's default `limit`); the grid varies it. The honest recall number;
+  `hits_kept` alone only restates whether the threshold sits below a target's score, and is
+  therefore the ceiling every `limit` column converges on.
 - **noise_per_q** — mean non-targets per question that survive both the limit and the
   threshold. The server floor is not modelled: every swept threshold is far above it.
 

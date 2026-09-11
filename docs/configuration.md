@@ -156,8 +156,8 @@ url = "http://127.0.0.1:3000/mcp"
 
 [recall]
 enabled = true
-limit = 5
-min_similarity = 0.35
+limit = 10
+min_similarity = 0.45
 
 [store]
 enabled = true
@@ -176,8 +176,8 @@ extract_timeout_ms = 5000
 | Key | Type | Default | Env Override | Description |
 | ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_AUTO_RECALL=off` | Enable auto-recall on every prompt. |
-| `limit` | number | `5` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. Never measured — `5` is inherited unexamined. It is not merely a cap: the 2026-09-09 sweep found 2 of the 12 benchmark targets ranking 7th and 8th, so at `limit = 5` no threshold can surface them and `min_similarity` is irrelevant for those prompts. Raising the limit and lowering the threshold trade against each other, and only the threshold has been measured. See [docs/minilm-test-data.md](minilm-test-data.md). |
-| `min_similarity` | number | `0.35` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. Measured on the live corpus 2026-09-09 by `alexandria bench-retrieval`'s threshold sweep (see [docs/minilm-test-data.md](minilm-test-data.md)), which counts how many of 12 known targets a threshold actually delivers through `limit`: `0.35` delivers 9/12, `0.50` delivers 7/12, and the old `0.58` Pi default delivers only 4/12 — it assumed genuine matches score 0.6+ and drops two thirds of real hits. `0.40` is strictly dominated (same delivered hits as `0.45`, roughly double the noise) and should not be used. `0.35` is a deliberate recall-favouring pick: it admits ~3 non-target memories per prompt against `0.50`'s ~0.3, on the grounds that a memory that never surfaces is the failure auto-recall exists to prevent. It is not free — the weakest target scores 0.338 and falls below it. |
+| `limit` | number | `10` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. It is not merely a cap — a target ranked below it cannot be surfaced by any threshold, so it is a recall lever in its own right, and the stronger of the two. Measured 2026-09-09 on an 880-fact corpus by `alexandria bench-retrieval`'s limit × threshold grid (see [docs/minilm-test-data.md](minilm-test-data.md), "Result limit"): delivery saturates at `10`, because the worst of the 12 benchmark target ranks is 9, so `15` and `20` add non-target memories and no hits. Was `5` until that measurement, which hid 3 of the 11 targets that cleared the then-default threshold on score. Lowering it below `3` also silently narrows spreading activation (`activation.top_n`). |
+| `min_similarity` | number | `0.45` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. Measured by the same grid, which counts how many of 12 known targets a threshold actually delivers *through* `limit`. **Read it together with `limit` — the two are not independent.** At `limit = 10`: `0.45` delivers 8/12 at ~1.0 non-targets per prompt, `0.35` delivers 11/12 at ~4.7, `0.50` delivers 7/12 at ~0.5, and the old `0.58` Pi default delivers only 4/12 — it assumed genuine matches score 0.6+ and drops two thirds of real hits. `0.40` is strictly dominated (same 8 delivered as `0.45`, roughly double the noise) and should not be used. `0.45` is chosen as the frontier pick: paired with `limit = 10` it delivers what the previous `5`/`0.35` pair did at a third of the injection. Note that `0.45` is only on the frontier *because* the limit is 10 — at `limit = 5` it was dominated by `0.50`, so do not lower one without revisiting the other. It is not free: the weakest target scores 0.338 and falls below it. |
 
 ### `[store]`
 

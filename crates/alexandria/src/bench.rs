@@ -78,23 +78,35 @@ const QUESTIONS: [(&str, &str); 12] = [
 /// metric definitions to be comparable at all.
 const BASELINE_SIZE: usize = 143;
 
-/// Client-side auto-recall cutoffs to sweep. `0.35` is the measured default both clients
-/// ship; `0.58` is the pre-measurement default they used to, kept in the sweep so the
-/// comparison that retired it stays reproducible. The rest bracket the two.
+/// Client-side auto-recall cutoffs to sweep. `0.45` is the measured default both clients
+/// ship; `0.35` was the default until the limit was measured and `0.58` before that, both
+/// kept in the sweep so the comparisons that retired them stay reproducible. The rest
+/// bracket the three.
 const THRESHOLDS: [f32; 6] = [0.30, 0.35, 0.40, 0.45, 0.50, 0.58];
 
 /// How many results the auto-recall hook asks the server for
-/// (`ALEXANDRIA_AUTO_RECALL_LIMIT`, default 5 — `contrib/claude/hooks/alexandria-recall.sh`).
-/// A target ranked below this never reaches the client, whatever the threshold.
-const RECALL_LIMIT: usize = 5;
+/// (`ALEXANDRIA_AUTO_RECALL_LIMIT`, default 10 — `contrib/claude/hooks/alexandria-recall.sh`).
+/// A target ranked below this never reaches the client, whatever the threshold. Was 5 until
+/// 2026-09-09, when the grid below measured it; the threshold tables recorded in
+/// `docs/minilm-test-data.md` before that date are the `limit = 5` row and will not reproduce
+/// from the single-limit table any more — compare them against the grid's `5` row instead.
+const RECALL_LIMIT: usize = 10;
 
-/// One threshold's worth of the client-filter simulation.
+/// Result limits to sweep alongside `THRESHOLDS`. Raising the limit and lowering the
+/// threshold trade against each other, so neither is readable from a single row — the
+/// grid is the only honest view. `RECALL_LIMIT` is in the set so the recorded
+/// single-limit table still reproduces from the same run.
+const LIMITS: [usize; 6] = [3, 5, 8, 10, 15, 20];
+
+/// One (limit, threshold) cell of the client-filter simulation.
 struct Sweep {
+    limit: usize,
     threshold: f32,
-    /// Targets scoring at or above the threshold, ignoring rank.
+    /// Targets scoring at or above the threshold, ignoring rank. Limit-independent, so
+    /// it repeats down each threshold column.
     hits_kept: usize,
-    /// Targets that clear the threshold *and* land in the top `RECALL_LIMIT`, so a
-    /// client would actually see them. The honest recall number.
+    /// Targets that clear the threshold *and* land in the top `limit`, so a client would
+    /// actually see them. The honest recall number.
     hits_delivered: usize,
     /// Mean non-targets per question that survive both the limit and the threshold.
     /// An upper bound on useless injection: a non-target can still be a useful memory.
@@ -115,7 +127,7 @@ struct Metrics {
     nonhit: [f32; 3],
     /// p50, p90, p99 of every fact-to-fact pair.
     ff: [f32; 3],
-    /// Client-threshold simulation, one row per `THRESHOLDS` entry.
+    /// Client-filter simulation, one entry per `LIMITS` x `THRESHOLDS` cell.
     sweep: Vec<Sweep>,
 }
 
@@ -202,12 +214,13 @@ fn compute(
     }
 }
 
-/// Simulate what auto-recall actually does: the server returns the top `RECALL_LIMIT`,
-/// the client drops anything below its threshold, and whatever is left is injected into
-/// the prompt. The server floor is not modelled — every swept threshold is far above it,
-/// so it cannot change the outcome.
+/// Simulate what auto-recall actually does: the server returns the top `limit`, the
+/// client drops anything below its threshold, and whatever is left is injected into the
+/// prompt. Both levers are swept because they trade against each other. The server floor
+/// is not modelled — every swept threshold is far above it, so it cannot change the
+/// outcome.
 fn sweep(scores: &[Vec<f32>], targets: &[Option<usize>]) -> Vec<Sweep> {
-    // Rank once per question; the thresholds only filter what the limit already let through.
+    // Rank once per question; limit and threshold only filter that one ordering.
     let scored: Vec<(&Vec<f32>, usize, Vec<usize>)> = scores
         .iter()
         .zip(targets)
@@ -215,22 +228,21 @@ fn sweep(scores: &[Vec<f32>], targets: &[Option<usize>]) -> Vec<Sweep> {
             let t = (*target)?;
             let mut idx: Vec<usize> = (0..row.len()).collect();
             idx.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
-            idx.truncate(RECALL_LIMIT);
             Some((row, t, idx))
         })
         .collect();
 
-    THRESHOLDS
-        .iter()
-        .map(|&threshold| {
+    let mut out = Vec::with_capacity(LIMITS.len() * THRESHOLDS.len());
+    for &limit in &LIMITS {
+        for &threshold in &THRESHOLDS {
             let mut hits_kept = 0;
             let mut hits_delivered = 0;
             let mut noise = 0usize;
-            for (row, t, top) in &scored {
+            for (row, t, ranked) in &scored {
                 if row[*t] >= threshold {
                     hits_kept += 1;
                 }
-                for &i in top {
+                for &i in ranked.iter().take(limit) {
                     if row[i] < threshold {
                         continue;
                     }
@@ -241,14 +253,16 @@ fn sweep(scores: &[Vec<f32>], targets: &[Option<usize>]) -> Vec<Sweep> {
                     }
                 }
             }
-            Sweep {
+            out.push(Sweep {
+                limit,
                 threshold,
                 hits_kept,
                 hits_delivered,
                 noise_per_q: noise as f64 / scored.len() as f64,
-            }
-        })
-        .collect()
+            });
+        }
+    }
+    out
 }
 
 /// Score one corpus against the pre-embedded questions.
@@ -325,11 +339,31 @@ fn report(label: &str, m: &Metrics, model: &str) {
     println!("\nclient threshold sweep (server returns top {RECALL_LIMIT}, client drops below T):");
     println!("\n| T | hits_kept | hits_delivered | noise_per_q |");
     println!("|---|---|---|---|");
-    for s in &m.sweep {
+    for s in m.sweep.iter().filter(|s| s.limit == RECALL_LIMIT) {
         println!(
             "| {:.2} | {}/{} | {}/{} | {:.2} |",
             s.threshold, s.hits_kept, m.scored, s.hits_delivered, m.scored, s.noise_per_q
         );
+    }
+
+    // hits_kept is limit-independent, so the grid drops it: the whole point here is that
+    // a target can clear every threshold and still never be delivered.
+    println!(
+        "\nlimit x threshold grid, hits_delivered out of {} (noise_per_q):",
+        m.scored
+    );
+    print!("\n| limit |");
+    for t in THRESHOLDS {
+        print!(" T={t:.2} |");
+    }
+    println!("\n|---|{}", "---|".repeat(THRESHOLDS.len()));
+    for &limit in &LIMITS {
+        let marker = if limit == RECALL_LIMIT { " (now)" } else { "" };
+        print!("| {limit}{marker} |");
+        for s in m.sweep.iter().filter(|s| s.limit == limit) {
+            print!(" {} ({:.1}) |", s.hits_delivered, s.noise_per_q);
+        }
+        println!();
     }
 }
 
@@ -427,7 +461,7 @@ mod tests {
 
     #[test]
     fn sweep_separates_kept_from_delivered_and_counts_noise() {
-        // q0: target scores 0.36, straddling the 0.35 recommendation, and ranks 3rd.
+        // q0: target scores 0.36, straddling the 0.35 row, and ranks 3rd.
         // q1: target scores 0.50 but ranks 6th, so the limit hides it whatever T is.
         let scores = vec![
             vec![0.36, 0.60, 0.50, 0.34, 0.20, 0.10],
@@ -435,9 +469,17 @@ mod tests {
         ];
         let targets = vec![Some(0), Some(5)];
         let s = sweep(&scores, &targets);
-        assert_eq!(s.len(), THRESHOLDS.len());
+        assert_eq!(s.len(), LIMITS.len() * THRESHOLDS.len());
 
-        let at = |t: f32| s.iter().find(|r| (r.threshold - t).abs() < 1e-6).unwrap();
+        let cell = |limit: usize, t: f32| {
+            s.iter()
+                .find(|r| r.limit == limit && (r.threshold - t).abs() < 1e-6)
+                .unwrap()
+        };
+        // Bound to a literal 5, not `RECALL_LIMIT`: these assertions describe the fixture's
+        // limit-5 behaviour, which is the interesting case because q1's target sits at rank 6.
+        // Tying them to the shipped default would silently re-point them every time it moves.
+        let at = |t: f32| cell(5, t);
 
         // 0.30 clears both targets; only q0's is inside the top 5.
         assert_eq!(at(0.30).hits_kept, 2);
@@ -457,6 +499,29 @@ mod tests {
         assert_eq!(at(0.58).hits_kept, 0);
         assert_eq!(at(0.58).hits_delivered, 0);
         assert!((at(0.58).noise_per_q - 2.5).abs() < 1e-9); // (1 + 4) / 2
+
+        // The limit dimension: q1's target ranks 6th, so no threshold reaches it at 5 and
+        // every threshold below 0.50 reaches it at 8. 8 exceeds the 6-fact fixture, so it
+        // is the whole corpus — and the noise is unchanged from limit 5, because the two
+        // entries the wider limit admits are q0's 0.20/0.10, already below every T here.
+        assert_eq!(cell(8, 0.30).hits_delivered, 2);
+        assert!((cell(8, 0.30).noise_per_q - 4.0).abs() < 1e-9);
+        // 0.58 is above q1's 0.50 target, so widening the limit buys nothing there.
+        assert_eq!(cell(8, 0.58).hits_delivered, 0);
+
+        // Narrowing to 3 keeps q0's target (rank 3) and sheds two non-targets.
+        assert_eq!(cell(3, 0.35).hits_delivered, 1);
+        assert!((cell(3, 0.35).noise_per_q - 2.5).abs() < 1e-9); // (2 + 3) / 2
+
+        // hits_kept ignores rank, so it must not move with the limit.
+        assert_eq!(cell(3, 0.35).hits_kept, cell(20, 0.35).hits_kept);
+
+        // `report()` prints the single-limit threshold table by filtering the sweep on
+        // RECALL_LIMIT, so a RECALL_LIMIT outside LIMITS would print an empty table and say
+        // nothing about it. This is the one coupling between the two constants.
+        assert!(LIMITS.contains(&RECALL_LIMIT));
+        // At the shipped limit the whole 6-fact fixture fits, so both targets are delivered.
+        assert_eq!(cell(RECALL_LIMIT, 0.30).hits_delivered, 2);
     }
 
     #[test]
