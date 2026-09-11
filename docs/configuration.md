@@ -157,7 +157,7 @@ url = "http://127.0.0.1:3000/mcp"
 [recall]
 enabled = true
 limit = 5
-min_similarity = 0.58
+min_similarity = 0.35
 
 [store]
 enabled = true
@@ -177,7 +177,7 @@ extract_timeout_ms = 5000
 | ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_AUTO_RECALL=off` | Enable auto-recall on every prompt. |
 | `limit` | number | `5` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. |
-| `min_similarity` | number | `0.58` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. **Recommended: `0.35`.** The `0.58` Pi default predates measurement and assumed genuine matches score 0.6+; on `all-MiniLM-L6-v2` (measured 2026-09-08, synthetic pairs) question-vs-matching-statement scores 0.40–0.65 and unrelated memories 0.07–0.40, so `0.58` drops most real hits. `0.35` keeps them and admits only topically adjacent memories. The Claude Code hook (`contrib/claude`) already defaults to `0.35`; the Pi default is left at `0.58` pending a change to the extension. |
+| `min_similarity` | number | `0.35` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. Measured on the live corpus 2026-09-09 by `alexandria bench-retrieval`'s threshold sweep (see [docs/minilm-test-data.md](minilm-test-data.md)), which counts how many of 12 known targets a threshold actually delivers through `limit`: `0.35` delivers 9/12, `0.50` delivers 7/12, and the old `0.58` Pi default delivers only 4/12 — it assumed genuine matches score 0.6+ and drops two thirds of real hits. `0.40` is strictly dominated (same delivered hits as `0.45`, roughly double the noise) and should not be used. `0.35` is a deliberate recall-favouring pick: it admits ~3 non-target memories per prompt against `0.50`'s ~0.3, on the grounds that a memory that never surfaces is the failure auto-recall exists to prevent. It is not free — the weakest target scores 0.338 and falls below it. |
 
 ### `[store]`
 

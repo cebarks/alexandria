@@ -48,7 +48,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `update_memory` with content change: creates a soft-deleted snapshot of old content, then links via `derived_from` edge. The old version is hidden from search but preserved for lineage.
 - `import_document` creates a `raw` table record for the full document, then `extracted_from` edges from each chunk to it.
 - Spreading activation fires on the top N results of `retrieve_memories` (configurable via `activation.top_n`, default 3) — it's a side effect, not part of the ranking.
-- `retrieve_memories` drops results below `retrieve.min_similarity` (default 0.30) server-side, *after* ranking and *before* activation is triggered. The pi extension's client threshold (0.58) sits deliberately above this floor — keep that ordering if you tune either.
+- `retrieve_memories` drops results below `retrieve.min_similarity` (default 0.10) server-side, *after* ranking and *before* activation is triggered. It is a noise cutoff only — the client threshold (`[recall] min_similarity`, 0.35) does the real filtering, and both are measured, not chosen. Do not restate either number here; `docs/minilm-test-data.md` records the measurements and `docs/configuration.md` the rationale.
 - Cluster maintenance runs as a background `tokio::spawn` in HTTP mode only (not stdio), at an interval configurable via `cluster.maintenance_interval_secs` (default 300s / 5 minutes). It drains **all** eligible merges per tick, not one.
 - Every split/merge is recorded in the `maintenance_log` table (`v004`) and surfaced at `/debug/maintenance`. If cluster behavior looks wrong, that table is the audit trail.
 - Sessions are created implicitly by `store_memory(session_id)` — there is no create tool. `SessionRepo::touch()` bumps `memory_count` **and** `ended_at`, so `ended_at` means last-activity; only a non-null `summary` distinguishes a finalized session. See `docs/session-memory.md`.
@@ -60,7 +60,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 
 - The repo intentionally carries no `rust-toolchain.toml` and no `.cargo/config.toml` — `rust-version = "1.98"` + edition 2024 are the only compiler statement; mold/`target-cpu` live in each dev's `~/.cargo/config.toml` (see TODO-misc "Build / toolchain"). Don't re-add them to the repo.
 - Use the `just` recipes (they match CI): `just test`, `just lint`, `just fmt`, `just ci` (fmt + lint + test + `cargo deny`). `just install-hooks` wires `.githooks/pre-commit`.
-- Run tests on **stable**, not nightly: `diskann-wide` (SurrealDB transitive dep) fails trait inference on its NEON intrinsics under recent nightlies on aarch64, and the failure looks like it originates in this workspace. Current suite: 153 tests, all green.
+- Run tests on **stable**, not nightly: `diskann-wide` (SurrealDB transitive dep) fails trait inference on its NEON intrinsics under recent nightlies on aarch64, and the failure looks like it originates in this workspace. Current suite: 151 tests, all green.
 - All integration tests use `Database::connect_embedded()` (in-memory SurrealDB) — no disk state between tests.
 - `CandleProvider` tests download the real model on first run (~80MB) — they're slow the first time.
 - Test helpers in `alexandria-storage/src/connection.rs`: `connect_embedded()` for quick in-memory DB.

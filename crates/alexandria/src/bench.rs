@@ -78,6 +78,29 @@ const QUESTIONS: [(&str, &str); 12] = [
 /// metric definitions to be comparable at all.
 const BASELINE_SIZE: usize = 143;
 
+/// Client-side auto-recall cutoffs to sweep. `0.35` is the measured default both clients
+/// ship; `0.58` is the pre-measurement default they used to, kept in the sweep so the
+/// comparison that retired it stays reproducible. The rest bracket the two.
+const THRESHOLDS: [f32; 6] = [0.30, 0.35, 0.40, 0.45, 0.50, 0.58];
+
+/// How many results the auto-recall hook asks the server for
+/// (`ALEXANDRIA_AUTO_RECALL_LIMIT`, default 5 — `contrib/claude/hooks/alexandria-recall.sh`).
+/// A target ranked below this never reaches the client, whatever the threshold.
+const RECALL_LIMIT: usize = 5;
+
+/// One threshold's worth of the client-filter simulation.
+struct Sweep {
+    threshold: f32,
+    /// Targets scoring at or above the threshold, ignoring rank.
+    hits_kept: usize,
+    /// Targets that clear the threshold *and* land in the top `RECALL_LIMIT`, so a
+    /// client would actually see them. The honest recall number.
+    hits_delivered: usize,
+    /// Mean non-targets per question that survive both the limit and the threshold.
+    /// An upper bound on useless injection: a non-target can still be a useful memory.
+    noise_per_q: f64,
+}
+
 /// One corpus's worth of numbers, in the column order of the measurements table.
 struct Metrics {
     corpus: usize,
@@ -92,6 +115,8 @@ struct Metrics {
     nonhit: [f32; 3],
     /// p50, p90, p99 of every fact-to-fact pair.
     ff: [f32; 3],
+    /// Client-threshold simulation, one row per `THRESHOLDS` entry.
+    sweep: Vec<Sweep>,
 }
 
 /// Linear-interpolated percentile, matching `numpy.percentile`'s default. The
@@ -172,8 +197,58 @@ fn compute(
         hit_max: hits.iter().copied().fold(f32::NEG_INFINITY, f32::max),
         nonhit: percentiles(&mut nonhits),
         ff: percentiles(&mut ff),
+        sweep: sweep(scores, targets),
         ranks,
     }
+}
+
+/// Simulate what auto-recall actually does: the server returns the top `RECALL_LIMIT`,
+/// the client drops anything below its threshold, and whatever is left is injected into
+/// the prompt. The server floor is not modelled — every swept threshold is far above it,
+/// so it cannot change the outcome.
+fn sweep(scores: &[Vec<f32>], targets: &[Option<usize>]) -> Vec<Sweep> {
+    // Rank once per question; the thresholds only filter what the limit already let through.
+    let scored: Vec<(&Vec<f32>, usize, Vec<usize>)> = scores
+        .iter()
+        .zip(targets)
+        .filter_map(|(row, target)| {
+            let t = (*target)?;
+            let mut idx: Vec<usize> = (0..row.len()).collect();
+            idx.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+            idx.truncate(RECALL_LIMIT);
+            Some((row, t, idx))
+        })
+        .collect();
+
+    THRESHOLDS
+        .iter()
+        .map(|&threshold| {
+            let mut hits_kept = 0;
+            let mut hits_delivered = 0;
+            let mut noise = 0usize;
+            for (row, t, top) in &scored {
+                if row[*t] >= threshold {
+                    hits_kept += 1;
+                }
+                for &i in top {
+                    if row[i] < threshold {
+                        continue;
+                    }
+                    if i == *t {
+                        hits_delivered += 1;
+                    } else {
+                        noise += 1;
+                    }
+                }
+            }
+            Sweep {
+                threshold,
+                hits_kept,
+                hits_delivered,
+                noise_per_q: noise as f64 / scored.len() as f64,
+            }
+        })
+        .collect()
 }
 
 /// Score one corpus against the pre-embedded questions.
@@ -244,6 +319,16 @@ fn report(label: &str, m: &Metrics, model: &str) {
             "  sanity check FAIL: floor {floor:.2} >= hit_min {:.3}; this model has no usable \
              noise floor on this corpus",
             m.hit_min
+        );
+    }
+
+    println!("\nclient threshold sweep (server returns top {RECALL_LIMIT}, client drops below T):");
+    println!("\n| T | hits_kept | hits_delivered | noise_per_q |");
+    println!("|---|---|---|---|");
+    for s in &m.sweep {
+        println!(
+            "| {:.2} | {}/{} | {}/{} | {:.2} |",
+            s.threshold, s.hits_kept, m.scored, s.hits_delivered, m.scored, s.noise_per_q
         );
     }
 }
@@ -330,6 +415,40 @@ mod tests {
         // non-targets sorted: 0.1 0.2 0.3 0.5 0.6 0.8
         assert!((m.nonhit[0] - 0.4).abs() < 1e-6);
         assert!((m.ff[0] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sweep_separates_kept_from_delivered_and_counts_noise() {
+        // q0: target scores 0.36, straddling the 0.35 recommendation, and ranks 3rd.
+        // q1: target scores 0.50 but ranks 6th, so the limit hides it whatever T is.
+        let scores = vec![
+            vec![0.36, 0.60, 0.50, 0.34, 0.20, 0.10],
+            vec![0.90, 0.80, 0.70, 0.60, 0.55, 0.50],
+        ];
+        let targets = vec![Some(0), Some(5)];
+        let s = sweep(&scores, &targets);
+        assert_eq!(s.len(), THRESHOLDS.len());
+
+        let at = |t: f32| s.iter().find(|r| (r.threshold - t).abs() < 1e-6).unwrap();
+
+        // 0.30 clears both targets; only q0's is inside the top 5.
+        assert_eq!(at(0.30).hits_kept, 2);
+        assert_eq!(at(0.30).hits_delivered, 1);
+        assert!((at(0.30).noise_per_q - 4.0).abs() < 1e-9); // (3 + 5) / 2
+
+        // 0.35 still keeps q0's 0.36; one fewer non-target survives.
+        assert_eq!(at(0.35).hits_kept, 2);
+        assert_eq!(at(0.35).hits_delivered, 1);
+        assert!((at(0.35).noise_per_q - 3.5).abs() < 1e-9); // (2 + 5) / 2
+
+        // 0.40 drops q0's target entirely while admitting the same noise as 0.35 did.
+        assert_eq!(at(0.40).hits_kept, 1);
+        assert_eq!(at(0.40).hits_delivered, 0);
+
+        // 0.58 drops both targets and still injects 2.5 non-targets per question.
+        assert_eq!(at(0.58).hits_kept, 0);
+        assert_eq!(at(0.58).hits_delivered, 0);
+        assert!((at(0.58).noise_per_q - 2.5).abs() < 1e-9); // (1 + 4) / 2
     }
 
     #[test]
