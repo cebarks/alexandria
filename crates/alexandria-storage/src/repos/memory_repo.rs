@@ -3,7 +3,7 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue, ToSql};
 
-use crate::models::Fact;
+use crate::models::{Fact, RawRecord};
 use crate::record_id_to_string;
 
 pub struct MemoryRepo<'a> {
@@ -46,6 +46,22 @@ impl<'a> MemoryRepo<'a> {
         Ok(id.to_sql())
     }
 
+    /// Create a `raw` record holding a full source document for `import_document`.
+    pub async fn create_raw(&self, content: &str) -> Result<String> {
+        let mut response = self
+            .db
+            .query("CREATE raw SET content = $content, deleted = false")
+            .bind(("content", content.to_string()))
+            .await?;
+
+        let created: Option<RawRecord> = response.take(0)?;
+        let raw = created.ok_or_else(|| anyhow::anyhow!("Failed to create raw record"))?;
+        let id = raw
+            .id
+            .ok_or_else(|| anyhow::anyhow!("Raw record has no id"))?;
+        Ok(record_id_to_string(&id))
+    }
+
     pub async fn get_fact(&self, id: &str) -> Result<Option<Fact>> {
         let mut response = self
             .db
@@ -54,6 +70,38 @@ impl<'a> MemoryRepo<'a> {
             .await?;
         let fact: Option<Fact> = response.take(0)?;
         Ok(fact)
+    }
+
+    /// Id of a live fact whose content is byte-identical to `content`, if any.
+    // ponytail: full scan on `content`; add a non-unique index if store latency shows it.
+    pub async fn find_by_content(&self, content: &str) -> Result<Option<String>> {
+        #[derive(serde::Deserialize, SurrealValue)]
+        struct IdOnly {
+            id: RecordId,
+        }
+        let mut response = self
+            .db
+            .query("SELECT id FROM fact WHERE deleted = false AND content = $content LIMIT 1")
+            .bind(("content", content.to_string()))
+            .await?;
+        let ids: Vec<IdOnly> = response.take(0)?;
+        Ok(ids.into_iter().next().map(|r| record_id_to_string(&r.id)))
+    }
+
+    /// The `k` live facts nearest to `query` by cosine similarity, nearest first.
+    /// `<|k,COSINE|>` goes through the HNSW index when `schema::ensure_vector_index`
+    /// has defined it and falls back to a brute-force scan inside the database when
+    /// it has not.
+    pub async fn nearest(&self, query: &[f32], k: usize) -> Result<Vec<Fact>> {
+        let mut response = self
+            .db
+            .query(format!(
+                "SELECT * FROM fact WHERE deleted = false AND embedding <|{k},COSINE|> $q"
+            ))
+            .bind(("q", query.to_vec()))
+            .await?;
+        let facts: Vec<Fact> = response.take(0)?;
+        Ok(facts)
     }
 
     pub async fn soft_delete_fact(&self, id: &str) -> Result<()> {
@@ -248,6 +296,27 @@ mod tests {
     use crate::connection::Database;
 
     #[tokio::test]
+    async fn test_create_raw() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let id = repo.create_raw("full document").await.unwrap();
+        assert!(id.starts_with("raw:"), "unexpected id {id}");
+
+        let mut response = db
+            .inner()
+            .query("SELECT * FROM type::record($id)")
+            .bind(("id", id.clone()))
+            .await
+            .unwrap();
+        let raw: Option<RawRecord> = response.take(0).unwrap();
+        let raw = raw.expect("raw record round-trips");
+        assert_eq!(raw.content, "full document");
+        assert!(!raw.deleted);
+    }
+
+    #[tokio::test]
     async fn test_list_and_count_facts() {
         let db = Database::connect_embedded().await.unwrap();
         crate::schema::migrate(db.inner()).await.unwrap();
@@ -293,6 +362,42 @@ mod tests {
         assert_eq!(page1.len(), 1);
         assert_eq!(page2.len(), 1);
         assert_ne!(page1[0].content, page2[0].content);
+    }
+
+    #[tokio::test]
+    async fn test_nearest_orders_by_similarity_and_skips_deleted() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        crate::schema::ensure_vector_index(db.inner(), 2)
+            .await
+            .unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let near = repo
+            .create_fact("near", 0.5, &[1.0, 0.0], &[])
+            .await
+            .unwrap();
+        let mid = repo
+            .create_fact("mid", 0.5, &[0.7, 0.7], &[])
+            .await
+            .unwrap();
+        repo.create_fact("far", 0.5, &[0.0, 1.0], &[])
+            .await
+            .unwrap();
+        let gone = repo
+            .create_fact("gone", 0.5, &[1.0, 0.1], &[])
+            .await
+            .unwrap();
+        repo.soft_delete_fact(&gone).await.unwrap();
+
+        let got: Vec<String> = repo
+            .nearest(&[0.9, 0.1], 2)
+            .await
+            .unwrap()
+            .iter()
+            .map(|f| record_id_to_string(f.id.as_ref().unwrap()))
+            .collect();
+        assert_eq!(got, vec![near, mid]);
     }
 
     #[tokio::test]

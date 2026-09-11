@@ -1,9 +1,10 @@
+mod bench;
 mod config;
 
 use std::sync::Arc;
 
 use alexandria_mcp::AlexandriaServer;
-use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
+use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider, MAX_TOKENS};
 use alexandria_storage::record_id_to_string;
 use alexandria_storage::{Database, schema, system_config};
 use config::Config;
@@ -13,18 +14,19 @@ use rmcp::ServiceExt;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    const USAGE: &str = "Usage: alexandria [migrate-embeddings | --help]";
+    const USAGE: &str = "Usage: alexandria [migrate-embeddings | bench-retrieval | --help]";
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [] => {}
         ["migrate-embeddings"] => return migrate_embeddings().await,
+        ["bench-retrieval"] => return bench::run().await,
         ["--help"] | ["-h"] => {
             println!("{USAGE}");
             return Ok(());
         }
         _ => anyhow::bail!("unexpected arguments {args:?}. {USAGE}"),
     }
-    tracing::info!("Alexandria v0.2 starting...");
+    tracing::info!("Alexandria v{} starting...", env!("CARGO_PKG_VERSION"));
 
     // 1. Load configuration
     let config = Config::load()?;
@@ -58,7 +60,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Loading embedding model: {}", config.embedding.model);
     let embedding = CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
     let dims = embedding.dimensions();
-    system_config::check_embedding_model(db.inner(), &config.embedding.model, dims).await?;
+    system_config::check_embedding_model(db.inner(), &config.embedding.model, dims, MAX_TOKENS)
+        .await?;
+    schema::ensure_vector_index(db.inner(), dims).await?;
     tracing::info!("Embedding model loaded ({dims} dimensions)");
 
     // 4. Create MCP server
@@ -99,6 +103,10 @@ async fn main() -> anyhow::Result<()> {
 async fn migrate_embeddings() -> anyhow::Result<()> {
     use alexandria_mcp::migrate::{ReembedOutcome, reembed};
 
+    tracing::info!(
+        "Alexandria v{} migrate-embeddings starting...",
+        env!("CARGO_PKG_VERSION")
+    );
     let config = Config::load()?;
     let db = Database::connect(&config.database.data_dir).await?;
     schema::migrate(db.inner()).await?;
@@ -106,10 +114,10 @@ async fn migrate_embeddings() -> anyhow::Result<()> {
     tracing::info!("Loading embedding model: {}", config.embedding.model);
     let embedding = CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
 
-    match reembed(&db, &embedding).await? {
+    match reembed(&db, &embedding, config.embedding.batch_size).await? {
         ReembedOutcome::Skipped(why) => println!("Nothing to do: {why}"),
         ReembedOutcome::Done { facts, clusters } => println!(
-            "Re-embedded {facts} facts and {clusters} cluster centroids with {} ({} dims). Restart the service.",
+            "Re-embedded {facts} facts and {clusters} cluster centroids with {} ({} dims, {MAX_TOKENS} tokens). Restart the service.",
             embedding.model_id(),
             embedding.dimensions()
         ),
