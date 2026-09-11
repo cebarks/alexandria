@@ -235,15 +235,7 @@ impl AlexandriaServer {
         // 6. Session linkage (implicit create on first use)
         if let Some(ref session_id) = params.session_id {
             let session_repo = SessionRepo::new(self.db.inner());
-            if session_repo
-                .find_by_external_id(session_id)
-                .await?
-                .is_none()
-            {
-                session_repo.create(session_id, None, None).await?;
-            }
-            let session = session_repo.find_by_external_id(session_id).await?.unwrap();
-            let session_rid = session.id.map(|r| record_id_to_string(&r)).unwrap();
+            let session_rid = session_repo.find_or_create(session_id).await?;
             session_repo.add_memory(&session_rid, &fact_id).await?;
             session_repo.touch(session_id).await?;
         }
@@ -367,17 +359,7 @@ impl AlexandriaServer {
         // Session linkage (implicit create on first use), resolved once for all chunks
         let session_repo = SessionRepo::new(self.db.inner());
         let session_rid = match params.session_id {
-            Some(ref session_id) => {
-                if session_repo
-                    .find_by_external_id(session_id)
-                    .await?
-                    .is_none()
-                {
-                    session_repo.create(session_id, None, None).await?;
-                }
-                let session = session_repo.find_by_external_id(session_id).await?.unwrap();
-                Some(session.id.map(|r| record_id_to_string(&r)).unwrap())
-            }
+            Some(ref session_id) => Some(session_repo.find_or_create(session_id).await?),
             None => None,
         };
 

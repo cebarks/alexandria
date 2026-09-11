@@ -59,6 +59,17 @@ impl<'a> SessionRepo<'a> {
         Ok(crate::record_id_to_string(&id))
     }
 
+    /// Find a session by external_id, creating it if missing. Returns the record ID string.
+    pub async fn find_or_create(&self, external_id: &str) -> Result<String> {
+        match self.find_by_external_id(external_id).await? {
+            Some(session) => session
+                .id
+                .map(|id| crate::record_id_to_string(&id))
+                .ok_or_else(|| anyhow::anyhow!("Session has no id")),
+            None => self.create(external_id, None, None).await,
+        }
+    }
+
     /// Refresh ended_at on a session.
     pub async fn touch(&self, external_id: &str) -> Result<()> {
         self.db
@@ -247,6 +258,25 @@ mod tests {
         let memories = repo.get_memories("sess-003").await.unwrap();
         let contents: Vec<&str> = memories.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(contents, ["first", "second", "third"]);
+    }
+
+    #[tokio::test]
+    async fn test_find_or_create_is_idempotent() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = SessionRepo::new(db.inner());
+
+        let first = repo.find_or_create("sess-004").await.unwrap();
+        let second = repo.find_or_create("sess-004").await.unwrap();
+        assert_eq!(first, second);
+
+        let mut response = db
+            .inner()
+            .query("SELECT * FROM `session` WHERE external_id = 'sess-004'")
+            .await
+            .unwrap();
+        let rows: Vec<Session> = response.take(0).unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test]
