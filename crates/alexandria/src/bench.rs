@@ -92,6 +92,11 @@ const THRESHOLDS: [f32; 6] = [0.30, 0.35, 0.40, 0.45, 0.50, 0.58];
 /// from the single-limit table any more — compare them against the grid's `5` row instead.
 const RECALL_LIMIT: usize = 10;
 
+/// The client-side threshold shipped alongside `RECALL_LIMIT` (`ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY`,
+/// default 0.45). A target scoring below it is dropped whatever its rank, so the limit can only
+/// ever hide a target that scores at or above this — the headroom check counts those alone.
+const RECALL_THRESHOLD: f32 = 0.45;
+
 /// Result limits to sweep alongside `THRESHOLDS`. Raising the limit and lowering the
 /// threshold trade against each other, so neither is readable from a single row — the
 /// grid is the only honest view. `RECALL_LIMIT` is in the set so the recorded
@@ -123,6 +128,8 @@ struct Metrics {
     corpus: usize,
     scored: usize,
     ranks: Vec<usize>,
+    /// Each scored target's own score, parallel to `ranks`.
+    hit_scores: Vec<f32>,
     mean_rank: f64,
     top1: usize,
     mean_gap: f64,
@@ -216,6 +223,7 @@ fn compute(
         ff: percentiles(&mut ff),
         sweep: sweep(scores, targets),
         ranks,
+        hit_scores: hits,
     }
 }
 
@@ -325,21 +333,33 @@ fn report(label: &str, m: &Metrics, model: &str) {
     }
 
     // `RECALL_LIMIT` was set where delivery saturates, which is a property of the corpus, not
-    // the model: rank inflates as the corpus grows, and a target past the limit clears every
-    // threshold on score and is never delivered, with no other signal. A rank equal to the
-    // limit is still delivered.
-    let worst = m.ranks.iter().copied().max().unwrap_or(0);
-    let hidden = m.ranks.iter().filter(|&&r| r > RECALL_LIMIT).count();
+    // the model: rank inflates as the corpus grows, and a target past the limit that clears
+    // the threshold on score is never delivered, with no other signal. Targets under
+    // `RECALL_THRESHOLD` are excluded — the client drops those at any limit, so their rank
+    // is not the limit's problem (the first version of this check counted them and warned on
+    // a target the threshold had already discarded). A rank equal to the limit is delivered.
+    let kept: Vec<usize> = m
+        .ranks
+        .iter()
+        .zip(&m.hit_scores)
+        .filter(|(_, score)| **score >= RECALL_THRESHOLD)
+        .map(|(&rank, _)| rank)
+        .collect();
+    let worst = kept.iter().copied().max().unwrap_or(0);
+    let hidden = kept.iter().filter(|&&r| r > RECALL_LIMIT).count();
     if hidden == 0 {
         println!(
-            "\nrecall limit headroom: worst rank {worst} of limit {RECALL_LIMIT} ({} positions)",
+            "\nrecall limit headroom: worst rank {worst} of limit {RECALL_LIMIT} among the {} targets \
+             at or above T={RECALL_THRESHOLD:.2} ({} positions)",
+            kept.len(),
             RECALL_LIMIT - worst
         );
     } else {
         println!(
-            "\nrecall limit headroom WARN: worst rank {worst} exceeds limit {RECALL_LIMIT}; {hidden} \
-             target(s) clear the threshold on score but are never delivered — re-run the grid \
-             below and revisit the client default"
+            "\nrecall limit headroom WARN: {hidden} of the {} targets at or above T={RECALL_THRESHOLD:.2} \
+             rank past limit {RECALL_LIMIT} (worst {worst}) and are never delivered — re-run the grid \
+             below and revisit the client default",
+            kept.len()
         );
     }
 
@@ -477,6 +497,7 @@ mod tests {
         let m = compute(4, &scores, &targets, ff);
 
         assert_eq!(m.ranks, vec![1, 3]);
+        assert_eq!(m.hit_scores, vec![0.9, 0.4]);
         assert_eq!(m.top1, 1);
         assert_eq!(m.scored, 2);
         assert!((m.mean_rank - 2.0).abs() < 1e-9);
@@ -550,6 +571,9 @@ mod tests {
         // RECALL_LIMIT, so a RECALL_LIMIT outside LIMITS would print an empty table and say
         // nothing about it. This is the one coupling between the two constants.
         assert!(LIMITS.contains(&RECALL_LIMIT));
+        // The headroom line reasons about the shipped pair; keep it on the grid so the two
+        // can be read against each other.
+        assert!(THRESHOLDS.contains(&RECALL_THRESHOLD));
         // At the shipped limit the whole 6-fact fixture fits, so both targets are delivered.
         assert_eq!(cell(RECALL_LIMIT, 0.30).hits_delivered, 2);
     }
