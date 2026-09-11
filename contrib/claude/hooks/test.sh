@@ -39,6 +39,7 @@ hook() { jq -cn --arg s "$sess" --arg p "$1" '{session_id:$s,prompt:$p}' | ./ale
 hook "no, use jj instead of git"
 hook "always run clippy before pushing"
 hook "no, use jj instead of git"
+hook "no, it's completed"   # one-word capture: dropped
 got=$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq -c '[.memories[] | select(.tags|index("auto-detected")) | .content] | sort')
 echo "$got"
 [ "$got" = '["User correction: jj instead of git","User preference: Use jj instead of git","User preference: run clippy before pushing"]' ]
