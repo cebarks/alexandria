@@ -91,7 +91,7 @@ stop
 grep -q '^\[User\]: which storage engine' "$td/prompt.txt"
 grep -q '^\[Assistant\]: We decided' "$td/prompt.txt"
 grep -q 'ignore me\|hmm\|tool_result' "$td/prompt.txt" && exit 1   # `! cmd` never trips set -e
-grep -q '^\[Tool error\]: Bash {"command":"cargo test","description":"Run tests"} -- Exit code 101' "$td/prompt.txt"   # is_error results are fed in, attributed to their tool_use; harness <tool_use_error> ones are not
+grep -q '^\[Tool error\]: Bash cargo test -- Exit code 101' "$td/prompt.txt"   # is_error results are fed in, attributed to their tool_use; harness <tool_use_error> ones are not
 grep -q '^\[Tool error\]: orphan error' "$td/prompt.txt"   # unknown tool_use_id keeps the bare form
 grep -q 'tool_use_error\|has not been read' "$td/prompt.txt" && exit 1
 grep -q 'User correction: jj instead of git' "$td/prompt.txt"   # already-stored block
