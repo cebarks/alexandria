@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod clusters;
 pub mod dashboard;
 pub mod graph;
@@ -17,6 +18,7 @@ use crate::AlexandriaServer;
 pub fn router(server: AlexandriaServer) -> Router {
     Router::new()
         .route("/debug", get(dashboard::handler))
+        .route("/debug/assets/{name}", get(assets::asset))
         .route("/debug/memories", get(memories::list))
         .route("/debug/memories/{id}", get(memories::detail))
         .route("/debug/clusters", get(clusters::list))

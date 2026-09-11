@@ -24,6 +24,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 axum = "0.8"
+askama = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
