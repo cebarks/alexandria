@@ -15,7 +15,7 @@ fmt-fix:
 
 # Lint with clippy (warnings as errors, matches CI)
 lint:
-    RUSTFLAGS="-Dwarnings" cargo clippy --all-targets --all-features
+    RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets --all-features
 
 # Run all tests
 test:
@@ -23,7 +23,7 @@ test:
 
 # Fast type-check
 check:
-    cargo check --all-features
+    cargo check --workspace --all-features
 
 # Run the server
 run:
