@@ -93,3 +93,13 @@ mean rank and separation; its noise floor (nonhit_p50 0.54, fact-fact p50 0.64) 
 compressed as bge's. Both larger models lose badly on the paraphrase-heavy question 11 and
 bge on question 12, where MiniLM's keyword overlap carries it. The corpus is short
 technical statements, and small mean-pooled MiniLM appears to be the right shape for it.
+
+## Third pass (2026-09-09): same model, 5x corpus
+
+Moved to `docs/minilm-test-data.md`, which is maintained; these plan docs are not. MiniLM
+was rerun alone against the grown corpus with `alexandria bench-retrieval` (`crates/alexandria/src/bench.rs`),
+which also computes the retrieve floor from the model's own output instead of by hand. The
+reconstructed 143-fact baseline reproduces the first-pass row above on every column and
+every per-question rank; at 743 facts `mean_rank` goes 1.42 -> 2.75, `top1` 9/12 -> 7/12 and
+`mean_gap` +0.148 -> +0.077, with `hit_min`/`hit_max` unchanged. Floor 0.07 live, 0.08 on
+the baseline, against the 0.10 default; no config change.
