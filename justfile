@@ -37,6 +37,17 @@ clean:
 deny:
     cargo deny check
 
+# Re-download vendored debug-UI assets and verify against SHA256SUMS
+vendor-assets:
+    cd crates/alexandria-mcp/assets && \
+    curl -fsSL -o htmx-2.0.10.min.js https://unpkg.com/htmx.org@2.0.10/dist/htmx.min.js && \
+    curl -fsSL -o vis-network-10.1.2.min.js https://unpkg.com/vis-network@10.1.2/standalone/umd/vis-network.min.js && \
+    sha256sum -c SHA256SUMS
+
+# Check vendored debug-UI assets against SHA256SUMS
+verify-assets:
+    cd crates/alexandria-mcp/assets && sha256sum -c SHA256SUMS
+
 # Full CI suite locally — run before pushing
 ci: fmt lint test deny
 
