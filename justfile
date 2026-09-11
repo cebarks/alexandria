@@ -49,7 +49,7 @@ verify-assets:
     cd crates/alexandria-mcp/assets && sha256sum -c SHA256SUMS
 
 # Full CI suite locally — run before pushing
-ci: fmt lint test deny
+ci: fmt lint test deny verify-assets
 
 # Install git hooks (pre-commit: fmt + clippy)
 install-hooks:
