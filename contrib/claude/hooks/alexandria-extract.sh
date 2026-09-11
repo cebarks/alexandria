@@ -9,7 +9,7 @@
 # and always exits 0.
 #
 # Env (all optional):
-#   ALEXANDRIA_AUTO_STORE          "off" disables
+#   ALEXANDRIA_AUTO_STORE          "off" disables; "on" enables in headless (sdk-*) sessions, where the default is off
 #   ALEXANDRIA_EXTRACT_MODEL       default haiku
 #   ALEXANDRIA_EXTRACT_MIN_CHARS   default 1500; new text below this is deferred to a later turn
 #   ALEXANDRIA_EXTRACT_FLUSH_WAIT  default 1; seconds to wait for the transcript to flush before reading it (tests set 0)
@@ -18,7 +18,10 @@
 #   ALEXANDRIA_DETACHED            set by this hook on its detached copy; tests set it to run inline
 set -uo pipefail
 [ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
-[ "${ALEXANDRIA_AUTO_STORE:-}" != "off" ] || exit 0
+# Headless sessions (`claude -p`, Agent SDK) inherit CLAUDE_CODE_ENTRYPOINT=sdk-*: auto-store is off
+# there unless ALEXANDRIA_AUTO_STORE=on, so scripted experiments never land in the real database.
+store=${ALEXANDRIA_AUTO_STORE:-}; [ -n "$store" ] || case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*) store=off;; esac
+[ "$store" != off ] || exit 0
 
 MCP="$(dirname "$(readlink -f "$0")")/alexandria-recall.sh"   # debug CLI mode = one-shot tool calls
 MIN_CHARS="${ALEXANDRIA_EXTRACT_MIN_CHARS:-1500}"

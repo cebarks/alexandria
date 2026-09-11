@@ -111,7 +111,7 @@ goes to `$XDG_RUNTIME_DIR/alexandria/extract.log`.
 | `ALEXANDRIA_AUTO_RECALL_LIMIT` | `5` | Max memories retrieved per prompt |
 | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.35` | Minimum similarity to inject a hit (measured; see `[recall]` in [docs/configuration.md](../../docs/configuration.md)) |
 | `ALEXANDRIA_AUTO_RECALL` | (unset) | Set to `off` to disable recall |
-| `ALEXANDRIA_AUTO_STORE` | (unset) | Set to `off` to disable the detectors and extraction |
+| `ALEXANDRIA_AUTO_STORE` | (unset) | Set to `off` to disable the detectors and extraction. Headless sessions (`claude -p`, Agent SDK; `CLAUDE_CODE_ENTRYPOINT=sdk-*`) default to off so scripted experiments never land in the real database; set `on` to enable there |
 | `ALEXANDRIA_EXTRACT_MODEL` | `haiku` | Model passed to `claude -p --model` for extraction |
 | `ALEXANDRIA_EXTRACT_MIN_CHARS` | `1500` | New transcript text required before an extraction call |
 | `ALEXANDRIA_EXTRACT_FLUSH_WAIT` | `1` | Seconds to wait before reading the transcript; Stop fires ~50 ms before the last assistant message is flushed (tests set `0`) |
