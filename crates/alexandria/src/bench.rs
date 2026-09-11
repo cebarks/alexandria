@@ -2,8 +2,10 @@
 //! separates a correct answer from the rest of the corpus, and derive the
 //! `retrieve.min_similarity` floor from that model's own output rather than by hand.
 //!
-//! Read-only, but SurrealKV is single-writer: run it with the server stopped, or
-//! against a copy of the data dir via `ALEXANDRIA_DATA_DIR`.
+//! SurrealKV is single-writer: run it with the server stopped, or against a copy of
+//! the data dir via `ALEXANDRIA_DATA_DIR`. The only write is defining the HNSW index
+//! if the copy lacks it, so the overlap check below measures the index and not the
+//! brute-force fallback.
 //!
 //! Corpus vectors are read as stored, so this measures the model the corpus was
 //! embedded with — only the questions are embedded here.
@@ -11,7 +13,7 @@
 use alexandria_engine::search::cosine_similarity;
 use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
 use alexandria_storage::repos::MemoryRepo;
-use alexandria_storage::{Database, record_id_to_string};
+use alexandria_storage::{Database, record_id_to_string, schema};
 use chrono::{DateTime, Utc};
 
 use crate::config::Config;
@@ -467,6 +469,71 @@ fn report(label: &str, m: &Metrics, model: &str) {
     }
 }
 
+/// Exact-scan ids the index did not return. The HNSW answer differs from the exact
+/// top-k by exactly this set, so an empty result means the server serves what
+/// `measure()` scored.
+fn hnsw_dropped<'a>(exact: &'a [String], hnsw: &[String]) -> Vec<&'a str> {
+    exact
+        .iter()
+        .filter(|id| !hnsw.contains(id))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Every metric above ranks the whole corpus in process; the server answers from the HNSW
+/// index, which is approximate. Ask the index for the same top-`RECALL_LIMIT` per question
+/// and report where the two disagree, so an index change (or a regression in it) shows up
+/// in the bench and not only in production.
+async fn report_hnsw_overlap(
+    repo: &MemoryRepo<'_>,
+    facts: &[(String, Vec<f32>)],
+    qvecs: &[Vec<f32>],
+) -> anyhow::Result<()> {
+    let mut agree = 0;
+    let mut total = 0;
+    let mut deliverable = 0;
+    let mut delivered = 0;
+    let mut diffs = Vec::new();
+    for (i, ((_, target), q)) in QUESTIONS.iter().zip(qvecs).enumerate() {
+        let mut idx: Vec<usize> = (0..facts.len()).collect();
+        idx.sort_by(|&a, &b| {
+            cosine_similarity(q, &facts[b].1).total_cmp(&cosine_similarity(q, &facts[a].1))
+        });
+        let exact: Vec<String> = idx
+            .iter()
+            .take(RECALL_LIMIT)
+            .map(|&i| facts[i].0.clone())
+            .collect();
+        let hnsw: Vec<String> = repo
+            .nearest(q, RECALL_LIMIT)
+            .await?
+            .iter()
+            .filter_map(|f| f.id.as_ref().map(record_id_to_string))
+            .collect();
+        let dropped = hnsw_dropped(&exact, &hnsw);
+        total += exact.len();
+        agree += exact.len() - dropped.len();
+        if exact.iter().any(|id| id == target) {
+            deliverable += 1;
+            if !dropped.contains(target) {
+                delivered += 1;
+            }
+        }
+        if !dropped.is_empty() {
+            diffs.push((i + 1, dropped.join(", ")));
+        }
+    }
+    println!(
+        "\nhnsw top-{RECALL_LIMIT} vs exact scan: {agree}/{total} ids agree over {} questions, \
+         target delivered {delivered}/{deliverable}",
+        QUESTIONS.len()
+    );
+    for (n, dropped) in diffs {
+        println!("  {n:>2}. index dropped {dropped}");
+    }
+    Ok(())
+}
+
 pub async fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
     tracing::info!("Reading corpus from {}", config.database.data_dir.display());
@@ -512,6 +579,8 @@ pub async fn run() -> anyhow::Result<()> {
         QUESTIONS.len()
     );
     report("Live corpus", &live_metrics, provider.model_id());
+    schema::ensure_vector_index(db.inner(), provider.dimensions()).await?;
+    report_hnsw_overlap(&MemoryRepo::new(db.inner()), &live, &qvecs).await?;
 
     let mut by_age = all;
     by_age.sort_by_key(|(_, _, created)| *created);
@@ -632,6 +701,16 @@ mod tests {
         assert!(THRESHOLDS.contains(&RECALL_THRESHOLD));
         // At the shipped limit the whole 6-fact fixture fits, so both targets are delivered.
         assert_eq!(cell(RECALL_LIMIT, 0.30).hits_delivered, 2);
+    }
+
+    #[test]
+    fn hnsw_dropped_lists_exact_ids_the_index_missed_in_exact_order() {
+        let exact: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        // Order and extras on the index side are irrelevant; only exact-side absence counts.
+        let hnsw: Vec<String> = ["d", "z", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(hnsw_dropped(&exact, &hnsw), vec!["a", "c"]);
+        assert!(hnsw_dropped(&exact, &exact).is_empty());
+        assert_eq!(hnsw_dropped(&exact, &[]).len(), exact.len());
     }
 
     #[test]
