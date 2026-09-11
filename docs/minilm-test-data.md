@@ -27,6 +27,13 @@ behind the recorded tables — if it stops reproducing, distrust the live row.
 Corpus vectors are read as stored rather than recomputed, so the bench measures the model
 the corpus was actually embedded with. Only the questions are embedded at run time.
 
+Every metric ranks the corpus by exact cosine in process. The server answers from the HNSW
+index, which is approximate, so after the live row the bench asks the index for the same
+top-`RECALL_LIMIT` per question through `MemoryRepo::nearest` and prints where the two
+disagree. It defines the index on the snapshot first if the copy lacks it (the only write the
+bench makes); without that the query falls back to a brute-force scan and the overlap would
+be trivially perfect.
+
 ## Results (2026-09-09)
 
 Corpus `created_at` spans 2026-09-08 12:30:01 UTC .. 2026-09-10 00:44:21 UTC. The baseline
@@ -358,6 +365,20 @@ this cell, not the 12-question claim.
 0.38), which the shipped threshold drops anyway. The headroom line is unchanged: worst rank 8
 (q1) among the 14 targets at or above 0.45, two positions left.
 
+### HNSW overlap (1008 facts)
+
+First pass after the overlap check landed. Live corpus, 1008 facts, `limit = 10`:
+
+```
+hnsw top-10 vs exact scan: 200/200 ids agree over 20 questions, target delivered 19/19
+```
+
+Every id the exact scan puts in the top 10 comes back from the index, for every question, so
+the recorded metrics describe what the server serves. `19/19` because q12's target ranks 12
+on the exact scan and so is not in the set the index could have delivered; it is not an index
+miss. The index is defined with SurrealDB's default `EFC`/`M`, and this line is where a change
+to either would show.
+
 ## Metric definitions
 
 - **rank** — position of the target fact when the whole corpus is sorted by cosine descending
@@ -376,6 +397,10 @@ this cell, not the 12-question claim.
   therefore the ceiling every `limit` column converges on.
 - **noise_per_q** — mean non-targets per question that survive both the limit and the
   threshold. The server floor is not modelled: every swept threshold is far above it.
+- **hnsw overlap** — over all questions, how many of the exact scan's top-`RECALL_LIMIT` ids
+  the HNSW index also returned, out of the number asked for. **target delivered** counts the
+  targets inside the exact top-`RECALL_LIMIT` that the index returned too. Questions whose
+  exact top-k differs from the index's are listed under the line with the dropped ids.
 
 Percentiles use linear interpolation, matching `numpy.percentile`'s default. The 2026-09-08
 second pass ran through numpy; nearest-rank here would shift the derived floor by a hundredth
