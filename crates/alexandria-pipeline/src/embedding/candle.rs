@@ -103,6 +103,10 @@ impl CandleProvider {
 
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
+        // Read into a Vec rather than mmap so the workspace can keep `unsafe_code = "forbid"`.
+        // Costs a ~90 MB peak (buffer + built tensors) until `BertModel::load` returns; mmap
+        // would not remove it, candle copies each tensor out anyway. Revisit with
+        // `#[allow(unsafe_code)]` + `from_mmaped_safetensors` only for a much larger model.
         let vb = VarBuilder::from_buffered_safetensors(
             std::fs::read(weights_path)?,
             candle_core::DType::F32,
