@@ -58,3 +58,38 @@ simply contains no pair similar enough to justify 0.90.
 10. "the model keeps wrapping its answer in backticks and adding chatter afterwards, how should I read the structured output" -> `fact:306636gbydvykw7lrmr8`
 11. "why are very short strings disappearing from what gets saved" -> `fact:ykw2fqnaj9j7q71o3mey`
 12. "how fast is memory lookup supposed to be" -> `fact:g8q5rwzz89m4dyidz21h`
+
+## Second pass (2026-09-08, evening): query prefixes and nomic
+
+Same 143-fact corpus (dumped from the 08:08 data copy) and the same 12 questions, run
+through sentence-transformers on CPU instead of candle so that non-BERT architectures could
+be tried without writing loaders. MiniLM and multi-qa reproduce the candle numbers exactly,
+so the two paths are comparable. bge-small now carries its query instruction prefix; nomic
+uses `search_query:` / `search_document:`. Qwen3-Embedding-0.6B (596M params) and
+embeddinggemma-300m (gated) were not run.
+
+| model | dims | mean_rank | top1 | mean_gap | hit_min | hit_max | nonhit_p50 | nonhit_p90 | nonhit_p99 | ff_p50 | ff_p90 | ff_p99 | doc ms/text | query ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sentence-transformers/all-MiniLM-L6-v2 | 384 | 1.42 | 9/12 | +0.148 | 0.338 | 0.667 | 0.078 | 0.212 | 0.373 | 0.132 | 0.302 | 0.571 | 5.1 | 4.0 |
+| sentence-transformers/multi-qa-MiniLM-L6-cos-v1 | 384 | 2.33 | 8/12 | +0.091 | 0.318 | 0.635 | 0.082 | 0.215 | 0.375 | 0.125 | 0.290 | 0.568 | 7.3 | 3.9 |
+| BAAI/bge-small-en-v1.5 (with query prefix) | 384 | 5.92 | 8/12 | +0.042 | 0.584 | 0.783 | 0.547 | 0.617 | 0.683 | 0.592 | 0.670 | 0.778 | 15.2 | 8.5 |
+| nomic-ai/nomic-embed-text-v1.5 | 768 | 5.67 | 7/12 | +0.036 | 0.588 | 0.803 | 0.544 | 0.603 | 0.663 | 0.639 | 0.705 | 0.806 | 71.2 | 24.4 |
+| nomic-ai/nomic-embed-text-v1.5 truncated to 384 | 384 | 4.17 | 8/12 | +0.038 | 0.575 | 0.805 | 0.537 | 0.603 | 0.660 | 0.637 | 0.705 | 0.804 | 72.0 | 23.8 |
+
+Per-question rank (MiniLM / multi-qa / bge+prefix / nomic / nomic@384):
+
+| q | ranks |
+|---|---|
+| 1 hooks going stale after git pull | 4 / 9 / 17 / 4 / 5 |
+| 9 systemd status flag gotcha | 1 / 1 / 2 / 7 / 7 |
+| 10 structured output wrapped in backticks | 1 / 1 / 1 / 3 / 5 |
+| 11 very short strings disappearing | 2 / 5 / 20 / 45 / 25 |
+| 12 how fast is memory lookup | 2 / 4 / 24 / 1 / 1 |
+| all others | 1 across the board (q7 nomic 2, q4 multi-qa 2) |
+
+Outcome: default unchanged. The query prefix did not help bge (mean rank 5.92 vs 5.42
+without it). nomic is 6x the parameters, 14x the per-text latency, and still loses on
+mean rank and separation; its noise floor (nonhit_p50 0.54, fact-fact p50 0.64) is as
+compressed as bge's. Both larger models lose badly on the paraphrase-heavy question 11 and
+bge on question 12, where MiniLM's keyword overlap carries it. The corpus is short
+technical statements, and small mean-pooled MiniLM appears to be the right shape for it.
