@@ -19,7 +19,7 @@ lint:
 
 # Run all Rust tests
 test:
-    cargo test --all-features
+    cargo test --workspace --all-features
 
 # Type-check and test the pi companion (node:test over tsx, hermetic)
 ext-test:
