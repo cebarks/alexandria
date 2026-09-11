@@ -4,9 +4,11 @@
 # Reads the hook JSON on stdin, serializes the transcript lines added since the
 # last run, asks `claude -p` (haiku by default) for standalone memories using the
 # same prompt as the Pi extension, and stores them with session_id and the
-# `extracted` tag. Incremental: a marker file holds the transcript line count at
-# the last run; short turns accumulate until enough new text exists. Fails open
-# and always exits 0.
+# `extracted` tag. The already-stored block holds this session's memories plus
+# the auto-recall hits the transcript carries for each prompt (cross-session
+# dedup). Incremental: a marker file holds the transcript line count at the last
+# run; short turns accumulate until enough new text exists. Fails open and
+# always exits 0.
 #
 # Env (all optional):
 #   ALEXANDRIA_AUTO_STORE          "off" disables; "on" enables in headless (sdk-*) sessions, where the default is off
@@ -54,8 +56,7 @@ text=$(tail -n +"$((done_lines + 1))" "$transcript" | jq -rR '
   def txt: if type == "string" then . else [.[]? | select(.type == "text") | .text] | join("\n") end;
   fromjson? | select(.type == "user" or .type == "assistant") | .type as $role | (.message.content // "")
   | ((txt | select(length > 0)
-      | select(startswith("<local-command") or startswith("<command-") or startswith("<system-reminder")
-               or startswith("Relevant memories retrieved automatically") | not)
+      | select(startswith("<local-command") or startswith("<command-") or startswith("<system-reminder") | not)
       | (if $role == "user" then "[User]: " else "[Assistant]: " end) + .),
      (.[]? | select(.type == "tool_result" and .is_error == true) | .content | txt
       | select(startswith("<tool_use_error>") | not) | "[Tool error]: " + .[:300]))
@@ -66,9 +67,21 @@ text=$(tail -n +"$((done_lines + 1))" "$transcript" | jq -rR '
 # Marker first: a broken or slow turn is never retried.
 mkdir -p "${marker%/*}"; echo "$total" >"$marker"
 
+# Cross-session dedup: the recall hook's hits for each prompt in this chunk sit in the transcript as
+# hook_additional_context attachments, already filtered to the tuned threshold, so they go into the
+# already-stored block at no cost. A post-hoc similarity filter on the candidates cannot replace this:
+# on all-MiniLM-L6-v2 (measured 2026-09-08) real duplicates score 0.64-0.76 against each other and
+# distinct neighbours 0.63-0.76. ponytail: covers only what the user's prompts recalled; a gotcha that
+# surfaces purely from tool output, or auto-recall off, still dedups within the session only.
+recalled=$(tail -n +"$((done_lines + 1))" "$transcript" | jq -rR '
+  fromjson? | select(.type == "attachment") | .attachment
+  | select(.type == "hook_additional_context" and .hookEvent == "UserPromptSubmit")
+  | .content[]? | strings | select(startswith("Relevant memories retrieved automatically"))
+  | split("\n")[] | select(startswith("- (similarity ")) | sub("^- \\(similarity [^,]*, "; "- (")' | sort -u)
 stored=$("$MCP" get_session "$(jq -cn --arg s "$session" '{session_id:$s}')" 2>/dev/null \
   | jq -r '.memories[]?.content | "- " + .')
-[ -n "$stored" ] || stored="(nothing stored yet this session)"
+stored=$(printf '%s\n%s' "$stored" "$recalled" | sed '/^$/d')
+[ -n "$stored" ] || stored="(nothing stored yet)"
 
 # Prompt text is verbatim from contrib/pi/extensions/alexandria-auto-recall/src/extraction.ts.
 prompt="You are a memory extraction system. Given a conversation between a user and an AI coding assistant, extract durable facts worth remembering across sessions.
@@ -98,7 +111,7 @@ Respond with JSON only:
 
 If nothing is worth extracting, respond with: {\"memories\": []}
 
-Already stored this session (do not duplicate):
+Already stored, this session or recalled for its prompts (do not duplicate):
 <already_stored>
 $stored
 </already_stored>

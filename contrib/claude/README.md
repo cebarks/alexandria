@@ -36,7 +36,9 @@ tool result as `[Tool error]:`, so a silent fix-and-retry still shows the model 
 successful tool output, `<tool_use_error>` harness refusals, thinking, and injected system lines are
 dropped), and once at least `ALEXANDRIA_EXTRACT_MIN_CHARS` of new text exists it
 asks `claude -p --model haiku` for standalone durable facts using the Pi extraction prompt, with the
-session's already-stored memories listed for dedup. Results are stored with the session id and an
+session's already-stored memories and the auto-recall hits the transcript carries for this chunk's
+prompts listed for dedup (so a gotcha already stored by an earlier session is not stored again, as long
+as some prompt recalled it). Results are stored with the session id and an
 `extracted` tag. Short turns cost nothing; one haiku call covers several turns. A marker file
 `$XDG_RUNTIME_DIR/alexandria/<session_id>.extracted` holds the transcript line count and is written
 before the LLM call, so a failed or slow turn is never retried: one haiku call per turn, 80 s
