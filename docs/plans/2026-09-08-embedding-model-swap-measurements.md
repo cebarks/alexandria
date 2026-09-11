@@ -18,13 +18,16 @@ Corpus: 143 active facts from the live database. Questions: 12, listed below.
 | cluster.join_threshold | 0.75 |
 | cluster.merge_threshold | 0.88 |
 | cluster.cohesion_floor | 0.60 |
-| retrieve.min_similarity | 0.36 |
+| retrieve.min_similarity | 0.08 |
 | client auto-recall threshold | 0.22 |
 
 Not applied: the incumbent won, so config defaults are unchanged. The retrieve
-floor derived here (0.36) would cut a true hit at 0.338, and nonhit_p99 (0.373)
-exceeds hit_min, so the spec's threshold rule has no valid solution on this
-corpus. bge-small was measured without its query instruction prefix.
+floor was first derived as 0.36 under the original spec rule (between hit_min
+and nonhit_p99, midpoint on overlap), which would cut a true hit at 0.338; that
+rule was rewritten on 2026-09-08 to `nonhit_p50`, giving 0.08, next to the
+hand-picked 0.10 default. Under the new rule msmarco fails the sanity check
+(nonhit_p50 0.173 > hit_min 0.119); every other model passes. bge-small was
+measured without its query instruction prefix.
 
 Reasoning: no candidate beat the incumbent on both criteria — MiniLM has the
 lowest mean_rank (1.42 vs 2.33 / 5.42 / 12.58) and the largest mean_gap

@@ -67,8 +67,13 @@ Threshold rule for the winner:
 
 - Cluster thresholds: find the percentile each current value sits at under MiniLM's fact-to-fact
   distribution, take the same percentile under the winner, round to two decimals.
-- Retrieve floor: just below the lowest correct-hit score across the questions, and above the
-  highest non-hit score, rounded down to two decimals. If those overlap, take the midpoint.
+- Retrieve floor: the median non-hit score (`nonhit_p50`), rounded to two decimals. The floor is a
+  noise cutoff only, so it is derived from the non-hit distribution and never from the hits; the
+  client auto-recall threshold does the discrimination. Sanity check: the value must be below the
+  lowest correct-hit score. If it is not, the model has no usable noise floor; report that instead
+  of deriving a threshold. (Rewritten 2026-09-08: the original rule, "between the lowest hit and
+  the highest non-hit, midpoint on overlap", has no valid solution once any non-hit outscores the
+  weakest hit, which every real corpus produces, and the midpoint cuts a true hit by construction.)
 
 ## 2. Provider pooling
 
