@@ -90,17 +90,19 @@ Open items noticed while getting Alexandria running under Claude Code (2026-09-0
   `RUSTFLAGS`, so neither `target-cpu` nor mold applied there). Dev boxes wanting it keep
   `-C target-cpu=native` + mold in `~/.cargo/config.toml`. Windows `target-cpu` verification is
   moot. Repo keeps `rust-version = "1.98"` + edition 2024 as the only compiler floor statement.
-- [ ] **`[profile.release]` (lto = "thin", codegen-units = 1, strip) added 2026-09-08, never built.**
-  Only `cargo build --workspace` (dev profile) has been run since the toolchain/profile changes,
-  and the 2026-09-08 dependency major bumps (notably `hf-hub` 1.0 / `hf-xet`) were likewise only
-  dev-built and tested; do a `cargo build --release` smoke test before shipping a release artifact.
-- [ ] **Dockerfile base bumped to `rust:1.98.1-alpine3.22` and OpenSSL stripped, container build
-  not yet exercised.** After the hf-hub 1.0 port, `cargo tree` shows no `openssl`/`openssl-sys`
-  left (network is rustls + `aws-lc-sys`); the builder's `openssl-dev`/`pkgconfig` and the
-  runtime's `libssl3`/`libcrypto3` were removed on 2026-09-09 based on that, not on a real
-  `docker build`. `aws-lc-sys`'s build script normally needs only a C compiler on x86_64-musl,
-  but if the container build starts failing, `cmake` is the first suspect to add to the builder
-  apk line.
+- [x] **`[profile.release]` (lto = "thin", codegen-units = 1, strip) added 2026-09-08, never built.**
+  Done 2026-09-10 at integration: `cargo build --release --locked` passed on x86-64 Linux (binary
+  links only libc/libm/libgcc_s), and the container release build (musl, same profile) passed
+  below.
+- [x] **Dockerfile base bumped to `rust:1.98.1-alpine3.22` and OpenSSL stripped, container build
+  not yet exercised.** Verified 2026-09-10: full `podman build` succeeded — `aws-lc-sys` builds on
+  alpine/musl with just a C compiler, no `cmake` needed. `alexandria --help` runs in the final
+  image. Correction to the original claim: the runtime image *still contains*
+  `libssl.so.3`/`libcrypto.so.3` — `apk-tools` itself links them and `ssl_client` is in the base,
+  so they can never be absent from an apk-managed Alpine image; removing the explicit
+  `libssl3 libcrypto3` install was a declaration change, not a size change. What genuinely
+  dropped is the *alexandria binary's* OpenSSL linkage (hf-hub 1.0 moved to rustls), which is
+  the CVE-surface point.
 
 - [ ] **Startup memory doubled during model load (2026-09-08).** `candle.rs` now reads the safetensors
   file into a `Vec<u8>` (`from_buffered_safetensors`) instead of mmap, so the workspace can carry
