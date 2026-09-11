@@ -51,7 +51,8 @@ pub struct AlexandriaServer {
     pub heat_spacing_halflife: f64,
     pub activation_config: ActivationConfig,
     pub activation_top_n: usize,
-    /// Hard floor on cosine similarity for retrieve_memories results.
+    /// Hard floor on cosine similarity for retrieve_memories results. The
+    /// builder default matches `RetrieveConfig`; production overrides it from config.
     pub retrieve_min_similarity: f32,
 }
 
@@ -69,7 +70,7 @@ impl AlexandriaServer {
             heat_spacing_halflife,
             activation_config: ActivationConfig::default(),
             activation_top_n: 3,
-            retrieve_min_similarity: 0.30,
+            retrieve_min_similarity: 0.10,
         }
     }
 

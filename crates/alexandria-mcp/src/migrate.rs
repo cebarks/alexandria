@@ -8,9 +8,6 @@ use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{Database, record_id_to_string, system_config};
 use anyhow::ensure;
 
-/// Facts per `embed()` call. Bounds peak memory for large corpora.
-const BATCH: usize = 32;
-
 #[derive(Debug)]
 pub enum ReembedOutcome {
     /// Nothing to do; the string is a human-readable reason.
@@ -21,9 +18,12 @@ pub enum ReembedOutcome {
     },
 }
 
+/// `batch_size` is facts per `embed()` call; it bounds peak memory for large corpora.
+/// Must be at least 1; `Config::load` rejects 0 before this is reached.
 pub async fn reembed(
     db: &Database,
     provider: &dyn EmbeddingProvider,
+    batch_size: usize,
 ) -> anyhow::Result<ReembedOutcome> {
     let new_model = provider.model_id();
     let memories = MemoryRepo::new(db.inner());
@@ -52,7 +52,7 @@ pub async fn reembed(
     let rows = memories.all_ids_and_content().await?;
     let total = rows.len();
     let mut done = 0;
-    for batch in rows.chunks(BATCH) {
+    for batch in rows.chunks(batch_size) {
         let texts: Vec<&str> = batch.iter().map(|(_, c)| c.as_str()).collect();
         let vecs = provider.embed(&texts).await?;
         ensure!(
