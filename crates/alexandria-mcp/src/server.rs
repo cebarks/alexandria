@@ -91,6 +91,14 @@ impl AlexandriaServer {
     }
 }
 
+/// Result of `do_store_memory`. `duplicate` means an identical live fact already
+/// existed and `id` is that fact's id; nothing was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreOutcome {
+    pub id: String,
+    pub duplicate: bool,
+}
+
 #[tool_router]
 impl AlexandriaServer {
     #[tool(
@@ -114,14 +122,17 @@ impl AlexandriaServer {
     }
 
     #[tool(
-        description = "Persist a durable fact, decision, preference, or correction so future sessions/agents can recall it. Call this proactively whenever you learn something worth remembering — a user preference, an architectural decision and its rationale, a resolved bug's root cause, a gotcha you just discovered — not only when explicitly told to 'remember this'. Cheap and idempotent-ish (dedup happens via clustering); prefer storing over losing context. Write content as a standalone statement that makes sense without the current conversation."
+        description = "Persist a durable fact, decision, preference, or correction so future sessions/agents can recall it. Call this proactively whenever you learn something worth remembering — a user preference, an architectural decision and its rationale, a resolved bug's root cause, a gotcha you just discovered — not only when explicitly told to 'remember this'. Cheap and idempotent: storing byte-identical content returns the existing memory's id with status 'duplicate' instead of a second copy, so prefer storing over losing context. A reworded restatement is still a new memory; use update_memory to revise an existing one. Write content as a standalone statement that makes sense without the current conversation."
     )]
     async fn store_memory(
         &self,
         Parameters(params): Parameters<StoreMemoryParams>,
     ) -> CallToolResult {
         match self.do_store_memory(params).await {
-            Ok(id) => CallToolResult::structured(serde_json::json!({ "status": "ok", "id": id })),
+            Ok(StoreOutcome { id, duplicate }) => {
+                let status = if duplicate { "duplicate" } else { "ok" };
+                CallToolResult::structured(serde_json::json!({ "status": status, "id": id }))
+            }
             Err(e) => CallToolResult::structured_error(serde_json::json!({
                 "status": "error",
                 "message": e.to_string()
@@ -215,18 +226,28 @@ impl ServerHandler for AlexandriaServer {}
 
 // Implementation details
 impl AlexandriaServer {
-    pub async fn do_store_memory(&self, params: StoreMemoryParams) -> anyhow::Result<String> {
+    pub async fn do_store_memory(&self, params: StoreMemoryParams) -> anyhow::Result<StoreOutcome> {
         let tags = params.tags.unwrap_or_default();
+        let content = params.content.trim();
+
+        // 0. Exact-content duplicate check. Measured 2026-09-10 on the live corpus
+        // (docs/minilm-test-data.md, "Duplicate bar"): no cosine bar separates
+        // restatements from adjacent distinct facts, and 0.98 caught only the
+        // byte-identical set, so equality is the whole of what the data supports.
+        let repo = MemoryRepo::new(self.db.inner());
+        if let Some(id) = repo.find_by_content(content).await? {
+            return Ok(StoreOutcome {
+                id,
+                duplicate: true,
+            });
+        }
 
         // 1. Embed
-        let embeddings = self.embedding.embed(&[&params.content]).await?;
+        let embeddings = self.embedding.embed(&[content]).await?;
         let embedding = &embeddings[0];
 
         // 2. Create fact
-        let repo = MemoryRepo::new(self.db.inner());
-        let fact_id = repo
-            .create_fact(&params.content, 0.5, embedding, &tags)
-            .await?;
+        let fact_id = repo.create_fact(content, 0.5, embedding, &tags).await?;
 
         // 3. Create heat state
         let heat_repo = HeatRepo::new(self.db.inner());
@@ -257,7 +278,10 @@ impl AlexandriaServer {
             session_repo.touch(session_id).await?;
         }
 
-        Ok(fact_id)
+        Ok(StoreOutcome {
+            id: fact_id,
+            duplicate: false,
+        })
     }
 
     pub async fn do_update_memory(&self, params: UpdateMemoryParams) -> anyhow::Result<String> {
@@ -851,6 +875,55 @@ mod get_info_tests {
         assert!(info.capabilities.tools.is_some());
     }
 
+    #[tokio::test]
+    async fn store_memory_returns_existing_id_for_identical_content() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let store = |content: &str| StoreMemoryParams {
+            content: content.to_string(),
+            tags: None,
+            session_id: None,
+            agent_id: None,
+            model: None,
+        };
+
+        let first = server.do_store_memory(store("same fact")).await.unwrap();
+        assert!(!first.duplicate);
+
+        // Byte-identical content, and the same content with surrounding whitespace.
+        let again = server.do_store_memory(store("same fact")).await.unwrap();
+        assert_eq!(
+            again,
+            StoreOutcome {
+                id: first.id.clone(),
+                duplicate: true
+            }
+        );
+        let padded = server
+            .do_store_memory(store("  same fact\n"))
+            .await
+            .unwrap();
+        assert_eq!(padded.id, first.id);
+        assert!(padded.duplicate);
+
+        // Different content stores normally even though the stub embeds it identically.
+        let other = server.do_store_memory(store("other fact")).await.unwrap();
+        assert!(!other.duplicate);
+        assert_ne!(other.id, first.id);
+
+        // A soft-deleted fact does not count as a live duplicate.
+        MemoryRepo::new(server.db.inner())
+            .soft_delete_fact(&first.id)
+            .await
+            .unwrap();
+        let revived = server.do_store_memory(store("same fact")).await.unwrap();
+        assert!(!revived.duplicate);
+        assert_ne!(revived.id, first.id);
+    }
+
     /// Stub that maps content/query text to fixed embeddings so we can assert
     /// the retrieve floor deterministically: text containing "far" -> [0, 1]
     /// (orthogonal to the query, cosine 0), everything else -> [1, 0] (aligned
@@ -1142,7 +1215,8 @@ mod get_info_tests {
                 model: None,
             })
             .await
-            .unwrap();
+            .unwrap()
+            .id;
         MemoryRepo::new(server.db.inner())
             .soft_delete_fact(&gone)
             .await
@@ -1370,7 +1444,6 @@ mod get_info_tests {
         );
         assert_eq!(result.is_error, Some(false));
     }
-
     /// Each retrieve records an access on its top results: the heat row's
     /// access_count climbs and last_touched moves. Ranking is unaffected.
     #[tokio::test]
@@ -1390,7 +1463,8 @@ mod get_info_tests {
                 model: None,
             })
             .await
-            .unwrap();
+            .unwrap()
+            .id;
         let heat_repo = HeatRepo::new(server.db.inner());
         let before = heat_repo.get(&id).await.unwrap().unwrap();
         assert_eq!(before.access_count, 0);

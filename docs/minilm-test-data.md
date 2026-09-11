@@ -414,6 +414,41 @@ per-question rank reproduces, and the before-snapshot run reproduced all of them
 the metric definitions are unchanged; the fact-fact columns of the baseline are simply
 measured on new vectors from here on.
 
+### Duplicate bar (1161 facts)
+
+Finding A3 in `docs/performance-and-ability-findings.md` proposed rejecting a `store_memory`
+whose nearest live fact scores above a high cosine bar, and said to measure the bar first. On
+2026-09-10 every pair of live facts was compared on a copy of the 256-token corpus (1161 facts,
+soft-deleted excluded). Nearest-neighbour cosine per fact, and pairs by band:
+
+| band | facts whose nearest neighbour is here | pairs | byte-identical pairs |
+|---|---|---|---|
+| 0.95 to 1.00 | 19 | 137 | 94 |
+| 0.90 to 0.95 | 6 | 36 | 0 |
+| 0.85 to 0.90 | 28 | 19 | 0 |
+| 0.35 to 0.85 | 1108 | | |
+
+Within the top band, all 94 identical pairs score 1.0, 42 pairs sit in 0.97 to 0.99 and one in
+0.95 to 0.97; none of those 43 is identical.
+
+**One junk family is 172 of the 173 pairs at or above 0.90.** The Claude hook's correction
+detector stored "User correction: completed" 14 times across sessions (91 pairs at 1.0) plus the
+variants "been completed" (0.974 against it), "completed first" (0.947) and "completed)" (0.942).
+Its per-session marker only stops repeats within a session.
+
+**No bar separates restatements from adjacent facts.** The single non-junk pair above 0.95
+(0.967) is a bug description and its fix instruction; collapsing it loses the fix. The readable
+true restatements score 0.949 (a config note reworded), 0.891, 0.884 and 0.878, and share those
+bands with distinct facts such as an attempt-versus-result pair at 0.903. This is the
+0.63 to 0.76 problem from `TODO-misc.md` moved up the scale, not solved.
+
+**Decision.** At 0.98 the cosine check catches exactly the byte-identical set, so
+`store_memory` dedups on trimmed content equality instead and needs no threshold. Rerun this
+measurement before adding a semantic bar: the throwaway probe was a `cargo` example that opened a
+copy of the data dir, loaded `SELECT * FROM fact WHERE deleted = false`, ran
+`cosine_similarity` over all pairs, and printed the histogram plus every pair at or above 0.85
+with both contents, which is what makes the false positives readable.
+
 ## Metric definitions
 
 - **rank** — position of the target fact when the whole corpus is sorted by cosine descending

@@ -60,7 +60,7 @@ the data dir via `ALEXANDRIA_DATA_DIR`, which keeps the server down only for a `
 
 | Tool | Description |
 | ------ | ------------- |
-| `store_memory` | Store text with auto-embedding, clustering, and heat initialization; optional `session_id` to group it |
+| `store_memory` | Store text with auto-embedding, clustering, and heat initialization; optional `session_id` to group it. Byte-identical live content returns the existing id with `status: "duplicate"` |
 | `retrieve_memories` | Semantic similarity search with spreading activation on top results; optional `session_id` to scope |
 | `recall` | Progressive two-phase recall: broad cluster scan → focused scope narrowing |
 | `update_memory` | Update content/tags/confidence; content changes re-embed and create lineage |

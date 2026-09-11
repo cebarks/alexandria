@@ -139,6 +139,16 @@ Recommendation: delete unless the measured gain from wiring is real. Half-alive 
 
 **Severity:** Medium. **Effort:** small.
 
+**Status (2026-09-10):** shipped as an exact-content check, not a cosine bar. Measured on the
+1161-fact live corpus first (`docs/minilm-test-data.md`, "Duplicate bar"): 172 of the 173 pairs
+at or above 0.90 were one auto-detected junk family ("User correction: completed" and variants);
+the only other pair above 0.95 was a bug description next to its fix, and every genuine
+restatement scored 0.89 to 0.95, interleaved with distinct facts. A 0.98 bar caught exactly the
+byte-identical set, so `store_memory` now runs `MemoryRepo::find_by_content` before embedding and
+returns `{"status": "duplicate", "id": <existing>}`. Re-measure before adding a semantic bar; the
+junk family is a Claude-hook detector bug (`alexandria-recall.sh`, correction pattern 1), fixed
+separately.
+
 **Where.** The `store_memory` tool description promises "dedup happens via clustering"
 (`server.rs:86`). Clustering groups facts; it never rejects or merges one. `TODO-misc.md`
 ("A restated target scores as a miss") already records that duplicates outrank the original in the

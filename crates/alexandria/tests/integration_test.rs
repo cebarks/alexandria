@@ -89,7 +89,7 @@ async fn test_delete_excludes_from_search() {
         agent_id: None,
         model: None,
     };
-    let fact_id = server.do_store_memory(params).await.unwrap();
+    let fact_id = server.do_store_memory(params).await.unwrap().id;
 
     // Verify it appears in retrieve
     let params = alexandria_mcp::tools::RetrieveMemoriesParams {
@@ -171,7 +171,7 @@ async fn test_update_memory_content() {
         agent_id: None,
         model: None,
     };
-    let id = server.do_store_memory(params).await.unwrap();
+    let id = server.do_store_memory(params).await.unwrap().id;
 
     // Update content
     let update_params = alexandria_mcp::tools::UpdateMemoryParams {
@@ -202,7 +202,7 @@ async fn test_update_memory_tags_only() {
         agent_id: None,
         model: None,
     };
-    let id = server.do_store_memory(params).await.unwrap();
+    let id = server.do_store_memory(params).await.unwrap().id;
 
     // Update tags only — should not trigger re-embedding
     let update_params = alexandria_mcp::tools::UpdateMemoryParams {

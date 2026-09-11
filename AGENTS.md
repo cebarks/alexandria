@@ -45,6 +45,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
   fallback. `migrate-embeddings` drops the index before re-embedding because it rejects vectors of
   any other dimension; the next boot redefines it.
 - Cluster `member_count` is queried live (not cached) — `load_cluster_infos()` calls `get_members()` per cluster, so it is one query per cluster. Fine at current scale, the first thing to revisit if cluster counts grow.
+- `store_memory` dedups on exact content only: `MemoryRepo::find_by_content` (trimmed, byte-equal, `deleted = false`) runs before embedding and returns `{"status":"duplicate","id":<existing>}` without writing or linking a session. No cosine bar: measured on the live corpus (`docs/minilm-test-data.md`, "Duplicate bar"), 0.98 caught exactly the identical set and anything lower collapsed bug/fix pairs. Reworded restatements are still stored.
 - `update_memory` with content change: creates a soft-deleted snapshot of old content, then links via `derived_from` edge. The old version is hidden from search but preserved for lineage.
 - `import_document` creates a `raw` table record for the full document, then `extracted_from` edges from each chunk to it.
 - Spreading activation fires on the top N results of `retrieve_memories` (configurable via `activation.top_n`, default 3) — it's a side effect, not part of the ranking. The same loop records an access on each of those facts (`record_access`: `on_access` + `HeatRepo::update`), so `access_count`, `stability`, and `last_touched` are real. Nothing reads heat for ranking yet — both tools rank by cosine only, and `broad_recall` still gets `heat: 1.0`. That is deliberate (A2 in `docs/performance-and-ability-findings.md`): the data is being collected so the wire-or-delete call can be made on evidence.
@@ -60,7 +61,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 
 - The repo intentionally carries no `rust-toolchain.toml` and no `.cargo/config.toml` — `rust-version = "1.98"` + edition 2024 are the only compiler statement; mold/`target-cpu` live in each dev's `~/.cargo/config.toml` (see TODO-misc "Build / toolchain"). Don't re-add them to the repo.
 - Use the `just` recipes (they match CI): `just test`, `just lint`, `just fmt`, `just ci` (fmt + lint + test + `cargo deny`). `just install-hooks` wires `.githooks/pre-commit`.
-- Run tests on **stable**, not nightly: `diskann-wide` (SurrealDB transitive dep) fails trait inference on its NEON intrinsics under recent nightlies on aarch64, and the failure looks like it originates in this workspace. Current suite: 163 tests, all green.
+- Run tests on **stable**, not nightly: `diskann-wide` (SurrealDB transitive dep) fails trait inference on its NEON intrinsics under recent nightlies on aarch64, and the failure looks like it originates in this workspace. Current suite: 166 tests, all green.
 - All integration tests use `Database::connect_embedded()` (in-memory SurrealDB) — no disk state between tests.
 - `CandleProvider` tests download the real model on first run (~80MB) — they're slow the first time.
 - Test helpers in `alexandria-storage/src/connection.rs`: `connect_embedded()` for quick in-memory DB.

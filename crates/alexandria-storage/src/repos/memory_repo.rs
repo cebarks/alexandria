@@ -72,6 +72,22 @@ impl<'a> MemoryRepo<'a> {
         Ok(fact)
     }
 
+    /// Id of a live fact whose content is byte-identical to `content`, if any.
+    // ponytail: full scan on `content`; add a non-unique index if store latency shows it.
+    pub async fn find_by_content(&self, content: &str) -> Result<Option<String>> {
+        #[derive(serde::Deserialize, SurrealValue)]
+        struct IdOnly {
+            id: RecordId,
+        }
+        let mut response = self
+            .db
+            .query("SELECT id FROM fact WHERE deleted = false AND content = $content LIMIT 1")
+            .bind(("content", content.to_string()))
+            .await?;
+        let ids: Vec<IdOnly> = response.take(0)?;
+        Ok(ids.into_iter().next().map(|r| record_id_to_string(&r.id)))
+    }
+
     /// The `k` live facts nearest to `query` by cosine similarity, nearest first.
     /// `<|k,COSINE|>` goes through the HNSW index when `schema::ensure_vector_index`
     /// has defined it and falls back to a brute-force scan inside the database when
