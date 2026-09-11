@@ -13,9 +13,9 @@ async fn test_fresh_db_runs_all_migrations() {
         .unwrap();
     let rows: Vec<serde_json::Value> = result.take(0).unwrap();
     assert_eq!(rows.len(), 1);
-    // Version should be "5" (latest migration)
+    // Version should be "6" (latest migration)
     let version = rows[0]["value"].as_str().unwrap();
-    assert_eq!(version, "5");
+    assert_eq!(version, "6");
 }
 
 #[tokio::test]
@@ -26,14 +26,14 @@ async fn test_migrate_idempotent() {
     schema::migrate(db.inner()).await.unwrap();
     schema::migrate(db.inner()).await.unwrap();
 
-    // Still at version 5
+    // Still at version 6
     let mut result = db
         .inner()
         .query("SELECT * FROM system_config WHERE key = 'schema_version'")
         .await
         .unwrap();
     let rows: Vec<serde_json::Value> = result.take(0).unwrap();
-    assert_eq!(rows[0]["value"].as_str().unwrap(), "5");
+    assert_eq!(rows[0]["value"].as_str().unwrap(), "6");
 }
 
 #[tokio::test]
@@ -69,4 +69,26 @@ async fn test_memory_edge_table_exists_after_migration() {
     let edges: Vec<serde_json::Value> = result.take(0).unwrap();
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0]["edge_type"].as_str().unwrap(), "relates_to");
+}
+
+// CREATE alone doesn't prove the migration ran — SurrealDB implicitly creates
+// undefined tables as SCHEMALESS; the field assertions below do.
+#[tokio::test]
+async fn test_reminder_table_exists_after_migration() {
+    let db = Database::connect_embedded().await.unwrap();
+    schema::migrate(db.inner()).await.unwrap();
+
+    let result = db
+        .inner()
+        .query("CREATE reminder SET message = 'probe', schedule_kind = 'once', next_due_at = time::now()")
+        .await
+        .unwrap();
+    result.check().unwrap();
+
+    // SCHEMAFULL defaults from v006 must be present on the created row.
+    let mut result = db.inner().query("SELECT * FROM reminder").await.unwrap();
+    let rows: Vec<serde_json::Value> = result.take(0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["status"].as_str().unwrap(), "pending");
+    assert_eq!(rows[0]["delivered_count"].as_i64().unwrap(), 0);
 }

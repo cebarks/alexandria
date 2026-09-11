@@ -14,6 +14,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         include_str!("v004_maintenance_log.surql"),
     ),
     (5, "session", include_str!("v005_session.surql")),
+    (6, "reminder", include_str!("v006_reminder.surql")),
 ];
 
 /// Run all pending migrations. Safe to call on every startup.
