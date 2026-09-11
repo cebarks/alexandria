@@ -363,7 +363,15 @@ pub async fn run() -> anyhow::Result<()> {
         .iter()
         .map(|(id, v, _)| (id.clone(), v.clone()))
         .collect();
-    report("Live corpus", &measure(&live, &qvecs), provider.model_id());
+    let live_metrics = measure(&live, &qvecs);
+    anyhow::ensure!(
+        live_metrics.scored > 0,
+        "none of the {} benchmark questions' target facts exist in this corpus — the `fact:` \
+         record IDs in QUESTIONS (crates/alexandria/src/bench.rs) are frozen from the install the question set was \
+         built on, so bench-retrieval only measures that database. Every metric would be NaN or inf.",
+        QUESTIONS.len()
+    );
+    report("Live corpus", &live_metrics, provider.model_id());
 
     let mut by_age = all;
     by_age.sort_by_key(|(_, _, created)| *created);
