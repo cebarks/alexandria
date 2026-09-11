@@ -112,7 +112,7 @@ Controls server-side filtering of `retrieve_memories` results.
 
 | Key | Type | Default | Description |
 | ----- | ------ | --------- | ------------- |
-| `min_similarity` | f32 | `0.10` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A noise cutoff only. Model-dependent: for `all-MiniLM-L6-v2` (measured 2026-09-08), a keyword or near-paraphrase hit scores 0.55–0.76, a natural-language question against its matching statement 0.40–0.65, and a question sharing no vocabulary with the statement as low as ~0.2. Unrelated memories score 0.07–0.40. The floor stays below the vocabulary-free cases; client thresholds do the real filtering. |
+| `min_similarity` | f32 | `0.10` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A noise cutoff only. Model-dependent: for `all-MiniLM-L6-v2` (measured 2026-09-08), a keyword or near-paraphrase hit scores 0.55–0.76, a natural-language question against its matching statement 0.40–0.65, and a question sharing no vocabulary with the statement as low as ~0.2. Unrelated memories score 0.07–0.40. The floor stays below the vocabulary-free cases; client thresholds do the real filtering. Derived by the retrieve-floor rule in `docs/plans/2026-09-08-embedding-model-swap-design.md` (median non-hit score, rounded to two decimals, checked to sit below the lowest correct hit); the rule gives 0.08 for MiniLM and 0.10 is kept because the difference is immaterial. |
 
 ## Environment Variable Overrides
 

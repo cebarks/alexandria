@@ -91,6 +91,12 @@ pub struct RetrieveConfig {
     /// results. A noise cutoff only: with all-MiniLM-L6-v2 a natural-language
     /// question against a stored statement scores ~0.2 and unrelated text
     /// ~0.0, so this must stay low. Default 0.10.
+    ///
+    /// Derived by the retrieve-floor rule in
+    /// `docs/plans/2026-09-08-embedding-model-swap-design.md`: the median
+    /// non-hit score rounded to two decimals, which must sit below the lowest
+    /// correct hit. The rule gives 0.08 for MiniLM; 0.10 is kept because the
+    /// difference is immaterial.
     pub min_similarity: f32,
 }
 
