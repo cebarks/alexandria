@@ -13,6 +13,7 @@ alexandria-engine = { path = "../alexandria-engine" }
 alexandria-pipeline = { path = "../alexandria-pipeline" }
 alexandria-mcp = { path = "../alexandria-mcp" }
 tokio = { workspace = true }
+chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

@@ -1,3 +1,4 @@
+mod bench;
 mod config;
 
 use std::sync::Arc;
@@ -13,11 +14,12 @@ use rmcp::ServiceExt;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    const USAGE: &str = "Usage: alexandria [migrate-embeddings | --help]";
+    const USAGE: &str = "Usage: alexandria [migrate-embeddings | bench-retrieval | --help]";
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [] => {}
         ["migrate-embeddings"] => return migrate_embeddings().await,
+        ["bench-retrieval"] => return bench::run().await,
         ["--help"] | ["-h"] => {
             println!("{USAGE}");
             return Ok(());
