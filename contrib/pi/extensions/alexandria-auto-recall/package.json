@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test 'src/**/*.test.ts'"
+    "test": "node --test 'src/**/*.test.ts'",
+    "typecheck": "tsc"
   },
   "dependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
@@ -12,7 +13,8 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "latest",
-    "@types/node": "^20.0.0"
+    "@types/node": "^20.0.0",
+    "typescript": "^5.9.3"
   },
   "pi": {
     "extensions": [

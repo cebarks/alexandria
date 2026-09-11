@@ -57,7 +57,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `CandleProvider` tests download the real model on first run (~80MB) — they're slow the first time.
 - Test helpers in `alexandria-storage/src/connection.rs`: `connect_embedded()` for quick in-memory DB.
 - Env-mutating config tests must carry `#[serial]` (`serial_test`) — `cargo test` runs them in parallel within a binary and they otherwise race.
-- The pi extension's tests are `src/**/*.test.ts` under `contrib/pi/extensions/alexandria-auto-recall/`, run by `just test-pi` (plain `node --test`, Node >= 22.18 for native type stripping, no `npm install`). Test files import with `.ts` specifiers because Node does not rewrite `.js` to `.ts`; the source modules keep `.js` specifiers and only work under `node --test` because their cross-module imports are `import type`. A new source module with a runtime import of a sibling will load under pi but not under the tests.
+- The pi extension's tests are `src/**/*.test.ts` under `contrib/pi/extensions/alexandria-auto-recall/`, run by `just test-pi` (plain `node --test`, Node >= 22.18 for native type stripping, no `npm install`). Test files import with `.ts` specifiers because Node does not rewrite `.js` to `.ts` (`tsconfig.json` sets `allowImportingTsExtensions` + `noEmit` so `just typecheck-pi`, which does `npm ci` then `tsc`, accepts them); the source modules keep `.js` specifiers and only work under `node --test` because their cross-module imports are `import type`. A new source module with a runtime import of a sibling will load under pi but not under the tests.
 
 ## CI
 

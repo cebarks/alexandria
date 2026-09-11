@@ -25,6 +25,11 @@ test:
 test-pi:
     npm --prefix contrib/pi/extensions/alexandria-auto-recall test
 
+# Type-check the pi extension (needs the lockfile's node_modules, so this one does npm ci)
+typecheck-pi:
+    npm --prefix contrib/pi/extensions/alexandria-auto-recall ci
+    npm --prefix contrib/pi/extensions/alexandria-auto-recall run typecheck
+
 # Fast type-check
 check:
     cargo check --all-features
@@ -42,7 +47,7 @@ deny:
     cargo deny check
 
 # Full CI suite locally — run before pushing
-ci: fmt lint test test-pi deny
+ci: fmt lint test test-pi typecheck-pi deny
 
 # Install git hooks (pre-commit: fmt + clippy)
 install-hooks:

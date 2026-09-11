@@ -78,6 +78,7 @@ jobs:
         with:
           tool: just
       - run: just test-pi
+      - run: just typecheck-pi
 
   deny:
     name: cargo-deny
