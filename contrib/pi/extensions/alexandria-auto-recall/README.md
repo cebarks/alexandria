@@ -34,7 +34,7 @@ url = "http://127.0.0.1:3000/mcp"
 [recall]
 enabled = true
 limit = 5
-min_similarity = 0.58
+min_similarity = 0.35
 
 [store]
 enabled = true
@@ -49,7 +49,7 @@ extract_timeout_ms = 5000
 | `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | Alexandria server MCP endpoint |
 | `ALEXANDRIA_AUTO_RECALL` | (enabled) | Set to `off` to disable auto-recall |
 | `ALEXANDRIA_AUTO_RECALL_LIMIT` | `5` | Max memories to retrieve |
-| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.58` | Minimum cosine similarity, inclusive (model-dependent; sits above the server-side `[retrieve] min_similarity` floor). Measured too high for `all-MiniLM-L6-v2`: recommended `0.35`, see `[recall]` in `docs/configuration.md` |
+| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.35` | Minimum cosine similarity, inclusive (model-dependent; sits above the server-side `[retrieve] min_similarity` floor). Measured on the live corpus for `all-MiniLM-L6-v2`; the former `0.58` default delivered 4 of 12 known targets against `0.35`'s 9. See `[recall]` in `docs/configuration.md` |
 | `ALEXANDRIA_AUTO_STORE` | (enabled) | Set to `off` to disable all store behavior — detectors and extraction alike |
 | `ALEXANDRIA_EXTRACT_MODEL` | `vertex/claude-haiku-4-5` | Model for the LLM extraction pass |
 | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | `5000` | Extraction timeout in milliseconds |

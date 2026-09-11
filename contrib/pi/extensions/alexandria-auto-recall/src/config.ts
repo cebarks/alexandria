@@ -73,11 +73,10 @@ export const CONFIG = {
 	recallMinSimilarity: Number(
 		process.env.ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY ??
 			toml.recall?.min_similarity ??
-			// TODO: 0.58 was chosen assuming genuine matches score 0.6+. Measured
-			// 2026-09-08 on all-MiniLM-L6-v2: question-vs-statement matches score
-			// 0.40-0.65, so this drops most of them. Recommended: 0.35, matching
-			// the Claude Code hook. See docs/configuration.md [recall].
-			0.58,
+			// 0.35, matching the Claude Code hook. Measured 2026-09-09 by the
+			// bench-retrieval threshold sweep: of 12 known targets, 0.35 delivers
+			// 9 and the previous 0.58 default delivers 4. See docs/minilm-test-data.md.
+			0.35,
 	),
 
 	storeDisabled:

@@ -80,9 +80,11 @@ npm install
 Config file: `$XDG_CONFIG_HOME/alexandria/client.toml`, same precedence as the server
 (defaults → file → `ALEXANDRIA_CLIENT_CONFIG` → individual env vars). See
 [docs/configuration.md](../../docs/configuration.md) for the full reference. Every key is optional;
-the defaults work against a locally running server. Note: the extension default
-`min_similarity = 0.58` is measured too high for `all-MiniLM-L6-v2` — set `0.35`
-(see `[recall]` in docs/configuration.md).
+the defaults work against a locally running server.
+
+`min_similarity` defaults to `0.35`, measured for `all-MiniLM-L6-v2` (see `[recall]` in
+[docs/configuration.md](../../docs/configuration.md)). The previous `0.58` default was too
+high: it delivered 4 of 12 known targets where `0.35` delivers 9.
 
 ```toml
 [server]
@@ -91,7 +93,7 @@ url = "http://127.0.0.1:3000/mcp"
 [recall]
 enabled = true
 limit = 5
-min_similarity = 0.58
+min_similarity = 0.35
 
 [store]
 enabled = true
