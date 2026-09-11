@@ -271,6 +271,10 @@ impl Config {
                 anyhow::anyhow!("invalid ALEXANDRIA_EMBEDDING_BATCH_SIZE `{batch}`: {e}")
             })?;
         }
+        anyhow::ensure!(
+            config.embedding.batch_size > 0,
+            "embedding.batch_size must be at least 1"
+        );
 
         Ok(config)
     }
@@ -452,6 +456,25 @@ mod tests {
             err.to_string().contains("ALEXANDRIA_EMBEDDING_BATCH_SIZE"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_embedding_env_zero_batch_size() {
+        let env = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "0")]);
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("batch_size"), "{err}");
+    }
+
+    #[test]
+    fn test_embedding_toml_zero_batch_size() {
+        let path =
+            std::env::temp_dir().join(format!("alexandria-batch0-{}.toml", std::process::id()));
+        std::fs::write(&path, "[embedding]\nbatch_size = 0\n").unwrap();
+        let vars = [("ALEXANDRIA_CONFIG", path.to_str().unwrap())];
+        let env = env(&vars);
+        let err = Config::load_from(&env).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.to_string().contains("batch_size"), "{err}");
     }
 
     #[test]

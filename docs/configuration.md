@@ -73,7 +73,7 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 |-----|------|---------|-------------|
 | `model` | string | `"sentence-transformers/all-MiniLM-L6-v2"` | HuggingFace model ID. Must be a BERT-family model compatible with candle. Pooling mode (CLS or mean) is read from the model repo's `1_Pooling/config.json`; models without it use mean pooling. |
 | `device` | string | `"cpu"` | Compute device. Only `"cpu"` is currently supported. |
-| `batch_size` | usize | `32` | Facts per `embed()` call during `alexandria migrate-embeddings`. Bounds peak memory on large corpora; must be at least 1. The server itself embeds one text at a time. |
+| `batch_size` | usize | `32` | Facts per `embed()` call during `alexandria migrate-embeddings`. Bounds peak memory on large corpora; must be at least 1, checked at config load. The server itself embeds one text at a time. |
 
 **Switching models on an existing database:** stop the server, set the new `model`, run `alexandria migrate-embeddings` (re-embeds every memory and cluster centroid, then updates the lock), and start the server again. Thresholds (`[cluster]` and `[retrieve] min_similarity`) are tuned to the default model; retune them if you switch. The migration is not transactional: if it fails partway, rerun it. Do not revert `model` in config afterwards, the database may hold a mix of old and new vectors.
 
