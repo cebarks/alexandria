@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => anyhow::bail!("unexpected arguments {args:?}. {USAGE}"),
     }
-    tracing::info!("Alexandria v0.2 starting...");
+    tracing::info!("Alexandria v{} starting...", env!("CARGO_PKG_VERSION"));
 
     // 1. Load configuration
     let config = Config::load()?;
@@ -146,7 +146,10 @@ async fn main() -> anyhow::Result<()> {
 async fn migrate_embeddings() -> anyhow::Result<()> {
     use alexandria_mcp::migrate::{ReembedOutcome, reembed};
 
-    tracing::info!("Alexandria v0.2 migrate-embeddings starting...");
+    tracing::info!(
+        "Alexandria v{} migrate-embeddings starting...",
+        env!("CARGO_PKG_VERSION")
+    );
     let config = Config::load()?;
     let db = Database::connect(&config.database.data_dir).await?;
     schema::migrate(db.inner()).await?;
