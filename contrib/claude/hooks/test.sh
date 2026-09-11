@@ -106,15 +106,23 @@ echo "$got"
 [ "$got" = '[{"content":"We decided to use SurrealKV because it needs no external process","tags":["decision","extracted"]}]' ]
 # No new transcript lines: LLM not called again. New short line: deferred (marker unchanged).
 stop; [ "$(cat "$td/calls")" = 1 ]
-jq -cn '{type:"user",message:{content:"ok"}}' >>"$td/t.jsonl"
+jq -cn '{type:"user",message:{content:"ok"}},{type:"assistant",message:{content:[{type:"text",text:"short"}]}}' >>"$td/t.jsonl"
 ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 10 ]
+# A queued prompt dispatched inside the flush wait sits past the last assistant line: the chunk and
+# the marker stop there, and the prompt is extracted with its own turn.
+jq -cn '{type:"user",message:{content:"queued follow-up prompt"}}' >>"$td/t.jsonl"
+stop; [ "$(cat "$td/calls")" = 2 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 12 ]
+grep -q '^\[User\]: ok' "$td/prompt.txt"; grep -q 'queued follow-up' "$td/prompt.txt" && exit 1
+jq -cn '{type:"assistant",message:{content:[{type:"text",text:"reply to the queued prompt"}]}}' >>"$td/t.jsonl"
+stop; [ "$(cat "$td/calls")" = 3 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 14 ]
+grep -q '^\[User\]: queued follow-up prompt' "$td/prompt.txt"; grep -q '^\[User\]: ok' "$td/prompt.txt" && exit 1
 # stop_hook_active / child guard: no call.
 jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ./alexandria-extract.sh
-[ "$(cat "$td/calls")" = 1 ]
+[ "$(cat "$td/calls")" = 3 ]
 # Headless sessions: no call, marker untouched.
-jq -cn '{type:"user",message:{content:"headless chatter that must not be extracted"}}' >>"$td/t.jsonl"
+jq -cn '{type:"assistant",message:{content:[{type:"text",text:"headless chatter that must not be extracted"}]}}' >>"$td/t.jsonl"
 for ep in sdk-py bench remote_cowork_trigger local-agent; do
-  CLAUDE_CODE_ENTRYPOINT=$ep stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 10 ]
+  CLAUDE_CODE_ENTRYPOINT=$ep stop; [ "$(cat "$td/calls")" = 3 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 14 ]
 done
 # Empty result: exactly one call, nothing stored.
 cat >"$td/empty.sh" <<'STUB'
@@ -123,16 +131,16 @@ echo "$(( $(cat "$(dirname "$0")/calls2" 2>/dev/null || echo 0) + 1 ))" >"$(dirn
 echo '{"memories": []}'
 STUB
 chmod +x "$td/empty.sh"
-jq -cn '{type:"user",message:{content:"purely tactical chatter, nothing durable here"}}' >>"$td/t.jsonl"
+jq -cn '{type:"assistant",message:{content:[{type:"text",text:"purely tactical chatter, nothing durable here"}]}}' >>"$td/t.jsonl"
 ALEXANDRIA_EXTRACT_CMD="$td/empty.sh" stop; [ "$(cat "$td/calls2")" = 1 ]
-[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("extracted"))] | length')" = 1 ]
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("extracted"))] | length')" = 3 ]   # the three stub stops above, nothing new
 # Detach: without ALEXANDRIA_DETACHED the hook returns at once; the work finishes in a detached copy.
 cat >"$td/slow.sh" <<'STUB'
 #!/usr/bin/env bash
 sleep 2; echo '{"memories":[{"content":"Detached extraction outlives the hook","tags":[]}]}'
 STUB
 chmod +x "$td/slow.sh"
-jq -cn '{type:"user",message:{content:"enough new text that the marker advances again"}}' >>"$td/t.jsonl"
+jq -cn '{type:"assistant",message:{content:[{type:"text",text:"enough new text that the marker advances again"}]}}' >>"$td/t.jsonl"
 start=$SECONDS
 ALEXANDRIA_DETACHED='' ALEXANDRIA_EXTRACT_CMD="$td/slow.sh" stop
 [ $((SECONDS - start)) -le 1 ]
