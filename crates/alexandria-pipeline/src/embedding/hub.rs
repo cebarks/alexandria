@@ -5,6 +5,14 @@
 //! ponytail: files are written straight into `snapshots/<sha>/`, with no `blobs/`
 //! symlink, `.no_exist` marker, or lock files. Every reader we care about
 //! only looks at the snapshot path. Add the rest if a second consumer needs it.
+//!
+//! ponytail: revision `main` only, no `HF_TOKEN`, no `HF_ENDPOINT`. Consequences: a
+//! cached revision is served forever (delete the repo dir to re-fetch); a model
+//! lacking `1_Pooling/config.json` pays one 404 per online boot and falls to the
+//! warn-and-assume-mean path offline (every sentence-transformers repo ships it, so
+//! this never fires today); two servers first-booting on the same empty cache both
+//! download (rename-into-place keeps the result correct); gated or private models
+//! cannot be fetched. Add whichever one actually bites.
 
 use std::path::{Path, PathBuf};
 
