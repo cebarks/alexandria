@@ -46,8 +46,10 @@ echo "$got"
 # Auto-store off: nothing new.
 ALEXANDRIA_AUTO_STORE=off hook "never use tabs"
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 3 ]
-# Headless session (CLAUDE_CODE_ENTRYPOINT=sdk-*): detectors off by default, on with ALEXANDRIA_AUTO_STORE=on.
+# Headless session (CLAUDE_CODE_ENTRYPOINT gate): detectors off by default, on with ALEXANDRIA_AUTO_STORE=on.
 CLAUDE_CODE_ENTRYPOINT=sdk-cli hook "never use spaces"
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 3 ]
+CLAUDE_CODE_ENTRYPOINT=claude-code-github-action hook "never use spaces"
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 3 ]
 CLAUDE_CODE_ENTRYPOINT=sdk-cli ALEXANDRIA_AUTO_STORE=on hook "never use spaces"
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 4 ]
@@ -109,9 +111,11 @@ ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "
 # stop_hook_active / child guard: no call.
 jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ./alexandria-extract.sh
 [ "$(cat "$td/calls")" = 1 ]
-# Headless session: no call, marker untouched.
+# Headless sessions: no call, marker untouched.
 jq -cn '{type:"user",message:{content:"headless chatter that must not be extracted"}}' >>"$td/t.jsonl"
-CLAUDE_CODE_ENTRYPOINT=sdk-py stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 10 ]
+for ep in sdk-py bench remote_cowork_trigger local-agent; do
+  CLAUDE_CODE_ENTRYPOINT=$ep stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 10 ]
+done
 # Empty result: exactly one call, nothing stored.
 cat >"$td/empty.sh" <<'STUB'
 #!/usr/bin/env bash
