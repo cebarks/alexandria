@@ -19,7 +19,7 @@ lint:
 
 # Run all tests
 test:
-    cargo test --all-features
+    cargo test --workspace --all-features
 
 # Fast type-check
 check:
