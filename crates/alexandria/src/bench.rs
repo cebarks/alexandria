@@ -461,7 +461,7 @@ fn report(label: &str, m: &Metrics, model: &str) {
         let marker = if limit == RECALL_LIMIT { " (now)" } else { "" };
         print!("| {limit}{marker} |");
         for s in m.sweep.iter().filter(|s| s.limit == limit) {
-            print!(" {} ({:.1}) |", s.hits_delivered, s.noise_per_q);
+            print!(" {} ({:.2}) |", s.hits_delivered, s.noise_per_q);
         }
         println!();
     }
