@@ -155,8 +155,10 @@ it rested on the 2026-09-08 synthetic-pair ranges rather than on the corpus.
 the baseline. The one target it drops outright is the weakest, at `hit_min` 0.338 — so it is
 not accurate to say `0.35` keeps every real hit; it keeps 11 of 12 by score and delivers 9.
 
-**`0.40` is strictly dominated on both corpora** — the same `hits_delivered` as `0.45` at
-roughly double the noise. It is never the right pick, whatever else is being traded off.
+**`0.40` is strictly dominated on both corpora in this pass** — the same `hits_delivered` as
+`0.45` at roughly double the noise. That held for the original 12 questions only: with the
+recent targets in, `0.40` buys two more hits on the live corpus and becomes a trade rather than
+a dominated cell — see [Grid with the recent targets in](#grid-with-the-recent-targets-in-965-facts).
 
 **At `limit = 5` the remaining choice was `0.35` against `0.50`:** 9 hits at 3.00 injected
 non-targets, or 7 hits at 0.33. Nine times the injection for two more hits out of twelve.
@@ -314,6 +316,47 @@ Live corpus, 957 facts, `limit = 10`:
 (957 vs 880) and part is that the new questions, being about other projects' memories, sit
 in denser neighbourhoods of the corpus than the Alexandria-specific originals; the two are
 not separable from one pass.
+
+### Grid with the recent targets in (965 facts)
+
+The 20-question threshold table above is the `limit = 10` row of a grid, read the same way
+as the 880-fact one. Re-run 2026-09-10 on 965 facts (eight added since the 957 pass; every
+rank and every column reproduces except `nonhit_p99` 0.340 -> 0.339 and `ff_p90` 0.286 ->
+0.287). The baseline grid is identical to the 143-fact one recorded under [Result
+limit](#result-limit) and is not repeated. Cells are `hits_delivered` out of 20 with
+`noise_per_q` in parentheses.
+
+Live corpus, 965 facts:
+
+| limit | T=0.30 | T=0.35 | T=0.40 | T=0.45 | T=0.50 | T=0.58 |
+|---|---|---|---|---|---|---|
+| 3 | 15 (2.2) | 15 (2.0) | 14 (1.5) | 13 (1.1) | 13 (0.6) | 9 (0.1) |
+| 5 | 16 (4.1) | 16 (3.4) | 15 (2.2) | 13 (1.4) | 13 (0.7) | 9 (0.1) |
+| 8 | 19 (6.0) | 18 (4.8) | 16 (2.8) | 14 (1.6) | 13 (0.7) | 9 (0.1) |
+| **10** (shipped) | 19 (7.2) | 18 (5.5) | 16 (3.0) | **14 (1.6)** | 13 (0.7) | 9 (0.1) |
+| 15 | 20 (9.8) | 19 (6.5) | 16 (3.2) | 14 (1.6) | 13 (0.7) | 9 (0.1) |
+| 20 | 20 (11.7) | 19 (7.2) | 16 (3.2) | 14 (1.6) | 13 (0.7) | 9 (0.1) |
+
+**The shipped pair stays, by the rule that picked it.** The pair moves only when another cell
+strictly dominates it — at least as many hits at no more noise — on both corpora. No cell does.
+`limit=8, T=0.45` ties it exactly: the 14 targets that clear 0.45 all rank 8 or better, so the
+two cells deliver the same set. `limit=3, T=0.40` delivers 14 at 1.5 against 1.65, but it is a
+different 14 — it trades q1 (rank 8, 0.47) for q15 (rank 2, 0.41) — it is 7 (0.7) against
+8 (0.3) on the baseline, and the `limit=3` caveat above (coupling with `activation.top_n`)
+still applies.
+
+**`0.40` is no longer dominated, and the docs that said so were read off the 12-question
+grid.** At `limit=10` it delivers 16 at 2.95 against `0.45`'s 14 at 1.65: the two targets it
+adds are q15 (0.41) and q20 (0.43), and the price is +1.3 non-targets per prompt. That is a
+genuine trade in the same shape as the limit's — +2 hits for +1.3 noise, against the limit's
++3 for +1.5 — and the dominance rule does not take trades. On the baseline `0.40` is still
+dominated (8 at 0.9 against 8 at 0.3). Anyone pricing recall above injection should read
+this cell, not the 12-question claim.
+
+**Saturation still holds at 10 for what the threshold admits.** Every column is flat from
+`limit=8` to `10`; only `T=0.30` and `0.35` pick up a hit at 15, and it is q12 (rank 11,
+0.38), which the shipped threshold drops anyway. The headroom line is unchanged: worst rank 8
+(q1) among the 14 targets at or above 0.45, two positions left.
 
 ## Metric definitions
 
