@@ -60,14 +60,43 @@ impl<'a> SessionRepo<'a> {
     }
 
     /// Find a session by external_id, creating it if missing. Returns the record ID string.
-    pub async fn find_or_create(&self, external_id: &str) -> Result<String> {
-        match self.find_by_external_id(external_id).await? {
-            Some(session) => session
-                .id
-                .map(|id| crate::record_id_to_string(&id))
-                .ok_or_else(|| anyhow::anyhow!("Session has no id")),
-            None => self.create(external_id, None, None).await,
+    /// `agent_id` / `model` are set on create and fill still-empty fields on an existing
+    /// session; a value already stored is never overwritten.
+    pub async fn find_or_create(
+        &self,
+        external_id: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<String> {
+        let Some(session) = self.find_by_external_id(external_id).await? else {
+            return self.create(external_id, agent_id, model).await;
+        };
+        let id = session
+            .id
+            .map(|id| crate::record_id_to_string(&id))
+            .ok_or_else(|| anyhow::anyhow!("Session has no id"))?;
+
+        let fill_agent = session.agent_id.is_none().then_some(agent_id).flatten();
+        let fill_model = session.model.is_none().then_some(model).flatten();
+        if fill_agent.is_some() || fill_model.is_some() {
+            let mut q = self
+                .db
+                .query(
+                    "UPDATE `session` SET \
+                     agent_id = $agent_id ?? agent_id, \
+                     model = $model ?? model \
+                     WHERE external_id = $external_id",
+                )
+                .bind(("external_id", external_id.to_string()));
+            if let Some(a) = fill_agent {
+                q = q.bind(("agent_id", a.to_string()));
+            }
+            if let Some(m) = fill_model {
+                q = q.bind(("model", m.to_string()));
+            }
+            q.await?.check()?;
         }
+        Ok(id)
     }
 
     /// Refresh ended_at on a session.
@@ -266,8 +295,8 @@ mod tests {
         crate::schema::migrate(db.inner()).await.unwrap();
         let repo = SessionRepo::new(db.inner());
 
-        let first = repo.find_or_create("sess-004").await.unwrap();
-        let second = repo.find_or_create("sess-004").await.unwrap();
+        let first = repo.find_or_create("sess-004", None, None).await.unwrap();
+        let second = repo.find_or_create("sess-004", None, None).await.unwrap();
         assert_eq!(first, second);
 
         let mut response = db
@@ -277,6 +306,43 @@ mod tests {
             .unwrap();
         let rows: Vec<Session> = response.take(0).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_or_create_fills_agent_and_model_if_empty() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = SessionRepo::new(db.inner());
+
+        // First seen without metadata.
+        repo.find_or_create("sess-005", None, None).await.unwrap();
+        let s = repo.find_by_external_id("sess-005").await.unwrap().unwrap();
+        assert_eq!(s.agent_id, None);
+        assert_eq!(s.model, None);
+
+        // Acquires it later.
+        repo.find_or_create("sess-005", Some("claude-code"), None)
+            .await
+            .unwrap();
+        let s = repo.find_by_external_id("sess-005").await.unwrap().unwrap();
+        assert_eq!(s.agent_id.as_deref(), Some("claude-code"));
+        assert_eq!(s.model, None);
+
+        // Set values are never overwritten; still-empty ones are filled.
+        repo.find_or_create("sess-005", Some("other"), Some("haiku"))
+            .await
+            .unwrap();
+        let s = repo.find_by_external_id("sess-005").await.unwrap().unwrap();
+        assert_eq!(s.agent_id.as_deref(), Some("claude-code"));
+        assert_eq!(s.model.as_deref(), Some("haiku"));
+
+        // Set on create when given.
+        repo.find_or_create("sess-006", Some("pi"), Some("sonnet"))
+            .await
+            .unwrap();
+        let s = repo.find_by_external_id("sess-006").await.unwrap().unwrap();
+        assert_eq!(s.agent_id.as_deref(), Some("pi"));
+        assert_eq!(s.model.as_deref(), Some("sonnet"));
     }
 
     #[tokio::test]
