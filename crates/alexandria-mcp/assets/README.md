@@ -28,6 +28,27 @@ Both licenses are permissive and compatible with this project's AGPL-3.0-or-late
 contributions. `vis-network` is dual-licensed and may be used under either term; the `standalone/umd`
 build is used because the v10 ESM/CJS packaging change does not apply to it.
 
+### Bundled transitive dependencies
+
+The `vis-network` `standalone/umd` build inlines its dependencies, so their licenses travel with it.
+Recorded here because a license audit of this repository will not find them in `Cargo.lock` or via
+`cargo deny` — these bytes are not a crate dependency.
+
+| Bundled in | Component | Version | License |
+| --- | --- | --- | --- |
+| `vis-network-10.1.2.min.js` | Hammer.JS | 2.0.17-rc (2019-12-16) | MIT |
+
+`htmx-2.0.10.min.js` has no runtime dependencies.
+
+## Byte-for-byte fidelity
+
+These files are committed **exactly as upstream publishes them** and are never edited, minified
+further, or stripped. Both end with a `//# sourceMappingURL=` trailer pointing at a `.map` file that
+is deliberately *not* vendored, so browser devtools will 404 on the source map. That is accepted:
+modifying the bytes to remove the trailer would break the guarantee that `SHA256SUMS` can be checked
+against the upstream release, which is worth more than a silent devtools 404 on an internal admin
+surface. Vendoring the maps instead would roughly triple the committed size for no runtime benefit.
+
 ## Verifying
 
 ```sh
