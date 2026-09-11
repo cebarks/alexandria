@@ -11,7 +11,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `RELATE` needs pre-parsed `RecordId` via `.bind()` — inline `type::record()` in RELATE fails
 - `type::record()` replaces `type::thing()` (removed in 3.x)
 - Query result structs need `#[derive(SurrealValue)]` from `surrealdb::types`
-- `RecordId` formatting: use `record_id_to_string()` helper, not `.to_string()`
+- `RecordId` formatting: use `record_id_to_string()` helper (in `alexandria-storage/src/lib.rs`, re-exported by `alexandria-mcp/src/server.rs`), not `.to_string()`
 - Connection: `surrealdb::engine::any::connect("mem://")` with `kv-mem` feature; `surrealkv://path` with `kv-surrealkv`
 
 ## rmcp (MCP SDK) Patterns
@@ -47,6 +47,15 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Known inconsistency: session-scoped retrieval walks edges through `SessionRepo::get_memories()` → `MemoryRepo::get_fact()`, which does **not** filter `deleted = false` the way the unscoped path does. Soft-deleted memories therefore still surface in `get_session` and `retrieve_memories(session_id: ...)`. Not yet fixed — don't document it as intended behavior.
 - Schema migrations are forward-only, numbered (`v001`, `v002`, ...), tracked in `system_config` table. Current head is `v005_session.surql`.
 - Embedding model is locked on first boot — changing `config.toml` model without wiping data will refuse to start.
+
+## Build Gate
+
+Before any `cargo check`, `cargo run`, or `cargo build`, run these in order and fix what they report:
+
+1. `cargo fmt --all -- --check` (or `just fmt`)
+2. `cargo clippy --workspace --all-targets --all-features -- -D warnings` (or just `just lint`)
+
+Both must pass clean first. Do not skip the gate to "just see if it compiles".
 
 ## Testing
 
@@ -89,6 +98,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `contrib/pi/README.md` — how the pi skill and extension differ and install
 - `AGENTS.md` — this file. It was named `CLAUDE.md` until the docs sweep that added session memory
   and the pi extension docs, so older `docs/plans/*` references to `CLAUDE.md` point here.
+  `CLAUDE.md` still exists as a one-line `@AGENTS.md` import so Claude Code auto-loads this file.
 
 ## Config Precedence
 

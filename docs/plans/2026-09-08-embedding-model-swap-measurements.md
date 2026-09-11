@@ -18,13 +18,16 @@ Corpus: 143 active facts from the live database. Questions: 12, listed below.
 | cluster.join_threshold | 0.75 |
 | cluster.merge_threshold | 0.88 |
 | cluster.cohesion_floor | 0.60 |
-| retrieve.min_similarity | 0.36 |
+| retrieve.min_similarity | 0.08 |
 | client auto-recall threshold | 0.22 |
 
 Not applied: the incumbent won, so config defaults are unchanged. The retrieve
-floor derived here (0.36) would cut a true hit at 0.338, and nonhit_p99 (0.373)
-exceeds hit_min, so the spec's threshold rule has no valid solution on this
-corpus. bge-small was measured without its query instruction prefix.
+floor was first derived as 0.36 under the original spec rule (between hit_min
+and nonhit_p99, midpoint on overlap), which would cut a true hit at 0.338; that
+rule was rewritten on 2026-09-08 to `nonhit_p50`, giving 0.08, next to the
+hand-picked 0.10 default. Under the new rule msmarco fails the sanity check
+(nonhit_p50 0.173 > hit_min 0.119); every other model passes. bge-small was
+measured without its query instruction prefix.
 
 Reasoning: no candidate beat the incumbent on both criteria — MiniLM has the
 lowest mean_rank (1.42 vs 2.33 / 5.42 / 12.58) and the largest mean_gap
@@ -55,3 +58,48 @@ simply contains no pair similar enough to justify 0.90.
 10. "the model keeps wrapping its answer in backticks and adding chatter afterwards, how should I read the structured output" -> `fact:306636gbydvykw7lrmr8`
 11. "why are very short strings disappearing from what gets saved" -> `fact:ykw2fqnaj9j7q71o3mey`
 12. "how fast is memory lookup supposed to be" -> `fact:g8q5rwzz89m4dyidz21h`
+
+## Second pass (2026-09-08, evening): query prefixes and nomic
+
+Same 143-fact corpus (dumped from the 08:08 data copy) and the same 12 questions, run
+through sentence-transformers on CPU instead of candle so that non-BERT architectures could
+be tried without writing loaders. MiniLM and multi-qa reproduce the candle numbers exactly,
+so the two paths are comparable. bge-small now carries its query instruction prefix; nomic
+uses `search_query:` / `search_document:`. Qwen3-Embedding-0.6B (596M params) and
+embeddinggemma-300m (gated) were not run.
+
+| model | dims | mean_rank | top1 | mean_gap | hit_min | hit_max | nonhit_p50 | nonhit_p90 | nonhit_p99 | ff_p50 | ff_p90 | ff_p99 | doc ms/text | query ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sentence-transformers/all-MiniLM-L6-v2 | 384 | 1.42 | 9/12 | +0.148 | 0.338 | 0.667 | 0.078 | 0.212 | 0.373 | 0.132 | 0.302 | 0.571 | 5.1 | 4.0 |
+| sentence-transformers/multi-qa-MiniLM-L6-cos-v1 | 384 | 2.33 | 8/12 | +0.091 | 0.318 | 0.635 | 0.082 | 0.215 | 0.375 | 0.125 | 0.290 | 0.568 | 7.3 | 3.9 |
+| BAAI/bge-small-en-v1.5 (with query prefix) | 384 | 5.92 | 8/12 | +0.042 | 0.584 | 0.783 | 0.547 | 0.617 | 0.683 | 0.592 | 0.670 | 0.778 | 15.2 | 8.5 |
+| nomic-ai/nomic-embed-text-v1.5 | 768 | 5.67 | 7/12 | +0.036 | 0.588 | 0.803 | 0.544 | 0.603 | 0.663 | 0.639 | 0.705 | 0.806 | 71.2 | 24.4 |
+| nomic-ai/nomic-embed-text-v1.5 truncated to 384 | 384 | 4.17 | 8/12 | +0.038 | 0.575 | 0.805 | 0.537 | 0.603 | 0.660 | 0.637 | 0.705 | 0.804 | 72.0 | 23.8 |
+
+Per-question rank (MiniLM / multi-qa / bge+prefix / nomic / nomic@384):
+
+| q | ranks |
+|---|---|
+| 1 hooks going stale after git pull | 4 / 9 / 17 / 4 / 5 |
+| 9 systemd status flag gotcha | 1 / 1 / 2 / 7 / 7 |
+| 10 structured output wrapped in backticks | 1 / 1 / 1 / 3 / 5 |
+| 11 very short strings disappearing | 2 / 5 / 20 / 45 / 25 |
+| 12 how fast is memory lookup | 2 / 4 / 24 / 1 / 1 |
+| all others | 1 across the board (q7 nomic 2, q4 multi-qa 2) |
+
+Outcome: default unchanged. The query prefix did not help bge (mean rank 5.92 vs 5.42
+without it). nomic is 6x the parameters, 14x the per-text latency, and still loses on
+mean rank and separation; its noise floor (nonhit_p50 0.54, fact-fact p50 0.64) is as
+compressed as bge's. Both larger models lose badly on the paraphrase-heavy question 11 and
+bge on question 12, where MiniLM's keyword overlap carries it. The corpus is short
+technical statements, and small mean-pooled MiniLM appears to be the right shape for it.
+
+## Third pass (2026-09-09): same model, 5x corpus
+
+Moved to `docs/minilm-test-data.md`, which is maintained; these plan docs are not. MiniLM
+was rerun alone against the grown corpus with `alexandria bench-retrieval` (`crates/alexandria/src/bench.rs`),
+which also computes the retrieve floor from the model's own output instead of by hand. The
+reconstructed 143-fact baseline reproduces the first-pass row above on every column and
+every per-question rank; at 743 facts `mean_rank` goes 1.42 -> 2.75, `top1` 9/12 -> 7/12 and
+`mean_gap` +0.148 -> +0.077, with `hit_min`/`hit_max` unchanged. Floor 0.07 live, 0.08 on
+the baseline, against the 0.10 default; no config change.
