@@ -6,15 +6,15 @@ cd "$(dirname "$0")"
 export ALEXANDRIA_URL="${ALEXANDRIA_URL:-http://127.0.0.1:3000/mcp}"
 export ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY=0.0
 unset CLAUDE_CODE_ENTRYPOINT ALEXANDRIA_AUTO_STORE   # hermetic: the harness running this script may be headless
-XDG_RUNTIME_DIR=$(mktemp -d); export XDG_RUNTIME_DIR
-trap 'rm -rf "$XDG_RUNTIME_DIR"' EXIT
+XDG_STATE_HOME=$(mktemp -d); export XDG_STATE_HOME
+trap 'rm -rf "$XDG_STATE_HOME"' EXIT
 sess="sess-test-$$"
 cleanup() { # delete every memory stored under $sess so test runs don't pile up
   ./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" 2>/dev/null \
     | jq -r '.memories[]?.id' | while read -r id; do
       ./alexandria-recall.sh delete_memory "$(jq -cn --arg i "$id" '{id:$i}')" >/dev/null; done
 }
-trap 'cleanup; rm -rf "$XDG_RUNTIME_DIR"' EXIT
+trap 'cleanup; rm -rf "$XDG_STATE_HOME"' EXIT
 
 fact="The hook test project uses SurrealDB as its database backend"
 # Seed one memory using the script's own MCP helper.
@@ -68,7 +68,7 @@ out=$(jq -cn '{session_id:"sess-test-123",tool_name:"mcp__alexandria__import_doc
 [ "$(jq -r '.hookSpecificOutput.updatedInput.session_id' <<<"$out")" = "sess-test-123" ]
 [ "$(jq -r '.hookSpecificOutput.updatedInput.mode' <<<"$out")" = "chunk" ]
 # Extract hook: fake transcript + stub LLM, incremental marker, extracted tag.
-td=$(mktemp -d); trap 'cleanup; rm -rf "$XDG_RUNTIME_DIR" "$td"' EXIT
+td=$(mktemp -d); trap 'cleanup; rm -rf "$XDG_STATE_HOME" "$td"' EXIT
 jq -cn '{type:"user",message:{content:"<local-command-caveat>ignore me</local-command-caveat>"}}
         ,{type:"user",message:{content:"which storage engine should we pick?"}}
         ,{type:"assistant",message:{content:[{type:"thinking",thinking:"hmm"},{type:"tool_use",name:"Bash"}]}}
@@ -103,13 +103,13 @@ echo "$got"
 # No new transcript lines: LLM not called again. New short line: deferred (marker unchanged).
 stop; [ "$(cat "$td/calls")" = 1 ]
 jq -cn '{type:"user",message:{content:"ok"}}' >>"$td/t.jsonl"
-ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 9 ]
+ALEXANDRIA_EXTRACT_MIN_CHARS=1500 stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 9 ]
 # stop_hook_active / child guard: no call.
 jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ./alexandria-extract.sh
 [ "$(cat "$td/calls")" = 1 ]
 # Headless session: no call, marker untouched.
 jq -cn '{type:"user",message:{content:"headless chatter that must not be extracted"}}' >>"$td/t.jsonl"
-CLAUDE_CODE_ENTRYPOINT=sdk-py stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_RUNTIME_DIR/alexandria/$sess.extracted")" = 9 ]
+CLAUDE_CODE_ENTRYPOINT=sdk-py stop; [ "$(cat "$td/calls")" = 1 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 9 ]
 # Empty result: exactly one call, nothing stored.
 cat >"$td/empty.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -128,7 +128,7 @@ STUB
 chmod +x "$td/slow.sh"
 jq -cn '{type:"user",message:{content:"enough new text that the marker advances again"}}' >>"$td/t.jsonl"
 start=$SECONDS
-HOME=$td ALEXANDRIA_DETACHED='' ALEXANDRIA_EXTRACT_CMD="$td/slow.sh" stop   # HOME: log lands in $td, not the real one
+ALEXANDRIA_DETACHED='' ALEXANDRIA_EXTRACT_CMD="$td/slow.sh" stop
 [ $((SECONDS - start)) -le 1 ]
 found=
 for _ in $(seq 20); do
@@ -138,9 +138,14 @@ done
 [ -n "$found" ]
 # Log rotation: an oversize log is renamed to .1 by the parent before it re-execs. stop_hook_active
 # makes the detached child exit at once, so only the synchronous parent path is under test.
-[ -f "$td/.cargo/logs/alexandria/extract.log" ]
-head -c 1048576 /dev/zero >"$td/.cargo/logs/alexandria/extract.log"
-jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | HOME=$td ALEXANDRIA_DETACHED='' ./alexandria-extract.sh
-[ "$(stat -c %s "$td/.cargo/logs/alexandria/extract.log.1")" = 1048576 ]
-[ "$(stat -c %s "$td/.cargo/logs/alexandria/extract.log")" = 0 ]
+[ -f "$XDG_STATE_HOME/alexandria/extract.log" ]
+head -c 1048576 /dev/zero >"$XDG_STATE_HOME/alexandria/extract.log"
+jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ALEXANDRIA_DETACHED='' ./alexandria-extract.sh
+[ "$(stat -c %s "$XDG_STATE_HOME/alexandria/extract.log.1")" = 1048576 ]
+[ "$(stat -c %s "$XDG_STATE_HOME/alexandria/extract.log")" = 0 ]
+# Marker pruning: the parent deletes markers idle for over 7 days, keeps fresh ones.
+touch -d '8 days ago' "$XDG_STATE_HOME/alexandria/old.extracted" "$XDG_STATE_HOME/alexandria/old.stored"
+jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | ALEXANDRIA_DETACHED='' ./alexandria-extract.sh
+[ ! -e "$XDG_STATE_HOME/alexandria/old.extracted" ]; [ ! -e "$XDG_STATE_HOME/alexandria/old.stored" ]
+[ -f "$XDG_STATE_HOME/alexandria/$sess.extracted" ]
 echo OK

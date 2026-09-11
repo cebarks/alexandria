@@ -27,7 +27,7 @@ extraction) the `claude` CLI.
   ("always ...", "never ...", "from now on ...", "use X instead of Y") phrasing, same patterns as the
   Pi detectors, and stores unambiguous hits as `User correction: ...` / `User preference: ...` with
   tags `correction`/`preference` + `auto-detected` and the session id. Deduped per session via
-  `$XDG_RUNTIME_DIR/alexandria/<session_id>.stored`. The Pi error-resolution tracker is not ported;
+  `$XDG_STATE_HOME/alexandria/<session_id>.stored`. The Pi error-resolution tracker is not ported;
   failed tool results are fed to the extraction pass instead (below).
 
 `alexandria-extract.sh` is a `Stop` hook. After each assistant turn it serializes the transcript lines
@@ -40,7 +40,7 @@ session's already-stored memories and the auto-recall hits the transcript carrie
 prompts listed for dedup (so a gotcha already stored by an earlier session is not stored again, as long
 as some prompt recalled it). Results are stored with the session id and an
 `extracted` tag. Short turns cost nothing; one haiku call covers several turns. A marker file
-`$XDG_RUNTIME_DIR/alexandria/<session_id>.extracted` holds the transcript line count and is written
+`$XDG_STATE_HOME/alexandria/<session_id>.extracted` holds the transcript line count and is written
 before the LLM call, so a failed or slow turn is never retried: one haiku call per turn, 80 s
 timeout. The child `claude` runs with
 `ALEXANDRIA_HOOK_CHILD=1`, which makes every hook here exit immediately (no recursion). Measured
@@ -105,7 +105,9 @@ kills hooks still running when the session ends, so the script re-execs itself w
 does the 15–80 s LLM call, never holds your next turn, and finishes even if you quit right after
 your last turn (verified 2026-09-08: a 10 s stub completed 11 s after the headless session exited).
 The script's own 80 s budget bounds a wedged `claude -p`. No `"async": true` is needed. Its stderr
-goes to `~/.cargo/logs/alexandria/extract.log`, rotated to `extract.log.1` once it passes 1 MiB.
+goes to `$XDG_STATE_HOME/alexandria/extract.log` (default `~/.local/state/alexandria/`), rotated to
+`extract.log.1` once it passes 1 MiB; marker files in the same directory idle for over 7 days are pruned
+at the same time.
 
 **Config (env vars, all optional):**
 
