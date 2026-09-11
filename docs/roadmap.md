@@ -1,6 +1,6 @@
 # Roadmap
 
-**Current state:** 8 MCP tools, schema `v006`, HTTP + stdio + Docker deployment, one
+**Current state:** 13 MCP tools, schema `v006`, HTTP + stdio + Docker deployment, one
 crate per layer and two client-side pi integrations under `contrib/pi/`.
 
 ## Completed
@@ -176,11 +176,11 @@ milestone:
 
 - ~~**Session-scoped search ignores soft-deletes.**~~ Done 2026-09-08 — `SessionRepo::get_memories()`
   filters `deleted = false`, matching the unscoped path.
-- **No session enumeration.** `get_session` needs an id you already know; there is no `list_sessions`,
-  and `recall` walks clusters rather than sessions. `/debug/sessions` (v0.2.7) lists them in the browser;
-  the MCP surface still cannot.
-- **`session.agent_id` / `session.model` are dead columns.** Present in schema and model, never
-  populated — either wire them to a tool parameter or drop them.
+- ~~**No session enumeration.**~~ Done 2026-09-09: `list_sessions` (13 tools total) lists newest-first
+  with live memory counts, filterable by `agent_id`, `tag`, `finalized`. `/debug/sessions` (v0.2.7)
+  lists them in the browser. `recall` still walks clusters rather than sessions.
+- ~~**`session.agent_id` / `session.model` are dead columns.**~~ Done: optional `agent_id` / `model`
+  on `store_memory` and `import_document`, recorded on the session when first seen.
 - **No tests for the pi extension.** The detector regexes and extraction prompt have no coverage, so
   a pattern edit is unguarded.
 - **Extension does not use sessions.** Auto-store writes are ungrouped.

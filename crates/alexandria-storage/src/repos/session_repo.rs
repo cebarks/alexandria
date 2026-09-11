@@ -5,7 +5,7 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue};
 
-use crate::models::Session;
+use crate::models::{Session, SessionListItem};
 
 /// A session row flattened for display.
 ///
@@ -175,6 +175,35 @@ impl<'a> SessionRepo<'a> {
             .await?;
         let facts: Vec<crate::models::Fact> = response.take(0)?;
         Ok(facts)
+    }
+
+    /// List sessions newest-first with a live non-deleted memory count. Each filter is
+    /// applied only when `Some`; `finalized` selects sessions with (`true`) or without
+    /// (`false`) a summary.
+    ///
+    /// Distinct from [`SessionRepo::list`], which the debug UI uses: that one has no filters
+    /// and orders by last activity, this one is the `list_sessions` tool's query.
+    pub async fn list_filtered(
+        &self,
+        agent_id: Option<&str>,
+        tag: Option<&str>,
+        finalized: Option<bool>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SessionListItem>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT *,                  count(->contains_session_memory->(fact WHERE deleted = false)) AS memory_count                  FROM `session`                  WHERE ($agent_id IS NONE OR agent_id = $agent_id)                  AND ($tag IS NONE OR $tag IN tags)                  AND ($finalized IS NONE OR (summary IS NOT NONE) = $finalized)                  ORDER BY started_at DESC LIMIT $limit START $offset",
+            )
+            .bind(("agent_id", agent_id.map(str::to_string)))
+            .bind(("tag", tag.map(str::to_string)))
+            .bind(("finalized", finalized))
+            .bind(("limit", limit))
+            .bind(("offset", offset))
+            .await?;
+        let sessions: Vec<SessionListItem> = response.take(0)?;
+        Ok(sessions)
     }
 
     /// Finalize a session: set ended_at, summary, and tags.
@@ -809,5 +838,76 @@ mod tests {
 
         assert_eq!(repo.count().await.unwrap(), 4);
         assert_eq!(repo.count_finalized().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_filters_orders_and_counts() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = SessionRepo::new(db.inner());
+        let memory_repo = crate::repos::MemoryRepo::new(db.inner());
+
+        let a = repo.create("sess-a", Some("pi"), None).await.unwrap();
+        let keep = memory_repo
+            .create_fact("kept", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let gone = memory_repo
+            .create_fact("gone", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        repo.add_memory(&a, &keep).await.unwrap();
+        repo.add_memory(&a, &gone).await.unwrap();
+        memory_repo.soft_delete_fact(&gone).await.unwrap();
+
+        repo.create("sess-b", Some("claude-code"), None)
+            .await
+            .unwrap();
+        repo.finalize("sess-b", Some("done"), Some(&["review".to_string()]))
+            .await
+            .unwrap();
+
+        repo.create("sess-c", Some("claude-code"), None)
+            .await
+            .unwrap();
+
+        // Newest first, live count excludes soft-deleted facts.
+        let all = repo.list_filtered(None, None, None, 20, 0).await.unwrap();
+        let ids: Vec<&str> = all.iter().map(|s| s.external_id.as_str()).collect();
+        assert_eq!(ids, ["sess-c", "sess-b", "sess-a"]);
+        assert_eq!(all[2].memory_count, 1);
+        assert_eq!(all[0].memory_count, 0);
+
+        let by_agent = repo
+            .list_filtered(Some("claude-code"), None, None, 20, 0)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = by_agent.iter().map(|s| s.external_id.as_str()).collect();
+        assert_eq!(ids, ["sess-c", "sess-b"]);
+
+        let by_tag = repo
+            .list_filtered(None, Some("review"), None, 20, 0)
+            .await
+            .unwrap();
+        assert_eq!(by_tag.len(), 1);
+        assert_eq!(by_tag[0].external_id, "sess-b");
+
+        let open = repo
+            .list_filtered(None, None, Some(false), 20, 0)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = open.iter().map(|s| s.external_id.as_str()).collect();
+        assert_eq!(ids, ["sess-c", "sess-a"]);
+
+        let closed = repo
+            .list_filtered(None, None, Some(true), 20, 0)
+            .await
+            .unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].external_id, "sess-b");
+
+        let page = repo.list_filtered(None, None, None, 1, 1).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].external_id, "sess-b");
     }
 }
