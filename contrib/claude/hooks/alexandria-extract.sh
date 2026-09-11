@@ -124,12 +124,13 @@ $text
 # shellcheck disable=SC2086  # CMD is deliberately word-split
 out=$(ALEXANDRIA_HOOK_CHILD=1 timeout 80 $CMD <<<"$prompt" 2>/dev/null) || { echo "alexandria-extract: LLM call failed" >&2; exit 0; }
 # Models often wrap the JSON in a ``` fence and add prose after it: keep the first fenced block.
+# shellcheck disable=SC2016  # the backticks are a regex, not a command substitution
 json=$(sed -n '/^```/,/^```/{/^```/d;p}' <<<"$out"); [ -n "$json" ] || json=$out
 mems=$(jq -c '.memories[]? | select((.content|type) == "string" and .content != "")
   | {content, tags: ([.tags[]? | strings] + ["extracted"] | unique)}' <<<"$json" 2>/dev/null)
 [ -n "$mems" ] || exit 0
 while read -r m; do
-  res=$("$MCP" store_memory "$(jq -c --arg s "$session" '. + {session_id:$s}' <<<"$m")") \
+  res=$("$MCP" store_memory "$(jq -c --arg s "$session" '. + {session_id:$s,agent_id:"claude-code"}' <<<"$m")") \
     || echo "alexandria-extract: store failed: $res" >&2
 done <<<"$mems"
 exit 0

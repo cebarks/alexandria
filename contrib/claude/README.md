@@ -48,9 +48,10 @@ timeout. The child `claude` runs with
 purely tactical session.
 
 `alexandria-session.sh` is a `PreToolUse` hook matched on `mcp__alexandria__store_memory` and
-`mcp__alexandria__import_document`. When the agent calls either without a `session_id`, it rewrites
-the call to include the Claude Code session id, so memories and imported chunks are grouped per
-session without relying on the model to remember.
+`mcp__alexandria__import_document`. When the agent calls either without a `session_id` or
+`agent_id`, it rewrites the call to include the Claude Code session id and `agent_id: "claude-code"`,
+so memories and imported chunks are grouped per session and attributed without relying on the model
+to remember. The recall and extract hooks stamp the same `agent_id` on the stores they make themselves.
 
 All three fail open. If the server is unreachable or errors, the recall hook returns a `systemMessage`
 ("Alexandria memory unavailable: ...") so you can see it, and the prompt proceeds with nothing

@@ -42,6 +42,7 @@ hook "no, use jj instead of git"
 got=$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq -c '[.memories[] | select(.tags|index("auto-detected")) | .content] | sort')
 echo "$got"
 [ "$got" = '["User correction: jj instead of git","User preference: Use jj instead of git","User preference: run clippy before pushing"]' ]
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq -r '.session.agent_id')" = claude-code ]   # hook stores stamp the session
 # Auto-store off: nothing new.
 ALEXANDRIA_AUTO_STORE=off hook "never use tabs"
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 3 ]
@@ -51,11 +52,15 @@ CLAUDE_CODE_ENTRYPOINT=sdk-cli hook "never use spaces"
 CLAUDE_CODE_ENTRYPOINT=sdk-cli ALEXANDRIA_AUTO_STORE=on hook "never use spaces"
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 4 ]
 
-# Session hook: injects session_id when missing, silent when present.
+# Session hook: injects session_id and agent_id when missing, silent when both present.
 out=$(jq -cn '{session_id:"sess-test-123",tool_name:"mcp__alexandria__store_memory",tool_input:{content:"x"}}' | ./alexandria-session.sh)
 [ "$(jq -r '.hookSpecificOutput.updatedInput.session_id' <<<"$out")" = "sess-test-123" ]
+[ "$(jq -r '.hookSpecificOutput.updatedInput.agent_id' <<<"$out")" = "claude-code" ]
 [ "$(jq -r '.hookSpecificOutput.updatedInput.content' <<<"$out")" = "x" ]
-[ -z "$(jq -cn '{session_id:"s",tool_input:{content:"x",session_id:"already"}}' | ./alexandria-session.sh)" ]
+[ -z "$(jq -cn '{session_id:"s",tool_input:{content:"x",session_id:"already",agent_id:"other"}}' | ./alexandria-session.sh)" ]
+# Set values are kept; only the missing one is filled.
+[ "$(jq -cn '{session_id:"s",tool_input:{content:"x",session_id:"already"}}' | ./alexandria-session.sh | jq -c '.hookSpecificOutput.updatedInput')" = '{"content":"x","session_id":"already","agent_id":"claude-code"}' ]
+[ "$(jq -cn '{session_id:"s",tool_input:{content:"x",agent_id:"other"}}' | ./alexandria-session.sh | jq -c '.hookSpecificOutput.updatedInput')" = '{"content":"x","agent_id":"other","session_id":"s"}' ]
 # Garbage stdin never blocks the tool call.
 [ -z "$(echo 'not json' | ./alexandria-session.sh)" ]
 # Session hook is generic over tool_input: import_document payload gets the same treatment.
