@@ -39,6 +39,8 @@ async fn test_full_flow_store_and_retrieve() {
             content: content.to_string(),
             tags: Some(vec!["auth".to_string()]),
             session_id: None,
+            agent_id: None,
+            model: None,
         };
         let result = server.do_store_memory(params).await;
         assert!(result.is_ok(), "Failed to store: {content}");
@@ -49,6 +51,8 @@ async fn test_full_flow_store_and_retrieve() {
             content: content.to_string(),
             tags: Some(vec!["database".to_string()]),
             session_id: None,
+            agent_id: None,
+            model: None,
         };
         let result = server.do_store_memory(params).await;
         assert!(result.is_ok(), "Failed to store: {content}");
@@ -82,6 +86,8 @@ async fn test_delete_excludes_from_search() {
         content: "temporary secret key is abc123".to_string(),
         tags: None,
         session_id: None,
+        agent_id: None,
+        model: None,
     };
     let fact_id = server.do_store_memory(params).await.unwrap();
 
@@ -137,6 +143,8 @@ async fn test_recall_broad_and_focused() {
             content: content.to_string(),
             tags: None,
             session_id: None,
+            agent_id: None,
+            model: None,
         };
         server.do_store_memory(params).await.unwrap();
     }
@@ -160,6 +168,8 @@ async fn test_update_memory_content() {
         content: "Rust is version 1.75".to_string(),
         tags: Some(vec!["rust".to_string()]),
         session_id: None,
+        agent_id: None,
+        model: None,
     };
     let id = server.do_store_memory(params).await.unwrap();
 
@@ -189,6 +199,8 @@ async fn test_update_memory_tags_only() {
         content: "SurrealDB is a database".to_string(),
         tags: Some(vec!["db".to_string()]),
         session_id: None,
+        agent_id: None,
+        model: None,
     };
     let id = server.do_store_memory(params).await.unwrap();
 
@@ -218,6 +230,8 @@ async fn test_import_document_whole() {
         chunk_strategy: None,
         tags: Some(vec!["imported".to_string()]),
         session_id: None,
+        agent_id: None,
+        model: None,
     };
     let result = server.do_import_document(params).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -236,6 +250,8 @@ async fn test_import_document_chunk_by_heading() {
         chunk_strategy: Some("heading".to_string()),
         tags: Some(vec!["book".to_string()]),
         session_id: None,
+        agent_id: None,
+        model: None,
     };
     let result = server.do_import_document(params).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -254,6 +270,8 @@ async fn test_import_document_chunk_by_paragraph() {
         chunk_strategy: Some("paragraph".to_string()),
         tags: None,
         session_id: None,
+        agent_id: None,
+        model: None,
     };
     let result = server.do_import_document(params).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
