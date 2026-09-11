@@ -128,7 +128,7 @@ STUB
 chmod +x "$td/slow.sh"
 jq -cn '{type:"user",message:{content:"enough new text that the marker advances again"}}' >>"$td/t.jsonl"
 start=$SECONDS
-ALEXANDRIA_DETACHED='' ALEXANDRIA_EXTRACT_CMD="$td/slow.sh" stop
+HOME=$td ALEXANDRIA_DETACHED='' ALEXANDRIA_EXTRACT_CMD="$td/slow.sh" stop   # HOME: log lands in $td, not the real one
 [ $((SECONDS - start)) -le 1 ]
 found=
 for _ in $(seq 20); do
@@ -136,4 +136,11 @@ for _ in $(seq 20); do
   sleep 0.5
 done
 [ -n "$found" ]
+# Log rotation: an oversize log is renamed to .1 by the parent before it re-execs. stop_hook_active
+# makes the detached child exit at once, so only the synchronous parent path is under test.
+[ -f "$td/.cargo/logs/alexandria/extract.log" ]
+head -c 1048576 /dev/zero >"$td/.cargo/logs/alexandria/extract.log"
+jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,stop_hook_active:true}' | HOME=$td ALEXANDRIA_DETACHED='' ./alexandria-extract.sh
+[ "$(stat -c %s "$td/.cargo/logs/alexandria/extract.log.1")" = 1048576 ]
+[ "$(stat -c %s "$td/.cargo/logs/alexandria/extract.log")" = 0 ]
 echo OK
