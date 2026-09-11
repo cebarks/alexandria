@@ -1,4 +1,21 @@
+//! HTML responses for the debug UI.
+//!
+//! Two paths coexist here while the migration is in flight. `esc()` and `layout()` are
+//! the legacy hand-built one: markup assembled with `format!`, where escaping is a
+//! per-call-site habit and therefore easy to forget. The templates under
+//! `crates/alexandria-mcp/templates/` rendered through [`page()`] are the replacement:
+//! askama auto-escapes `{{ }}` at compile time, so escaping is structural. New code
+//! must use templates + `page()`; the legacy path stays only because the six existing
+//! pages still call `layout()` (removed in Task 1.5).
+
+use askama::Template;
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Response};
+
 /// Escape a string for safe interpolation into HTML text/attribute content.
+///
+/// Legacy: prefer a template, where escaping is automatic. Still needed by the
+/// `format!`-built pages until they are migrated.
 pub fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -56,6 +73,49 @@ dl.fact-meta dd {{ margin: 0; }}
     )
 }
 
+/// Render a template, mapping render failure to a plain-text 500.
+///
+/// A render failure is a programming error, not a data error — fall back to plain
+/// text rather than `error.html`, because rendering *that* could fail too.
+pub fn page<T: Template>(tpl: T) -> Response {
+    match tpl.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Data-layer failure (DB unreachable, bad record id) rendered through the layout.
+pub fn error_page(nav: &'static str, message: &str) -> Response {
+    page(ErrorTemplate {
+        nav,
+        message: message.to_string(),
+    })
+}
+
+#[derive(Template)]
+#[template(path = "error.html")]
+pub struct ErrorTemplate {
+    pub nav: &'static str,
+    pub message: String,
+}
+
+/// Test-only caller for `templates/_pagination.html`: askama compiles a template only
+/// when something derives from it, so this is what keeps the `pager` macro checked.
+/// Delete alongside `_test_pager.html` once Task 1.4 wires the macro into a real page.
+#[cfg(test)]
+#[derive(Template)]
+#[template(path = "_test_pager.html")]
+struct PagerTemplate {
+    page: usize,
+    total_pages: usize,
+    total: usize,
+    extra: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +137,131 @@ mod tests {
         assert!(html.contains("Test Page"));
         assert!(html.contains("<p>hello</p>"));
         assert!(html.contains("htmx.org"));
+    }
+
+    // --- templates -------------------------------------------------------------
+
+    fn render_pager(page: usize, total_pages: usize, total: usize, extra: &str) -> String {
+        PagerTemplate {
+            page,
+            total_pages,
+            total,
+            extra: extra.to_string(),
+        }
+        .render()
+        .unwrap()
+    }
+
+    /// The layout hard-codes the asset path, so nothing else would notice if it drifted
+    /// from the route that actually serves the file.
+    #[test]
+    fn test_layout_embeds_vendored_htmx_not_a_cdn() {
+        let html = ErrorTemplate {
+            nav: "dashboard",
+            message: "x".into(),
+        }
+        .render()
+        .unwrap();
+        assert!(
+            html.contains(super::super::assets::HTMX_URL),
+            "layout must reference the vendored asset constant"
+        );
+        assert!(!html.contains("unpkg.com"), "no CDN references may remain");
+    }
+
+    #[test]
+    fn test_error_template_escapes_message() {
+        let html = ErrorTemplate {
+            nav: "dashboard",
+            message: "<script>alert(1)</script>".into(),
+        }
+        .render()
+        .unwrap();
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "must be escaped"
+        );
+        // askama 0.16 writes character references numerically (`&#60;`, not the `&lt;` that
+        // legacy `esc()` emits). Equivalent to a browser, different bytes — so assert the
+        // whole escaped paragraph, which fails if escaping is ever weakened in either form.
+        assert!(
+            html.contains(r#"<p class="error">&#60;script&#62;alert(1)&#60;/script&#62;</p>"#),
+            "got: {html}"
+        );
+        assert!(html.contains(r#"class="error""#));
+    }
+
+    /// The base template reads `nav`, so a child context that omits the field is a compile
+    /// error rather than a page with no highlight; this pins the runtime half of the deal.
+    #[test]
+    fn test_layout_marks_active_nav() {
+        let html = ErrorTemplate {
+            nav: "clusters",
+            message: "x".into(),
+        }
+        .render()
+        .unwrap();
+        assert!(
+            html.contains(r#"class="active">Clusters"#),
+            "active nav link not marked"
+        );
+        // and a non-active one must not be marked
+        assert!(!html.contains(r#"class="active">Memories"#));
+    }
+
+    #[test]
+    fn test_pager_macro_renders_nothing_for_a_single_page() {
+        let html = render_pager(1, 1, 7, "");
+        assert!(!html.contains("pagination"), "got: {html}");
+        assert!(!html.contains("entries"), "got: {html}");
+    }
+
+    #[test]
+    fn test_pager_macro_renders_both_links_on_a_middle_page() {
+        let html = render_pager(2, 3, 42, "");
+        assert!(
+            html.contains(r#"href="/debug/memories?page=1""#),
+            "got: {html}"
+        );
+        assert!(html.contains("← Prev"), "got: {html}");
+        assert!(
+            html.contains(r#"href="/debug/memories?page=3""#),
+            "got: {html}"
+        );
+        assert!(html.contains("Next →"), "got: {html}");
+        assert!(html.contains("Page 2 of 3 (42 entries)"), "got: {html}");
+    }
+
+    #[test]
+    fn test_pager_macro_omits_out_of_range_links() {
+        let first = render_pager(1, 3, 42, "");
+        assert!(!first.contains("Prev"), "got: {first}");
+        assert!(
+            first.contains(r#"href="/debug/memories?page=2""#),
+            "got: {first}"
+        );
+
+        let last = render_pager(3, 3, 42, "");
+        assert!(!last.contains("Next"), "got: {last}");
+        assert!(
+            last.contains(r#"href="/debug/memories?page=2""#),
+            "got: {last}"
+        );
+    }
+
+    /// `extra` is re-emitted in the same position on both links. askama still escapes the
+    /// attribute — `&` arrives as `&#38;`, the correct encoding in an `href`, which the
+    /// browser resolves back to `&` when the link is followed.
+    #[test]
+    fn test_pager_macro_appends_extra_to_every_link() {
+        let html = render_pager(2, 3, 42, "&search=foo&tag=bar");
+        assert!(
+            html.contains(r#"href="/debug/memories?page=1&#38;search=foo&#38;tag=bar""#),
+            "got: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/debug/memories?page=3&#38;search=foo&#38;tag=bar""#),
+            "got: {html}"
+        );
     }
 }

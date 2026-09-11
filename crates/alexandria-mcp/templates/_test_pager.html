@@ -1,0 +1,6 @@
+{# Test-only scaffolding, reached from `html.rs`'s `PagerTemplate`. askama only
+   compiles templates reachable from a `#[derive(Template)]`, so without this caller
+   `templates/_pagination.html` would never be parsed or type-checked. No shipped page
+   uses the `pager` macro until the migration in Task 1.4. #}
+{% import "_pagination.html" as p %}
+{{ p::pager("/debug/memories", page, total_pages, total, extra) }}

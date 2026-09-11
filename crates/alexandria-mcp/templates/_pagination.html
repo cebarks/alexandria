@@ -1,0 +1,15 @@
+{# Contract: `extra` is appended into a query string (e.g. `&search=foo&tag=bar`), so the
+   *caller* must build it from already-percent-encoded values. askama still escapes it here
+   (`&` becomes `&#38;`), which is the correct encoding inside an href attribute and what
+   the browser sends when the link is followed. #}
+{% macro pager(base, page, total_pages, total, extra) -%}
+{% if total_pages > 1 -%}
+<div class="pagination">
+  <span>
+  {%- if page > 1 %}<a class="link" href="{{ base }}?page={{ page - 1 }}{{ extra }}">← Prev</a>{% endif %}
+  <span>Page {{ page }} of {{ total_pages }} ({{ total }} entries)</span>
+  {%- if page < total_pages %}<a class="link" href="{{ base }}?page={{ page + 1 }}{{ extra }}">Next →</a>{% endif %}
+  </span>
+</div>
+{%- endif %}
+{%- endmacro %}
