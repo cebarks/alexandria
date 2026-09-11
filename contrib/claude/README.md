@@ -28,18 +28,19 @@ extraction) the `claude` CLI.
   Pi detectors, and stores unambiguous hits as `User correction: ...` / `User preference: ...` with
   tags `correction`/`preference` + `auto-detected` and the session id. Deduped per session via
   `$XDG_RUNTIME_DIR/alexandria/<session_id>.stored`. The Pi error-resolution tracker is not ported;
-  the extraction pass covers resolved bugs better.
+  failed tool results are fed to the extraction pass instead (below).
 
 `alexandria-extract.sh` is a `Stop` hook. After each assistant turn it serializes the transcript lines
-added since its last run (user text and assistant text only; tool calls, thinking, and injected
-system lines are dropped), and once at least `ALEXANDRIA_EXTRACT_MIN_CHARS` of new text exists it
+added since its last run (user text, assistant text, and the first 300 characters of each failed
+tool result as `[Tool error]:`, so a silent fix-and-retry still shows the model the root cause;
+successful tool output, `<tool_use_error>` harness refusals, thinking, and injected system lines are
+dropped), and once at least `ALEXANDRIA_EXTRACT_MIN_CHARS` of new text exists it
 asks `claude -p --model haiku` for standalone durable facts using the Pi extraction prompt, with the
 session's already-stored memories listed for dedup. Results are stored with the session id and an
 `extracted` tag. Short turns cost nothing; one haiku call covers several turns. A marker file
 `$XDG_RUNTIME_DIR/alexandria/<session_id>.extracted` holds the transcript line count and is written
-before the LLM call, so a failed or slow turn is never retried across turns. Within a turn, an empty
-or failed first attempt gets one retry inside the remaining 80 s budget (haiku is non-deterministic
-on the same prompt), so purely tactical turns cost two calls. The child `claude` runs with
+before the LLM call, so a failed or slow turn is never retried: one haiku call per turn, 80 s
+timeout. The child `claude` runs with
 `ALEXANDRIA_HOOK_CHILD=1`, which makes every hook here exit immediately (no recursion). Measured
 2026-09-08 on a ~40-line transcript: about 15 s wall time, haiku correctly returned no memories for a
 purely tactical session.
@@ -118,6 +119,18 @@ goes to `$XDG_RUNTIME_DIR/alexandria/extract.log`.
 | `ALEXANDRIA_EXTRACT_CMD` | (unset) | Replace the `claude -p ...` command (prompt on stdin, JSON on stdout); used by tests |
 | `ALEXANDRIA_HOOK_CHILD` | (unset) | Set by the extract hook on its `claude -p` child; every hook exits immediately when set |
 | `ALEXANDRIA_DETACHED` | (unset) | Set by the extract hook on its detached copy; set it yourself to run the hook inline (tests do) |
+
+`CLAUDE_CODE_ENTRYPOINT` is an internal Claude Code variable, not in the documented settings list. The
+`sdk-*` gate matches the binary's own "running under an SDK" check (`sdk-cli` for `claude -p`, `sdk-ts` and
+`sdk-py` for the Agent SDKs; confirmed on 2.1.263 from the bundled JS and the Python SDK source; interactive
+is `cli`). If a release renames it, the hooks silently fall back to always-on. After upgrading, re-check with
+
+```bash
+claude -p 'Run with the Bash tool and reply with only its output: echo ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT' --allowedTools Bash
+```
+
+which prints the value the hooks see (a Bash tool call inherits the env; no stub needed). The prompt
+must come before `--allowedTools`, which otherwise swallows it as a tool name.
 
 The hooks are configured by env vars only; they do not read `client.toml` (bash has no TOML parser,
 and a `yq`/`tomlq` dependency for a handful of values is worse than a handful of env vars). Set them
