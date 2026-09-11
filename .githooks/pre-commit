@@ -4,16 +4,16 @@ set -euo pipefail
 echo "🔍 Running pre-commit checks..."
 
 # 1. Formatting check
-echo "  → cargo fmt --check"
-if ! cargo fmt --all -- --check 2>&1; then
+echo "  → just fmt"
+if ! just fmt 2>&1; then
     echo ""
-    echo "❌ Formatting check failed. Run 'cargo fmt --all' to fix."
+    echo "❌ Formatting check failed. Run 'just fmt-fix' to fix."
     exit 1
 fi
 
 # 2. Clippy (warnings as errors)
-echo "  → cargo clippy"
-if ! RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets --all-features 2>&1; then
+echo "  → just lint"
+if ! just lint 2>&1; then
     echo ""
     echo "❌ Clippy check failed. Fix the warnings above."
     exit 1
