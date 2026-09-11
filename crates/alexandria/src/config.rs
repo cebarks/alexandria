@@ -95,11 +95,13 @@ pub struct RetrieveConfig {
     /// question against a stored statement scores ~0.2 and unrelated text
     /// ~0.0, so this must stay low. Default 0.10.
     ///
-    /// Derived by the retrieve-floor rule in
-    /// `docs/plans/2026-09-08-embedding-model-swap-design.md`: the median
-    /// non-hit score rounded to two decimals, which must sit below the lowest
-    /// correct hit. The rule gives 0.08 for MiniLM; 0.10 is kept because the
-    /// difference is immaterial.
+    /// Derived by the retrieve-floor rule, which `alexandria bench-retrieval`
+    /// computes from the model's own output: the median non-hit score rounded
+    /// to two decimals, valid only if it sits below the weakest correct hit.
+    /// The result is a property of the model *and* the corpus and drifts down
+    /// as the corpus grows — 0.08 at 143 facts, 0.07 at 807. 0.10 is kept
+    /// regardless: the weakest true hit scores 0.338, so every candidate sits
+    /// far below it. See `docs/minilm-test-data.md`.
     pub min_similarity: f32,
 }
 
