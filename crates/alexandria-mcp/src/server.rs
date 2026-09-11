@@ -17,8 +17,9 @@ use alexandria_storage::Database;
 use chrono::{DateTime, SecondsFormat, Utc, Weekday};
 
 use crate::tools::{
-    DeleteMemoryParams, FinalizeSessionParams, GetSessionParams, ImportDocumentParams,
-    RecallParams, RetrieveMemoriesParams, SetReminderParams, StoreMemoryParams, UpdateMemoryParams,
+    CheckRemindersParams, DeleteMemoryParams, FinalizeSessionParams, GetSessionParams,
+    ImportDocumentParams, RecallParams, RetrieveMemoriesParams, SetReminderParams,
+    StoreMemoryParams, UpdateMemoryParams,
 };
 
 /// Z-suffixed UTC RFC 3339 spelling — single source of truth for every datetime
@@ -221,6 +222,21 @@ impl AlexandriaServer {
     )]
     async fn set_reminder(&self, Parameters(params): Parameters<SetReminderParams>) -> String {
         match self.do_set_reminder(params).await {
+            Ok(result) => result,
+            Err(e) => {
+                serde_json::json!({ "status": "error", "message": error_message(&e) }).to_string()
+            }
+        }
+    }
+
+    #[tool(
+        description = "Check for reminders that have come due and consume them. Client integrations call this automatically at the start of each interaction; you generally don't need to call it manually unless the user asks 'any reminders?'. Delivery is best-effort-once: calling this marks returned reminders as delivered (recurring ones advance to their next occurrence, coalescing any missed fires into a missed_occurrences count)."
+    )]
+    async fn check_reminders(
+        &self,
+        Parameters(params): Parameters<CheckRemindersParams>,
+    ) -> String {
+        match self.do_check_reminders(params).await {
             Ok(result) => result,
             Err(e) => {
                 serde_json::json!({ "status": "error", "message": error_message(&e) }).to_string()
@@ -841,6 +857,210 @@ impl AlexandriaServer {
             out["warning"] = serde_json::Value::String(w);
         }
         Ok(out.to_string())
+    }
+
+    /// Deliver the reminders that have come due, consuming each one.
+    ///
+    /// Due-ness is a query-time predicate — `status = 'pending' AND
+    /// next_due_at <= now` (`ReminderRepo::list_due`) — because delivery rides on
+    /// interactions and never on a background timer. Targeting is decided here:
+    /// global reminders always deliver, a project reminder delivers on an exact
+    /// match with the caller's project, and one that has been overdue for
+    /// `escalation_hours` escalates to global delivery so a project that stops
+    /// being visited can't swallow it silently. The escalation boundary is
+    /// inclusive on the escalate side — a row escalates once it is *at least*
+    /// `escalation_hours` overdue, which is what makes `escalation_hours: 0`
+    /// escalate every overdue project reminder.
+    ///
+    /// Consumption is best-effort-once: a one-shot becomes `delivered`, while a
+    /// recurring schedule advances to the first fire after `now` and the
+    /// occurrences skipped in between are reported as `missed_occurrences`
+    /// instead of trickling out one per check. Recording a delivery is a separate
+    /// write per row and every per-row failure is handled in place — the row is
+    /// skipped (staying pending, so the next check retries it) and the rows
+    /// already gathered are still reported, because dropping the response would
+    /// discard the consumption of rows that can never come due again. The window
+    /// that remains is a consume that succeeds and then loses its response (the
+    /// request future being cancelled): that row is consumed and unreported.
+    pub async fn do_check_reminders(&self, params: CheckRemindersParams) -> anyhow::Result<String> {
+        use alexandria_engine::reminders as sched;
+        use alexandria_storage::repos::ReminderRepo;
+
+        let tz = self.reminders.tz;
+        let now = Utc::now();
+        // Saturate without wrapping *or* panicking: `escalation_hours` is a bare
+        // u64 in config, `Duration::hours` takes an i64 count of hours *and*
+        // panics above i64::MAX/3600 of them, so saturating the `u64`→`i64` step
+        // alone still lands on "TimeDelta::hours out of bounds" — which would kill
+        // the serve loop (stdio) or the request task (HTTP) on every check.
+        // `try_hours` reports the bound instead, and a window too large to
+        // represent is a window nothing can be overdue by: project reminders are
+        // held rather than escalated.
+        let escalation = match i64::try_from(self.reminders.escalation_hours)
+            .ok()
+            .and_then(chrono::Duration::try_hours)
+        {
+            Some(window) => window,
+            None => {
+                tracing::warn!(
+                    "reminders escalation_hours {} cannot be represented as a duration; \
+                     project reminders will be held rather than escalated",
+                    self.reminders.escalation_hours
+                );
+                chrono::Duration::MAX
+            }
+        };
+
+        let repo = ReminderRepo::new(self.db.inner());
+        let due = repo.list_due(now).await?;
+        let due_count = due.len();
+
+        let mut delivered = Vec::new();
+        for r in due {
+            // Without an id there is nothing to record the consumption against;
+            // treat it like any other unreadable row rather than sending an empty
+            // key to the repo.
+            let Some(id) = r.id.as_ref().map(record_id_to_string) else {
+                tracing::warn!("skipping reminder row with no id: {}", r.message);
+                continue;
+            };
+
+            // Reconstructing the spec is the row's own integrity check, done
+            // before any targeting decision so a corrupt row is reported once per
+            // shape rather than only in the contexts that would have delivered
+            // it. One bad row must never break the others, and must not be
+            // cancelled behind the user's back: log it (the engine's message
+            // already names the row) and leave it pending.
+            let spec = match sched::spec_from_reminder(&r) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    tracing::warn!("skipping unreadable reminder: {}", error_message(&e));
+                    continue;
+                }
+            };
+            // A row with no `next_due_at` has no measurable age, so neither
+            // "held" nor "escalated" can be answered honestly. The writer cannot
+            // produce one (Task 9 rejects a NULL next_due_at), but `list_due`'s
+            // `next_due_at <= $now` does select a NULL in SurrealQL, so an admin
+            // path or migration can put one here: name it and skip it rather than
+            // reporting `due_at: null` or — at `escalation_hours: 0` — escalating
+            // a reminder that was never due.
+            let Some(due_at) = r.next_due_at else {
+                tracing::warn!("skipping reminder {id} with no next_due_at: {}", r.message);
+                continue;
+            };
+            let recurring = !matches!(spec, sched::ScheduleSpec::Once { .. });
+
+            let escalated = match &r.target_project {
+                None => false,
+                Some(target) => {
+                    // Byte-exact and case-sensitive on purpose: nothing
+                    // normalizes either side, and the other side is Task 14's pi
+                    // companion, whose hint is `basename(git rev-parse
+                    // --show-toplevel)` (overridable with
+                    // ALEXANDRIA_REMINDERS_PROJECT). So "Alexandria" vs
+                    // "alexandria", a worktree directory name, or a trailing
+                    // space is not an error — the symptom is a targeted reminder
+                    // that arrives late with `escalated: true` instead of
+                    // surfacing in its own project.
+                    if params.project.as_deref() == Some(target.as_str()) {
+                        false
+                    } else if now - due_at < escalation {
+                        continue; // held for a matching context
+                    } else {
+                        true
+                    }
+                }
+            };
+
+            // Occurrences strictly after the stored due time and up to now: the
+            // occurrence being delivered *is* the stored one, so it is excluded.
+            let missed = if recurring {
+                match sched::occurrences_between(&spec, due_at, now, tz) {
+                    Ok(missed) => missed,
+                    Err(e) => {
+                        tracing::warn!(
+                            "skipping reminder {id} while coalescing missed fires: {}",
+                            error_message(&e)
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                0
+            };
+            // None on a recurring spec means it has no future fire left; it is
+            // delivered once more and consumed rather than left due forever.
+            let new_next = if recurring {
+                match sched::next_fire(&spec, now, tz) {
+                    Ok(next) => next,
+                    Err(e) => {
+                        tracing::warn!(
+                            "skipping reminder {id} while advancing its schedule: {}",
+                            error_message(&e)
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            // The one step that cannot be redone: a failed write leaves the row
+            // pending, so reporting it anyway would double-deliver while
+            // propagating the error would throw away the rows already consumed
+            // above. Skip it, keep the rest.
+            if let Err(e) = repo.record_delivery(&id, new_next).await {
+                tracing::warn!("failed to consume reminder {id}: {}", error_message(&e));
+                continue;
+            }
+
+            delivered.push(serde_json::json!({
+                "id": id,
+                "message": r.message,
+                "target": match &r.target_project {
+                    Some(p) => format!("project:{p}"),
+                    None => "global".to_string(),
+                },
+                "escalated": escalated,
+                "recurring": recurring,
+                "missed_occurrences": missed,
+                "due_at": rfc3339_utc(due_at),
+                "schedule": sched::human_readable(&spec),
+                "note": r.note,
+                "provenance": {
+                    "project": r.prov_project,
+                    "session_id": r.prov_session_id,
+                },
+                "next_due_at": new_next.map(rfc3339_utc),
+            }));
+        }
+
+        // There is no background timer, so this line is the only record that the
+        // server saw a reminder at all. Checks run per interaction and mostly
+        // find nothing, which stays at debug; an actual delivery is worth an
+        // info-level entry (matching the startup info in main.rs).
+        let delivered_count = delivered.len();
+        if delivered_count > 0 {
+            tracing::info!(
+                due = due_count,
+                delivered = delivered_count,
+                project = ?params.project,
+                "check_reminders"
+            );
+        } else {
+            tracing::debug!(
+                due = due_count,
+                delivered = 0,
+                project = ?params.project,
+                "check_reminders"
+            );
+        }
+
+        Ok(serde_json::json!({
+            "count": delivered_count,
+            "delivered": delivered,
+        })
+        .to_string())
     }
 
     // --- Internal helpers ---
