@@ -51,6 +51,7 @@ Both must pass clean first. Do not skip the gate to "just see if it compiles".
 
 ## Testing
 
+- The repo intentionally carries no `rust-toolchain.toml` and no `.cargo/config.toml` — `rust-version = "1.98"` + edition 2024 are the only compiler statement; mold/`target-cpu` live in each dev's `~/.cargo/config.toml` (see TODO-misc "Build / toolchain"). Don't re-add them to the repo.
 - All integration tests use `Database::connect_embedded()` (in-memory SurrealDB) — no disk state between tests.
 - `CandleProvider` tests download the real model on first run (~80MB) — they're slow the first time.
 - Test helpers in `alexandria-storage/src/connection.rs`: `connect_embedded()` for quick in-memory DB.
