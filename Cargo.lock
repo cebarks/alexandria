@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alexandria-engine",
  "alexandria-mcp",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alexandria-storage",
  "anyhow",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alexandria-engine",
  "alexandria-pipeline",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-pipeline"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alexandria-engine",
  "alexandria-storage",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
