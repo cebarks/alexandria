@@ -56,6 +56,22 @@ impl<'a> MemoryRepo<'a> {
         Ok(fact)
     }
 
+    /// The `k` live facts nearest to `query` by cosine similarity, nearest first.
+    /// `<|k,COSINE|>` goes through the HNSW index when `schema::ensure_vector_index`
+    /// has defined it and falls back to a brute-force scan inside the database when
+    /// it has not.
+    pub async fn nearest(&self, query: &[f32], k: usize) -> Result<Vec<Fact>> {
+        let mut response = self
+            .db
+            .query(format!(
+                "SELECT * FROM fact WHERE deleted = false AND embedding <|{k},COSINE|> $q"
+            ))
+            .bind(("q", query.to_vec()))
+            .await?;
+        let facts: Vec<Fact> = response.take(0)?;
+        Ok(facts)
+    }
+
     pub async fn soft_delete_fact(&self, id: &str) -> Result<()> {
         self.db
             .query("UPDATE type::record($id) SET deleted = true")
@@ -293,6 +309,42 @@ mod tests {
         assert_eq!(page1.len(), 1);
         assert_eq!(page2.len(), 1);
         assert_ne!(page1[0].content, page2[0].content);
+    }
+
+    #[tokio::test]
+    async fn test_nearest_orders_by_similarity_and_skips_deleted() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        crate::schema::ensure_vector_index(db.inner(), 2)
+            .await
+            .unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let near = repo
+            .create_fact("near", 0.5, &[1.0, 0.0], &[])
+            .await
+            .unwrap();
+        let mid = repo
+            .create_fact("mid", 0.5, &[0.7, 0.7], &[])
+            .await
+            .unwrap();
+        repo.create_fact("far", 0.5, &[0.0, 1.0], &[])
+            .await
+            .unwrap();
+        let gone = repo
+            .create_fact("gone", 0.5, &[1.0, 0.1], &[])
+            .await
+            .unwrap();
+        repo.soft_delete_fact(&gone).await.unwrap();
+
+        let got: Vec<String> = repo
+            .nearest(&[0.9, 0.1], 2)
+            .await
+            .unwrap()
+            .iter()
+            .map(|f| record_id_to_string(f.id.as_ref().unwrap()))
+            .collect();
+        assert_eq!(got, vec![near, mid]);
     }
 
     #[tokio::test]

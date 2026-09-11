@@ -60,3 +60,17 @@ async fn test_candle_cls_pooled_model_loads_and_normalises() {
     let norm: f32 = vectors[0].iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
 }
+
+/// Same model, same text: flipping the pooling flag must change the vector,
+/// proving the CLS branch is actually taken rather than falling back to mean.
+#[tokio::test]
+async fn test_candle_cls_and_mean_pooling_differ() {
+    let mut provider = CandleProvider::new("sentence-transformers/all-MiniLM-L6-v2", "cpu")
+        .await
+        .unwrap();
+    let mean = provider.embed(&["hello world"]).await.unwrap().remove(0);
+    provider.set_cls_pooling(true);
+    let cls = provider.embed(&["hello world"]).await.unwrap().remove(0);
+    assert_eq!(mean.len(), cls.len());
+    assert_ne!(mean, cls);
+}

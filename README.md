@@ -51,6 +51,7 @@ First run downloads the embedding model from HuggingFace Hub (~80MB).
 | `import_document` | Import and chunk documents with `extracted_from` edge tracking |
 | `delete_memory` | Soft-delete a memory by ID |
 | `get_session` | Return a session's metadata plus every memory stored during it |
+| `list_sessions` | List sessions newest-first with live memory counts; filter by `agent_id`, `tag`, or `finalized` |
 | `finalize_session` | Close a session with a summary, tags, and `ended_at` |
 
 Tool and parameter descriptions are written directively ("call this proactively when…") because
@@ -60,7 +61,8 @@ that measurably changes how often client LLMs reach for them unprompted.
 
 Passing `session_id` to `store_memory` groups memories under a caller-chosen handle, and the session
 is created on first use. `retrieve_memories` with `session_id` restricts ranking to that session's
-memories, `get_session` reads the whole session back, and `finalize_session` records its summary.
+memories, `get_session` reads the whole session back, `list_sessions` finds a session whose id you
+don't have, and `finalize_session` records its summary.
 See [docs/session-memory.md](docs/session-memory.md) for the data model and current limitations.
 
 ### Getting agents to actually use memory
@@ -279,7 +281,7 @@ engine and storage together. See [AGENTS.md](AGENTS.md) for the full set.
 
 ```bash
 just          # list recipes
-just test     # cargo test --all-features — 116 tests
+just test     # cargo test --all-features — 147 tests
 just lint     # clippy, warnings as errors (matches CI)
 just fmt-fix  # rustfmt
 just ci       # fmt + lint + test + cargo-deny, the full pre-push check
