@@ -64,6 +64,21 @@ jobs:
           tool: just
       - run: just test
 
+  pi-tests:
+    name: Pi extension tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2
+        with:
+          tool: just
+      - run: just test-pi
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

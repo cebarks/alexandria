@@ -3,6 +3,9 @@
   "version": "2.0.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "node --test 'src/**/*.test.ts'"
+  },
   "dependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
     "smol-toml": "^1.8.0"

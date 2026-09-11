@@ -114,8 +114,9 @@ client detects "Session not found", reconnects, and retries once before surfacin
 
 ### Limitations worth knowing
 
-- **No unit tests.** The detector and extraction-prompt logic has no test coverage in the repo, even
-  though the original design called for one. Regex changes are currently unguarded.
+- **Only the pure logic is tested.** `just test-pi` (or `npm test` in the extension directory)
+  runs `node:test` over the detectors, the dedup buffer, and the extraction serializer/parser.
+  The extraction prompt itself, recall, and the MCP client have no coverage.
 - **No session memory integration.** The extension stores and retrieves without a `session_id`, so
   its writes are ungrouped. See [docs/session-memory.md](../../docs/session-memory.md).
 - **Recall ignores `recall`.** It uses `retrieve_memories`, never the two-phase `recall` tool, so

@@ -21,6 +21,10 @@ lint:
 test:
     cargo test --all-features
 
+# Run the pi extension unit tests (node:test with native type stripping; no npm install needed)
+test-pi:
+    npm --prefix contrib/pi/extensions/alexandria-auto-recall test
+
 # Fast type-check
 check:
     cargo check --all-features
@@ -38,7 +42,7 @@ deny:
     cargo deny check
 
 # Full CI suite locally — run before pushing
-ci: fmt lint test deny
+ci: fmt lint test test-pi deny
 
 # Install git hooks (pre-commit: fmt + clippy)
 install-hooks:
