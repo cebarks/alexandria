@@ -88,10 +88,14 @@ more than an order of magnitude.
 The fifth row (927 facts, 2026-09-10, taken with the server stopped) is the first pass after
 `bench-retrieval` started printing its own recall-limit headroom. Same shape as before —
 `hit_min`/`hit_max` unchanged, `mean_rank` 3.25 -> 3.42 — but the worst target rank is now 10
-(q12, 6 -> 7 -> 9 -> 10 across the live passes), which is exactly `RECALL_LIMIT`. Headroom is
-zero: q12 is still delivered, and the next fact that outscores it on that question is not. The
-`limit = 10` grid row at 927 matches the 880 grid on every hit count; only `noise_per_q` moved,
-by at most 0.2.
+(q12, 6 -> 7 -> 9 -> 10 across the live passes), which is exactly `RECALL_LIMIT`. That is not
+the headroom that matters: q12's target scores 0.379, under the shipped `T = 0.45`, so the
+client drops it at any limit. Among the eight targets that clear 0.45 the worst rank is q1 at 8,
+so the shipped pair has two positions of headroom — which is what `bench-retrieval`'s headroom
+line reports, after its first version counted every target and warned on q12. The `limit = 10`
+grid row at 927 matches the 880 grid on every hit count; only `noise_per_q` moved, by at most
+0.2. Rows 10, 15 and 20 are identical at `T = 0.45`, so nothing above the threshold sits past
+rank 10 and a wider limit would buy nothing today.
 
 ### Floor
 
