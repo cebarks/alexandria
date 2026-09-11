@@ -1,11 +1,13 @@
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use hf_hub::HFClientSync;
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationParams};
 
+use super::hub;
 use super::provider::EmbeddingProvider;
 
 /// sentence-transformers models ship `1_Pooling/config.json`. Only the CLS flag
@@ -16,6 +18,12 @@ fn cls_pooling_from_json(s: &str) -> bool {
         .and_then(|v| v.get("pooling_mode_cls_token")?.as_bool())
         .unwrap_or(false)
 }
+
+/// Longest input, in wordpiece tokens including `[CLS]`/`[SEP]`, that one embedding sees.
+/// The cached `tokenizer.json` ships 128; sentence-transformers serves this model at 256 and
+/// the live corpus p99 is 284 (docs/performance-and-ability-findings.md, A1). Locked in
+/// `system_config` beside the model id, so changing it forces a re-embed.
+pub const MAX_TOKENS: usize = 256;
 
 pub struct CandleProvider {
     model: BertModel,
@@ -28,15 +36,42 @@ pub struct CandleProvider {
 
 impl CandleProvider {
     pub async fn new(model_id: &str, device_str: &str) -> Result<Self> {
-        let model_id_owned = model_id.to_string();
-        let device_str_owned = device_str.to_string();
+        // Cache first, network only on a miss (see hub.rs).
+        let required = async |file: &str| {
+            hub::fetch(model_id, file)
+                .await
+                .and_then(|p| p.with_context(|| format!("{file} not found in {model_id}")))
+                .with_context(|| format!("Failed to download {file}"))
+        };
+        let config_path = required("config.json").await?;
+        let tokenizer_path = required("tokenizer.json").await?;
+        let weights_path = required("model.safetensors").await?;
 
+        // Optional: pooling config. Not every repo has it; absence means mean pooling.
+        let cls_pooling = match hub::fetch(model_id, "1_Pooling/config.json").await {
+            Ok(Some(p)) => std::fs::read_to_string(p)
+                .map(|s| cls_pooling_from_json(&s))
+                .unwrap_or(false),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    "could not load 1_Pooling/config.json for {model_id} ({e}); assuming mean pooling"
+                );
+                false
+            }
+        };
+
+        let device_str_owned = device_str.to_string();
         // Model loading is CPU-bound, run in blocking task
-        let (model, tokenizer, device, dimensions, cls_pooling) =
-            tokio::task::spawn_blocking(move || {
-                Self::load_model(&model_id_owned, &device_str_owned)
-            })
-            .await??;
+        let (model, tokenizer, device, dimensions) = tokio::task::spawn_blocking(move || {
+            Self::load_model(
+                &config_path,
+                &tokenizer_path,
+                &weights_path,
+                &device_str_owned,
+            )
+        })
+        .await??;
 
         tracing::info!("Pooling: {}", if cls_pooling { "cls" } else { "mean" });
 
@@ -50,61 +85,52 @@ impl CandleProvider {
         })
     }
 
+    /// Test hook: override the pooling mode read from `1_Pooling/config.json`.
+    /// Lets `tests/embedding_test.rs` prove the CLS branch runs without a second model download.
+    #[doc(hidden)]
+    pub fn set_cls_pooling(&mut self, cls: bool) {
+        self.cls_pooling = cls;
+    }
+
     fn load_model(
-        model_id: &str,
+        config_path: &Path,
+        tokenizer_path: &Path,
+        weights_path: &Path,
         device_str: &str,
-    ) -> Result<(BertModel, Tokenizer, Device, usize, bool)> {
+    ) -> Result<(BertModel, Tokenizer, Device, usize)> {
         let device = match device_str {
             "cpu" => Device::Cpu,
             _ => Device::Cpu, // fallback to CPU
         };
 
-        let client = HFClientSync::new().context("Failed to create HuggingFace Hub client")?;
-        // Short-form ids like "gpt2" have no owner.
-        let (owner, name) = model_id.split_once('/').unwrap_or(("", model_id));
-        let repo = client.model(owner, name);
-        // Cache first, as hf-hub 0.5 did. Without this, 1.0 revalidates every
-        // cached file against the Hub on each boot and retries when offline.
-        let get = |file: &str| {
-            repo.download_file()
-                .filename(file)
-                .local_files_only(true)
-                .send()
-                .or_else(|_| repo.download_file().filename(file).send())
-        };
-
-        let config_path = get("config.json").context("Failed to download config.json")?;
-        let tokenizer_path = get("tokenizer.json").context("Failed to download tokenizer.json")?;
-        let weights_path =
-            get("model.safetensors").context("Failed to download model.safetensors")?;
-
-        // Optional: pooling config. Not every repo has it; absence means mean pooling.
-        let cls_pooling = get("1_Pooling/config.json")
-            .inspect_err(|e| {
-                tracing::warn!(
-                    "could not load 1_Pooling/config.json for {model_id} ({e}); assuming mean pooling"
-                )
-            })
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|s| cls_pooling_from_json(&s))
-            .unwrap_or(false);
-
-        let config_str = std::fs::read_to_string(&config_path)?;
+        let config_str = std::fs::read_to_string(config_path)?;
         let config: BertConfig = serde_json::from_str(&config_str)?;
         let dimensions = config.hidden_size;
 
-        let tokenizer =
-            Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut tokenizer =
+            Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_TOKENS,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // No padding: inputs go through one at a time and the attention mask makes
+        // padding a no-op for the result, so the fixed 128 in the file was pure cost.
+        tokenizer.with_padding(None);
 
+        // Read into a Vec rather than mmap so the workspace can keep `unsafe_code = "forbid"`.
+        // Costs a ~90 MB peak (buffer + built tensors) until `BertModel::load` returns; mmap
+        // would not remove it, candle copies each tensor out anyway. Revisit with
+        // `#[allow(unsafe_code)]` + `from_mmaped_safetensors` only for a much larger model.
         let vb = VarBuilder::from_buffered_safetensors(
-            std::fs::read(&weights_path)?,
+            std::fs::read(weights_path)?,
             candle_core::DType::F32,
             &device,
         )?;
         let model = BertModel::load(vb, &config)?;
 
-        Ok((model, tokenizer, device, dimensions, cls_pooling))
+        Ok((model, tokenizer, device, dimensions))
     }
 
     fn embed_sync(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -115,6 +141,12 @@ impl CandleProvider {
                 .tokenizer
                 .encode(*text, true)
                 .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+            if !encoding.get_overflowing().is_empty() {
+                tracing::warn!(
+                    chars = text.chars().count(),
+                    "text exceeds {MAX_TOKENS} tokens; only its first {MAX_TOKENS} are embedded"
+                );
+            }
 
             let input_ids = encoding.get_ids().to_vec();
             let attention_mask = encoding.get_attention_mask().to_vec();
@@ -186,22 +218,7 @@ impl EmbeddingProvider for CandleProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{CandleProvider, cls_pooling_from_json};
-
-    /// Same model, same text: flipping the pooling flag must change the vector,
-    /// proving the CLS branch is actually taken rather than falling back to mean.
-    #[tokio::test]
-    async fn cls_and_mean_pooling_differ() {
-        let mut provider = CandleProvider::new("sentence-transformers/all-MiniLM-L6-v2", "cpu")
-            .await
-            .unwrap();
-        assert!(!provider.cls_pooling, "MiniLM ships mean pooling");
-        let mean = provider.embed_sync(&["hello world"]).unwrap().remove(0);
-        provider.cls_pooling = true;
-        let cls = provider.embed_sync(&["hello world"]).unwrap().remove(0);
-        assert_eq!(mean.len(), cls.len());
-        assert_ne!(mean, cls);
-    }
+    use super::cls_pooling_from_json;
 
     #[test]
     fn cls_true_when_flag_set() {

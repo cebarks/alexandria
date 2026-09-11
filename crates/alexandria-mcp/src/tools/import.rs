@@ -16,4 +16,12 @@ pub struct ImportDocumentParams {
         description = "Optional session ID to group the imported chunks into a session context. Auto-creates the session on first use."
     )]
     pub session_id: Option<String>,
+    #[schemars(
+        description = "Optional identifier of the agent or harness storing this (e.g. 'claude-code', 'pi'). Only meaningful with session_id; recorded on the session when first seen, never overwrites a value already set."
+    )]
+    pub agent_id: Option<String>,
+    #[schemars(
+        description = "Optional model name of the agent storing this (e.g. 'claude-sonnet-5'). Only meaningful with session_id; recorded on the session when first seen, never overwrites a value already set."
+    )]
+    pub model: Option<String>,
 }
