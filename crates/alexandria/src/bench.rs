@@ -16,10 +16,14 @@ use chrono::{DateTime, Utc};
 
 use crate::config::Config;
 
-/// Question -> the fact that answers it. Verbatim from the 2026-09-08 run
-/// (`docs/plans/2026-09-08-embedding-model-swap-measurements.md`) so that new rows
-/// stack on the table recorded there.
-const QUESTIONS: [(&str, &str); 12] = [
+/// Question -> the fact that answers it. The first 12 are verbatim from the 2026-09-08 run
+/// (`docs/plans/2026-09-08-embedding-model-swap-measurements.md`); their targets are all in
+/// the baseline window, so the baseline row still reproduces the table recorded there. The
+/// rest (added 2026-09-10) target facts stored after that window, from other projects, so
+/// the live row also checks that a recent memory can be found and is not just measuring
+/// fixed questions against a growing haystack. They are absent from the baseline corpus and
+/// score as `absent` on that row.
+const QUESTIONS: [(&str, &str); 20] = [
     (
         "how do I make sure the claude hooks do not go stale after a git pull",
         "fact:114neszsc6wf6roti3nh",
@@ -67,6 +71,38 @@ const QUESTIONS: [(&str, &str); 12] = [
     (
         "how fast is memory lookup supposed to be",
         "fact:g8q5rwzz89m4dyidz21h",
+    ),
+    (
+        "pkill -f with an anchored path pattern does not find my process even though it is running",
+        "fact:s54d27iol1v5cvr3dfeh",
+    ),
+    (
+        "jj squash prints an error about the editor failing to initialize, did the squash happen",
+        "fact:8x2na75v2uyuvtj2y2d8",
+    ),
+    (
+        "passing zero to a seconds flag pegs a core, how should I constrain the argument",
+        "fact:m27pl2qci3h2idbz4ku7",
+    ),
+    (
+        "a tiny text change produced a huge diff in the rendered svg, why",
+        "fact:ij7g7c4gql4byjq0wsf3",
+    ),
+    (
+        "reading the link speed file under sys class net gives -1 or an error for some interfaces",
+        "fact:o3z29nj29curn65rn0e3",
+    ),
+    (
+        "what is the config key for pango markup on a text block",
+        "fact:46x5bi68675hryxec20y",
+    ),
+    (
+        "would turning on object lock for the backup bucket break restic",
+        "fact:61zqxqcijsi7n847632x",
+    ),
+    (
+        "the lifecycle rule has been on for a day and nothing expired yet, is it broken",
+        "fact:i2tf44mnoigxqro4898n",
     ),
 ];
 
@@ -127,9 +163,10 @@ struct Sweep {
 struct Metrics {
     corpus: usize,
     scored: usize,
-    ranks: Vec<usize>,
-    /// Each scored target's own score, parallel to `ranks`.
-    hit_scores: Vec<f32>,
+    /// One slot per `QUESTIONS` entry; `None` where the target is absent from this corpus.
+    ranks: Vec<Option<usize>>,
+    /// Each target's own score, parallel to `ranks`.
+    hit_scores: Vec<Option<f32>>,
     mean_rank: f64,
     top1: usize,
     mean_gap: f64,
@@ -183,7 +220,11 @@ fn compute(
     let mut nonhits = Vec::new();
 
     for (row, target) in scores.iter().zip(targets) {
-        let Some(t) = *target else { continue };
+        let Some(t) = *target else {
+            ranks.push(None);
+            hits.push(None);
+            continue;
+        };
         let hit = row[t];
         // Rank is 1 + however many facts outscore the target. Exact float ties would
         // resolve optimistically, which on real cosine values does not happen.
@@ -201,14 +242,14 @@ fn compute(
             }
             nonhits.push(s);
         }
-        ranks.push(better + 1);
+        ranks.push(Some(better + 1));
         gaps.push((hit - best_other) as f64);
-        hits.push(hit);
+        hits.push(Some(hit));
     }
 
-    let scored = ranks.len();
-    let mean_rank = ranks.iter().sum::<usize>() as f64 / scored as f64;
-    let top1 = ranks.iter().filter(|&&r| r == 1).count();
+    let scored = gaps.len();
+    let mean_rank = ranks.iter().flatten().sum::<usize>() as f64 / scored as f64;
+    let top1 = ranks.iter().filter(|&&r| r == Some(1)).count();
     let mean_gap = gaps.iter().sum::<f64>() / scored as f64;
 
     Metrics {
@@ -217,8 +258,12 @@ fn compute(
         mean_rank,
         top1,
         mean_gap,
-        hit_min: hits.iter().copied().fold(f32::INFINITY, f32::min),
-        hit_max: hits.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        hit_min: hits.iter().flatten().copied().fold(f32::INFINITY, f32::min),
+        hit_max: hits
+            .iter()
+            .flatten()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max),
         nonhit: percentiles(&mut nonhits),
         ff: percentiles(&mut ff),
         sweep: sweep(scores, targets),
@@ -303,8 +348,10 @@ fn measure(facts: &[(String, Vec<f32>)], qvecs: &[Vec<f32>]) -> Metrics {
 fn report(label: &str, m: &Metrics, model: &str) {
     println!("\n## {label}");
     println!(
-        "corpus: {} facts, {}/12 questions scored",
-        m.corpus, m.scored
+        "corpus: {} facts, {}/{} questions scored",
+        m.corpus,
+        m.scored,
+        QUESTIONS.len()
     );
     println!(
         "\n| model | mean_rank | top1 | mean_gap | hit_min | hit_max | nonhit_p50 | nonhit_p90 | nonhit_p99 | ff_p50 | ff_p90 | ff_p99 |"
@@ -329,7 +376,10 @@ fn report(label: &str, m: &Metrics, model: &str) {
     println!("\nper-question rank:");
     for (i, ((q, _), rank)) in QUESTIONS.iter().zip(&m.ranks).enumerate() {
         let short: String = q.chars().take(64).collect();
-        println!("  {:>2}. rank {:<4} {short}", i + 1, rank);
+        match rank {
+            Some(r) => println!("  {:>2}. rank {r:<4} {short}", i + 1),
+            None => println!("  {:>2}. absent    {short}", i + 1),
+        }
     }
 
     // `RECALL_LIMIT` was set where delivery saturates, which is a property of the corpus, not
@@ -342,8 +392,9 @@ fn report(label: &str, m: &Metrics, model: &str) {
         .ranks
         .iter()
         .zip(&m.hit_scores)
-        .filter(|(_, score)| **score >= RECALL_THRESHOLD)
-        .map(|(&rank, _)| rank)
+        .filter_map(|(rank, score)| rank.zip(*score))
+        .filter(|(_, score)| *score >= RECALL_THRESHOLD)
+        .map(|(rank, _)| rank)
         .collect();
     let worst = kept.iter().copied().max().unwrap_or(0);
     let hidden = kept.iter().filter(|&&r| r > RECALL_LIMIT).count();
@@ -496,8 +547,8 @@ mod tests {
         let ff = vec![0.1, 0.2, 0.3];
         let m = compute(4, &scores, &targets, ff);
 
-        assert_eq!(m.ranks, vec![1, 3]);
-        assert_eq!(m.hit_scores, vec![0.9, 0.4]);
+        assert_eq!(m.ranks, vec![Some(1), Some(3)]);
+        assert_eq!(m.hit_scores, vec![Some(0.9), Some(0.4)]);
         assert_eq!(m.top1, 1);
         assert_eq!(m.scored, 2);
         assert!((m.mean_rank - 2.0).abs() < 1e-9);
@@ -579,11 +630,16 @@ mod tests {
     }
 
     #[test]
-    fn compute_skips_questions_whose_target_is_absent() {
+    fn compute_keeps_absent_targets_in_position() {
+        // q0's target is not in this corpus; q1's is. The per-question slots stay parallel
+        // to QUESTIONS so `report()` prints each rank against its own question.
         let scores = vec![vec![0.9, 0.5], vec![0.2, 0.8]];
-        let targets = vec![Some(0), None];
+        let targets = vec![None, Some(1)];
         let m = compute(2, &scores, &targets, vec![0.5]);
         assert_eq!(m.scored, 1);
-        assert_eq!(m.ranks, vec![1]);
+        assert_eq!(m.ranks, vec![None, Some(1)]);
+        assert_eq!(m.hit_scores, vec![None, Some(0.8)]);
+        assert!((m.mean_rank - 1.0).abs() < 1e-9);
+        assert_eq!(m.top1, 1);
     }
 }

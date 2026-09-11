@@ -25,7 +25,7 @@ active facts. The baseline exists to prove the metric definitions still match th
 behind the recorded tables — if it stops reproducing, distrust the live row.
 
 Corpus vectors are read as stored rather than recomputed, so the bench measures the model
-the corpus was actually embedded with. Only the 12 questions are embedded at run time.
+the corpus was actually embedded with. Only the questions are embedded at run time.
 
 ## Results (2026-09-09)
 
@@ -252,6 +252,69 @@ Limits on how far to read the grid, beyond the three that apply to the threshold
 - Nothing here says what happens between 10 and 15, or whether 10 still saturates at 2000 facts.
   The grid is six points chosen to bracket the shipped value, not a curve.
 
+### Recent targets (2026-09-10, 20 questions)
+
+Every target above predates the baseline window, so those rows measure fixed questions
+against a growing haystack and never check that a *recent* memory can be found. On 2026-09-10
+eight questions were added (13–20 in [Test data](#test-data)), each targeting a fact stored on
+2026-09-09 from another project — restic/S3, oatbar, jj, clap — so that they do not sit in
+the cluster of memories about Alexandria itself that crowds q12. The live row is now over 20
+questions and **does not stack on the table above**; this pass starts a new one. The baseline
+row still scores only the original 12 (the new targets are absent from that corpus) and is
+the comparability check as before.
+
+| corpus | facts | scored | mean_rank | top1 | mean_gap | hit_min | hit_max | nonhit_p50 | nonhit_p90 | nonhit_p99 | ff_p50 | ff_p90 | ff_p99 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| baseline (143 oldest active) | 143 | 12/20 | 1.42 | 9/12 | +0.148 | 0.338 | 0.667 | 0.078 | 0.212 | 0.372 | 0.130 | 0.298 | 0.560 |
+| live | 957 | 20/20 | 2.75 | 12/20 | +0.082 | 0.338 | 0.828 | 0.079 | 0.197 | 0.340 | 0.129 | 0.286 | 0.497 |
+
+The baseline row reproduces the 2026-09-09 row on every column with the eight absent
+questions skipped, so the absent-target path changes nothing for the questions it does score.
+
+Per-question rank, live. Against the per-question table above (743 facts) the originals moved
+on three questions — q4 5 -> 7, q11 5 -> 7, q12 6 -> 11 — and are unchanged on the rest:
+
+| # | question | live |
+|---|---|---|
+| 13 | pkill -f with an anchored path pattern does not find my process even though it is running | 1 |
+| 14 | jj squash prints an error about the editor failing to initialize, did the squash happen | 1 |
+| 15 | passing zero to a seconds flag pegs a core, how should I constrain the argument | 2 |
+| 16 | a tiny text change produced a huge diff in the rendered svg, why | 1 |
+| 17 | reading the link speed file under sys class net gives -1 or an error for some interfaces | 2 |
+| 18 | what is the config key for pango markup on a text block | 1 |
+| 19 | would turning on object lock for the backup bucket break restic | 1 |
+| 20 | the lifecycle rule has been on for a day and nothing expired yet, is it broken | 4 |
+
+**Recent memories are found, and more easily than the old ones.** Five of the eight rank 1
+and the worst is 4, against a worst of 11 among the originals. That is the expected shape,
+not evidence the model improved: a fact stored yesterday has had one day to accumulate
+neighbours, where the originals have had two days and a 6x corpus. `hit_max` rose from 0.667
+to 0.828, so the strongest hit in the set is now one of the new targets. Six of the eight
+clear the shipped `T = 0.45` and all six are delivered at `limit = 10`; the other two score
+between 0.40 and 0.45 (they appear in the 0.40 row's `hits_kept` and not the 0.45 row's).
+
+**q12 has crossed the limit.** Its target now ranks 11, past `RECALL_LIMIT = 10`, but it
+scores under `T = 0.45`, so the client would have dropped it anyway and the headroom line is
+unchanged: worst rank 8 (q1) among the 14 targets that clear the threshold, two positions
+left. It is the only target past rank 10, which is why the `limit = 15` row picks up exactly
+one more hit than `limit = 10` at `T = 0.30` and `0.35` (its score is 0.379) and none above.
+
+Live corpus, 957 facts, `limit = 10`:
+
+| T | hits_kept | hits_delivered | noise_per_q |
+|---|---|---|---|
+| 0.30 | 20/20 | 19/20 | 7.20 |
+| 0.35 | 19/20 | 18/20 | 5.45 |
+| 0.40 | 16/20 | 16/20 | 2.95 |
+| **0.45** | 14/20 | **14/20** | 1.65 |
+| 0.50 | 13/20 | 13/20 | 0.70 |
+| 0.58 | 9/20 | 9/20 | 0.15 |
+
+`noise_per_q` at `0.45` is 1.65 against 1.0 in the 880-fact grid. Part of that is the corpus
+(957 vs 880) and part is that the new questions, being about other projects' memories, sit
+in denser neighbourhoods of the corpus than the Alexandria-specific originals; the two are
+not separable from one pass.
+
 ## Metric definitions
 
 - **rank** — position of the target fact when the whole corpus is sorted by cosine descending
@@ -259,8 +322,8 @@ Limits on how far to read the grid, beyond the three that apply to the threshold
 - **top1** — questions whose target ranked 1.
 - **mean_gap** — mean over questions of (target score − best non-target score). Negative on a
   miss, so a corpus that crowds the target drags it toward zero.
-- **hit_min / hit_max** — min and max of the 12 target scores. Independent of corpus size.
-- **nonhit_pN** — percentiles over every question-to-non-target score (12 × corpus).
+- **hit_min / hit_max** — min and max of the scored targets' scores. Independent of corpus size.
+- **nonhit_pN** — percentiles over every question-to-non-target score (scored questions × corpus).
 - **ff_pN** — percentiles over every fact-to-fact pair.
 - **hits_kept** — targets scoring at or above the client threshold, ignoring rank.
 - **hits_delivered** — targets that clear the threshold *and* rank within the row's `limit`, so
@@ -277,8 +340,10 @@ and silently break comparability with the recorded tables.
 
 ## Test data
 
-Question → the fact that answers it. Frozen from the 2026-09-08 run so new rows stack on the
-recorded tables; the list is `QUESTIONS` in `crates/alexandria/src/bench.rs`.
+Question → the fact that answers it; the list is `QUESTIONS` in `crates/alexandria/src/bench.rs`. Questions
+1–12 are frozen from the 2026-09-08 run and every target is inside the baseline window.
+Questions 13–20 were added 2026-09-10 and target facts stored 2026-09-09 from other projects;
+they are absent from the baseline corpus and print as `absent` on that row.
 
 1. "how do I make sure the claude hooks do not go stale after a git pull" -> `fact:114neszsc6wf6roti3nh`
 2. "is there a maximum width I should wrap at when adding new code" -> `fact:jlzhe9hclr73wrlc3805`
@@ -292,14 +357,21 @@ recorded tables; the list is `QUESTIONS` in `crates/alexandria/src/bench.rs`.
 10. "the model keeps wrapping its answer in backticks and adding chatter afterwards, how should I read the structured output" -> `fact:306636gbydvykw7lrmr8`
 11. "why are very short strings disappearing from what gets saved" -> `fact:ykw2fqnaj9j7q71o3mey`
 12. "how fast is memory lookup supposed to be" -> `fact:g8q5rwzz89m4dyidz21h`
+13. "pkill -f with an anchored path pattern does not find my process even though it is running" -> `fact:s54d27iol1v5cvr3dfeh`
+14. "jj squash prints an error about the editor failing to initialize, did the squash happen" -> `fact:8x2na75v2uyuvtj2y2d8`
+15. "passing zero to a seconds flag pegs a core, how should I constrain the argument" -> `fact:m27pl2qci3h2idbz4ku7`
+16. "a tiny text change produced a huge diff in the rendered svg, why" -> `fact:ij7g7c4gql4byjq0wsf3`
+17. "reading the link speed file under sys class net gives -1 or an error for some interfaces" -> `fact:o3z29nj29curn65rn0e3`
+18. "what is the config key for pango markup on a text block" -> `fact:46x5bi68675hryxec20y`
+19. "would turning on object lock for the backup bucket break restic" -> `fact:61zqxqcijsi7n847632x`
+20. "the lifecycle rule has been on for a day and nothing expired yet, is it broken" -> `fact:i2tf44mnoigxqro4898n`
 
 ## Limitations
 
-- **Every target predates 2026-09-08 16:26 UTC.** The 590 facts added since are never a
-  correct answer, only distractors. This makes the live row a clean measurement of fixed
-  questions against a growing haystack, but it does not check that a recently stored memory
-  can be found at all. Add questions targeting recent facts before reading the bench as a
-  general retrieval-quality signal.
+- **The recent targets are one day old.** Questions 13–20 check that a memory stored after
+  the baseline window can be found, but all eight targets date from a single day, and their
+  ranks will inflate the way the originals' did as the corpus grows around them. Read them as
+  the near-term signal, not as a different model.
 - **The baseline is reconstructed by size, not identity.** `BASELINE_SIZE = 143` takes the
   143 oldest *active* facts, which is not the same set that was active on 2026-09-08: any of
   those deleted since drops out and the window reaches forward to replace it. Drift is
@@ -309,5 +381,5 @@ recorded tables; the list is `QUESTIONS` in `crates/alexandria/src/bench.rs`.
   predates 2026-09-08 12:30 UTC. The `08:08` in the measurements doc is local time (UTC-4)
   and is when the data dir was created, not when the measurement ran, so a cutoff built from
   it selects nothing.
-- **12 questions is a small sample.** A single question changing rank moves `mean_rank` by up
-  to a twelfth of the change. Treat differences of a tenth as noise.
+- **20 questions is a small sample** (12 on the baseline row). A single question changing rank
+  moves `mean_rank` by up to a twentieth of the change. Treat differences of a tenth as noise.
