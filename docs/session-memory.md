@@ -19,7 +19,6 @@ session
 ├── started_at     datetime     -- default time::now()
 ├── ended_at       option<datetime>
 ├── summary        option<string>
-├── memory_count   int          -- default 0
 └── tags           array<string>
 
 (session)->contains_session_memory->(fact)
@@ -27,8 +26,9 @@ session
 
 A session is linked to its memories by `contains_session_memory` graph edges, not by a column on
 `fact`. The same memory can therefore belong to several sessions; membership is additive and
-never moves or copies the fact. `memory_count` is a denormalized counter maintained on write, not
-a computed `count()`.
+never moves or copies the fact. There is no stored count: `v006` dropped the column, and both
+`get_session` and `list_sessions` compute `memory_count` live from the edges, excluding
+soft-deleted facts.
 
 `external_id` is the only identity that matters to clients. It is an opaque string the caller
 chooses (pi's session UUID, a ticket number, `"2026-08-27-auth-refactor"` — anything), and it is
@@ -37,18 +37,18 @@ what you pass to every session tool below. SurrealDB's own record ID for the ses
 ## Lifecycle
 
 ```text
-store_memory(session_id="s1")   # implicit create of `s1`, edge to the new fact, count++
-store_memory(session_id="s1")   # edge + count++
+store_memory(session_id="s1")   # implicit create of `s1`, edge to the new fact
+store_memory(session_id="s1")   # edge
 retrieve_memories(session_id="s1")   # search scoped to s1's facts
 get_session(session_id="s1")         # metadata + every fact, oldest first
+list_sessions(agent_id="pi", finalized=false)   # find a session id you don't have
 finalize_session(session_id="s1", summary=..., tags=[...])   # close it out
 ```
 
 **Creation is implicit.** Passing an unknown `session_id` to `store_memory` creates the session on
 first use — there is no `create_session` tool, and no need to check for existence first.
 
-**`ended_at` means "last activity," not "closed."** Every store bumps `memory_count` and refreshes
-`ended_at`. That field is only *also* the close timestamp when `finalize_session` writes it, so
+**`ended_at` means "last activity," not "closed."** Every store refreshes `ended_at`. That field is only *also* the close timestamp when `finalize_session` writes it, so
 `ended_at` alone cannot tell you whether a session was finalized. Check `summary`: an unfinalized
 session has `summary: null`.
 
@@ -56,9 +56,10 @@ session has `summary: null`.
 
 | Tool | Session behavior |
 | --- | --- |
-| `store_memory` | Optional `session_id`. Auto-creates the session, relates the new fact, bumps the counter. |
+| `store_memory` | Optional `session_id`. Auto-creates the session and relates the new fact. |
 | `retrieve_memories` | Optional `session_id` scopes the candidate set to that session's facts before ranking. |
 | `get_session` | Takes `session_id`; returns session metadata plus every linked memory (id, content, tags, confidence, `created_at`), ordered oldest first. Errors if the id is unknown. |
+| `list_sessions` | All optional: `agent_id`, `tag`, `finalized` (`true` = has a summary, `false` = open), `limit` (default 20), `offset`. Returns sessions newest-first by `started_at`, each with the same metadata block as `get_session` and a live non-deleted `memory_count`, in one query. |
 | `finalize_session` | Takes `session_id` and optional `summary` / `tags`; sets `ended_at = time::now()` plus whichever fields were supplied. Errors if the id is unknown. |
 
 Both `Option` fields on `finalize_session` are genuinely optional: calling it with only
@@ -68,19 +69,11 @@ Both `Option` fields on `finalize_session` are genuinely optional: calling it wi
 
 These are real gaps in the shipped implementation, not usage advice:
 
-- **No session enumeration.** There is no `list_sessions` tool, and sessions are not reachable
-  through `recall` (which walks clusters, not sessions). `get_session` requires knowing the
-  `external_id` already, so a session you failed to record the id for is not recoverable through
-  MCP — only through the debug UI or a direct query.
-- **`agent_id` and `model` are dead columns today.** The `session` table defines both and
-  `SessionRepo::create` accepts them, but the MCP path calls it with `(None, None)` and no tool
-  parameter exposes either. Nothing populates them.
-- **Session-scoped search does not filter soft-deleted memories.** The unscoped path queries
-  `fact WHERE deleted = false`; the session path walks edges through `SessionRepo::get_memories()`,
-  which fetches each fact with `get_fact()` and never checks `deleted`. So
-  `retrieve_memories(session_id: ...)` can return a memory the user asked you to forget, and
-  `get_session` lists deleted memories with no marker distinguishing them. Tracked as a
-  follow-up — until it is fixed, treat session-scoped hits as needing a sanity check.
+- **Sessions are not reachable through `recall`** (which walks clusters, not sessions), and
+  `list_sessions` has no search — it filters on `agent_id`, `tag`, and finalized state only, so
+  finding a session by what its summary says means paging through the list.
+- **No debug UI page for sessions.** The `/debug` views cover memories, clusters, the graph, and
+  the maintenance log; sessions are reachable only through the MCP tools or a direct query.
 - **The pi extension does not populate sessions.** `contrib/pi/` stores and retrieves memories
   without a `session_id`, so auto-store/auto-recall traffic is ungrouped. Session tools are for
   agents that decide to use them explicitly.
