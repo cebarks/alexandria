@@ -5,7 +5,7 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 ## Features
 
 - **Semantic search** — Cosine similarity over local embeddings (all-MiniLM-L6-v2 via candle, pure Rust)
-- **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool.
+- **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool. Accesses are recorded on `retrieve_memories`; heat is not yet used in ranking.
 - **Spreading activation** — Accessing a memory warms its graph neighbors. Heat propagates along edges with configurable decay.
 - **Graph edges** — Memories link via `relates_to`, `supports`, `contradicts`, `derived_from`, and `extracted_from` edges
 - **Hierarchical clustering** — Automatic cluster assignment on store, background split/merge maintenance with a queryable audit log

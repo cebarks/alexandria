@@ -98,6 +98,13 @@ measured under this truncation. They may move once long facts embed on their ful
 
 **Severity:** Medium. Needs a decision. **Effort:** small either way.
 
+**Status (2026-09-10):** deferred with data collection. `retrieve_memories` now records an access on
+its top `activation_top_n` results (`record_access` in `server.rs`), and the debug memory page shows
+the decayed value as "Heat now". Ranking is untouched. Revisit wire-or-delete once real access
+history exists; note that `bench-retrieval` cannot measure a heat-weighted ranking on a snapshot
+with no access history, and that auto-recall is the dominant access source, so access-boosted
+ranking would mostly amplify the ranker's own picks.
+
 **Where.**
 
 - `crates/alexandria-engine/src/heat/decay.rs:31` (`projected_heat`) and `:46` (`on_access`) have

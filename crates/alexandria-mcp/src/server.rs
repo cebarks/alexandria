@@ -29,7 +29,7 @@ fn tool_json(result: anyhow::Result<String>) -> CallToolResult {
 }
 
 use alexandria_engine::clusters::{ClusterInfo, assign_to_cluster, update_centroid};
-use alexandria_engine::heat::{ActivationConfig, compute_activation_targets};
+use alexandria_engine::heat::{ActivationConfig, compute_activation_targets, on_access};
 use alexandria_engine::recall::{
     ClusterWithMembers, FactSummary, ScopeHandle, broad_recall, focused_recall,
 };
@@ -468,12 +468,13 @@ impl AlexandriaServer {
             .filter(|(_, sim)| *sim >= self.retrieve_min_similarity)
             .collect();
 
-        // 4. Trigger spreading activation for top results
+        // 4. Record the access and trigger spreading activation for top results
         for (idx, _) in ranked.iter().take(self.activation_top_n) {
             let fact = &facts[*idx];
             if let Some(ref id) = fact.id {
                 let fact_id_str = record_id_to_string(id);
-                // Fire-and-forget activation — don't block on it
+                // Best-effort side effects — never fail a retrieval over them
+                let _ = self.record_access(&fact_id_str).await;
                 let _ = self.trigger_activation(&fact_id_str, 1.0).await;
             }
         }
@@ -684,6 +685,38 @@ impl AlexandriaServer {
             }
         }
         Ok(())
+    }
+
+    /// Record an access on a memory's heat row: reset heat, grow stability by
+    /// spacing, bump access_count. Heat is recorded here but not yet used in
+    /// ranking; see A2 in docs/performance-and-ability-findings.md.
+    async fn record_access(&self, fact_id: &str) -> anyhow::Result<()> {
+        let heat_repo = HeatRepo::new(self.db.inner());
+        let Some(row) = heat_repo.get(fact_id).await? else {
+            return Ok(());
+        };
+        let Some(ref row_id) = row.id else {
+            return Ok(());
+        };
+        let mut state = alexandria_engine::heat::HeatState {
+            heat: row.heat,
+            stability: row.stability,
+            last_touched: row
+                .last_touched
+                .map(|dt| dt.timestamp().max(0) as u64)
+                .unwrap_or(0),
+            access_count: row.access_count.max(0) as u64,
+        };
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        on_access(&mut state, now, self.heat_spacing_halflife);
+        heat_repo
+            .update(
+                &record_id_to_string(row_id),
+                state.heat,
+                state.stability,
+                state.access_count as i64,
+            )
+            .await
     }
 
     /// Trigger spreading activation for a memory access.
@@ -1336,6 +1369,48 @@ mod get_info_tests {
             structured
         );
         assert_eq!(result.is_error, Some(false));
+    }
+
+    /// Each retrieve records an access on its top results: the heat row's
+    /// access_count climbs and last_touched moves. Ranking is unaffected.
+    #[tokio::test]
+    async fn retrieve_memories_records_access_on_top_results() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server =
+            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0);
+        let id = server
+            .do_store_memory(StoreMemoryParams {
+                content: "a near memory".to_string(),
+                tags: None,
+                session_id: None,
+                agent_id: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+        let heat_repo = HeatRepo::new(server.db.inner());
+        let before = heat_repo.get(&id).await.unwrap().unwrap();
+        assert_eq!(before.access_count, 0);
+
+        let retrieve = || {
+            server.do_retrieve_memories(RetrieveMemoriesParams {
+                query: "anything".to_string(),
+                limit: Some(10),
+                session_id: None,
+            })
+        };
+        retrieve().await.unwrap();
+        let after_one = heat_repo.get(&id).await.unwrap().unwrap();
+        assert_eq!(after_one.access_count, 1);
+        assert!(after_one.last_touched >= before.last_touched);
+
+        retrieve().await.unwrap();
+        let after_two = heat_repo.get(&id).await.unwrap().unwrap();
+        assert_eq!(after_two.access_count, 2);
+        assert_eq!(after_two.heat, 1.0);
     }
 
     fn check_structured(label: &str, result: &CallToolResult) {

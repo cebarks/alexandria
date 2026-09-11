@@ -218,14 +218,27 @@ pub async fn detail(
                 .last_touched
                 .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
                 .unwrap_or_else(|| "—".to_string());
+            let heat_now = alexandria_engine::heat::projected_heat(
+                &alexandria_engine::heat::HeatState {
+                    heat: h.heat,
+                    stability: h.stability,
+                    last_touched: h
+                        .last_touched
+                        .map(|dt| dt.timestamp().max(0) as u64)
+                        .unwrap_or(0),
+                    access_count: h.access_count.max(0) as u64,
+                },
+                chrono::Utc::now().timestamp().max(0) as u64,
+            );
             format!(
                 r#"<dl class="fact-meta">
   <dt>Heat</dt><dd>{:.3}</dd>
+  <dt>Heat now</dt><dd>{:.3}</dd>
   <dt>Stability</dt><dd>{:.3}</dd>
   <dt>Access count</dt><dd>{}</dd>
   <dt>Last touched</dt><dd>{}</dd>
 </dl>"#,
-                h.heat, h.stability, h.access_count, last_touched
+                h.heat, heat_now, h.stability, h.access_count, last_touched
             )
         }
         None => "<p>No heat state recorded.</p>".to_string(),
