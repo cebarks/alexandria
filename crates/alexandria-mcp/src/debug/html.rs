@@ -1,77 +1,14 @@
 //! HTML responses for the debug UI.
 //!
-//! Two paths coexist here while the migration is in flight. `esc()` and `layout()` are
-//! the legacy hand-built one: markup assembled with `format!`, where escaping is a
-//! per-call-site habit and therefore easy to forget. The templates under
-//! `crates/alexandria-mcp/templates/` rendered through [`page()`] are the replacement:
-//! askama auto-escapes `{{ }}` at compile time, so escaping is structural. New code
-//! must use templates + `page()`; the legacy path stays only because the six existing
-//! pages still call `layout()` (removed in Task 1.5).
+//! Every page is an askama template under `crates/alexandria-mcp/templates/`, rendered
+//! through [`page()`]. askama auto-escapes `{{ }}` at compile time, so escaping is
+//! structural rather than a per-call-site habit — there is deliberately no escape helper
+//! here to reach for. Values interpolated into a URL rather than into HTML text need the
+//! right *context* escape (`|urlencode`), which templates apply explicitly.
 
 use askama::Template;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-
-/// Escape a string for safe interpolation into HTML text/attribute content.
-///
-/// Legacy: prefer a template, where escaping is automatic. Still needed by the
-/// `format!`-built pages until they are migrated.
-pub fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-/// Wrap a body fragment in the shared page layout (nav + htmx script + minimal CSS).
-pub fn layout(title: &str, body: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>{title} — Alexandria Debug</title>
-<script src="https://unpkg.com/htmx.org@1.9.12"></script>
-<style>
-body {{ font-family: system-ui, sans-serif; margin: 0; padding: 0; background: #0d1117; color: #c9d1d9; }}
-nav {{ background: #161b22; padding: 12px 24px; border-bottom: 1px solid #30363d; }}
-nav a {{ color: #58a6ff; margin-right: 16px; text-decoration: none; }}
-main {{ padding: 24px; max-width: 1100px; margin: 0 auto; }}
-table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
-th, td {{ text-align: left; padding: 8px; border-bottom: 1px solid #30363d; }}
-th {{ color: #8b949e; font-weight: 600; }}
-input, select, textarea, button {{ background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; padding: 6px 8px; border-radius: 4px; }}
-button {{ cursor: pointer; }}
-.badge {{ display: inline-block; background: #21262d; padding: 2px 8px; border-radius: 12px; font-size: 12px; margin-right: 4px; }}
-a.link {{ color: #58a6ff; }}
-.error {{ color: #f85149; }}
-tr.deleted td {{ opacity: 0.45; text-decoration: line-through; }}
-tr.deleted td:first-child {{ text-decoration: none; }}
-.pagination {{ display: flex; justify-content: space-between; align-items: center; margin-top: 12px; color: #8b949e; font-size: 14px; }}
-.pagination a {{ margin: 0 4px; }}
-.badge-deleted {{ background: #3d1a1a; color: #f85149; border: 1px solid #6e2020; padding: 2px 10px; border-radius: 12px; font-size: 13px; margin-left: 8px; }}
-pre.content-block {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow-y: auto; }}
-dl.fact-meta {{ display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px; margin: 12px 0; }}
-dl.fact-meta dt {{ color: #8b949e; font-weight: 600; }}
-dl.fact-meta dd {{ margin: 0; }}
-</style>
-</head>
-<body>
-<nav>
-<a href="/debug">Dashboard</a>
-<a href="/debug/memories">Memories</a>
-<a href="/debug/clusters">Clusters</a>
-<a href="/debug/maintenance">Maintenance Log</a>
-<a href="/debug/query">Query Tester</a>
-</nav>
-<main>
-{body}
-</main>
-</body>
-</html>"#
-    )
-}
 
 /// Render a template, mapping render failure to a plain-text 500.
 ///
@@ -128,25 +65,6 @@ struct PagerTemplate {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_esc_escapes_all_special_chars() {
-        let input = r#"<script>alert("x")&'y'</script>"#;
-        let out = esc(input);
-        assert!(!out.contains('<'));
-        assert!(!out.contains('>'));
-        assert!(out.contains("&lt;script&gt;"));
-        assert!(out.contains("&quot;x&quot;"));
-        assert!(out.contains("&#39;y&#39;"));
-    }
-
-    #[test]
-    fn test_layout_includes_title_and_body() {
-        let html = layout("Test Page", "<p>hello</p>");
-        assert!(html.contains("Test Page"));
-        assert!(html.contains("<p>hello</p>"));
-        assert!(html.contains("htmx.org"));
-    }
-
     // --- templates -------------------------------------------------------------
 
     fn render_pager(prev_href: &str, next_href: &str, summary: &str) -> String {
@@ -188,9 +106,9 @@ mod tests {
             !html.contains("<script>alert(1)</script>"),
             "must be escaped"
         );
-        // askama 0.16 writes character references numerically (`&#60;`, not the `&lt;` that
-        // legacy `esc()` emits). Equivalent to a browser, different bytes — so assert the
-        // whole escaped paragraph, which fails if escaping is ever weakened in either form.
+        // askama 0.16 writes character references numerically (`&#60;`, not the named `&lt;`).
+        // Equivalent to a browser, different bytes — so assert the whole escaped paragraph,
+        // which fails if escaping is ever weakened in either form.
         assert!(
             html.contains(r#"<p class="error">&#60;script&#62;alert(1)&#60;/script&#62;</p>"#),
             "got: {html}"
