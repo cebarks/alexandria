@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::Response;
 
-use super::html::{error_page, esc, layout, page};
+use super::html::{error_page, page};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
@@ -184,146 +184,128 @@ pub async fn list(
     })
 }
 
-pub async fn detail(
-    State(server): State<AlexandriaServer>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+/// The heat block, pre-formatted. `{:.3}` has to happen in Rust because askama renders an
+/// `f64` with plain `Display`, which would print `1.5` where the page wants `1.500`.
+struct HeatView {
+    heat: String,
+    stability: String,
+    access_count: i64,
+    last_touched: String,
+}
+
+/// The cluster a fact belongs to, rendered as a link plus an id badge.
+struct ClusterView {
+    label: String,
+    id: String,
+}
+
+/// One incident edge. `in_id` / `out_id` are raw record ids: the template urlencodes them for
+/// the href and prints them as-is for the link text.
+struct EdgeView {
+    edge_type: String,
+    in_id: String,
+    out_id: String,
+    strength: String,
+}
+
+#[derive(Template)]
+#[template(path = "memory_detail.html")]
+struct MemoryDetailTemplate {
+    nav: &'static str,
+    id: String,
+    deleted: bool,
+    content: String,
+    tags: Vec<String>,
+    confidence: String,
+    created_at: String,
+    heat: Option<HeatView>,
+    cluster: Option<ClusterView>,
+    edges: Vec<EdgeView>,
+    /// Pretty-printed (`{:#?}`) metadata JSON, already rendered to text; `None` prints "None".
+    metadata: Option<String>,
+}
+
+pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<String>) -> Response {
     let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
     let fact = match repo.get_fact(&id).await {
         Ok(Some(f)) => f,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Html(layout("Not Found", "<p>Memory not found.</p>")),
-            );
+            // The detail page has always answered a missing id with 404, so keep the status
+            // rather than taking `error_page`'s 200.
+            let mut response = error_page("memories", "Memory not found.");
+            *response.status_mut() = StatusCode::NOT_FOUND;
+            return response;
         }
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(layout(
-                    "Error",
-                    &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
-                )),
-            );
+            // Same for a data-layer failure: legacy returned 500 here.
+            let mut response = error_page("memories", &e.to_string());
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return response;
         }
     };
 
     let heat_repo = alexandria_storage::repos::HeatRepo::new(server.db.inner());
-    let heat = heat_repo.get(&id).await.ok().flatten();
-    let heat_html = match &heat {
-        Some(h) => {
-            let last_touched = h
-                .last_touched
-                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-                .unwrap_or_else(|| "—".to_string());
-            format!(
-                r#"<dl class="fact-meta">
-  <dt>Heat</dt><dd>{:.3}</dd>
-  <dt>Stability</dt><dd>{:.3}</dd>
-  <dt>Access count</dt><dd>{}</dd>
-  <dt>Last touched</dt><dd>{}</dd>
-</dl>"#,
-                h.heat, h.stability, h.access_count, last_touched
-            )
-        }
-        None => "<p>No heat state recorded.</p>".to_string(),
-    };
+    let heat = heat_repo.get(&id).await.ok().flatten().map(|h| HeatView {
+        heat: format!("{:.3}", h.heat),
+        stability: format!("{:.3}", h.stability),
+        access_count: h.access_count,
+        last_touched: h
+            .last_touched
+            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "—".to_string()),
+    });
 
-    let cluster = repo.cluster_for_fact(&id).await.ok().flatten();
-    let cluster_html = match &cluster {
-        Some(c) => {
-            let cluster_id = c.id.as_ref().map(record_id_to_string).unwrap_or_default();
-            let label = esc(c.label.as_deref().unwrap_or("unlabeled"));
-            let encoded_id = esc(&cluster_id.replace(':', "%3A"));
-            format!(
-                r#"<a class="link" href="/debug/clusters/{encoded_id}">{label}</a> <span class="badge">{}</span>"#,
-                esc(&cluster_id)
-            )
-        }
-        None => "None".to_string(),
-    };
+    let cluster = repo
+        .cluster_for_fact(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|c| ClusterView {
+            label: c.label.unwrap_or_else(|| "unlabeled".to_string()),
+            id: c.id.as_ref().map(record_id_to_string).unwrap_or_default(),
+        });
 
     let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
-    let edges = edge_repo.get_edges_for(&id).await.unwrap_or_default();
-    let edges_html: String = edges
+    let edges = edge_repo
+        .get_edges_for(&id)
+        .await
+        .unwrap_or_default()
         .iter()
-        .map(|e| {
-            let in_id = e.in_node.as_ref().map(record_id_to_string).unwrap_or_default();
-            let out_id = e.out_node.as_ref().map(record_id_to_string).unwrap_or_default();
-            let in_encoded = esc(&in_id.replace(':', "%3A"));
-            let out_encoded = esc(&out_id.replace(':', "%3A"));
-            format!(
-                r#"<li><span class="badge">{}</span> <a class="link" href="/debug/memories/{in_encoded}">{}</a> → <a class="link" href="/debug/memories/{out_encoded}">{}</a> (strength {:.2})</li>"#,
-                esc(&e.edge_type),
-                esc(&in_id),
-                esc(&out_id),
-                e.strength
-            )
+        .map(|e| EdgeView {
+            edge_type: e.edge_type.clone(),
+            in_id: e
+                .in_node
+                .as_ref()
+                .map(record_id_to_string)
+                .unwrap_or_default(),
+            out_id: e
+                .out_node
+                .as_ref()
+                .map(record_id_to_string)
+                .unwrap_or_default(),
+            strength: format!("{:.2}", e.strength),
         })
         .collect();
-    let edges_section = if edges.is_empty() {
-        "<p>No edges.</p>".to_string()
-    } else {
-        format!("<ul>{edges_html}</ul>")
-    };
 
-    let tags: String = fact
-        .tags
-        .iter()
-        .map(|t| format!(r#"<span class="badge">{}</span>"#, esc(t)))
-        .collect();
-
-    // Deleted badge — shown prominently if the fact is deleted
-    let deleted_badge = if fact.deleted {
-        r#"<span class="badge-deleted">⚠ Deleted</span>"#.to_string()
-    } else {
-        String::new()
-    };
-
-    // Formatted created_at
-    let created_at_str = fact
+    let created_at = fact
         .created_at
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "—".to_string());
 
-    let metadata_section = match &fact.metadata {
-        Some(m) => format!(
-            "<h2>Metadata</h2><pre class=\"content-block\">{}</pre>",
-            esc(&format!("{m:#?}"))
-        ),
-        None => "<h2>Metadata</h2><p>None</p>".to_string(),
-    };
-
-    let body = format!(
-        r##"<p><a class="link" href="/debug/memories">← Back to memories</a></p>
-<h1>Memory {id_esc} {deleted_badge}</h1>
-<p><a class="link" href="/debug/graph/{id_esc}">View graph →</a></p>
-<pre class="content-block">{content_esc}</pre>
-<dl class="fact-meta">
-  <dt>Tags</dt><dd>{tags}</dd>
-  <dt>Confidence</dt><dd>{confidence:.2}</dd>
-  <dt>Created</dt><dd>{created_at}</dd>
-</dl>
-<h2>Heat</h2>
-{heat_section}
-<h2>Cluster</h2>
-<p>{cluster_html}</p>
-<h2>Edges</h2>
-{edges_section}
-{metadata_section}"##,
-        id_esc = esc(&id),
-        deleted_badge = deleted_badge,
-        content_esc = esc(&fact.content),
-        tags = tags,
-        confidence = fact.confidence,
-        created_at = created_at_str,
-        heat_section = heat_html,
-        cluster_html = cluster_html,
-        edges_section = edges_section,
-        metadata_section = metadata_section,
-    );
-
-    (StatusCode::OK, Html(layout("Memory Detail", &body)))
+    page(MemoryDetailTemplate {
+        nav: "memories",
+        id,
+        // Deleted badge is shown prominently next to the heading.
+        deleted: fact.deleted,
+        content: fact.content,
+        tags: fact.tags,
+        confidence: format!("{:.2}", fact.confidence),
+        created_at,
+        heat,
+        cluster,
+        edges,
+        metadata: fact.metadata.as_ref().map(|m| format!("{m:#?}")),
+    })
 }
 
 #[cfg(test)]
@@ -500,8 +482,12 @@ mod tests {
 
         assert!(!text.contains("<script>alert(1)</script>"));
         assert!(!text.contains("<img src=x onerror=alert(2)>"));
-        assert!(text.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-        assert!(text.contains("&lt;img src=x onerror=alert(2)&gt;"));
+        assert!(text.contains(
+            r#"<pre class="content-block">&#60;script&#62;alert(1)&#60;/script&#62;</pre>"#
+        ));
+        assert!(
+            text.contains(r#"<span class="badge">&#60;img src=x onerror=alert(2)&#62;</span>"#)
+        );
     }
 
     #[tokio::test]
