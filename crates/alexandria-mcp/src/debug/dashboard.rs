@@ -1,32 +1,39 @@
+use askama::Template;
 use axum::extract::State;
-use axum::response::Html;
+use axum::response::Response;
 
-use super::html::{esc, layout};
+use super::html::{error_page, page};
 use crate::AlexandriaServer;
 
-pub async fn handler(State(server): State<AlexandriaServer>) -> Html<String> {
-    let body = match alexandria_storage::stats::gather(server.db.inner()).await {
-        Ok(stats) => format!(
-            r#"<h1>Alexandria Debug Dashboard</h1>
-<table>
-<tr><th>Facts (active)</th><td>{}</td></tr>
-<tr><th>Facts (deleted)</th><td>{}</td></tr>
-<tr><th>Clusters</th><td>{}</td></tr>
-<tr><th>Edges</th><td>{}</td></tr>
-<tr><th>Raw documents</th><td>{}</td></tr>
-</table>"#,
-            stats.fact_count,
-            stats.deleted_fact_count,
-            stats.cluster_count,
-            stats.edge_count,
-            stats.raw_count,
-        ),
-        Err(e) => format!(
-            r#"<p class="error">Failed to load stats: {}</p>"#,
-            esc(&e.to_string())
-        ),
+/// Counts come from `alexandria_storage::stats::Stats`, flattened into plain fields so the
+/// template does not depend on a storage type. Every value is a `usize`, so auto-escaping is
+/// a no-op here; the shape is what the legacy `format!` page rendered.
+#[derive(Template)]
+#[template(path = "dashboard.html")]
+struct DashboardTemplate {
+    nav: &'static str,
+    fact_count: usize,
+    deleted_fact_count: usize,
+    cluster_count: usize,
+    edge_count: usize,
+    raw_count: usize,
+}
+
+pub async fn handler(State(server): State<AlexandriaServer>) -> Response {
+    let stats = match alexandria_storage::stats::gather(server.db.inner()).await {
+        Ok(stats) => stats,
+        // The legacy page prefixed the raw error, so the prefix travels with the message.
+        Err(e) => return error_page("dashboard", &format!("Failed to load stats: {e}")),
     };
-    Html(layout("Dashboard", &body))
+
+    page(DashboardTemplate {
+        nav: "dashboard",
+        fact_count: stats.fact_count,
+        deleted_fact_count: stats.deleted_fact_count,
+        cluster_count: stats.cluster_count,
+        edge_count: stats.edge_count,
+        raw_count: stats.raw_count,
+    })
 }
 
 #[cfg(test)]

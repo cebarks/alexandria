@@ -1,0 +1,10 @@
+{% extends "layout.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block body %}<h1>Alexandria Debug Dashboard</h1>
+<table>
+<tr><th>Facts (active)</th><td>{{ fact_count }}</td></tr>
+<tr><th>Facts (deleted)</th><td>{{ deleted_fact_count }}</td></tr>
+<tr><th>Clusters</th><td>{{ cluster_count }}</td></tr>
+<tr><th>Edges</th><td>{{ edge_count }}</td></tr>
+<tr><th>Raw documents</th><td>{{ raw_count }}</td></tr>
+</table>{% endblock %}
