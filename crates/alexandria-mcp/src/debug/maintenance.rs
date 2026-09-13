@@ -1,9 +1,9 @@
+use askama::Template;
 use axum::extract::{Query, State};
-use axum::response::Html;
+use axum::response::Response;
 
-use super::html::{esc, layout};
+use super::html::{error_page, page};
 use crate::AlexandriaServer;
-use alexandria_storage::record_id_to_string;
 
 #[derive(serde::Deserialize)]
 pub struct Pagination {
@@ -12,104 +12,83 @@ pub struct Pagination {
 
 const PAGE_SIZE: usize = 50;
 
+/// One `maintenance_log` row, flattened for display. The action badge is markup, so it lives
+/// in the template and this carries the raw `action` string it switches on; `targets` are the
+/// raw record ids and the template links them.
+struct MaintenanceRow {
+    action: String,
+    source_id: String,
+    targets: Vec<String>,
+    members_moved: i64,
+    timestamp: String,
+}
+
+/// `prev_href` / `next_href` / `summary` feed `templates/_pagination.html`'s `pager` macro,
+/// which is presentational: this page paginates by `?page=N`, so the full hrefs are built
+/// here and an empty string means no link on that side.
+#[derive(Template)]
+#[template(path = "maintenance.html")]
+struct MaintenanceTemplate {
+    nav: &'static str,
+    logs: Vec<MaintenanceRow>,
+    prev_href: String,
+    next_href: String,
+    summary: String,
+    total_pages: usize,
+    total: usize,
+}
+
 pub async fn list(
     State(server): State<AlexandriaServer>,
     Query(params): Query<Pagination>,
-) -> Html<String> {
-    let page = params.page.unwrap_or(1).max(1);
-    let offset = (page - 1) * PAGE_SIZE;
+) -> Response {
+    // `current_page`, not `page`: the render helper `html::page` is in scope in this module.
+    let current_page = params.page.unwrap_or(1).max(1);
+    let offset = (current_page - 1) * PAGE_SIZE;
 
     let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
     let total = cluster_repo.count_maintenance_logs().await.unwrap_or(0);
     let logs = match cluster_repo.list_maintenance_logs(PAGE_SIZE, offset).await {
         Ok(l) => l,
-        Err(e) => {
-            return Html(layout(
-                "Maintenance Log",
-                &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
-            ));
-        }
+        Err(e) => return error_page("maintenance", &e.to_string()),
     };
 
-    let mut rows_html = String::new();
-    for log in &logs {
-        let _id = log.id.as_ref().map(record_id_to_string).unwrap_or_default();
-        let action_badge = match log.action.as_str() {
-            "merge" => {
-                r#"<span class="badge" style="background:#1a3d2a;color:#3fb950;">merge</span>"#
-            }
-            "split" => {
-                r#"<span class="badge" style="background:#3d2f1a;color:#d29922;">split</span>"#
-            }
-            _ => r#"<span class="badge">unknown</span>"#,
-        };
-
-        let target_links: Vec<String> = log
-            .target_ids
-            .iter()
-            .map(|tid| {
-                let encoded = tid.replace(':', "%3A");
-                format!(
-                    r#"<a class="link" href="/debug/clusters/{encoded}">{}</a>"#,
-                    esc(tid)
-                )
-            })
-            .collect();
-        let targets = target_links.join(", ");
-
-        let timestamp = log
-            .created_at
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_default();
-
-        rows_html.push_str(&format!(
-            r#"<tr>
-<td>{action_badge}</td>
-<td>{}</td>
-<td>{targets}</td>
-<td>{}</td>
-<td>{timestamp}</td>
-</tr>"#,
-            esc(&log.source_id),
-            log.members_moved,
-        ));
-    }
+    let rows = logs
+        .iter()
+        .map(|log| MaintenanceRow {
+            action: log.action.clone(),
+            source_id: log.source_id.clone(),
+            targets: log.target_ids.clone(),
+            members_moved: log.members_moved,
+            timestamp: log
+                .created_at
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_default(),
+        })
+        .collect();
 
     let total_pages = total.div_ceil(PAGE_SIZE);
-    let pagination = if total_pages > 1 {
-        let prev = if page > 1 {
-            format!(
-                r#"<a class="link" href="/debug/maintenance?page={}">← Prev</a>"#,
-                page - 1
-            )
-        } else {
-            String::new()
-        };
-        let next = if page < total_pages {
-            format!(
-                r#"<a class="link" href="/debug/maintenance?page={}">Next →</a>"#,
-                page + 1
-            )
-        } else {
-            String::new()
-        };
-        format!(
-            r#"<div class="pagination">{prev} <span>Page {page} of {total_pages} ({total} entries)</span> {next}</div>"#
-        )
+    let prev_href = if current_page > 1 {
+        format!("/debug/maintenance?page={}", current_page - 1)
     } else {
-        format!(r#"<p>{total} entries</p>"#)
+        String::new()
     };
+    let next_href = if current_page < total_pages {
+        format!("/debug/maintenance?page={}", current_page + 1)
+    } else {
+        String::new()
+    };
+    let summary = format!("Page {current_page} of {total_pages} ({total} entries)");
 
-    let body = format!(
-        r#"<h1>Maintenance Log</h1>
-<table>
-<tr><th>Action</th><th>Source</th><th>Target(s)</th><th>Members Moved</th><th>Time</th></tr>
-{rows_html}
-</table>
-{pagination}"#
-    );
-
-    Html(layout("Maintenance Log", &body))
+    page(MaintenanceTemplate {
+        nav: "maintenance",
+        logs: rows,
+        prev_href,
+        next_href,
+        summary,
+        total_pages,
+        total,
+    })
 }
 
 #[cfg(test)]
