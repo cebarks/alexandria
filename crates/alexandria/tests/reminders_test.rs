@@ -1225,3 +1225,47 @@ async fn list_surfaces_corrupt_row_with_invalid_schedule_marker() {
     );
     assert_eq!(repo.get(&healthy).await.unwrap().unwrap().status, "pending");
 }
+
+/// The passive safety net: `retrieve_memories` also carries a read-only
+/// `due_reminders` array, so an agent that never calls `check_reminders` still
+/// sees that something came due. Piggybacking must never consume — the whole
+/// delivery model (claim-based `record_delivery`, escalation, occurrence
+/// coalescing) lives in `check_reminders` alone, so a read that advanced or
+/// flipped a row would silently steal the reminder from the next check. The
+/// follow-up check therefore has to deliver the same row.
+#[tokio::test]
+async fn piggyback_lists_due_reminders_without_consuming() {
+    let server = setup().await;
+    server
+        .do_set_reminder(once_params("nag me", "2020-01-01T12:00:00Z"))
+        .await
+        .unwrap();
+    server
+        .do_store_memory(alexandria_mcp::tools::StoreMemoryParams {
+            content: "OAuth tokens expire after 7 days".to_string(),
+            tags: None,
+            session_id: None,
+        })
+        .await
+        .unwrap();
+
+    let out: serde_json::Value = serde_json::from_str(
+        &server
+            .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+                query: "token expiration".to_string(),
+                limit: Some(5),
+                session_id: None,
+            })
+            .await
+            .unwrap()
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(out["due_reminders"].as_array().unwrap().len(), 1);
+    assert_eq!(out["due_reminders"][0]["message"], "nag me");
+
+    // NOT consumed — check_reminders still delivers it
+    let chk: serde_json::Value =
+        serde_json::from_str(&server.do_check_reminders(check(None)).await.unwrap()).unwrap();
+    assert_eq!(chk["count"], 1);
+}

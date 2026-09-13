@@ -504,7 +504,10 @@ impl AlexandriaServer {
             };
 
         if facts.is_empty() {
-            return Ok(serde_json::json!({ "results": [] }));
+            return Ok(serde_json::json!({
+                "results": [],
+                "due_reminders": self.due_reminders_summary(5).await,
+            }));
         }
 
         // 3. Rank by similarity, then drop results below the server-side floor.
@@ -546,7 +549,10 @@ impl AlexandriaServer {
             })
             .collect();
 
-        Ok(serde_json::json!({ "results": results }))
+        Ok(serde_json::json!({
+            "results": results,
+            "due_reminders": self.due_reminders_summary(5).await,
+        }))
     }
 
     pub async fn do_recall(&self, params: RecallParams) -> anyhow::Result<String> {
@@ -576,6 +582,7 @@ impl AlexandriaServer {
             Ok(serde_json::json!({
                 "mode": "focused",
                 "memories": memories,
+                "due_reminders": self.due_reminders_summary(5).await,
             })
             .to_string())
         } else {
@@ -610,6 +617,7 @@ impl AlexandriaServer {
             Ok(serde_json::json!({
                 "mode": "broad",
                 "clusters": cluster_results,
+                "due_reminders": self.due_reminders_summary(5).await,
             })
             .to_string())
         }
@@ -1209,6 +1217,52 @@ impl AlexandriaServer {
     }
 
     // --- Internal helpers ---
+
+    /// Read-only due-reminder summary for piggybacking onto memory responses
+    /// (`retrieve_memories`, `recall`), so an agent that never calls
+    /// `check_reminders` still sees that something came due.
+    ///
+    /// Never consumes: due-ness is a query-time predicate, so listing leaves the
+    /// row pending and `check_reminders` keeps sole ownership of every delivery
+    /// decision (targeting, escalation, occurrence coalescing, the claim write).
+    /// Capped, oldest-due first (`list_due` orders by `next_due_at ASC`), to
+    /// bound how much noise an unrelated memory lookup carries.
+    ///
+    /// Fail-open: a reminder-layer error degrades to an empty array rather than
+    /// breaking retrieval, because a broken reminder table must not take the
+    /// memory tools down with it.
+    async fn due_reminders_summary(&self, cap: usize) -> Vec<serde_json::Value> {
+        use alexandria_storage::repos::ReminderRepo;
+
+        let repo = ReminderRepo::new(self.db.inner());
+        match repo.list_due(Utc::now()).await {
+            Ok(rows) => rows
+                .into_iter()
+                .take(cap)
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id.as_ref().map(record_id_to_string).unwrap_or_default(),
+                        "message": r.message,
+                        "target": match &r.target_project {
+                            Some(p) => format!("project:{p}"),
+                            None => "global".to_string(),
+                        },
+                        // A NULL `next_due_at` renders as JSON null: the only
+                        // writer cannot produce one (Task 9 refuses a schedule
+                        // with no future fire), but `list_due`'s `next_due_at <=
+                        // $now` does select such a row, so an admin/migration
+                        // path can. It is reported rather than hidden — like the
+                        // corrupt rows in `do_list_reminders`.
+                        "due_at": r.next_due_at.map(rfc3339_utc),
+                    })
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("due_reminders piggyback failed: {}", error_message(&e));
+                Vec::new() // fail-open: never break retrieval over reminders
+            }
+        }
+    }
 
     /// Assign a fact to a cluster, creating a new one if needed. Updates centroids.
     async fn assign_to_cluster_and_update(
