@@ -348,8 +348,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_memories_list_escapes_xss_payload_in_content_and_tags() {
-        // Security regression test: stored content/tags must render through esc() and never
-        // reach the response as raw executable HTML.
+        // Security regression test: stored content/tags must render escaped and never reach
+        // the response as raw executable HTML. askama auto-escapes every `{{ }}`, so there is
+        // no `esc()` call left to point at — the assertions below are the guard.
         let server = super::super::test_support::test_server().await;
         let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
         repo.create_fact(

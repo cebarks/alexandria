@@ -89,6 +89,10 @@ pub fn page<T: Template>(tpl: T) -> Response {
 }
 
 /// Data-layer failure (DB unreachable, bad record id) rendered through the layout.
+///
+/// Returns **200**. Callers that must preserve a legacy non-200 (cluster detail 500,
+/// memory-not-found 404) set `*response.status_mut()` themselves — `status_mut` touches only
+/// the status line, leaving the body and `text/html` content type intact.
 pub fn error_page(nav: &'static str, message: &str) -> Response {
     page(ErrorTemplate {
         nav,
@@ -103,9 +107,14 @@ pub struct ErrorTemplate {
     pub message: String,
 }
 
-/// Test-only caller for `templates/_pagination.html`: askama compiles a template only
-/// when something derives from it, so this is what keeps the `pager` macro checked.
-/// Delete alongside `_test_pager.html` once Task 1.4 wires the macro into a real page.
+/// Unit-level coverage of the `pager` contract in `templates/_pagination.html`.
+///
+/// askama compiles a template only when something derives from it, so this is also what keeps
+/// the macro type-checked. **Kept deliberately even though `maintenance.html` and
+/// `memories.html` now call the macro**: those call sites cannot reach the cases covered here.
+/// `maintenance.html` is `?page=N` only and its integration tests never exceed one page, so it
+/// exercises neither an `&`-bearing href (the `&#38;` escaping guard) nor the
+/// both-sides-empty case. Do not delete this in Task 1.5.
 #[cfg(test)]
 #[derive(Template)]
 #[template(path = "_test_pager.html")]

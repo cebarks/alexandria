@@ -1,6 +1,9 @@
-{# Test scaffolding only. askama compiles a template solely when some `#[derive(Template)]`
-   reaches it, so without this file `_pagination.html` would never be type-checked and a broken
-   macro would ship silently. Delete together with `PagerTemplate` in html.rs once a real page
-   uses the macro (Task 1.4). #}
+{# Test scaffolding — KEEP. askama compiles a template only when some `#[derive(Template)]`
+   reaches it, so without this file `_pagination.html` would never be type-checked.
+
+   It is also the only *runtime* coverage of the pager contract: the real call sites in
+   maintenance.html and memories.html cannot reach the both-hrefs-empty case or an
+   `&`-bearing href (maintenance is `?page=N` only). See `PagerTemplate` in
+   src/debug/html.rs, which carries the same note. Do not delete in Task 1.5. #}
 {% import "_pagination.html" as p %}
 {{ p::pager(prev_href, next_href, summary) }}

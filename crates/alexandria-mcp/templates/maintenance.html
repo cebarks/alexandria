@@ -2,6 +2,9 @@
 {% import "_pagination.html" as p %}
 {% block title %}Maintenance Log{% endblock %}
 {% block body %}<h1>Maintenance Log</h1>
+{# The `{% for %}`/`{% if %}` lines below are deliberately kept on ONE physical line each:
+   newlines inside a <td> render as visible whitespace, and the `, ` separator between target
+   links must not gain a stray space before </td>. Do not let a formatter reflow them. #}
 <table>
 <tr><th>Action</th><th>Source</th><th>Target(s)</th><th>Members Moved</th><th>Time</th></tr>
 {% for log in logs %}<tr>

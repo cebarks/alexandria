@@ -54,11 +54,11 @@ pub async fn list(
     };
 
     let rows = logs
-        .iter()
+        .into_iter()
         .map(|log| MaintenanceRow {
-            action: log.action.clone(),
-            source_id: log.source_id.clone(),
-            targets: log.target_ids.clone(),
+            action: log.action,
+            source_id: log.source_id,
+            targets: log.target_ids,
             members_moved: log.members_moved,
             timestamp: log
                 .created_at
@@ -93,6 +93,8 @@ pub async fn list(
 
 #[cfg(test)]
 mod tests {
+    use super::MaintenanceTemplate;
+    use askama::Template;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -162,5 +164,36 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("merge"));
         assert!(text.contains("1 entries"));
+    }
+
+    /// Both integration tests above create at most one log, so `total_pages > 1` is never true
+    /// and the `pager` call site is compiled but never rendered — and since both hrefs are
+    /// `String`, a swapped prev/next would not be caught by the type checker either.
+    #[test]
+    fn test_maintenance_template_renders_pager_with_correct_sides() {
+        let html = MaintenanceTemplate {
+            nav: "maintenance",
+            logs: vec![],
+            prev_href: "/debug/maintenance?page=1".to_string(),
+            next_href: "/debug/maintenance?page=3".to_string(),
+            summary: "Page 2 of 3 (101 entries)".to_string(),
+            total_pages: 3,
+            total: 101,
+        }
+        .render()
+        .unwrap();
+        assert!(
+            html.contains(r#"href="/debug/maintenance?page=1">← Prev"#),
+            "prev must carry the lower page number; got: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/debug/maintenance?page=3">Next →"#),
+            "next must carry the higher page number; got: {html}"
+        );
+        assert!(html.contains("Page 2 of 3 (101 entries)"), "got: {html}");
+        assert!(
+            !html.contains("<p>101 entries</p>"),
+            "multi-page render must not also emit the single-page fallback; got: {html}"
+        );
     }
 }
