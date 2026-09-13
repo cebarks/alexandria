@@ -1,0 +1,16 @@
+{% extends "layout.html" %}
+{% import "_pagination.html" as p %}
+{% block title %}Memories{% endblock %}
+{% block body %}<h1>Memories</h1>
+<form hx-get="/debug/memories" hx-target="#memory-results" hx-trigger="input changed delay:300ms from:input, change from:select">
+<input type="text" name="search" placeholder="search content..." value="{{ search }}">
+<input type="text" name="tag" placeholder="tag" value="{{ tag }}">
+<label><input type="checkbox" name="include_deleted" value="true" {% if include_deleted %}checked{% endif %}> include deleted</label>
+</form>
+<div id="memory-results">
+<table>
+<tr><th>ID</th><th>Content</th><th>Tags</th><th>Confidence</th><th>Created</th></tr>
+{% for row in rows %}<tr{% if row.deleted %} class="deleted"{% endif %}><td><a class="link" href="/debug/memories/{{ row.id|urlencode }}">{{ row.id }}</a></td><td>{{ row.preview }}</td><td>{% for tag_name in row.tags %}<span class="badge">{{ tag_name }}</span>{% endfor %}</td><td>{{ row.confidence }}</td><td>{{ row.created }}</td></tr>
+{% endfor %}</table>
+{% if prev_href != "" || next_href != "" %}{{ p::pager(prev_href, next_href, summary) }}{% else %}{# the macro renders nothing when both links are absent, but the legacy page always printed its count line, so the fallback lives here #}<div class="pagination"><span>{{ summary }}</span></div>{% endif %}
+</div>{% endblock %}

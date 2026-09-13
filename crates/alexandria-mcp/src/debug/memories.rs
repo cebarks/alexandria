@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
+use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::response::{Html, IntoResponse, Response};
 
-use super::html::{esc, layout};
+use super::html::{error_page, esc, layout, page};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
@@ -33,10 +34,39 @@ fn memories_url(
     format!("/debug/memories?{}", parts.join("&"))
 }
 
+/// One row of the memories table, flattened out of `Fact` so the template never has to deal
+/// with `Option<RecordId>`, with content truncation, or with how a float / timestamp renders.
+struct MemoryRow {
+    id: String,
+    /// The 120-char preview, with the trailing `…` already appended if it was truncated.
+    preview: String,
+    tags: Vec<String>,
+    confidence: String,
+    created: String,
+    deleted: bool,
+}
+
+/// `prev_href` / `next_href` / `summary` feed `templates/_pagination.html`'s `pager` macro,
+/// which is presentational: this page paginates by offset rather than by page number, so the
+/// full hrefs are built here via [`memories_url`], which is what carries the search / tag /
+/// include_deleted filters through the hop. An empty href means no link on that side.
+#[derive(Template)]
+#[template(path = "memories.html")]
+struct MemoriesTemplate {
+    nav: &'static str,
+    search: String,
+    tag: String,
+    include_deleted: bool,
+    rows: Vec<MemoryRow>,
+    prev_href: String,
+    next_href: String,
+    summary: String,
+}
+
 pub async fn list(
     State(server): State<AlexandriaServer>,
     Query(params): Query<HashMap<String, String>>,
-) -> Html<String> {
+) -> Response {
     let search = params.get("search").filter(|s| !s.is_empty());
     let tag = params.get("tag").filter(|s| !s.is_empty());
     let include_deleted = params
@@ -64,12 +94,7 @@ pub async fn list(
         .await
     {
         Ok(r) => r,
-        Err(e) => {
-            return Html(layout(
-                "Memories",
-                &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
-            ));
-        }
+        Err(e) => return error_page("memories", &e.to_string()),
     };
 
     let total = match repo
@@ -84,106 +109,79 @@ pub async fn list(
         Err(_) => rows.len(), // graceful fallback
     };
 
-    let mut rows_html = String::new();
-    for fact in &rows {
-        let id = fact
-            .id
-            .as_ref()
-            .map(record_id_to_string)
-            .unwrap_or_default();
-        let id_esc = esc(&id);
-        let tags = fact
-            .tags
-            .iter()
-            .map(|t| format!(r#"<span class="badge">{}</span>"#, esc(t)))
-            .collect::<String>();
+    let rows_view = rows
+        .iter()
+        .map(|fact| {
+            // Add "…" if content was truncated (single-pass: peek 121st char to detect overflow)
+            let preview = {
+                let mut chars = fact.content.chars();
+                let taken: String = chars.by_ref().take(120).collect();
+                if chars.next().is_some() {
+                    format!("{taken}…")
+                } else {
+                    taken
+                }
+            };
 
-        // Add "…" if content was truncated (single-pass: peek 121st char to detect overflow)
-        let content_preview = {
-            let mut chars = fact.content.chars();
-            let preview: String = chars.by_ref().take(120).collect();
-            if chars.next().is_some() {
-                format!("{}…", preview)
-            } else {
-                preview
+            // Format created_at as "YYYY-MM-DD HH:MM UTC", fallback to "—"
+            let created = fact
+                .created_at
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "—".to_string());
+
+            MemoryRow {
+                id: fact
+                    .id
+                    .as_ref()
+                    .map(record_id_to_string)
+                    .unwrap_or_default(),
+                preview,
+                tags: fact.tags.clone(),
+                confidence: format!("{:.2}", fact.confidence),
+                created,
+                // Deleted rows get a CSS class for dimming
+                deleted: fact.deleted,
             }
-        };
+        })
+        .collect();
 
-        // Format created_at as "YYYY-MM-DD HH:MM UTC", fallback to "—"
-        let created = fact
-            .created_at
-            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-            .unwrap_or_else(|| "—".to_string());
+    let showing_from = if rows.is_empty() { 0 } else { offset + 1 };
+    let showing_to = offset + rows.len();
+    let summary = format!("Showing {showing_from}\u{2013}{showing_to} of {total} memories");
 
-        // Deleted rows get a CSS class for dimming
-        let row_class = if fact.deleted {
-            r#" class="deleted""#
-        } else {
-            ""
-        };
+    let prev_href = if offset > 0 {
+        memories_url(
+            search.map(|s| s.as_str()),
+            tag.map(|s| s.as_str()),
+            include_deleted,
+            limit,
+            offset.saturating_sub(limit),
+        )
+    } else {
+        String::new()
+    };
+    let next_href = if offset + rows.len() < total {
+        memories_url(
+            search.map(|s| s.as_str()),
+            tag.map(|s| s.as_str()),
+            include_deleted,
+            limit,
+            offset + limit,
+        )
+    } else {
+        String::new()
+    };
 
-        rows_html.push_str(&format!(
-            r#"<tr{row_class}><td><a class="link" href="/debug/memories/{id_esc}">{id_esc}</a></td><td>{}</td><td>{}</td><td>{:.2}</td><td>{created}</td></tr>"#,
-            esc(&content_preview),
-            tags,
-            fact.confidence,
-        ));
-    }
-
-    let body = format!(
-        r##"<h1>Memories</h1>
-<form hx-get="/debug/memories" hx-target="#memory-results" hx-trigger="input changed delay:300ms from:input, change from:select">
-<input type="text" name="search" placeholder="search content..." value="{}">
-<input type="text" name="tag" placeholder="tag" value="{}">
-<label><input type="checkbox" name="include_deleted" value="true" {}> include deleted</label>
-</form>
-<div id="memory-results">
-<table>
-<tr><th>ID</th><th>Content</th><th>Tags</th><th>Confidence</th><th>Created</th></tr>
-{rows_html}
-</table>
-<div class="pagination"><span>{summary}</span><span>{prev_link} {next_link}</span></div>
-</div>"##,
-        esc(search.map(|s| s.as_str()).unwrap_or("")),
-        esc(tag.map(|s| s.as_str()).unwrap_or("")),
-        if include_deleted { "checked" } else { "" },
-        summary = {
-            let showing_from = if rows.is_empty() { 0 } else { offset + 1 };
-            let showing_to = offset + rows.len();
-            format!("Showing {showing_from}\u{2013}{showing_to} of {total} memories")
-        },
-        prev_link = if offset > 0 {
-            let prev_offset = offset.saturating_sub(limit);
-            format!(
-                r#"<a class="link" href="{}">← Prev</a>"#,
-                esc(&memories_url(
-                    search.map(|s| s.as_str()),
-                    tag.map(|s| s.as_str()),
-                    include_deleted,
-                    limit,
-                    prev_offset
-                ))
-            )
-        } else {
-            String::new()
-        },
-        next_link = if offset + rows.len() < total {
-            format!(
-                r#"<a class="link" href="{}">Next →</a>"#,
-                esc(&memories_url(
-                    search.map(|s| s.as_str()),
-                    tag.map(|s| s.as_str()),
-                    include_deleted,
-                    limit,
-                    offset + limit
-                ))
-            )
-        } else {
-            String::new()
-        },
-    );
-
-    Html(layout("Memories", &body))
+    page(MemoriesTemplate {
+        nav: "memories",
+        search: search.cloned().unwrap_or_default(),
+        tag: tag.cloned().unwrap_or_default(),
+        include_deleted,
+        rows: rows_view,
+        prev_href,
+        next_href,
+        summary,
+    })
 }
 
 pub async fn detail(
@@ -406,11 +404,11 @@ mod tests {
             "raw <img onerror> tag must not appear unescaped in the response"
         );
         assert!(
-            text.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            text.contains(r#"<td>&#60;script&#62;alert(1)&#60;/script&#62;</td>"#),
             "content should appear HTML-escaped"
         );
         assert!(
-            text.contains("&lt;img src=x onerror=alert(2)&gt;"),
+            text.contains(r#"<span class="badge">&#60;img src=x onerror=alert(2)&#62;</span>"#),
             "tag should appear HTML-escaped"
         );
     }
