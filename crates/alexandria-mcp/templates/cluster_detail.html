@@ -1,0 +1,9 @@
+{% extends "layout.html" %}
+{% block title %}Cluster Detail{% endblock %}
+{% block body %}<h1>Cluster {{ id }}</h1>
+<p>Cohesion: {{ cohesion }}</p>
+<table>
+<tr><th>ID</th><th>Content</th></tr>
+{% for member in members %}<tr><td><a class="link" href="/debug/memories/{{ member.id|urlencode }}">{{ member.id }}</a></td><td>{{ member.preview }}</td></tr>
+{% endfor %}</table>
+<p>{{ member_count }} members</p>{% endblock %}

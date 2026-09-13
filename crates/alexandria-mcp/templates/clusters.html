@@ -1,0 +1,8 @@
+{% extends "layout.html" %}
+{% block title %}Clusters{% endblock %}
+{% block body %}<h1>Clusters</h1>
+<table>
+<tr><th>ID</th><th>Label</th><th>Members</th><th>Depth</th></tr>
+{% for cluster in clusters %}<tr><td><a class="link" href="/debug/clusters/{{ cluster.id|urlencode }}">{{ cluster.id }}</a></td><td>{{ cluster.label }}</td><td>{{ cluster.members }}</td><td>{{ cluster.depth }}</td></tr>
+{% endfor %}</table>
+<p>{{ total }} clusters</p>{% endblock %}

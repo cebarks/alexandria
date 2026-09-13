@@ -1,8 +1,9 @@
+use askama::Template;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::response::Response;
 
-use super::html::{esc, layout};
+use super::html::{error_page, page};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
@@ -11,62 +12,85 @@ use crate::server::record_id_to_string;
 /// `ClusterConfig::default().cohesion_floor` in `crates/alexandria/src/config.rs`.
 const DISPLAY_COHESION_FLOOR: f32 = 0.6;
 
-pub async fn list(State(server): State<AlexandriaServer>) -> Html<String> {
+/// One row of the cluster list, flattened out of `Cluster` so the template never has to
+/// deal with `Option<RecordId>` or with how a record id is formatted.
+struct ClusterRow {
+    id: String,
+    label: String,
+    members: usize,
+    depth: i64,
+}
+
+#[derive(Template)]
+#[template(path = "clusters.html")]
+struct ClustersTemplate {
+    nav: &'static str,
+    clusters: Vec<ClusterRow>,
+    total: usize,
+}
+
+/// One member row of the detail view. `preview` is the 120-char content truncation the
+/// legacy page showed.
+struct MemberRow {
+    id: String,
+    preview: String,
+}
+
+#[derive(Template)]
+#[template(path = "cluster_detail.html")]
+struct ClusterDetailTemplate {
+    nav: &'static str,
+    id: String,
+    /// Already-resolved health text: the cohesion math stays in the handler (and in the
+    /// engine), the template only displays the verdict.
+    cohesion: String,
+    members: Vec<MemberRow>,
+    member_count: usize,
+}
+
+pub async fn list(State(server): State<AlexandriaServer>) -> Response {
     let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
     let clusters = match cluster_repo.list_with_counts().await {
         Ok(c) => c,
-        Err(e) => {
-            return Html(layout(
-                "Clusters",
-                &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
-            ));
-        }
+        Err(e) => return error_page("clusters", &e.to_string()),
     };
 
-    let mut rows_html = String::new();
-    for (cluster, count) in &clusters {
-        let id = cluster
-            .id
-            .as_ref()
-            .map(record_id_to_string)
-            .unwrap_or_default();
-        let label = cluster.label.as_deref().unwrap_or("(unlabeled)");
-        rows_html.push_str(&format!(
-            r#"<tr><td><a class="link" href="/debug/clusters/{id}">{id}</a></td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
-            esc(label),
-            count,
-            cluster.depth,
-        ));
-    }
+    let total = clusters.len();
+    let rows = clusters
+        .into_iter()
+        .map(|(cluster, count)| ClusterRow {
+            id: cluster
+                .id
+                .as_ref()
+                .map(record_id_to_string)
+                .unwrap_or_default(),
+            label: cluster
+                .label
+                .as_deref()
+                .unwrap_or("(unlabeled)")
+                .to_string(),
+            members: count,
+            depth: cluster.depth,
+        })
+        .collect();
 
-    let body = format!(
-        r#"<h1>Clusters</h1>
-<table>
-<tr><th>ID</th><th>Label</th><th>Members</th><th>Depth</th></tr>
-{rows_html}
-</table>
-<p>{} clusters</p>"#,
-        clusters.len(),
-    );
-
-    Html(layout("Clusters", &body))
+    page(ClustersTemplate {
+        nav: "clusters",
+        clusters: rows,
+        total,
+    })
 }
 
-pub async fn detail(
-    State(server): State<AlexandriaServer>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<String>) -> Response {
     let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
     let members = match cluster_repo.get_members(&id).await {
         Ok(m) => m,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(layout(
-                    "Error",
-                    &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
-                )),
-            );
+            // The detail handler has always answered a data-layer failure with 500 (the list
+            // handlers return 200), so keep the status rather than taking `error_page`'s.
+            let mut response = error_page("clusters", &e.to_string());
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return response;
         }
     };
 
@@ -75,7 +99,7 @@ pub async fn detail(
         // via get_members alone (it returns an empty Vec either way); render what we have.
     }
 
-    let cohesion_html = if members.len() >= 4 {
+    let cohesion = if members.len() >= 4 {
         // Recompute the centroid inline for display purposes (approximate: average of member embeddings).
         let dims = members[0].embedding.len();
         let mut centroid = vec![0.0f32; dims];
@@ -108,34 +132,26 @@ pub async fn detail(
         "N/A (fewer than 4 members)".to_string()
     };
 
-    let mut rows_html = String::new();
-    for fact in &members {
-        let fid = fact
-            .id
-            .as_ref()
-            .map(record_id_to_string)
-            .unwrap_or_default();
-        let content_preview: String = fact.content.chars().take(120).collect();
-        rows_html.push_str(&format!(
-            r#"<tr><td><a class="link" href="/debug/memories/{fid}">{fid}</a></td><td>{}</td></tr>"#,
-            esc(&content_preview),
-        ));
-    }
+    let member_count = members.len();
+    let rows = members
+        .iter()
+        .map(|fact| MemberRow {
+            id: fact
+                .id
+                .as_ref()
+                .map(record_id_to_string)
+                .unwrap_or_default(),
+            preview: fact.content.chars().take(120).collect(),
+        })
+        .collect();
 
-    let body = format!(
-        r#"<h1>Cluster {}</h1>
-<p>Cohesion: {}</p>
-<table>
-<tr><th>ID</th><th>Content</th></tr>
-{rows_html}
-</table>
-<p>{} members</p>"#,
-        esc(&id),
-        cohesion_html,
-        members.len(),
-    );
-
-    (StatusCode::OK, Html(layout("Cluster Detail", &body)))
+    page(ClusterDetailTemplate {
+        nav: "clusters",
+        id,
+        cohesion,
+        members: rows,
+        member_count,
+    })
 }
 
 #[cfg(test)]
