@@ -1,0 +1,38 @@
+{% extends "layout.html" %}
+{% block title %}Graph{% endblock %}
+{% block body %}<h1>Graph: {{ id }}</h1>
+<div id="graph" style="height: 600px; border: 1px solid #30363d;"></div>{% endblock %}
+{% block scripts %}{# Both script tags live in this block, in this order, and neither gets
+   `defer`. Do not "optimize" that:
+   1. layout.html defers htmx in <head>. A deferred script runs after the document parses but
+      AFTER any inline script in the body, so deferring vis-network while the code below stays
+      inline means `vis` is still undefined when it runs ("vis is not defined"). Loading it
+      plain and first here makes it execute synchronously before the inline tag, and being at
+      the end of <body> means the #graph div from block body has already been parsed.
+   2. The src is the vendored copy served from /debug/assets/ (see `VIS_NETWORK_URL` in
+      debug/assets.rs), not the third-party CDN this page pointed at before this commit (it
+      loaded 9.1.6 there, so this is also a 9 -> 10 major bump: the standalone UMD global build
+      is unchanged in v10, so `vis.DataSet` / `vis.Network` and every option below are as they
+      were). The filename carries the version, so replacing the asset means editing this line.
+   3. The id below is interpolated INSIDE a JavaScript string literal, where auto-escaping does
+      not help: browsers never decode character references in script text, so `{{ id }}` would
+      put `&#58;`-style garbage into the URL rather than neutralizing anything. `|urlencode`
+      percent-encodes it instead, which cannot produce a quote, a backslash or a `</script>`
+      sequence. This is the same encoding the memory detail page links here with. The <h1> above
+      is ordinary HTML text, so it stays plain `{{ id }}`. The trim marker on this comment's
+      closing delimiter keeps a blank line out of the rendered output. -#}
+<script src="/debug/assets/vis-network-10.1.2.min.js"></script>
+<script>
+fetch("/debug/api/graph/{{ id|urlencode }}")
+  .then(r => r.json())
+  .then(data => {
+    const nodes = new vis.DataSet(data.nodes);
+    const edges = new vis.DataSet(data.edges);
+    const container = document.getElementById("graph");
+    new vis.Network(container, { nodes, edges }, {
+      nodes: { color: "#58a6ff", font: { color: "#c9d1d9" } },
+      edges: { color: "#30363d", font: { color: "#8b949e" }, arrows: "to" },
+    });
+  });
+</script>
+{% endblock %}

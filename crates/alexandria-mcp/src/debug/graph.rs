@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
+use askama::Template;
 use axum::extract::{Path, State};
-use axum::response::{Html, Json};
+use axum::response::{Json, Response};
 
-use super::html::{esc, layout};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
@@ -70,27 +70,27 @@ pub async fn api_graph(
     }))
 }
 
-pub async fn page(Path(id): Path<String>) -> Html<String> {
-    let id_esc = esc(&id);
-    let body = format!(
-        r##"<h1>Graph: {id_esc}</h1>
-<div id="graph" style="height: 600px; border: 1px solid #30363d;"></div>
-<script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
-<script>
-fetch("/debug/api/graph/{id_esc}")
-  .then(r => r.json())
-  .then(data => {{
-    const nodes = new vis.DataSet(data.nodes);
-    const edges = new vis.DataSet(data.edges);
-    const container = document.getElementById("graph");
-    new vis.Network(container, {{ nodes, edges }}, {{
-      nodes: {{ color: "#58a6ff", font: {{ color: "#c9d1d9" }} }},
-      edges: {{ color: "#30363d", font: {{ color: "#8b949e" }}, arrows: "to" }},
-    }});
-  }});
-</script>"##
-    );
-    Html(layout("Graph", &body))
+/// The graph page itself.
+///
+/// `id` is the centre record id only: the nodes and edges are fetched client-side from
+/// [`api_graph`], so this handler does no database work and has no failure path to render.
+#[derive(Template)]
+#[template(path = "graph.html")]
+struct GraphTemplate {
+    nav: &'static str,
+    id: String,
+}
+
+/// The renderer is called by full path because this handler is itself named `page` — a module
+/// level `use super::html::page` would collide with it.
+pub async fn page(Path(id): Path<String>) -> Response {
+    super::html::page(GraphTemplate {
+        // There is no "Graph" nav entry (the page is only reached from a memory detail page),
+        // and inventing one is out of scope for a migration. "memories" is the section the
+        // graph belongs to, which keeps the highlight honest without claiming a link exists.
+        nav: "memories",
+        id,
+    })
 }
 
 #[cfg(test)]
