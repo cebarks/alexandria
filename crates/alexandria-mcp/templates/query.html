@@ -1,0 +1,23 @@
+{% extends "layout.html" %}
+{% block title %}Query Tester{% endblock %}
+{% block body %}<h1>Query Tester</h1>
+{# Everything below is a contract with `run` in query.rs, not just presentation:
+   `hx-post` must keep pointing at /debug/query/run, `hx-target` must keep pointing at the
+   #query-results div at the bottom of this block, and the three `name` attributes are the
+   keys `QueryForm` deserializes. Changing any of them silently breaks the swap, because the
+   results fragment (`query_results.html`) is not a page and has no link back to this form.
+   The trim marker on this comment's closing delimiter drops the newline after it, because
+   legacy had exactly one newline between `</h1>` and `<form>` and a blank line there renders as
+   extra vertical space. -#}
+<form hx-post="/debug/query/run" hx-target="#query-results">
+<label>Mode:
+<select name="mode">
+<option value="retrieve">retrieve_memories</option>
+<option value="recall">recall</option>
+</select>
+</label>
+<input type="text" name="query" placeholder="query text" required>
+<label>Limit (retrieve only): <input type="number" name="limit" value="10" min="1"></label>
+<button type="submit">Run</button>
+</form>
+<div id="query-results"></div>{% endblock %}

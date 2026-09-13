@@ -1,0 +1,27 @@
+{# The htmx fragment that `POST /debug/query/run` swaps into `#query-results`.
+   Unlike every other debug page this one deliberately does NOT extend `layout.html`: it is a
+   body fragment, and wrapping it would drop a second <nav> and a second copy of the CSS into the
+   results div.
+
+   Each `{% when %}` arm is one return branch of the two `format!` renderers this replaced
+   (`render_retrieve_results` / `render_recall_results`), so no branch is lost. Which arm runs is
+   decided in Rust: `Fragment` is an enum, so one render cannot produce two branches, and askama
+   checks the arms for exhaustiveness at compile time. `{:.4}` similarity formatting stays in
+   Rust -- askama renders an `f64` with plain `Display`, which would print `0.5` where the legacy
+   table printed `0.5000`.
+
+   Whitespace: the trim marker on each `when` drops the newline before it, and the one on this
+   comment's closing delimiter drops the newline after it, so a paragraph branch is exactly
+   `<p>...</p>` with nothing around it -- this is swapped into a live div. The only newlines left
+   are the ones between `<tr>` and between `<div>` siblings, which no browser renders, and which
+   match how `maintenance.html` and `memories.html` lay out their tables. -#}
+{% match fragment %}{%- when Fragment::Error { message } %}<p class="error">{{ message }}</p>
+{%- when Fragment::Notice { message } %}<p>{{ message }}</p>
+{%- when Fragment::Table { heading, rows } %}{% if let Some(title) = heading %}<h3>{{ title }}</h3>{% endif %}<table>
+<tr><th>ID</th><th>Content</th><th>Similarity</th></tr>
+{% for row in rows %}<tr><td><a class="link" href="/debug/memories/{{ row.id|urlencode }}">{{ row.id }}</a></td><td>{{ row.content }}</td><td>{{ row.similarity }}</td></tr>
+{% endfor %}</table>
+{%- when Fragment::Clusters { sections } %}<h3>Broad recall</h3>
+{% for cluster in sections %}<div><h3>Cluster {{ cluster.id }} (similarity {{ cluster.similarity }})</h3><ul>{% for content in cluster.contents %}<li>{{ content }}</li>{% endfor %}</ul></div>
+{% endfor %}
+{%- endmatch %}

@@ -1,27 +1,31 @@
+//! The Query Tester: a form page plus the htmx fragment that answers it.
+//!
+//! Both live in templates: `query.html` is a normal page, `query_results.html` is a body
+//! fragment (it does not extend `layout.html`). Because `run` only ever answers with a fragment,
+//! its error paths are `Fragment::Error` — `html::error_page` would wrap the message in a whole
+//! layout and swap a second `<nav>` into `#query-results`, which is not what this endpoint has
+//! ever returned.
+
+use askama::Template;
 use axum::Form;
 use axum::extract::State;
-use axum::response::Html;
+use axum::response::Response;
 use serde::Deserialize;
 
-use super::html::{esc, layout};
+use super::html::page;
 use crate::AlexandriaServer;
 use crate::tools::{RecallParams, RetrieveMemoriesParams};
 
-pub async fn form(State(_server): State<AlexandriaServer>) -> Html<String> {
-    let body = r##"<h1>Query Tester</h1>
-<form hx-post="/debug/query/run" hx-target="#query-results">
-<label>Mode:
-<select name="mode">
-<option value="retrieve">retrieve_memories</option>
-<option value="recall">recall</option>
-</select>
-</label>
-<input type="text" name="query" placeholder="query text" required>
-<label>Limit (retrieve only): <input type="number" name="limit" value="10" min="1"></label>
-<button type="submit">Run</button>
-</form>
-<div id="query-results"></div>"##;
-    Html(layout("Query Tester", body))
+/// The form. `nav` is the only field: no values are pre-filled, the inputs are static markup
+/// whose `name` attributes are what [`QueryForm`] deserializes.
+#[derive(Template)]
+#[template(path = "query.html")]
+struct QueryTemplate {
+    nav: &'static str,
+}
+
+pub async fn form(State(_server): State<AlexandriaServer>) -> Response {
+    page(QueryTemplate { nav: "query" })
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,11 +35,162 @@ pub struct QueryForm {
     pub limit: Option<usize>,
 }
 
-pub async fn run(
-    State(server): State<AlexandriaServer>,
-    Form(form): Form<QueryForm>,
-) -> Html<String> {
-    let body = match form.mode.as_str() {
+/// One row of the ID / Content / Similarity table. `retrieve_memories` results and focused
+/// recall share this shape — the legacy code rendered both with the same `format!` line.
+struct ResultRow {
+    id: String,
+    content: String,
+    similarity: String,
+}
+
+/// One cluster of a broad recall. Only the representative memory *contents* are listed: the
+/// legacy renderer never showed the per-memory ids or similarities inside the `<ul>`, so this
+/// drops nothing.
+struct RecallCluster {
+    id: String,
+    similarity: String,
+    contents: Vec<String>,
+}
+
+/// What `/debug/query/run` can answer — one variant per return branch of the two `format!`
+/// renderers this replaces. An enum rather than a struct of optional fields so the fragment
+/// cannot render two branches at once, and so the template's `{% match %}` is checked for
+/// exhaustiveness at compile time.
+enum Fragment {
+    /// A tool error, an unknown `mode` value, or a recall payload that failed to parse.
+    Error { message: String },
+    /// A bare-`<p>` empty state ("No results." and friends), which legacy had no class for.
+    Notice { message: String },
+    /// The results table. `heading` is `Some("Focused recall")` for recall's focused mode;
+    /// retrieve results had no heading at all.
+    Table {
+        heading: Option<&'static str>,
+        rows: Vec<ResultRow>,
+    },
+    /// Broad recall: one section per cluster. The `<h3>Broad recall</h3>` lives in the template.
+    Clusters { sections: Vec<RecallCluster> },
+}
+
+impl Fragment {
+    fn error(message: String) -> Self {
+        Self::Error { message }
+    }
+
+    fn notice(message: &str) -> Self {
+        Self::Notice {
+            message: message.to_string(),
+        }
+    }
+
+    /// A `retrieve_memories` result: `{ "results": [ { id, content, similarity }, … ] }`.
+    fn retrieve(value: &serde_json::Value) -> Self {
+        let rows = result_rows(value.get("results"));
+        if rows.is_empty() {
+            Self::notice("No results.")
+        } else {
+            Self::Table {
+                heading: None,
+                rows,
+            }
+        }
+    }
+
+    /// A `recall` result. The tool hands back a JSON *string*, so it can still fail to parse
+    /// here after a successful call — that is this function's own `Error` branch.
+    fn recall(json_str: &str) -> Self {
+        let value: serde_json::Value = match serde_json::from_str(json_str) {
+            Ok(v) => v,
+            Err(e) => return Self::error(format!("Failed to parse recall response: {e}")),
+        };
+
+        // The form never sends a scope handle, so in practice only "broad" arrives here, but
+        // both branches are kept: a missing or unexpected `mode` falls through to broad, which
+        // is what legacy did (`unwrap_or("")`), and broad with no clusters prints
+        // "No clusters found." rather than an empty table.
+        if value.get("mode").and_then(|v| v.as_str()).unwrap_or("") == "focused" {
+            let rows = result_rows(value.get("memories"));
+            if rows.is_empty() {
+                Self::notice("No memories in this scope.")
+            } else {
+                Self::Table {
+                    heading: Some("Focused recall"),
+                    rows,
+                }
+            }
+        } else {
+            let empty = Vec::new();
+            let clusters = value
+                .get("clusters")
+                .and_then(|c| c.as_array())
+                .unwrap_or(&empty);
+            let sections: Vec<RecallCluster> = clusters
+                .iter()
+                .map(|c| RecallCluster {
+                    id: string_field(c, "cluster_id"),
+                    similarity: similarity_field(c),
+                    contents: c
+                        .get("representative_memories")
+                        .and_then(|m| m.as_array())
+                        .unwrap_or(&empty)
+                        .iter()
+                        .map(|m| string_field(m, "content"))
+                        .collect(),
+                })
+                .collect();
+            if sections.is_empty() {
+                Self::notice("No clusters found.")
+            } else {
+                Self::Clusters { sections }
+            }
+        }
+    }
+}
+
+/// Rows for a JSON array of `{ id, content, similarity }` entries. A missing or non-array value
+/// yields no rows, which the callers turn into their empty state — as legacy did.
+fn result_rows(value: Option<&serde_json::Value>) -> Vec<ResultRow> {
+    let empty = Vec::new();
+    let entries = value.and_then(|v| v.as_array()).unwrap_or(&empty);
+    entries
+        .iter()
+        .map(|entry| ResultRow {
+            id: string_field(entry, "id"),
+            content: string_field(entry, "content"),
+            similarity: similarity_field(entry),
+        })
+        .collect()
+}
+
+/// A string field, empty when absent or not a string — the legacy renderers used
+/// `unwrap_or("")` rather than skipping a malformed entry, so a bad row shows blank cells.
+fn string_field(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A `similarity` as the legacy `{:.4}` printed it. Formatting stays in Rust: askama renders an
+/// `f64` with plain `Display`, which would print `0.5` where the table printed `0.5000`.
+fn similarity_field(value: &serde_json::Value) -> String {
+    let similarity = value
+        .get("similarity")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    format!("{similarity:.4}")
+}
+
+/// The fragment template. No `nav` field, because `query_results.html` is swapped into a div
+/// rather than extending `layout.html`.
+#[derive(Template)]
+#[template(path = "query_results.html")]
+struct QueryResultsTemplate {
+    fragment: Fragment,
+}
+
+pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryForm>) -> Response {
+    let fragment = match form.mode.as_str() {
         "retrieve" => {
             let params = RetrieveMemoriesParams {
                 query: form.query.clone(),
@@ -43,8 +198,8 @@ pub async fn run(
                 session_id: None,
             };
             match server.do_retrieve_memories(params).await {
-                Ok(value) => render_retrieve_results(&value),
-                Err(e) => format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
+                Ok(value) => Fragment::retrieve(&value),
+                Err(e) => Fragment::error(e.to_string()),
             }
         }
         // recall mode intentionally ignores `limit` — RecallParams has no limit field.
@@ -54,112 +209,13 @@ pub async fn run(
                 scope_handle: None,
             };
             match server.do_recall(params).await {
-                Ok(json_str) => render_recall_results(&json_str),
-                Err(e) => format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
+                Ok(json_str) => Fragment::recall(&json_str),
+                Err(e) => Fragment::error(e.to_string()),
             }
         }
-        other => format!(r#"<p class="error">Unknown mode: {}</p>"#, esc(other)),
+        other => Fragment::error(format!("Unknown mode: {other}")),
     };
-    Html(body)
-}
-
-fn render_retrieve_results(value: &serde_json::Value) -> String {
-    let empty = Vec::new();
-    let results = value
-        .get("results")
-        .and_then(|r| r.as_array())
-        .unwrap_or(&empty);
-
-    if results.is_empty() {
-        return "<p>No results.</p>".to_string();
-    }
-
-    let mut rows = String::new();
-    for r in results {
-        let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let content = r.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let similarity = r.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        rows.push_str(&format!(
-            r#"<tr><td><a class="link" href="/debug/memories/{}">{}</a></td><td>{}</td><td>{:.4}</td></tr>"#,
-            esc(id),
-            esc(id),
-            esc(content),
-            similarity,
-        ));
-    }
-
-    format!(r#"<table><tr><th>ID</th><th>Content</th><th>Similarity</th></tr>{rows}</table>"#)
-}
-
-fn render_recall_results(json_str: &str) -> String {
-    let value: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(e) => {
-            return format!(
-                r#"<p class="error">Failed to parse recall response: {}</p>"#,
-                esc(&e.to_string())
-            );
-        }
-    };
-
-    let mode = value.get("mode").and_then(|v| v.as_str()).unwrap_or("");
-
-    if mode == "focused" {
-        let empty = Vec::new();
-        let memories = value
-            .get("memories")
-            .and_then(|m| m.as_array())
-            .unwrap_or(&empty);
-        if memories.is_empty() {
-            return "<p>No memories in this scope.</p>".to_string();
-        }
-        let mut rows = String::new();
-        for m in memories {
-            let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let similarity = m.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            rows.push_str(&format!(
-                r#"<tr><td><a class="link" href="/debug/memories/{}">{}</a></td><td>{}</td><td>{:.4}</td></tr>"#,
-                esc(id),
-                esc(id),
-                esc(content),
-                similarity,
-            ));
-        }
-        format!(
-            r#"<h3>Focused recall</h3><table><tr><th>ID</th><th>Content</th><th>Similarity</th></tr>{rows}</table>"#
-        )
-    } else {
-        let empty = Vec::new();
-        let clusters = value
-            .get("clusters")
-            .and_then(|c| c.as_array())
-            .unwrap_or(&empty);
-        if clusters.is_empty() {
-            return "<p>No clusters found.</p>".to_string();
-        }
-        let mut sections = String::new();
-        for c in clusters {
-            let cluster_id = c.get("cluster_id").and_then(|v| v.as_str()).unwrap_or("");
-            let similarity = c.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let mems_empty = Vec::new();
-            let mems = c
-                .get("representative_memories")
-                .and_then(|m| m.as_array())
-                .unwrap_or(&mems_empty);
-            let mut mem_items = String::new();
-            for m in mems {
-                let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                mem_items.push_str(&format!("<li>{}</li>", esc(content)));
-            }
-            sections.push_str(&format!(
-                r#"<div><h3>Cluster {} (similarity {:.4})</h3><ul>{mem_items}</ul></div>"#,
-                esc(cluster_id),
-                similarity,
-            ));
-        }
-        format!("<h3>Broad recall</h3>{sections}")
-    }
+    page(QueryResultsTemplate { fragment })
 }
 
 #[cfg(test)]
