@@ -697,6 +697,21 @@ impl AlexandriaServer {
             anyhow::bail!("provide exactly one of due_at, pattern, or cron (got {got})");
         }
 
+        // A blank target is not "no target": `None` is global, while an empty or
+        // all-whitespace `target_project` matches no project hint (matching is
+        // byte-exact) and can therefore only ever be held and then escalated —
+        // noise at the worst possible time. Refuse it while the user is still
+        // asking, and name the alternative.
+        if params
+            .target_project
+            .as_deref()
+            .is_some_and(|project| project.trim().is_empty())
+        {
+            anyhow::bail!(
+                "target_project must be a non-empty project name, or omit it for a global reminder"
+            );
+        }
+
         let (spec, kind, row): (sched::ScheduleSpec, &'static str, RowFields) =
             if let Some(due) = params.due_at.as_deref() {
                 let due_at = sched::parse_datetime(due, tz)?;
@@ -872,16 +887,23 @@ impl AlexandriaServer {
     /// `escalation_hours` overdue, which is what makes `escalation_hours: 0`
     /// escalate every overdue project reminder.
     ///
-    /// Consumption is best-effort-once: a one-shot becomes `delivered`, while a
-    /// recurring schedule advances to the first fire after `now` and the
-    /// occurrences skipped in between are reported as `missed_occurrences`
-    /// instead of trickling out one per check. Recording a delivery is a separate
-    /// write per row and every per-row failure is handled in place — the row is
-    /// skipped (staying pending, so the next check retries it) and the rows
-    /// already gathered are still reported, because dropping the response would
-    /// discard the consumption of rows that can never come due again. The window
-    /// that remains is a consume that succeeds and then loses its response (the
-    /// request future being cancelled): that row is consumed and unreported.
+    /// Consumption is best-effort-once, including under concurrent consumers: a
+    /// one-shot becomes `delivered`, while a recurring schedule advances to the
+    /// first fire after `now` and the occurrences skipped in between are reported
+    /// as `missed_occurrences` instead of trickling out one per check. Each row is
+    /// claimed with a conditional write
+    /// (`ReminderRepo::record_delivery` — `status = 'pending' AND next_due_at =
+    /// <the value this call read>`), so two overlapping checks can never both
+    /// deliver the same row and a `cancel` landing after `list_due` can never be
+    /// clobbered into `delivered`: a lost claim skips the row, and the consumer
+    /// that won owns it. Recording a delivery is still a separate write per row
+    /// and every per-row outcome is handled in place — the row is skipped (staying
+    /// pending, so the next check retries it) and the rows already gathered are
+    /// still reported, because dropping the response would discard the consumption
+    /// of rows that can never come due again. The window that remains is a claim
+    /// that succeeds and then loses its response (the request future being
+    /// cancelled): that row is consumed and unreported, so the guarantee can lose
+    /// a delivery — it can no longer duplicate one.
     pub async fn do_check_reminders(&self, params: CheckRemindersParams) -> anyhow::Result<String> {
         use alexandria_engine::reminders as sched;
         use alexandria_storage::repos::ReminderRepo;
@@ -944,7 +966,9 @@ impl AlexandriaServer {
             // `next_due_at <= $now` does select a NULL in SurrealQL, so an admin
             // path or migration can put one here: name it and skip it rather than
             // reporting `due_at: null` or — at `escalation_hours: 0` — escalating
-            // a reminder that was never due.
+            // a reminder that was never due. This also makes `r.next_due_at` a
+            // real datetime for the rest of the loop, which is what the delivery
+            // claim below compares against.
             let Some(due_at) = r.next_due_at else {
                 tracing::warn!("skipping reminder {id} with no next_due_at: {}", r.message);
                 continue;
@@ -975,6 +999,10 @@ impl AlexandriaServer {
 
             // Occurrences strictly after the stored due time and up to now: the
             // occurrence being delivered *is* the stored one, so it is excluded.
+            // The count saturates at the engine's `MAX_ITER` iteration bound
+            // (10 000, `alexandria_engine::reminders::occurrences_between`): a
+            // schedule abandoned long enough to exceed it reports the cap, not a
+            // wrong-but-larger number.
             let missed = if recurring {
                 match sched::occurrences_between(&spec, due_at, now, tz) {
                     Ok(missed) => missed,
@@ -1005,13 +1033,27 @@ impl AlexandriaServer {
             } else {
                 None
             };
-            // The one step that cannot be redone: a failed write leaves the row
-            // pending, so reporting it anyway would double-deliver while
-            // propagating the error would throw away the rows already consumed
-            // above. Skip it, keep the rest.
-            if let Err(e) = repo.record_delivery(&id, new_next).await {
-                tracing::warn!("failed to consume reminder {id}: {}", error_message(&e));
-                continue;
+            // The one step that cannot be redone, which is why it is a claim
+            // rather than an update: the write only lands if the row is still
+            // pending with the exact `next_due_at` this call read from `list_due`
+            // (`r.next_due_at`, non-NULL here because of the skip above). A failed
+            // write leaves the row pending, so reporting it anyway would
+            // double-deliver while propagating the error would throw away the rows
+            // already consumed above; a lost claim means another check consumed it
+            // first or the user cancelled it, which is an expected outcome and
+            // worth a debug line at most. Either way: skip the row, keep the rest.
+            match repo.record_delivery(&id, new_next, r.next_due_at).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        "reminder {id} was consumed or cancelled elsewhere; skipping it"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("failed to consume reminder {id}: {}", error_message(&e));
+                    continue;
+                }
             }
 
             delivered.push(serde_json::json!({
@@ -1023,6 +1065,7 @@ impl AlexandriaServer {
                 },
                 "escalated": escalated,
                 "recurring": recurring,
+                // Saturated count: see the `MAX_ITER` bound noted where it is computed.
                 "missed_occurrences": missed,
                 "due_at": rfc3339_utc(due_at),
                 "schedule": sched::human_readable(&spec),

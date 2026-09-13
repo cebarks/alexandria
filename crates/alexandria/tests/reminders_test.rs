@@ -395,6 +395,43 @@ async fn set_reminder_exactly_one_error_names_given_fields() {
     assert_no_rows(&server).await;
 }
 
+/// A blank `target_project` is not "no target": `None` is global, while `"  "`
+/// matches no project hint (delivery matching is byte-exact), so the row could
+/// only ever be held and then escalated — an empty string is a reminder with
+/// nowhere to arrive, written as if it were targeted.
+#[tokio::test]
+async fn set_reminder_rejects_blank_target_project() {
+    let server = setup().await;
+    for blank in ["", "   ", "\t", " \n "] {
+        let mut p = once_params("x", "2030-01-01T12:00:00Z");
+        p.target_project = Some(blank.to_string());
+        let err = server.do_set_reminder(p).await.unwrap_err().to_string();
+        assert!(
+            err.contains("target_project"),
+            "error must name the field for {blank:?}: {err}"
+        );
+        assert!(
+            err.contains("empty"),
+            "error must say what is wrong for {blank:?}: {err}"
+        );
+        assert_no_rows(&server).await;
+    }
+
+    // A real name is untouched by the check, and is stored verbatim (byte-exact
+    // matching means a padded value is the caller's business, not a blank one).
+    let mut p = once_params("fine", "2030-01-01T12:00:00Z");
+    p.target_project = Some("infra".to_string());
+    let v: serde_json::Value =
+        serde_json::from_str(&server.do_set_reminder(p).await.unwrap()).unwrap();
+    assert_eq!(v["status"], "ok");
+    let row = ReminderRepo::new(server.db.inner())
+        .get(v["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.target_project.as_deref(), Some("infra"));
+}
+
 /// Duplicate/misspelled weekdays must not leak into the user-facing schedule
 /// string or into the stored row.
 #[tokio::test]
