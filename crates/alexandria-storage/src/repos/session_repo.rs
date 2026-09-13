@@ -174,12 +174,20 @@ impl<'a> SessionRepo<'a> {
         Ok(updated)
     }
 
-    /// List sessions, most recent activity first.
+    /// List sessions, most recent activity first, with a total order so paging is safe.
     ///
-    /// A session that has never been touched has a null `ended_at` and sorts last: SurrealDB
-    /// orders nulls as smaller than any value, so `DESC` pushes them to the end. The relative
-    /// order among those never-touched rows is not specified, so callers that need a stable
-    /// tail should page on a secondary key.
+    /// The guaranteed ordering is `ended_at DESC, external_id ASC`:
+    /// 1. Newest last-activity first. A session that has never been touched has a null
+    ///    `ended_at` and sorts last, because SurrealDB orders nulls as smaller than any value.
+    /// 2. Ties — which includes the entire never-touched group — break on `external_id`
+    ///    ascending. `external_id` is UNIQUE-indexed, so the pair is a total order and
+    ///    `LIMIT`/`START` cannot repeat or skip a row between pages.
+    ///
+    /// The secondary key is load-bearing, not cosmetic. `ORDER BY ended_at DESC` alone leaves
+    /// the never-touched group in an unspecified relative order — every row on a fresh install —
+    /// so page 2 could repeat a session page 1 showed and silently drop another.
+    ///
+    /// Note that `ended_at` is *last activity*, not completion; see [`SessionSummary`].
     pub async fn list(&self, limit: usize, offset: usize) -> Result<Vec<SessionSummary>> {
         // The `deleted = false` filter must sit *inside* the traversal target's parentheses.
         // `(->contains_session_memory->fact WHERE deleted = false).len()`,
@@ -192,7 +200,7 @@ impl<'a> SessionRepo<'a> {
                 "SELECT *, \
                  (->contains_session_memory->(fact WHERE deleted = false)).len() AS memory_count \
                  FROM `session` \
-                 ORDER BY ended_at DESC LIMIT $limit START $offset",
+                 ORDER BY ended_at DESC, external_id ASC LIMIT $limit START $offset",
             )
             .bind(("limit", limit as i64))
             .bind(("offset", offset as i64))
@@ -533,6 +541,97 @@ mod tests {
             assert!(s.started_at.is_some());
             assert!(s.ended_at.is_none());
         }
+    }
+
+    /// The property at risk is *across* pages, so this walks the whole set with a small LIMIT.
+    ///
+    /// Every row here is never-touched, so `ended_at` is NULL for all of them — the worst case,
+    /// and what a fresh install actually looks like. Ordering by `ended_at DESC` alone then
+    /// leaves the whole result set as one unspecified tie group.
+    ///
+    /// The no-duplicates/no-gaps check is the operator-visible property, but on its own it does
+    /// NOT catch the missing tie-break: an in-memory store happens to scan the tie group in one
+    /// stable order per process, so the pages come back disjoint even though a restart reshuffles
+    /// them. The exact-sequence assertion is what actually pins the contract, and it is the
+    /// reason this test exists alongside the set-equality check.
+    #[tokio::test]
+    async fn test_list_untouched_tail_pages_in_one_stable_total_order() {
+        const PAGE: usize = 3;
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = SessionRepo::new(db.inner());
+
+        // Seven rows, so the last page is a partial one — the boundary where a reshuffle shows
+        // up as a gap. Creation order is deliberately neither alphabetical nor reversed, so an
+        // accidental match with the expected order cannot come from insertion order.
+        let ids = ["s-m", "s-a", "s-z", "s-c", "s-f", "s-b", "s-y"];
+        for id in ids {
+            repo.create(id, None, None).await.unwrap();
+        }
+        assert_eq!(repo.count().await.unwrap(), ids.len());
+
+        let mut concatenated: Vec<String> = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = repo.list(PAGE, offset).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(
+                page.len() <= PAGE,
+                "LIMIT must cap every page, got {} at offset {offset}",
+                page.len()
+            );
+            concatenated.extend(page.into_iter().map(|s| s.external_id));
+            offset += PAGE;
+            assert!(offset <= ids.len() * PAGE, "pagination did not terminate");
+        }
+
+        let mut seen = concatenated.clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            concatenated.len(),
+            "a session appeared on two pages: {concatenated:?}"
+        );
+        let mut universe = ids.to_vec();
+        universe.sort();
+        assert_eq!(
+            seen, universe,
+            "the pages must cover every session exactly once"
+        );
+        assert_eq!(
+            concatenated, universe,
+            "the tie group must be ordered by external_id, not by whatever the scan yielded"
+        );
+    }
+
+    /// The tie-break must only break ties. A touched session still outranks every never-touched
+    /// one regardless of how its external_id sorts, and touched rows keep `ended_at DESC` order.
+    #[tokio::test]
+    async fn test_list_secondary_key_does_not_override_activity_order() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = SessionRepo::new(db.inner());
+
+        for id in ["z-active", "m-active", "a-quiet-1", "b-quiet-2"] {
+            repo.create(id, None, None).await.unwrap();
+        }
+        // Newest activity first, and named so alphabetical order is the reverse of it — if the
+        // secondary key leaked into the non-null group this cannot pass.
+        for id in ["z-active", "m-active"] {
+            settle().await;
+            repo.touch(id).await.unwrap();
+        }
+
+        let sessions = repo.list(10, 0).await.unwrap();
+        let ids: Vec<&str> = sessions.iter().map(|s| s.external_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["m-active", "z-active", "a-quiet-1", "b-quiet-2"],
+            "touched rows lead by ended_at DESC, then the null tail by external_id ASC"
+        );
     }
 
     #[tokio::test]
