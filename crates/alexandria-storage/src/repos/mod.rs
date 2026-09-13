@@ -8,4 +8,4 @@ pub use cluster_repo::ClusterRepo;
 pub use edge_repo::EdgeRepo;
 pub use heat_repo::HeatRepo;
 pub use memory_repo::MemoryRepo;
-pub use session_repo::SessionRepo;
+pub use session_repo::{SessionRepo, SessionSummary};
