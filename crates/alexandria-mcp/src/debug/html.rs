@@ -110,10 +110,9 @@ pub struct ErrorTemplate {
 #[derive(Template)]
 #[template(path = "_test_pager.html")]
 struct PagerTemplate {
-    page: usize,
-    total_pages: usize,
-    total: usize,
-    extra: String,
+    prev_href: String,
+    next_href: String,
+    summary: String,
 }
 
 #[cfg(test)]
@@ -141,12 +140,11 @@ mod tests {
 
     // --- templates -------------------------------------------------------------
 
-    fn render_pager(page: usize, total_pages: usize, total: usize, extra: &str) -> String {
+    fn render_pager(prev_href: &str, next_href: &str, summary: &str) -> String {
         PagerTemplate {
-            page,
-            total_pages,
-            total,
-            extra: extra.to_string(),
+            prev_href: prev_href.to_string(),
+            next_href: next_href.to_string(),
+            summary: summary.to_string(),
         }
         .render()
         .unwrap()
@@ -188,7 +186,6 @@ mod tests {
             html.contains(r#"<p class="error">&#60;script&#62;alert(1)&#60;/script&#62;</p>"#),
             "got: {html}"
         );
-        assert!(html.contains(r#"class="error""#));
     }
 
     /// The base template reads `nav`, so a child context that omits the field is a compile
@@ -209,59 +206,93 @@ mod tests {
         assert!(!html.contains(r#"class="active">Memories"#));
     }
 
+    /// With neither link present the macro emits no row at all. Callers that want a fallback
+    /// ("7 entries") supply it themselves — the macro must not guess.
     #[test]
-    fn test_pager_macro_renders_nothing_for_a_single_page() {
-        let html = render_pager(1, 1, 7, "");
+    fn test_pager_macro_renders_nothing_without_links() {
+        let html = render_pager("", "", "7 entries");
         assert!(!html.contains("pagination"), "got: {html}");
-        assert!(!html.contains("entries"), "got: {html}");
+        assert!(
+            !html.contains("7 entries"),
+            "summary must not render without a row; got: {html}"
+        );
     }
 
     #[test]
-    fn test_pager_macro_renders_both_links_on_a_middle_page() {
-        let html = render_pager(2, 3, 42, "");
+    fn test_pager_macro_renders_both_links_when_both_present() {
+        let html = render_pager(
+            "/debug/maintenance?page=1",
+            "/debug/maintenance?page=3",
+            "Page 2 of 3 (42 entries)",
+        );
         assert!(
-            html.contains(r#"href="/debug/memories?page=1""#),
+            html.contains(r#"href="/debug/maintenance?page=1""#),
             "got: {html}"
         );
         assert!(html.contains("← Prev"), "got: {html}");
         assert!(
-            html.contains(r#"href="/debug/memories?page=3""#),
+            html.contains(r#"href="/debug/maintenance?page=3""#),
             "got: {html}"
         );
         assert!(html.contains("Next →"), "got: {html}");
         assert!(html.contains("Page 2 of 3 (42 entries)"), "got: {html}");
     }
 
+    /// An empty href suppresses that side entirely rather than emitting a dead anchor.
     #[test]
-    fn test_pager_macro_omits_out_of_range_links() {
-        let first = render_pager(1, 3, 42, "");
+    fn test_pager_macro_omits_absent_side() {
+        let first = render_pager("", "/debug/maintenance?page=2", "Page 1 of 3");
         assert!(!first.contains("Prev"), "got: {first}");
         assert!(
-            first.contains(r#"href="/debug/memories?page=2""#),
+            first.contains(r#"href="/debug/maintenance?page=2""#),
             "got: {first}"
         );
 
-        let last = render_pager(3, 3, 42, "");
+        let last = render_pager("/debug/maintenance?page=2", "", "Page 3 of 3");
         assert!(!last.contains("Next"), "got: {last}");
         assert!(
-            last.contains(r#"href="/debug/memories?page=2""#),
+            last.contains(r#"href="/debug/maintenance?page=2""#),
             "got: {last}"
         );
     }
 
-    /// `extra` is re-emitted in the same position on both links. askama still escapes the
-    /// attribute — `&` arrives as `&#38;`, the correct encoding in an `href`, which the
-    /// browser resolves back to `&` when the link is followed.
+    /// memories.rs paginates by offset and must carry search/tag/include_deleted through the
+    /// hop, so its hrefs contain `&`. askama escapes that to `&#38;`, which is correct inside
+    /// an attribute and what the browser sends when the link is followed.
     #[test]
-    fn test_pager_macro_appends_extra_to_every_link() {
-        let html = render_pager(2, 3, 42, "&search=foo&tag=bar");
-        assert!(
-            html.contains(r#"href="/debug/memories?page=1&#38;search=foo&#38;tag=bar""#),
-            "got: {html}"
+    fn test_pager_macro_escapes_ampersands_in_href() {
+        let html = render_pager(
+            "/debug/memories?offset=0&limit=20&search=foo",
+            "",
+            "Showing 21-40 of 42 memories",
         );
         assert!(
-            html.contains(r#"href="/debug/memories?page=3&#38;search=foo&#38;tag=bar""#),
+            html.contains(r#"href="/debug/memories?offset=0&#38;limit=20&#38;search=foo""#),
             "got: {html}"
+        );
+    }
+
+    /// `.pagination` is `justify-content: space-between`, which only spreads content when the
+    /// div has several direct children. Wrapping prev/summary/next in a single span gives it
+    /// one flex item, `space-between` becomes a no-op, and the row silently left-aligns — a
+    /// visual regression no other test would catch.
+    #[test]
+    fn test_pager_macro_keeps_prev_summary_next_as_siblings() {
+        let html = render_pager(
+            "/debug/maintenance?page=1",
+            "/debug/maintenance?page=3",
+            "Page 2 of 3",
+        );
+        // Assert against the div's *direct* children. Checking only for an inner
+        // `</a> <span>…</span> <a` sequence still passes when everything is wrapped in an
+        // extra span, which is the exact defect being guarded against.
+        assert!(
+            html.contains(r#"<div class="pagination"><a class="link""#),
+            "prev link must be the div's first child, not nested in a wrapper; got: {html}"
+        );
+        assert!(
+            html.contains("Next →</a></div>"),
+            "next link must be the div's last child, not nested in a wrapper; got: {html}"
         );
     }
 }

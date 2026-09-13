@@ -1,15 +1,21 @@
-{# Contract: `extra` is appended into a query string (e.g. `&search=foo&tag=bar`), so the
-   *caller* must build it from already-percent-encoded values. askama still escapes it here
-   (`&` becomes `&#38;`), which is the correct encoding inside an href attribute and what
-   the browser sends when the link is followed. #}
-{% macro pager(base, page, total_pages, total, extra) -%}
-{% if total_pages > 1 -%}
-<div class="pagination">
-  <span>
-  {%- if page > 1 %}<a class="link" href="{{ base }}?page={{ page - 1 }}{{ extra }}">← Prev</a>{% endif %}
-  <span>Page {{ page }} of {{ total_pages }} ({{ total }} entries)</span>
-  {%- if page < total_pages %}<a class="link" href="{{ base }}?page={{ page + 1 }}{{ extra }}">Next →</a>{% endif %}
-  </span>
-</div>
+{# Contract: callers pass a COMPLETE href (query params included); an empty string means
+   "no link on that side". The macro deliberately does not build URLs, because the two pages
+   paginate differently -- maintenance.rs is page-based (?page=N) while memories.rs is
+   offset-based (?offset=N&limit=M, built by memories_url() so that search/tag/include_deleted
+   survive the hop. A macro that owned URL shape could only serve one of them.
+
+   askama escapes the href, so a caller's `&` renders as `&#38;`. That is correct inside an
+   attribute and is what the browser sends when the link is followed -- do not "fix" it with
+   |safe.
+
+   `summary` is caller-supplied text because the pages word it differently ("Page 2 of 3
+   (42 entries)" vs "Showing 1-20 of 42 memories"). #}
+{# prev / summary / next must stay THREE DIRECT SIBLINGS of the .pagination div. That div is
+   `justify-content: space-between`, which spreads its children to the edges -- wrap them in a
+   single span and the div has one flex item, so space-between becomes a no-op and the whole
+   row silently left-aligns. An absent link collapses to nothing, matching the legacy markup. #}
+{% macro pager(prev_href, next_href, summary) -%}
+{% if prev_href != "" || next_href != "" -%}
+<div class="pagination">{% if prev_href != "" %}<a class="link" href="{{ prev_href }}">← Prev</a>{% endif %} <span>{{ summary }}</span> {% if next_href != "" %}<a class="link" href="{{ next_href }}">Next →</a>{% endif %}</div>
 {%- endif %}
 {%- endmacro %}
