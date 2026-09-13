@@ -28,12 +28,13 @@ fn tool_json(result: anyhow::Result<String>) -> CallToolResult {
     }
 }
 
+use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
 use alexandria_engine::clusters::{ClusterInfo, assign_to_cluster, update_centroid};
 use alexandria_engine::heat::{ActivationConfig, compute_activation_targets};
 use alexandria_engine::recall::{
     ClusterWithMembers, FactSummary, ScopeHandle, broad_recall, focused_recall,
 };
-use alexandria_engine::search::rank_by_similarity;
+use alexandria_engine::search::{DEFAULT_MIN_SIMILARITY, rank_by_similarity};
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::Database;
 use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo, SessionRepo};
@@ -53,6 +54,9 @@ pub struct AlexandriaServer {
     pub activation_top_n: usize,
     /// Hard floor on cosine similarity for retrieve_memories results.
     pub retrieve_min_similarity: f32,
+    /// Avg member-to-centroid similarity below which a cluster is reported as needing a
+    /// split. Carried here so the debug UI shows the same verdict the maintenance task acts on.
+    pub cohesion_floor: f32,
 }
 
 impl AlexandriaServer {
@@ -69,7 +73,8 @@ impl AlexandriaServer {
             heat_spacing_halflife,
             activation_config: ActivationConfig::default(),
             activation_top_n: 3,
-            retrieve_min_similarity: 0.30,
+            retrieve_min_similarity: DEFAULT_MIN_SIMILARITY,
+            cohesion_floor: DEFAULT_COHESION_FLOOR,
         }
     }
 
@@ -85,6 +90,11 @@ impl AlexandriaServer {
 
     pub fn with_retrieve_min_similarity(mut self, min_similarity: f32) -> Self {
         self.retrieve_min_similarity = min_similarity;
+        self
+    }
+
+    pub fn with_cohesion_floor(mut self, cohesion_floor: f32) -> Self {
+        self.cohesion_floor = cohesion_floor;
         self
     }
 }
@@ -816,6 +826,27 @@ mod get_info_tests {
         assert!(instructions.contains("store_memory"));
         assert!(instructions.contains("retrieve_memories"));
         assert!(info.capabilities.tools.is_some());
+    }
+
+    /// `new()` is the construction path every test harness and any non-`main.rs` embedder
+    /// takes, so its fallbacks must be the engine's tuned constants rather than local
+    /// literals that can drift from what production actually runs.
+    #[tokio::test]
+    async fn test_new_uses_engine_default_thresholds() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        assert_eq!(
+            server.retrieve_min_similarity,
+            alexandria_engine::search::DEFAULT_MIN_SIMILARITY
+        );
+        assert_eq!(
+            server.cohesion_floor,
+            alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR
+        );
     }
 
     /// Stub that maps content/query text to fixed embeddings so we can assert

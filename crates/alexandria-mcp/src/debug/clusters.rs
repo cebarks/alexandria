@@ -7,11 +7,6 @@ use super::html::{error_page, page};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
-/// Default cohesion floor used only for the debug UI's health display.
-/// `AlexandriaServer` doesn't carry the configured value, so this mirrors
-/// `ClusterConfig::default().cohesion_floor` in `crates/alexandria/src/config.rs`.
-const DISPLAY_COHESION_FLOOR: f32 = 0.6;
-
 /// One row of the cluster list, flattened out of `Cluster` so the template never has to
 /// deal with `Option<RecordId>` or with how a record id is formatted.
 struct ClusterRow {
@@ -119,7 +114,7 @@ pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<Strin
             &id,
             &centroid,
             &embeddings,
-            DISPLAY_COHESION_FLOOR,
+            server.cohesion_floor,
         ) {
             alexandria_engine::clusters::maintenance::MaintenanceAction::Healthy => {
                 "Healthy".to_string()
@@ -227,5 +222,67 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("member fact content"));
+    }
+
+    /// Renders the cluster detail page for a 4-member cluster whose members all sit at
+    /// cosine 0.56 from their own averaged centroid — above a 0.4 floor, below the 0.6
+    /// default. `None` leaves the server on the value `new()` derives from the engine.
+    /// Before the floor was threaded, both calls rendered the same verdict.
+    async fn cohesion_verdict(cohesion_floor: Option<f32>) -> String {
+        let server = super::super::test_support::test_server().await;
+        let server = match cohesion_floor {
+            Some(floor) => server.with_cohesion_floor(floor),
+            None => server,
+        };
+        let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
+        let memory_repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+
+        // Two mirrored pairs about the x-axis: their mean is [0.56, 0.0], and the cosine
+        // of each unit member against it is 0.56.
+        let members = [
+            [0.56_f32, 0.8285],
+            [0.56, 0.8285],
+            [0.56, -0.8285],
+            [0.56, -0.8285],
+        ];
+        let c1 = cluster_repo
+            .create(Some("diffuse cluster"), &[0.56, 0.0])
+            .await
+            .unwrap();
+        for (i, embedding) in members.iter().enumerate() {
+            let fact = memory_repo
+                .create_fact(&format!("diffuse member {i}"), 0.5, embedding, &[])
+                .await
+                .unwrap();
+            cluster_repo.add_member(&c1, &fact).await.unwrap();
+        }
+
+        let app = crate::debug::router(server);
+        let uri = format!("/debug/clusters/{}", c1.replace(':', "%3A"));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_cluster_detail_cohesion_reads_the_servers_floor() {
+        let at_default = cohesion_verdict(None).await;
+        assert!(
+            at_default.contains("Needs split"),
+            "a cluster at cosine 0.56 must split under the default floor ({}), got: {at_default}",
+            alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR,
+        );
+
+        let at_relaxed_floor = cohesion_verdict(Some(0.4)).await;
+        assert!(
+            at_relaxed_floor.contains("Healthy"),
+            "a 0.4 cohesion_floor must report the same cluster as healthy, got: {at_relaxed_floor}"
+        );
     }
 }

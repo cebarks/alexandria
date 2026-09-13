@@ -1,5 +1,9 @@
 use crate::search::cosine_similarity;
 
+/// Default avg member-to-centroid similarity below which a cluster splits.
+/// Single source of truth — see `DEFAULT_MIN_SIMILARITY` in `crate::search`.
+pub const DEFAULT_COHESION_FLOOR: f32 = 0.6;
+
 /// Result of a cluster health check.
 #[derive(Debug)]
 pub enum MaintenanceAction {
