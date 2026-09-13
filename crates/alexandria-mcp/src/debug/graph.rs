@@ -95,9 +95,72 @@ pub async fn page(Path(id): Path<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use super::GraphTemplate;
+    use askama::Template;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    /// The graph page is the migration's most subtle template and had zero render coverage:
+    /// its only other test exercises the JSON API, never `GraphTemplate`. Everything this pins
+    /// fails silently in a browser while `just test` stays green.
+    #[test]
+    fn test_graph_template_embeds_vendored_vis_network_not_a_cdn() {
+        let html = GraphTemplate {
+            nav: "memories",
+            id: "fact:abc".into(),
+        }
+        .render()
+        .unwrap();
+
+        // Drift seam: assets.rs exports the path, this template hard-codes it. layout.html has
+        // the htmx equivalent guard; without this, a vis-network bump that misses the template
+        // 404s the script and the page renders blank with `vis is not defined`.
+        assert!(
+            html.contains(super::super::assets::VIS_NETWORK_URL),
+            "got: {html}"
+        );
+        assert!(!html.contains("unpkg.com"), "no CDN references may remain");
+
+        // Escaping CONTEXT, the subtlest decision in the migration. Inside a JS string literal
+        // browsers do not decode character references, so the id must be percent-encoded; the
+        // <h1> is ordinary HTML text, so it must not be.
+        assert!(
+            html.contains(r#"fetch("/debug/api/graph/fact%3Aabc")"#),
+            "id must be urlencoded inside the JS string literal; got: {html}"
+        );
+        assert!(
+            html.contains("<h1>Graph: fact:abc</h1>"),
+            "h1 is HTML text context and must stay unencoded; got: {html}"
+        );
+
+        // Load order: layout.html defers htmx in <head>, and a deferred script runs AFTER an
+        // inline body script. vis-network must therefore load plain, and first.
+        let lib = html
+            .find(super::super::assets::VIS_NETWORK_URL)
+            .expect("vis-network script tag missing");
+        let inline = html.find("new vis.Network").expect("inline script missing");
+        assert!(
+            lib < inline,
+            "vis-network must load before the inline script that uses `vis`"
+        );
+        assert!(
+            html.contains(&format!(
+                r#"<script src="{}"></script>"#,
+                super::super::assets::VIS_NETWORK_URL
+            )),
+            "vis-network must load plain, with no defer, so it executes before the inline script; got: {html}"
+        );
+
+        // The container the inline script looks up, and it must precede the scripts block.
+        let container = html
+            .find(r#"<div id="graph""#)
+            .expect("graph container missing");
+        assert!(
+            container < inline,
+            "#graph div must exist before the script runs"
+        );
+    }
 
     #[tokio::test]
     async fn test_api_graph_includes_nodes_and_edge() {
