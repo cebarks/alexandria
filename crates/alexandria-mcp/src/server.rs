@@ -17,9 +17,9 @@ use alexandria_storage::Database;
 use chrono::{DateTime, SecondsFormat, Utc, Weekday};
 
 use crate::tools::{
-    CheckRemindersParams, DeleteMemoryParams, FinalizeSessionParams, GetSessionParams,
-    ImportDocumentParams, RecallParams, RetrieveMemoriesParams, SetReminderParams,
-    StoreMemoryParams, UpdateMemoryParams,
+    CancelReminderParams, CheckRemindersParams, DeleteMemoryParams, FinalizeSessionParams,
+    GetSessionParams, ImportDocumentParams, ListRemindersParams, RecallParams,
+    RetrieveMemoriesParams, SetReminderParams, StoreMemoryParams, UpdateMemoryParams,
 };
 
 /// Z-suffixed UTC RFC 3339 spelling — single source of truth for every datetime
@@ -237,6 +237,33 @@ impl AlexandriaServer {
         Parameters(params): Parameters<CheckRemindersParams>,
     ) -> String {
         match self.do_check_reminders(params).await {
+            Ok(result) => result,
+            Err(e) => {
+                serde_json::json!({ "status": "error", "message": error_message(&e) }).to_string()
+            }
+        }
+    }
+
+    #[tool(
+        description = "List reminders (pending by default; filter by status 'pending'|'delivered'|'cancelled'|'all' and/or target project). Use when the user asks what reminders exist, or to find an ID before cancelling."
+    )]
+    async fn list_reminders(&self, Parameters(params): Parameters<ListRemindersParams>) -> String {
+        match self.do_list_reminders(params).await {
+            Ok(result) => result,
+            Err(e) => {
+                serde_json::json!({ "status": "error", "message": error_message(&e) }).to_string()
+            }
+        }
+    }
+
+    #[tool(
+        description = "Cancel a reminder by ID (soft-cancel; it stays listed under status=cancelled). Use when the user says a reminder is no longer needed, or after a reminder was delivered and the follow-up is done — for recurring reminders the user no longer wants."
+    )]
+    async fn cancel_reminder(
+        &self,
+        Parameters(params): Parameters<CancelReminderParams>,
+    ) -> String {
+        match self.do_cancel_reminder(params).await {
             Ok(result) => result,
             Err(e) => {
                 serde_json::json!({ "status": "error", "message": error_message(&e) }).to_string()
@@ -1104,6 +1131,81 @@ impl AlexandriaServer {
             "delivered": delivered,
         })
         .to_string())
+    }
+
+    /// Report the reminders matching a status/project filter, without consuming
+    /// or changing anything. This is the management view — what is scheduled, and
+    /// the place an ID is found before cancelling it.
+    ///
+    /// Unlike delivery, nothing here is filtered out for being unreadable: a row
+    /// whose schedule cannot be reconstructed is still owed to the user (or to an
+    /// operator cleaning up after a migration), so it is listed with the failure
+    /// named in its `schedule` field. Only that one row degrades — one corrupt
+    /// row must not hide every healthy reminder behind it.
+    pub async fn do_list_reminders(&self, params: ListRemindersParams) -> anyhow::Result<String> {
+        use alexandria_engine::reminders as sched;
+        use alexandria_storage::repos::ReminderRepo;
+
+        // `pending` is the default because it is what "what reminders do I have?"
+        // means; `all` is the one spelling of "no filter". Any other value is
+        // passed through to the repo, whose `status = $status` simply matches no
+        // row for a status that does not exist.
+        let status = match params.status.as_deref() {
+            None | Some("pending") => Some("pending"),
+            Some("all") => None,
+            s @ Some(_) => s,
+        };
+        let repo = ReminderRepo::new(self.db.inner());
+        let rows = repo.list(status, params.target_project.as_deref()).await?;
+
+        let reminders: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                let spec = sched::spec_from_reminder(r);
+                serde_json::json!({
+                    "id": r.id.as_ref().map(record_id_to_string).unwrap_or_default(),
+                    "message": r.message,
+                    "target": match &r.target_project {
+                        Some(p) => format!("project:{p}"),
+                        None => "global".to_string(),
+                    },
+                    "status": r.status,
+                    "schedule": spec
+                        .as_ref()
+                        .map(sched::human_readable)
+                        .unwrap_or_else(|e| format!("<invalid schedule: {e}>")),
+                    "next_due_at": r.next_due_at.map(rfc3339_utc),
+                    "delivered_count": r.delivered_count,
+                    "last_delivered_at": r.last_delivered_at.map(rfc3339_utc),
+                    "note": r.note,
+                    "created_at": r.created_at.map(rfc3339_utc),
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({ "count": reminders.len(), "reminders": reminders }).to_string())
+    }
+
+    /// Retire a reminder by ID.
+    ///
+    /// A soft cancel, and unconditional: the row keeps existing (under
+    /// `status = 'cancelled'`, visible in `do_list_reminders`) because it is the
+    /// only record that the reminder was ever set, and the write is not guarded
+    /// by the current status, so cancelling a delivered or already-cancelled
+    /// reminder is an idempotent success rather than an error. Only an ID that
+    /// matches no row is a failure — that is a typo or a stale reference, and
+    /// silently "cancelling" nothing would tell the user their reminder was
+    /// taken care of when it was not.
+    pub async fn do_cancel_reminder(&self, params: CancelReminderParams) -> anyhow::Result<String> {
+        use alexandria_storage::repos::ReminderRepo;
+
+        let repo = ReminderRepo::new(self.db.inner());
+        let existing = repo.get(&params.id).await?;
+        if existing.is_none() {
+            anyhow::bail!("Reminder not found: {}", params.id);
+        }
+        repo.cancel(&params.id).await?;
+        Ok(serde_json::json!({ "status": "ok", "id": params.id }).to_string())
     }
 
     // --- Internal helpers ---

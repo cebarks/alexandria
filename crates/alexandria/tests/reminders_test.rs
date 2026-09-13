@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use alexandria_engine::reminders::{human_readable, spec_from_reminder};
 use alexandria_mcp::server::{AlexandriaServer, RemindersSettings};
-use alexandria_mcp::tools::{CheckRemindersParams, ReminderPatternParams, SetReminderParams};
+use alexandria_mcp::tools::{
+    CancelReminderParams, CheckRemindersParams, ListRemindersParams, ReminderPatternParams,
+    SetReminderParams,
+};
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::models::schedule_kind;
 use alexandria_storage::repos::{NewReminder, ReminderRepo};
@@ -901,4 +904,324 @@ async fn check_recurring_advances_and_coalesces() {
     let out2: serde_json::Value =
         serde_json::from_str(&server.do_check_reminders(check(None)).await.unwrap()).unwrap();
     assert_eq!(out2["count"], 0);
+}
+
+// --- list_reminders / cancel_reminder: management views ---
+
+fn list_filter(status: Option<&str>, target_project: Option<&str>) -> ListRemindersParams {
+    ListRemindersParams {
+        status: status.map(str::to_string),
+        target_project: target_project.map(str::to_string),
+    }
+}
+
+/// Parse a tool response the way a client would, so a failed assertion shows the
+/// whole payload rather than just the field that was wrong.
+async fn list_json(server: &AlexandriaServer, params: ListRemindersParams) -> serde_json::Value {
+    let out = server.do_list_reminders(params).await.unwrap();
+    serde_json::from_str(&out).unwrap()
+}
+
+/// The management path end to end: what is scheduled, and taking one back again.
+///
+/// `list` defaults to pending (the status a user means when they ask without
+/// qualifying) and cancel is a soft cancel, so the row must stay discoverable
+/// under `cancelled` rather than vanish — it is the only record that the reminder
+/// was ever set.
+#[tokio::test]
+async fn list_and_cancel_roundtrip() {
+    let server = setup().await;
+    let out = server
+        .do_set_reminder(once_params("water plants", "2030-01-01T12:00:00Z"))
+        .await
+        .unwrap();
+    let id: String = serde_json::from_str::<serde_json::Value>(&out).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // default status filter = pending
+    let list = list_json(&server, list_filter(None, None)).await;
+    assert_eq!(list["count"], 1);
+    assert_eq!(list["reminders"][0]["message"], "water plants");
+    assert_eq!(
+        list["reminders"][0]["schedule"],
+        "one-shot at 2030-01-01 12:00 UTC"
+    );
+    assert_eq!(list["reminders"][0]["id"].as_str().unwrap(), id);
+    assert_eq!(list["reminders"][0]["target"], "global");
+    assert_eq!(list["reminders"][0]["status"], "pending");
+    // Every datetime in a reminder response keeps the Z-suffixed UTC spelling
+    // (`to_rfc3339()` would write `+00:00`), including the set-time stamp.
+    assert_eq!(list["reminders"][0]["next_due_at"], "2030-01-01T12:00:00Z");
+    assert!(
+        list["reminders"][0]["created_at"]
+            .as_str()
+            .is_some_and(|s| s.ends_with('Z')),
+        "created_at must be Z-suffixed: {}",
+        list["reminders"][0]["created_at"]
+    );
+    assert_eq!(list["reminders"][0]["delivered_count"], 0);
+    assert!(list["reminders"][0]["last_delivered_at"].is_null());
+
+    // cancel
+    let cancel: serde_json::Value = serde_json::from_str(
+        &server
+            .do_cancel_reminder(CancelReminderParams { id: id.clone() })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cancel["status"], "ok");
+    assert_eq!(cancel["id"].as_str().unwrap(), id);
+
+    // gone from pending, visible under cancelled
+    let list2 = list_json(&server, list_filter(None, None)).await;
+    assert_eq!(list2["count"], 0);
+    let list3 = list_json(&server, list_filter(Some("cancelled"), None)).await;
+    assert_eq!(list3["count"], 1);
+    assert_eq!(list3["reminders"][0]["message"], "water plants");
+
+    // cancel unknown id -> error, not panic
+    let err = server
+        .do_cancel_reminder(CancelReminderParams {
+            id: "reminder:nonexistent".to_string(),
+        })
+        .await;
+    let err = err.expect_err("an unknown id must not read as a successful cancel");
+    assert!(
+        err.to_string().contains("Reminder not found"),
+        "the error must name the failure: {err:#}"
+    );
+}
+
+/// The filter semantics the tool description promises: `pending` is the default,
+/// `all` is the only spelling of "no filter", an unknown status matches nothing
+/// (rather than erroring at the user), and the project filter is byte-exact and
+/// combines with the status filter.
+#[tokio::test]
+async fn list_status_and_project_filters() {
+    let server = setup().await;
+    // A pending global one-shot, a pending project reminder, and a delivered one.
+    let delivered_id = server
+        .do_set_reminder(once_params_overdue("pay rent", 60))
+        .await
+        .unwrap();
+    let delivered_id = serde_json::from_str::<serde_json::Value>(&delivered_id).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.do_check_reminders(check(None)).await.unwrap();
+    server
+        .do_set_reminder(weekly_params("standup"))
+        .await
+        .unwrap();
+    server
+        .do_set_reminder(once_params("someday", "2030-01-01T12:00:00Z"))
+        .await
+        .unwrap();
+
+    let pending = list_json(&server, list_filter(None, None)).await;
+    assert_eq!(pending["count"], 2, "the consumed row leaves pending");
+    assert!(
+        pending["reminders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["status"] == "pending"),
+        "the default filter must not mix statuses: {pending}"
+    );
+
+    let all = list_json(&server, list_filter(Some("all"), None)).await;
+    assert_eq!(all["count"], 3, "`all` means no filter");
+    let one_delivered = all["reminders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == delivered_id.as_str())
+        .unwrap_or_else(|| panic!("delivered row missing from {all}"));
+    assert_eq!(one_delivered["status"], "delivered");
+    // Delivery history survives: the list is where a user sees "fired 1 time".
+    assert_eq!(one_delivered["delivered_count"], 1);
+    assert!(one_delivered["last_delivered_at"]
+        .as_str()
+        .is_some_and(|s| s.ends_with('Z')));
+    // Consumption retires a one-shot by flipping `status`, not by clearing
+    // `next_due_at` (due-ness is `status = 'pending' AND next_due_at <= now`), so
+    // the list still reports the time it fired at — which is the answer to "when
+    // did that go off?".
+    assert!(one_delivered["next_due_at"].is_string());
+
+    let only_delivered = list_json(&server, list_filter(Some("delivered"), None)).await;
+    assert_eq!(only_delivered["count"], 1);
+
+    // A status outside the schema's set matches no row: an empty list is more
+    // useful to a client than an error to explain.
+    let bogus = list_json(&server, list_filter(Some("archived"), None)).await;
+    assert_eq!(bogus["count"], 0);
+
+    // Project filter: byte-exact (the same rule delivery uses), and combinable.
+    let projects = list_json(&server, list_filter(None, Some("alexandria"))).await;
+    assert_eq!(projects["count"], 1);
+    assert_eq!(projects["reminders"][0]["message"], "standup");
+    assert_eq!(projects["reminders"][0]["target"], "project:alexandria");
+    let mismatch = list_json(&server, list_filter(None, Some("Alexandria"))).await;
+    assert_eq!(mismatch["count"], 0, "project matching is byte-exact");
+    let delivered_in_project =
+        list_json(&server, list_filter(Some("delivered"), Some("infra"))).await;
+    assert_eq!(delivered_in_project["count"], 0);
+}
+
+/// Cancelling is unconditional and idempotent, which is what makes it safe for a
+/// client to retry: a reminder that already fired, or already was cancelled, is
+/// in a state the caller could accept, so it is a success rather than an error.
+/// What cancel must not do is undo delivery history or touch a different row.
+#[tokio::test]
+async fn cancel_is_soft_and_idempotent() {
+    let server = setup().await;
+    let fired = server
+        .do_set_reminder(once_params_overdue("renew cert", 60))
+        .await
+        .unwrap();
+    let fired = serde_json::from_str::<serde_json::Value>(&fired).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.do_check_reminders(check(None)).await.unwrap();
+    let other = server
+        .do_set_reminder(once_params("untouched", "2030-01-01T12:00:00Z"))
+        .await
+        .unwrap();
+    let other = serde_json::from_str::<serde_json::Value>(&other).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let cancel: serde_json::Value = serde_json::from_str(
+        &server
+            .do_cancel_reminder(CancelReminderParams { id: fired.clone() })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cancel["status"], "ok", "a delivered row is cancellable");
+
+    // Repeating it is still a success, and the row keeps what it already recorded.
+    let again: serde_json::Value = serde_json::from_str(
+        &server
+            .do_cancel_reminder(CancelReminderParams { id: fired.clone() })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(again["status"], "ok");
+
+    let row = ReminderRepo::new(server.db.inner())
+        .get(&fired)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "cancelled");
+    assert_eq!(row.delivered_count, 1, "cancel must not rewind delivery");
+    assert!(row.cancelled_at.is_some());
+
+    // Only the named row is touched, and the cancelled one stays listable.
+    let other_row = ReminderRepo::new(server.db.inner())
+        .get(&other)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(other_row.status, "pending");
+    assert_eq!(
+        list_json(&server, list_filter(Some("cancelled"), None)).await["count"],
+        1
+    );
+
+    // Nor does the cancelled row come back: the future pending one is not due,
+    // so a later check finds nothing to deliver.
+    let out: serde_json::Value =
+        serde_json::from_str(&server.do_check_reminders(check(None)).await.unwrap()).unwrap();
+    assert_eq!(
+        out["count"], 0,
+        "a cancelled reminder must never deliver: {out}"
+    );
+}
+
+/// A row the delivery loop refuses to consume must still appear in the listing:
+/// `list` is how an operator finds such a row to cancel it, so failing the whole
+/// response — or dropping the row — would hide exactly the backlog that
+/// `check_skips_corrupt_rows_and_still_delivers_the_healthy_one` leaves behind.
+/// The failure is rendered into that one row's `schedule`, per row, and every
+/// other row keeps its real one.
+#[tokio::test]
+async fn list_surfaces_corrupt_row_with_invalid_schedule_marker() {
+    let server = setup().await;
+    let repo = ReminderRepo::new(server.db.inner());
+
+    // A `once` row with no `due_at`: the shape `spec_from_reminder` rejects. It
+    // is due, so a check skips it — which is why the listing has to keep it.
+    let past = Utc::now() - chrono::Duration::minutes(5);
+    let corrupt = repo
+        .create(&raw_row("corrupt row", Some(past)))
+        .await
+        .unwrap();
+    let healthy = server
+        .do_set_reminder(once_params("healthy row", "2030-01-01T12:00:00Z"))
+        .await
+        .unwrap();
+    let healthy = serde_json::from_str::<serde_json::Value>(&healthy).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let list = list_json(&server, list_filter(None, None)).await;
+    assert_eq!(list["count"], 2, "corrupt row must still be listed: {list}");
+    let row = |message: &str| {
+        list["reminders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["message"] == message)
+            .unwrap_or_else(|| panic!("{message} row missing from {list}"))
+            .clone()
+    };
+
+    let corrupt_row = row("corrupt row");
+    let corrupt_schedule = corrupt_row["schedule"].as_str().unwrap();
+    assert!(
+        corrupt_schedule.starts_with("<invalid schedule:"),
+        "corrupt row must name its own failure: {corrupt_schedule}"
+    );
+    assert!(
+        corrupt_schedule.contains("once reminder missing due_at"),
+        "marker must carry the engine's reason: {corrupt_schedule}"
+    );
+    assert_eq!(corrupt_row["id"].as_str().unwrap(), corrupt);
+    assert_eq!(corrupt_row["status"], "pending");
+
+    // The neighbour is untouched by the row that failed beside it.
+    let healthy_row = row("healthy row");
+    assert_eq!(
+        healthy_row["schedule"].as_str().unwrap(),
+        "one-shot at 2030-01-01 12:00 UTC"
+    );
+    assert_eq!(healthy_row["id"].as_str().unwrap(), healthy);
+
+    // And a corrupt row is still manageable: cancelling it by the listed id
+    // retires it without touching the healthy row.
+    let cancel: serde_json::Value = serde_json::from_str(
+        &server
+            .do_cancel_reminder(CancelReminderParams {
+                id: corrupt.clone(),
+            })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cancel["status"], "ok");
+    assert_eq!(
+        repo.get(&corrupt).await.unwrap().unwrap().status,
+        "cancelled"
+    );
+    assert_eq!(repo.get(&healthy).await.unwrap().unwrap().status, "pending");
 }
