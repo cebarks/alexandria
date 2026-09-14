@@ -2363,7 +2363,7 @@ export function formatDueBlock(items: DueReminder[]): string {
 }
 ```
 
-**Step 4: Rewrite the `before_agent_start` recall handler in `index.ts` as a single dispatcher** that runs recall + reminders concurrently with per-feature failure isolation. (One merged handler avoids relying on undocumented multi-handler message-injection merging in pi.) Replace the existing `if (!CONFIG.recallDisabled) { pi.on("before_agent_start", ...) }` block with:
+**Step 4: Rewrite the `before_agent_start` recall handler in `index.ts` as a single dispatcher** that runs recall + reminders concurrently with per-feature failure isolation. (One merged handler keeps the ordering deterministic and injects exactly one message per prompt — pi does collect a `message` from each `before_agent_start` handler, so this is a choice, not a workaround.) Replace the existing `if (!CONFIG.recallDisabled) { pi.on("before_agent_start", ...) }` block with:
 
 ```ts
 	// ── Combined injection dispatcher (recall + reminders) ──────────────
@@ -2561,4 +2561,4 @@ git commit -m "test(extension): reminders formatting + config toggle tests; fina
 
 - **Client config shape**: flat `[reminders] enabled/project` in client.toml instead of `[features.*]` nesting — matches the existing `[recall]`/`[store]` convention (same capability).
 - **No `Feature` interface abstraction**: features are config-guarded modules dispatched from one handler; a formal interface would be premature abstraction for three features (AGENTS.md minimal-abstraction rule). The dispatcher still delivers per-feature failure isolation as designed.
-- **Single merged injection handler**: recall + reminders blocks are merged into one `before_agent_start` injection (customType `alexandria`) because pi's multi-handler message-injection merging isn't documented.
+- **Single merged injection handler**: recall + reminders blocks are merged into one `before_agent_start` injection (customType `alexandria`) for deterministic ordering and exactly one injected message per prompt. pi does merge messages from several handlers, so this is a design choice rather than a limitation.

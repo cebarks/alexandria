@@ -144,7 +144,8 @@ Other config keys can only be set via the TOML file.
 
 ## Client Configuration
 
-The Pi auto-recall/store extension loads its own config from `$XDG_CONFIG_HOME/alexandria/client.toml`.
+The Pi companion extension (recall / store / reminders) loads its own config from
+`$XDG_CONFIG_HOME/alexandria/client.toml`.
 
 Precedence: defaults → `client.toml` → `ALEXANDRIA_CLIENT_CONFIG` env var (path to alt TOML) → individual `ALEXANDRIA_*` env vars.
 
@@ -163,6 +164,10 @@ min_similarity = 0.58
 enabled = true
 extract_model = "vertex/claude-haiku-4-5"
 extract_timeout_ms = 5000
+
+[reminders]
+enabled = true
+project = "alexandria"
 ```
 
 ### `[server]`
@@ -186,6 +191,17 @@ extract_timeout_ms = 5000
 | `enabled` | bool | `true` | `ALEXANDRIA_AUTO_STORE=off` | Enable heuristic store detectors and LLM extraction. |
 | `extract_model` | string | `"vertex/claude-haiku-4-5"` | `ALEXANDRIA_EXTRACT_MODEL` | Model for session-end LLM extraction. Falls back to session model if unavailable. |
 | `extract_timeout_ms` | number | `5000` | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | Timeout for the extraction LLM call in milliseconds. |
+
+### `[reminders]`
+
+Client-side delivery keys. The server-side `[reminders]` section above configures how
+schedules are interpreted; this section only says whether the extension asks for due reminders, and
+what project hint it sends with the question.
+
+| Key | Type | Default | Env Override | Description |
+| ----- | ------ | --------- | ------------- | ------------- |
+| `enabled` | bool | `true` | `ALEXANDRIA_REMINDERS=off` | Call `check_reminders` on every prompt and inject whatever is due. The server runs no timer, so turning this off means reminders reach the user only if the agent calls `check_reminders` itself. |
+| `project` | string | (git repo dir name) | `ALEXANDRIA_REMINDERS_PROJECT` | Project hint sent with each check, matched exactly (case-sensitive) against the `target_project` set by `set_reminder`. Defaults to the basename of `git rev-parse --show-toplevel`; set it when the checkout directory is not the project name, as with a git worktree. Unset and outside a repo, only global and escalated reminders are delivered. |
 
 ---
 

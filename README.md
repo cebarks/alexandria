@@ -80,10 +80,13 @@ three levels:
 2. **Client-side skill** — for pi users, [`contrib/pi/skills/alexandria-memory/`](contrib/pi/skills/alexandria-memory/)
    documents concrete trigger conditions and tool choice guidance, mirroring how other high-usage
    MCP tools ship skills alongside themselves.
-3. **Optional auto-recall extension** — [`contrib/pi/extensions/alexandria-auto-recall/`](contrib/pi/extensions/alexandria-auto-recall/)
-   hooks `before_agent_start` to call `retrieve_memories` on every prompt automatically and inject
-   hits above a similarity threshold into context, so the agent never has to decide to check
-   memory. This trades latency and potential noise for guaranteed recall.
+3. **Optional companion extension** — [`contrib/pi/extensions/alexandria/`](contrib/pi/extensions/alexandria/)
+   hooks `before_agent_start` to call `retrieve_memories` and `check_reminders` on every prompt
+   automatically, injecting hits above a similarity threshold and whatever reminders are due into
+   context, and stores durable facts it detects in the conversation or extracts at session end — so
+   the agent never has to decide to check memory, and reminders reach the user even though the server
+   runs no timer. This trades latency and potential noise for guaranteed recall; each feature can be
+   turned off separately.
 
 Items 2 and 3 are client-side pi integrations, not part of the MCP server itself — see
 [`contrib/pi/README.md`](contrib/pi/README.md) for what they are and how to install them.
@@ -162,7 +165,8 @@ Legacy `~/.alexandria/` paths are used as fallback if the XDG paths don't exist 
 
 Reminder delivery is configured by the `[reminders]` section: `timezone` (IANA name, empty = system-local) governs naive datetime input and pattern/cron evaluation, and `escalation_hours` controls overdue escalation to global delivery.
 
-The Pi auto-recall/store extension has its own config at `$XDG_CONFIG_HOME/alexandria/client.toml`.
+The Pi companion extension (recall / store / reminders) has its own config at
+`$XDG_CONFIG_HOME/alexandria/client.toml`.
 
 See [docs/configuration.md](docs/configuration.md) for all options, client config reference, and migration instructions.
 

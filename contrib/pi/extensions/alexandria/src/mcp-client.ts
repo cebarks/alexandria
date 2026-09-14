@@ -15,23 +15,51 @@ import { CONFIG } from "./config.js";
 
 let clientPromise: Promise<Client> | null = null;
 
+/**
+ * Budget for the connect handshake: a single cheap round trip, so a server that
+ * has not answered within this is not going to answer anything else either. The
+ * SDK default is 60 s, which would let a socket-accepting but unresponsive
+ * server stall the prompt path for a minute before a tool call was even made.
+ */
+const HANDSHAKE_TIMEOUT_MS = 5000;
+
+/**
+ * Budget for the calls made on the prompt path (`retrieve_memories`,
+ * `check_reminders`). The SDK waits 60 s per request by default; both injections
+ * block the turn and both are best-effort, so they give up early and warn
+ * instead. Store calls keep the SDK default — they are fire-and-forget, and a
+ * store that embeds a long document legitimately takes a while.
+ */
+export const PROMPT_CALL_TIMEOUT_MS = 5000;
+
+async function connect(): Promise<Client> {
+	let url: URL;
+	try {
+		url = new URL(CONFIG.serverUrl);
+	} catch {
+		throw new Error(`Invalid ALEXANDRIA_URL: ${CONFIG.serverUrl}`);
+	}
+	const client = new Client({
+		name: "alexandria",
+		version: "2.1.0",
+	});
+	const transport = new StreamableHTTPClientTransport(url);
+	await client.connect(transport, { timeout: HANDSHAKE_TIMEOUT_MS });
+	return client;
+}
+
 export async function getClient(): Promise<Client> {
 	if (!clientPromise) {
-		clientPromise = (async () => {
-			let url: URL;
-			try {
-				url = new URL(CONFIG.serverUrl);
-			} catch {
-				throw new Error(`Invalid ALEXANDRIA_URL: ${CONFIG.serverUrl}`);
-			}
-			const client = new Client({
-				name: "alexandria-auto-recall",
-				version: "2.0.0",
-			});
-			const transport = new StreamableHTTPClientTransport(url);
-			await client.connect(transport);
-			return client;
-		})();
+		const attempt = connect();
+		clientPromise = attempt;
+		// A failed connect must not stay cached. Without this, one unreachable
+		// server (not up yet, bad ALEXANDRIA_URL, a network blip) replays the same
+		// rejection to every later caller until the process restarts, so per-prompt
+		// work like reminder delivery never resumes when the server comes back.
+		// The guard keeps the clear from clobbering a newer attempt.
+		attempt.catch(() => {
+			if (clientPromise === attempt) clientPromise = null;
+		});
 	}
 	return clientPromise;
 }
@@ -63,19 +91,24 @@ function isStaleSessionError(err: unknown): boolean {
  * Call an MCP tool with automatic reconnect on stale session.
  * If the first attempt fails with "Session not found", resets the client,
  * establishes a fresh connection, and retries exactly once.
+ *
+ * `timeoutMs` bounds the wait for this call; see {@linkcode PROMPT_CALL_TIMEOUT_MS}
+ * for why the prompt path passes one.
  */
 export async function callToolWithRetry(
 	name: string,
 	args: Record<string, unknown>,
+	timeoutMs?: number,
 ): Promise<Awaited<ReturnType<Client["callTool"]>>> {
+	const options = timeoutMs === undefined ? {} : { timeout: timeoutMs };
 	try {
 		const client = await getClient();
-		return await client.callTool({ name, arguments: args });
+		return await client.callTool({ name, arguments: args }, options);
 	} catch (err) {
 		if (isStaleSessionError(err)) {
 			resetClient();
 			const client = await getClient();
-			return await client.callTool({ name, arguments: args });
+			return await client.callTool({ name, arguments: args }, options);
 		}
 		throw err;
 	}

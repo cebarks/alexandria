@@ -1,6 +1,6 @@
 {
-  "name": "alexandria-auto-recall",
-  "version": "2.0.0",
+  "name": "alexandria",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "dependencies": {
@@ -9,7 +9,8 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "latest",
-    "@types/node": "^20.0.0"
+    "@types/node": "^20.0.0",
+    "typescript": "^5.9.0"
   },
   "pi": {
     "extensions": [
