@@ -55,6 +55,33 @@ pub struct QueryForm {
     pub dry_run: Option<String>,
 }
 
+/// The model the bands below were measured on, as the Query Tester's legend names it.
+///
+/// Held apart from [`SCORE_BANDS_LEGEND`] only because the template wraps it in `<code>`, and
+/// markup cannot come from a const (`|safe` is forbidden in this project — askama escapes every
+/// `{{ }}`, so the only remaining decision is context, not trustworthiness).
+pub const SCORE_BANDS_MODEL: &str = "all-MiniLM-L6-v2";
+
+/// The Query Tester's score-band legend: one sentence, one source.
+///
+/// This was static prose duplicated between `templates/query_results.html` and
+/// `docs/configuration.md`, which meant a re-measurement that updated one copy passed CI and left
+/// the operator's documentation contradicting the UI. Now the template renders this const, and
+/// `test_configuration_md_quotes_every_score_band` fails if `docs/configuration.md` stops quoting
+/// the same numbers.
+pub const SCORE_BANDS_LEGEND: &str = "measured 2026-09-08 -- model-dependent, so re-measure for any \
+     other embedding model: keyword or near-paraphrase hit 0.55-0.76, natural-language question \
+     against its matching statement 0.40-0.65, a question sharing no vocabulary with the statement \
+     as low as ~0.2, unrelated memories 0.07-0.40.";
+
+/// The four ranges inside [`SCORE_BANDS_LEGEND`], spelled as the legend spells them.
+///
+/// Not a second copy of the measurement: `test_score_band_ranges_are_in_the_legend` asserts each
+/// string occurs in the legend, so this array is an *index* into it rather than a parallel source.
+/// It exists so the docs cross-check can name every band without parsing prose, and so the
+/// rendered-fragment test covers all four rather than the three it happened to list.
+pub const SCORE_BAND_RANGES: &[&str] = &["0.55-0.76", "0.40-0.65", "~0.2", "0.07-0.40"];
+
 /// One row of the ID / Content / Similarity table. `retrieve_memories` results and focused
 /// recall share this shape — the legacy code rendered both with the same `format!` line.
 #[derive(Clone)]
@@ -1006,18 +1033,75 @@ mod tests {
         )
         .await;
         for needle in [
-            "all-MiniLM-L6-v2",
+            super::SCORE_BANDS_MODEL,
             "measured 2026-09-08",
             "model-dependent",
-            "0.55-0.76",
-            "0.40-0.65",
-            "0.07-0.40",
-        ] {
+        ]
+        .iter()
+        .chain(super::SCORE_BAND_RANGES.iter())
+        {
             assert!(
                 fragment.contains(needle),
                 "the score-band legend must state {needle:?}; got: {fragment}"
             );
         }
+        // The legend is one const, so the fragment must carry it whole — a partial render (a lost
+        // clause, a truncated string continuation) would still satisfy the per-band needles above.
+        assert!(
+            fragment.contains(&format!(
+                "Similarity bands for <code>{}</code>, {}",
+                super::SCORE_BANDS_MODEL,
+                super::SCORE_BANDS_LEGEND
+            )),
+            "the rendered legend must be the const verbatim; got: {fragment}"
+        );
+    }
+
+    /// Guards the claim that [`super::SCORE_BAND_RANGES`] is an index into the legend rather than a
+    /// second copy of it: every listed range must occur in the sentence the UI renders.
+    #[test]
+    fn score_band_ranges_are_in_the_legend() {
+        for range in super::SCORE_BAND_RANGES {
+            assert!(
+                super::SCORE_BANDS_LEGEND.contains(range),
+                "{range:?} is not in the legend: {:?}",
+                super::SCORE_BANDS_LEGEND
+            );
+        }
+    }
+
+    /// `docs/configuration.md` is the operator-facing contract for these same numbers: it is where
+    /// someone tunes `retrieve.min_similarity` looking for what a score *means*. Two independent
+    /// copies of one measurement was the bug, and the doc is not compiled, so the only way to make
+    /// the pairing a build-time fact is to read the file in at compile time and assert against it
+    /// here — an `include_str!` of markdown, not a runtime read, so a moved/renamed doc is a compile
+    /// error rather than a silently vacuous pass.
+    #[test]
+    fn configuration_md_quotes_every_score_band() {
+        const CONFIG_MD: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/configuration.md"
+        ));
+        // The doc uses en-dashes in the ranges (`0.55–0.76`); the template cannot, because askama
+        // would happily carry a non-ASCII dash into a `<code>`-adjacent run. Normalize so the
+        // comparison is about the *numbers*, not the typography.
+        let doc = CONFIG_MD.replace('\u{2013}', "-");
+        for needle in [super::SCORE_BANDS_MODEL, "measured 2026-09-08"]
+            .iter()
+            .chain(super::SCORE_BAND_RANGES.iter())
+        {
+            assert!(
+                doc.contains(needle),
+                "docs/configuration.md must keep quoting {needle:?} from SCORE_BANDS_LEGEND"
+            );
+        }
+        // The doc's table cell opens a sentence with "Model-dependent:" where the UI says
+        // "model-dependent" mid-sentence — the same claim in a different case, so this one needle
+        // is compared without case.
+        assert!(
+            doc.to_ascii_lowercase().contains("model-dependent"),
+            "docs/configuration.md must keep calling these bands model-dependent"
+        );
     }
 
     /// A wet run must say that activation ran and name the ids it seeded — the kept ones, never

@@ -115,9 +115,11 @@ Controls server-side filtering of `retrieve_memories` results.
 | `min_similarity` | f32 | `0.10` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A noise cutoff only. Model-dependent: for `all-MiniLM-L6-v2` (measured 2026-09-08), a keyword or near-paraphrase hit scores 0.55–0.76, a natural-language question against its matching statement 0.40–0.65, and a question sharing no vocabulary with the statement as low as ~0.2. Unrelated memories score 0.07–0.40. The floor stays below the vocabulary-free cases; client thresholds do the real filtering. |
 
 The default is defined once at `alexandria_engine::search::DEFAULT_MIN_SIMILARITY`, which both
-`RetrieveConfig::default()` and `AlexandriaServer`'s construction fallback read. The measured
-score bands above are duplicated in `crates/alexandria-mcp/templates/query_results.html` as the
-legend on the debug Query Tester — two copies of one measurement, so edit both together.
+`RetrieveConfig::default()` and `AlexandriaServer`'s construction fallback read. The measured score
+bands above are the same numbers the debug Query Tester renders; both come from one const,
+`SCORE_BANDS_LEGEND` in `crates/alexandria-mcp/src/debug/query.rs`, and
+`configuration_md_quotes_every_score_band` fails the build if this page stops quoting them, so
+re-measure by editing the const and this table together.
 
 ## Environment Variable Overrides
 

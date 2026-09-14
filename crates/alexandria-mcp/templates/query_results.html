@@ -35,7 +35,7 @@
 </dl>
 <p class="query-window">{{ report.window_note }}</p>
 <p class="query-activation">{{ report.activation_note }}</p>
-<p class="score-bands">Similarity bands for <code>all-MiniLM-L6-v2</code>, measured 2026-09-08 -- model-dependent, so re-measure for any other embedding model: keyword or near-paraphrase hit 0.55-0.76, natural-language question against its matching statement 0.40-0.65, a question sharing no vocabulary with the statement as low as ~0.2, unrelated memories 0.07-0.40.</p>
+<p class="score-bands">Similarity bands for <code>{{ crate::debug::query::SCORE_BANDS_MODEL }}</code>, {{ crate::debug::query::SCORE_BANDS_LEGEND }}</p>
 <p class="query-scope">The floor is applied <em>after</em> the top-<code>limit</code> truncation, so a dropped row below is one that was ranked inside that window -- this is not every suppressed memory in the database.</p>
 {% if let Some(note) = report.empty_note %}<p>{{ note }}</p>{% else %}<table>
 <tr><th>ID</th><th>Content</th><th>Similarity</th></tr>
