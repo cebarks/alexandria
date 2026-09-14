@@ -1,10 +1,18 @@
 {% extends "layout.html" %}
 {% block title %}Dashboard{% endblock %}
 {% block body %}<h1>Alexandria Debug Dashboard</h1>
+<h2>Counts</h2>
 <table>
 <tr><th>Facts (active)</th><td>{{ fact_count }}</td></tr>
 <tr><th>Facts (deleted)</th><td>{{ deleted_fact_count }}</td></tr>
 <tr><th>Clusters</th><td>{{ cluster_count }}</td></tr>
 <tr><th>Edges</th><td>{{ edge_count }}</td></tr>
 <tr><th>Raw documents</th><td>{{ raw_count }}</td></tr>
-</table>{% endblock %}
+<tr><th>Sessions</th><td>{{ session_count }}</td></tr>
+</table>
+{% if schema_note != "" %}<p class="error">{{ schema_note }}</p>{% endif %}
+<h2>Effective configuration</h2>
+<table>
+<tr><th>Setting</th><th>Value</th></tr>{# Every row is emitted on ONE physical line and the dashboard tests read a value by matching `<tr><th>label</th><td>` through to `</td>`, so a reflow inside a row breaks both the layout and the assertions. Do not let a formatter split these. #}
+{% for row in config_rows %}<tr><th>{{ row.label }}</th><td>{{ row.value }}</td></tr>
+{% endfor %}</table>{% endblock %}
