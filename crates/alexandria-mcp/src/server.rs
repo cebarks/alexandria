@@ -211,6 +211,19 @@ Use update_memory (not store_memory) when correcting something already stored �
 )]
 impl ServerHandler for AlexandriaServer {}
 
+/// Which optional stages a retrieval run performs.
+///
+/// A Rust-side parameter rather than fields on [`RetrieveMemoriesParams`], because that struct is
+/// the public MCP tool schema advertised to every LLM client — a debug-only knob there would be
+/// something agents could set.
+#[derive(Debug, Clone, Copy)]
+struct RetrieveOptions {
+    /// Fire spreading activation for the kept top-`top_n` results, i.e. write heat.
+    activate: bool,
+    /// Drop ranked results below `retrieve_min_similarity`.
+    apply_floor: bool,
+}
+
 // Implementation details
 impl AlexandriaServer {
     pub async fn do_store_memory(&self, params: StoreMemoryParams) -> anyhow::Result<String> {
@@ -438,7 +451,14 @@ impl AlexandriaServer {
         &self,
         params: RetrieveMemoriesParams,
     ) -> anyhow::Result<serde_json::Value> {
-        self.retrieve_core(params, true).await
+        self.retrieve_core(
+            params,
+            RetrieveOptions {
+                activate: true,
+                apply_floor: true,
+            },
+        )
+        .await
     }
 
     /// Non-mutating retrieval for the debug UI's dry-run mode.
@@ -450,13 +470,41 @@ impl AlexandriaServer {
         &self,
         params: RetrieveMemoriesParams,
     ) -> anyhow::Result<serde_json::Value> {
-        self.retrieve_core(params, false).await
+        self.retrieve_core(
+            params,
+            RetrieveOptions {
+                activate: false,
+                apply_floor: true,
+            },
+        )
+        .await
     }
 
-    /// Shared retrieval implementation. `activate` controls the spreading-activation side
-    /// effect *only*; every other step — embedding, loading, ranking, the similarity floor,
-    /// result building — is the same code on both paths, which is what makes dry results equal
-    /// wet results.
+    /// The ranked window *before* the similarity floor, for the debug Query Tester.
+    ///
+    /// Non-mutating (`activate: false`), so unlike [`Self::do_retrieve_memories`] it never warms
+    /// heat — the honest default for a surface that exists to explain a ranking rather than change
+    /// it. Returning the unfiltered window is what lets the tester name the results the floor
+    /// suppressed. Note the window is still only the top `limit` rows: the tool truncates to
+    /// `limit` *before* filtering, so neither path can see anything ranked below that.
+    pub async fn do_retrieve_memories_unfiltered(
+        &self,
+        params: RetrieveMemoriesParams,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.retrieve_core(
+            params,
+            RetrieveOptions {
+                activate: false,
+                apply_floor: false,
+            },
+        )
+        .await
+    }
+
+    /// Shared retrieval implementation. `options` selects the two optional stages — the
+    /// spreading-activation write and the similarity floor — and nothing else; every other step
+    /// (embedding, loading, ranking, result building) is the same code on every path, which is
+    /// what makes dry results equal wet results and the unfiltered window a superset of both.
     ///
     /// `do_retrieve_memories` must keep its exact signature: `#[tool] retrieve_memories` calls
     /// it, and the rmcp derives are sensitive to the shape of tool-adjacent methods. The knob is
@@ -466,7 +514,7 @@ impl AlexandriaServer {
     async fn retrieve_core(
         &self,
         params: RetrieveMemoriesParams,
-        activate: bool,
+        options: RetrieveOptions,
     ) -> anyhow::Result<serde_json::Value> {
         let limit = params.limit.unwrap_or(10);
 
@@ -492,15 +540,19 @@ impl AlexandriaServer {
             return Ok(serde_json::json!({ "results": [] }));
         }
 
-        // 3. Rank by similarity, then drop results below the server-side floor.
+        // 3. Rank by similarity, then — for the tool and the dry run — drop results below the
+        // server-side floor.
         // This is a conservative defense-in-depth cutoff: it removes pure noise
         // even if a client sets a lax threshold, without changing semantics for
         // deliberate agent lookups (the floor sits well below plausible matches).
+        // It is skipped only by the unfiltered debug path, which needs the suppressed rows back.
         let embeddings: Vec<Vec<f32>> = facts.iter().map(|f| f.embedding.clone()).collect();
-        let ranked: Vec<(usize, f32)> = rank_by_similarity(query_emb, &embeddings, limit)
-            .into_iter()
-            .filter(|(_, sim)| *sim >= self.retrieve_min_similarity)
-            .collect();
+        let mut ranked: Vec<(usize, f32)> = rank_by_similarity(query_emb, &embeddings, limit);
+        if options.apply_floor {
+            // `retain` keeps the rank order, so the activation loop below sees exactly the rows the
+            // old `into_iter().filter()` chain produced.
+            ranked.retain(|(_, sim)| *sim >= self.retrieve_min_similarity);
+        }
 
         // 4. Trigger spreading activation for top results.
         //
@@ -510,7 +562,7 @@ impl AlexandriaServer {
         //
         // Every `add_heat` it issues is a real database write, which is why the debug UI's
         // dry-run mode passes `activate: false` rather than calling this unconditionally.
-        if activate {
+        if options.activate {
             for (idx, _) in ranked.iter().take(self.activation_top_n) {
                 let fact = &facts[*idx];
                 if let Some(ref id) = fact.id {

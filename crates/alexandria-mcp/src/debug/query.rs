@@ -50,10 +50,34 @@ pub struct QueryForm {
 
 /// One row of the ID / Content / Similarity table. `retrieve_memories` results and focused
 /// recall share this shape — the legacy code rendered both with the same `format!` line.
+#[derive(Clone)]
 struct ResultRow {
     id: String,
     content: String,
+    /// `score` as the legacy table printed it (`{:.4}`). Askama renders an `f64` with plain
+    /// `Display`, which would print `0.5` where the table printed `0.5000`.
     similarity: String,
+    /// The same number as a value, for the floor comparison. `similarity` is display-only: a
+    /// truncated string cannot be compared against `retrieve_min_similarity` without inventing
+    /// rounding rules, so the comparison happens on what the tool itself compared.
+    score: f32,
+}
+
+/// What one retrieve run decided: the rows, and the settings that produced them.
+struct RetrieveReport {
+    /// `retrieve.min_similarity` in force, printed to two places like the config does.
+    floor: String,
+    /// `activation.top_n` in force.
+    top_n: usize,
+    kept: Vec<ResultRow>,
+    dropped: Vec<ResultRow>,
+    /// Counts the window honestly — "of the top N ranked, M fell below the floor", never "all
+    /// dropped results", because the tool truncates to `limit` before filtering.
+    window_note: String,
+    /// Whether the heat write happened, and which ids seeded it.
+    activation_note: String,
+    /// Set exactly when `kept` is empty, so the table is replaced by a line that says why.
+    empty_note: Option<&'static str>,
 }
 
 /// One cluster of a broad recall. Only the representative memory *contents* are listed: the
@@ -82,6 +106,10 @@ enum Fragment {
     },
     /// Broad recall: one section per cluster. The `<h3>Broad recall</h3>` lives in the template.
     Clusters { sections: Vec<RecallCluster> },
+    /// A retrieve run, with the floor / activation context that makes "why didn't this find X?"
+    /// answerable from the fragment alone. A struct variant because askama rejects `{ Variant { f } }`
+    /// syntax for tuple variants.
+    Retrieve { report: RetrieveReport },
 }
 
 impl Fragment {
@@ -92,19 +120,6 @@ impl Fragment {
     fn notice(message: &str) -> Self {
         Self::Notice {
             message: message.to_string(),
-        }
-    }
-
-    /// A `retrieve_memories` result: `{ "results": [ { id, content, similarity }, … ] }`.
-    fn retrieve(value: &serde_json::Value) -> Self {
-        let rows = result_rows(value.get("results"));
-        if rows.is_empty() {
-            Self::notice("No results.")
-        } else {
-            Self::Table {
-                heading: None,
-                rows,
-            }
         }
     }
 
@@ -166,10 +181,14 @@ fn result_rows(value: Option<&serde_json::Value>) -> Vec<ResultRow> {
     let entries = value.and_then(|v| v.as_array()).unwrap_or(&empty);
     entries
         .iter()
-        .map(|entry| ResultRow {
-            id: string_field(entry, "id"),
-            content: string_field(entry, "content"),
-            similarity: similarity_field(entry),
+        .map(|entry| {
+            let score = similarity_value(entry);
+            ResultRow {
+                id: string_field(entry, "id"),
+                content: string_field(entry, "content"),
+                similarity: format!("{score:.4}"),
+                score,
+            }
         })
         .collect()
 }
@@ -184,14 +203,20 @@ fn string_field(value: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
+/// A `similarity` as a number, or 0.0 when absent — the same default the legacy renderers printed.
+/// Read from the JSON `f64` the tool serialized from an `f32`, so it round-trips back to the
+/// exact value `retrieve_core` compared against the floor.
+fn similarity_value(value: &serde_json::Value) -> f32 {
+    value
+        .get("similarity")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32
+}
+
 /// A `similarity` as the legacy `{:.4}` printed it. Formatting stays in Rust: askama renders an
 /// `f64` with plain `Display`, which would print `0.5` where the table printed `0.5000`.
 fn similarity_field(value: &serde_json::Value) -> String {
-    let similarity = value
-        .get("similarity")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    format!("{similarity:.4}")
+    format!("{:.4}", similarity_value(value))
 }
 
 /// The fragment template. No `nav` field, because `query_results.html` is swapped into a div
@@ -200,9 +225,128 @@ fn similarity_field(value: &serde_json::Value) -> String {
 #[template(path = "query_results.html")]
 struct QueryResultsTemplate {
     fragment: Fragment,
+    /// Standing note about what the selected mode ignores, rendered above the fragment. See
+    /// [`RECALL_IGNORES_NOTE`] for why it is a constant rather than a per-field warning.
+    mode_note: Option<&'static str>,
+}
+
+/// Named on every recall fragment, always the same sentence. It *could* be conditional on the
+/// operator having filled a retrieve-only field in, but a conditional notice would then be naming
+/// `dry_run` while never being triggered by `dry_run` — and the byte-equality of two recall
+/// fragments that differ only in `dry_run` is what `test_query_run_recall_ignores_dry_run` pins.
+/// A constant line cannot be wrong and cannot break that property.
+const RECALL_IGNORES_NOTE: &str = "recall ignores limit, session_id and dry_run — it takes only a query and an optional scope handle.";
+
+/// One honest sentence about how many rows the ranked window held and how many the floor took.
+/// `window` is the tool's top-`limit` slice, not the database, so the wording says "ranked".
+fn window_note(window: usize, dropped: usize, floor: &str) -> String {
+    if window == 0 {
+        return "Nothing was ranked: the query loaded no memories to score.".to_string();
+    }
+    if dropped == 0 {
+        return format!(
+            "Ranked window: the top {window}. None of them fell below the server-side floor {floor}."
+        );
+    }
+    format!(
+        "Ranked window: the top {window}. {dropped} of them fell below the server-side floor {floor}."
+    )
+}
+
+/// One honest sentence about the spreading-activation write. It is the only side effect a retrieve
+/// run can have, so the fragment has to say whether it happened — and "happened" here means
+/// `retrieve_core` seeded activation from these ids, which only moves heat where an edge exists.
+fn activation_note(wet: bool, kept: &[ResultRow], top_n: usize) -> String {
+    if !wet {
+        return "Spreading activation did not run — this retrieval wrote nothing.".to_string();
+    }
+    let seeds: Vec<String> = kept.iter().take(top_n).map(|row| row.id.clone()).collect();
+    if seeds.is_empty() {
+        return "Spreading activation did not run: there was no kept result to seed it from."
+            .to_string();
+    }
+    let listed = seeds.join(", ");
+    format!(
+        "Spreading activation ran, seeded from {} of {} kept results: {listed}. Where a seed has \
+         graph neighbours, their heat increased.",
+        seeds.len(),
+        kept.len()
+    )
+}
+
+/// The retrieve branch of [`run`].
+///
+/// Two reads, on purpose:
+///
+/// 1. The kept table is whatever the path the operator selected returns — `do_retrieve_memories`
+///    when not dry (the real tool, heat write included), `do_retrieve_memories_dry` when dry. That
+///    is what "what would this query return" means here: the tool's own answer, not a reconstruction
+///    the debug layer could get wrong.
+/// 2. The unfiltered window (`do_retrieve_memories_unfiltered`, same ranking code, floor off, no
+///    writes) supplies the rows the floor suppressed, on every run — not just dry ones — so the
+///    kept list and the dropped list describe one ranking.
+///
+/// Reimplementing activation to avoid read 1 on a wet run would put an unsanctioned second write
+/// path in the debug layer, and recomputing `kept` from the window instead of asking the tool would
+/// let the two disagree silently. Both are avoided.
+async fn retrieve_fragment(
+    server: &AlexandriaServer,
+    query: String,
+    limit: Option<usize>,
+    session_id: Option<String>,
+    dry_run: bool,
+) -> Fragment {
+    // Built per call rather than moved, because `RetrieveMemoriesParams` is the tool's own params
+    // type and does not (and should not) derive `Clone`.
+    let params = || RetrieveMemoriesParams {
+        query: query.clone(),
+        limit,
+        session_id: session_id.clone(),
+    };
+    let kept = match if dry_run {
+        server.do_retrieve_memories_dry(params()).await
+    } else {
+        server.do_retrieve_memories(params()).await
+    } {
+        Ok(value) => result_rows(value.get("results")),
+        Err(e) => return Fragment::error(e.to_string()),
+    };
+    let window = match server.do_retrieve_memories_unfiltered(params()).await {
+        Ok(value) => result_rows(value.get("results")),
+        Err(e) => return Fragment::error(e.to_string()),
+    };
+
+    let floor = server.retrieve_min_similarity;
+    // Below the floor *and* absent from the kept table, so a row can never be shown twice if the
+    // two paths ever disagree about the comparison.
+    let dropped: Vec<ResultRow> = window
+        .iter()
+        .filter(|row| row.score < floor)
+        .filter(|row| !kept.iter().any(|kept| kept.id == row.id))
+        .cloned()
+        .collect();
+
+    let floor_text = format!("{floor:.2}");
+    let empty_note = match (kept.is_empty(), window.is_empty()) {
+        (false, _) => None,
+        // Nothing was loaded at all, which is a different fact from "everything was filtered".
+        (true, true) => Some("No results."),
+        (true, false) => Some("No results above the floor — see the dropped section below."),
+    };
+    let report = RetrieveReport {
+        window_note: window_note(window.len(), dropped.len(), &floor_text),
+        activation_note: activation_note(!dry_run, &kept, server.activation_top_n),
+        floor: floor_text,
+        top_n: server.activation_top_n,
+        empty_note,
+        kept,
+        dropped,
+    };
+    Fragment::Retrieve { report }
 }
 
 pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryForm>) -> Response {
+    let mode_note = matches!(form.mode.as_str(), "recall").then_some(RECALL_IGNORES_NOTE);
     let fragment = match form.mode.as_str() {
         "retrieve" => {
             // A checkbox sends `dry_run=true` when checked and nothing at all when not, so
@@ -218,33 +362,22 @@ pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryF
             // field, which is exactly the confusion this page exists to remove. So: blank means
             // unscoped.
             let session_id = form.session_id.filter(|id| !id.trim().is_empty());
-            let params = RetrieveMemoriesParams {
-                query: form.query.clone(),
-                limit: form.limit,
-                session_id,
-            };
             // Spreading activation writes heat, so a retrieve run is the one debug route that
             // mutates. The template says so out loud; the checkbox routes around it for an
-            // operator who wants an answer that a previous test query did not bias. The params
-            // are built once above and moved into whichever path is taken, so the two cannot drift
-            // apart in what they search for.
-            let retrieval = if dry_run {
-                server.do_retrieve_memories_dry(params).await
-            } else {
-                server.do_retrieve_memories(params).await
-            };
-            match retrieval {
-                Ok(value) => Fragment::retrieve(&value),
-                Err(e) => Fragment::error(e.to_string()),
-            }
+            // operator who wants an answer that a previous test query did not bias.
+            retrieve_fragment(&server, form.query, form.limit, session_id, dry_run).await
         }
-        // recall mode intentionally ignores `limit` and `session_id`: RecallParams has no limit
-        // field, and its `scope_handle` is an opaque handle returned by a previous broad recall
-        // that narrows into one cluster — a different concept from a session id, so there is
-        // nothing honest to map a session onto. It also ignores `dry_run`, for a reason worth
-        // stating before anyone adds a branch: `do_recall` writes nothing at all (no activation,
-        // no heat), so there is no side effect left for a dry run to skip. The form says
-        // "(retrieve only)" for all three fields.
+        // recall mode intentionally ignores all three of the form's retrieve-only fields:
+        //   - `limit`: `RecallParams` has no limit field at all;
+        //   - `session_id`: recall's `scope_handle` is an opaque handle returned by a previous
+        //     broad recall that narrows into one cluster — a different concept from a session id,
+        //     so there is nothing honest to map a session onto;
+        //   - `dry_run`: worth stating before anyone adds a branch, because `do_recall` writes
+        //     nothing at all (no activation, no heat), so there is no side effect left for a dry
+        //     run to skip.
+        // The form labels all three "(retrieve only)" and, since there is no JavaScript here to
+        // hide them, `mode_note` states it again in the fragment itself. That note is a constant:
+        // see [`RECALL_IGNORES_NOTE`] for why it cannot be conditional.
         "recall" => {
             let params = RecallParams {
                 query: form.query.clone(),
@@ -257,7 +390,10 @@ pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryF
         }
         other => Fragment::error(format!("Unknown mode: {other}")),
     };
-    page(QueryResultsTemplate { fragment })
+    page(QueryResultsTemplate {
+        fragment,
+        mode_note,
+    })
 }
 
 #[cfg(test)]
@@ -673,6 +809,357 @@ mod tests {
             sorted_lines(&plain),
             sorted_lines(&dry),
             "recall writes nothing, so dry_run must be a no-op there"
+        );
+    }
+
+    // --- Why didn't this find X? floor, dropped rows, activation ----------------
+    //
+    // These run on `test_support::banded_server()`, not `test_server()`: `StubEmbedding` returns
+    // one constant vector, so every similarity there is 1.0 and the floor can never drop
+    // anything. With the banded stub, "strong" scores 0.60 and "weak" 0.20 against a 0.30 floor.
+
+    /// Two memories that straddle the floor, stored through the server so each gets a
+    /// `heat_state` row. Returns their ids in (strong, weak) order.
+    async fn seed_straddling_pair(server: &crate::AlexandriaServer) -> (String, String) {
+        let mut ids = Vec::new();
+        for content in ["a strong match memory", "a weak match memory"] {
+            ids.push(
+                server
+                    .do_store_memory(crate::tools::StoreMemoryParams {
+                        content: content.to_string(),
+                        tags: None,
+                        session_id: None,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        (ids[0].clone(), ids[1].clone())
+    }
+
+    /// Split a fragment at the dropped section, so an assertion can say *which* table a row
+    /// appeared in. `None` when there is no dropped section at all.
+    fn split_at_dropped(fragment: &str) -> Option<(&str, &str)> {
+        fragment.split_once("Dropped by min_similarity")
+    }
+
+    #[tokio::test]
+    async fn test_query_tester_shows_floor_and_dropped_rows() {
+        let server = super::super::test_support::banded_server().await;
+        seed_straddling_pair(&server).await;
+        let app = crate::debug::router(server);
+
+        let fragment = run_form(
+            app,
+            "mode=retrieve&query=project+decision&limit=10&dry_run=true",
+        )
+        .await;
+
+        // The settings that decided the answer, labelled as the server's own.
+        assert!(
+            fragment.contains("<code>retrieve.min_similarity</code> = <strong>0.30</strong>"),
+            "the effective floor must be rendered above the results; got: {fragment}"
+        );
+        assert!(
+            fragment.contains("<code>activation.top_n</code> = <strong>3</strong>"),
+            "activation.top_n must be shown next to it; got: {fragment}"
+        );
+
+        let Some((kept, dropped)) = split_at_dropped(&fragment) else {
+            panic!("a below-floor row must produce a dropped section; got: {fragment}");
+        };
+        assert!(
+            kept.contains("a strong match memory") && kept.contains("0.6000"),
+            "the above-floor memory stays in the main table; got: {kept}"
+        );
+        assert!(
+            !kept.contains("a weak match memory"),
+            "the suppressed memory must not be presented as a kept result; got: {kept}"
+        );
+        assert!(
+            dropped.contains("a weak match memory") && dropped.contains("0.2000"),
+            "the suppressed memory must appear in the dropped section with its score; got: {dropped}"
+        );
+        // Honest about the window: the floor only ever sees the top `limit` rows.
+        assert!(
+            fragment.contains(
+                "Ranked window: the top 2. 1 of them fell below the server-side floor 0.30."
+            ),
+            "the fragment must count the window rather than claim to show every dropped row; got: {fragment}"
+        );
+        assert!(
+            fragment.contains("this is not every suppressed memory in the database"),
+            "the top-`limit`-before-floor caveat must be stated; got: {fragment}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_tester_has_no_dropped_section_when_floor_drops_nothing() {
+        let server = super::super::test_support::banded_server().await;
+        server
+            .do_store_memory(crate::tools::StoreMemoryParams {
+                content: "a strong match memory".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::debug::router(server);
+
+        let fragment = run_form(
+            app,
+            "mode=retrieve&query=project+decision&limit=10&dry_run=true",
+        )
+        .await;
+        assert!(
+            split_at_dropped(&fragment).is_none(),
+            "nothing was below the floor, so no dropped section may appear; got: {fragment}"
+        );
+        assert_eq!(
+            row_count(&fragment),
+            1,
+            "exactly the one kept row; got: {fragment}"
+        );
+        assert!(
+            fragment.contains(
+                "Ranked window: the top 1. None of them fell below the server-side floor 0.30."
+            ),
+            "the window note must say the floor took nothing; got: {fragment}"
+        );
+    }
+
+    /// The measured bands from `docs/configuration.md`, so a bare `0.31` in the table means
+    /// something. Model-dependent and measured, and the fragment has to say both.
+    #[tokio::test]
+    async fn test_query_tester_prints_the_measured_score_bands() {
+        let server = super::super::test_support::banded_server().await;
+        seed_straddling_pair(&server).await;
+        let app = crate::debug::router(server);
+
+        let fragment = run_form(
+            app,
+            "mode=retrieve&query=project+decision&limit=10&dry_run=true",
+        )
+        .await;
+        for needle in [
+            "all-MiniLM-L6-v2",
+            "measured 2026-09-08",
+            "model-dependent",
+            "0.55-0.76",
+            "0.40-0.65",
+            "0.07-0.40",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "the score-band legend must state {needle:?}; got: {fragment}"
+            );
+        }
+    }
+
+    /// A wet run must say that activation ran and name the ids it seeded — the kept ones, never
+    /// a row the floor had already dropped.
+    #[tokio::test]
+    async fn test_query_tester_reports_activation_seeds_on_a_wet_run() {
+        let server = super::super::test_support::banded_server().await;
+        let (strong_id, weak_id) = seed_straddling_pair(&server).await;
+        let app = crate::debug::router(server);
+
+        let fragment = run_form(app, "mode=retrieve&query=project+decision&limit=10").await;
+        assert!(
+            fragment.contains(&format!(
+                "Spreading activation ran, seeded from 1 of 1 kept results: {strong_id}."
+            )),
+            "a wet run must name the ids activation was seeded from; got: {fragment}"
+        );
+        assert!(
+            !fragment.contains(&format!("kept results: {weak_id}")),
+            "a row the floor dropped must not be reported as an activation seed; got: {fragment}"
+        );
+    }
+
+    /// The dry half of the same claim.
+    #[tokio::test]
+    async fn test_query_tester_reports_no_activation_on_a_dry_run() {
+        let server = super::super::test_support::banded_server().await;
+        seed_straddling_pair(&server).await;
+        let app = crate::debug::router(server);
+
+        let fragment = run_form(
+            app,
+            "mode=retrieve&query=project+decision&limit=10&dry_run=true",
+        )
+        .await;
+        assert!(
+            fragment.contains("Spreading activation did not run — this retrieval wrote nothing."),
+            "a dry run must say it did not activate; got: {fragment}"
+        );
+        assert!(
+            !fragment.contains("Spreading activation ran"),
+            "a dry run must not claim it activated; got: {fragment}"
+        );
+    }
+
+    /// The unfiltered window path is what every tester run now reads its dropped rows from, so it
+    /// must stay non-mutating. The seeded pair is joined by an edge specifically: with no edge,
+    /// activation would find nothing to warm and this assertion would pass even if the path *did*
+    /// call `trigger_activation`.
+    #[tokio::test]
+    async fn test_query_tester_unfiltered_window_writes_no_heat() {
+        let server = super::super::test_support::banded_server().await;
+        let ids = seed_banded_edge_pair(&server).await;
+        let before = banded_heat(&server, &ids).await;
+        assert_eq!(
+            before,
+            (Some(1.0), Some(1.0)),
+            "each seeded memory starts at heat 1.0"
+        );
+
+        let app = crate::debug::router(server.clone());
+        let fragment = run_form(
+            app,
+            "mode=retrieve&query=project+decision&limit=10&dry_run=true",
+        )
+        .await;
+        assert!(
+            fragment.contains("a strong match memory one")
+                && fragment.contains("a strong match memory two"),
+            "the run must actually retrieve the seeded pair; got: {fragment}"
+        );
+        assert_eq!(
+            banded_heat(&server, &ids).await,
+            before,
+            "the dry run's unfiltered window must leave heat exactly where it was"
+        );
+    }
+
+    /// Two memories above the floor — so the window the tester reads is never empty — joined by a
+    /// real `memory_edge`, which is what spreading activation walks.
+    async fn seed_banded_edge_pair(server: &crate::AlexandriaServer) -> (String, String) {
+        let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
+        let mut ids = Vec::new();
+        for content in ["a strong match memory one", "a strong match memory two"] {
+            ids.push(
+                server
+                    .do_store_memory(crate::tools::StoreMemoryParams {
+                        content: content.to_string(),
+                        tags: None,
+                        session_id: None,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        edge_repo
+            .create_edge(&ids[0], &ids[1], "relates_to", 1.0)
+            .await
+            .unwrap();
+        (ids[0].clone(), ids[1].clone())
+    }
+
+    /// Heat of both seeded memories, read through `HeatRepo` — no raw query from a route test.
+    async fn banded_heat(
+        server: &crate::AlexandriaServer,
+        ids: &(String, String),
+    ) -> (Option<f64>, Option<f64>) {
+        let heat_repo = alexandria_storage::repos::HeatRepo::new(server.db.inner());
+        (
+            heat_repo.get(&ids.0).await.unwrap().map(|h| h.heat),
+            heat_repo.get(&ids.1).await.unwrap().map(|h| h.heat),
+        )
+    }
+
+    /// The tool's own filtering must be untouched by the options plumbing: one row in, and it is
+    /// the above-floor one. `server.rs`'s boundary tests cover the same property at the engine's
+    /// edges; this pins that the *debug* entry point added alongside it did not change the tool.
+    #[tokio::test]
+    async fn test_unfiltered_window_is_a_superset_of_the_tool_results() {
+        let server = super::super::test_support::banded_server().await;
+        seed_straddling_pair(&server).await;
+        let params = || crate::tools::RetrieveMemoriesParams {
+            query: "project decision".to_string(),
+            limit: Some(10),
+            session_id: None,
+        };
+
+        let tool = server.do_retrieve_memories(params()).await.unwrap();
+        let dry = server.do_retrieve_memories_dry(params()).await.unwrap();
+        let window = server
+            .do_retrieve_memories_unfiltered(params())
+            .await
+            .unwrap();
+        let rows = |value: &serde_json::Value| {
+            value["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let tool_rows = rows(&tool);
+        assert_eq!(
+            tool_rows,
+            rows(&dry),
+            "dry and wet retrieval must return the same rows"
+        );
+        assert_eq!(
+            tool_rows.len(),
+            1,
+            "the tool must still drop the below-floor memory; got: {tool}"
+        );
+        let window_rows = rows(&window);
+        assert!(
+            window_rows.len() > tool_rows.len(),
+            "the unfiltered window must show strictly more rows than the tool; got {window_rows:?} \
+             vs {tool_rows:?}"
+        );
+        for id in &tool_rows {
+            assert!(
+                window_rows.contains(id),
+                "every tool result must also be in the window; missing {id}"
+            );
+        }
+    }
+
+    /// Requirement: stop the form lying about the fields recall ignores. The note is a constant —
+    /// see [`super::RECALL_IGNORES_NOTE`] — so it has to appear identically whether or not the
+    /// retrieve-only fields were filled in. `test_query_run_recall_ignores_dry_run` already pins
+    /// that two recall fragments differing only in `dry_run` are byte-identical; this pins the
+    /// other half, that a fully filled-in submission says the same thing.
+    #[tokio::test]
+    async fn test_query_tester_recall_note_is_constant() {
+        let server = super::super::test_support::test_server().await;
+        server
+            .do_store_memory(crate::tools::StoreMemoryParams {
+                content: "a recallable fact".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::debug::router(server);
+
+        let defaults = run_form(app.clone(), "mode=recall&query=recallable+fact").await;
+        let filled = run_form(
+            app.clone(),
+            "mode=recall&query=recallable+fact&limit=3&session_id=sess-zzz&dry_run=true",
+        )
+        .await;
+        for fragment in [&defaults, &filled] {
+            assert!(
+                fragment.contains(super::RECALL_IGNORES_NOTE),
+                "every recall fragment must name the ignored fields; got: {fragment}"
+            );
+        }
+        // And retrieve mode must not claim it ignores anything.
+        let retrieve = run_form(
+            app,
+            "mode=retrieve&query=recallable+fact&limit=3&dry_run=true",
+        )
+        .await;
+        assert!(
+            !retrieve.contains(super::RECALL_IGNORES_NOTE),
+            "the recall note must not appear on a retrieve fragment; got: {retrieve}"
         );
     }
 }

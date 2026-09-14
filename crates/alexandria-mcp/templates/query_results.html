@@ -4,18 +4,23 @@
    results div.
 
    Each `{% when %}` arm is one return branch of the two `format!` renderers this replaced
-   (`render_retrieve_results` / `render_recall_results`), so no branch is lost. Which arm runs is
-   decided in Rust: `Fragment` is an enum, so one render cannot produce two branches, and askama
-   checks the arms for exhaustiveness at compile time. `{:.4}` similarity formatting stays in
-   Rust -- askama renders an `f64` with plain `Display`, which would print `0.5` where the legacy
-   table printed `0.5000`.
+   (`render_retrieve_results` / `render_recall_results`), plus the `Retrieve` arm that answers
+   "why didn't this find X?". Which arm runs is decided in Rust: `Fragment` is an enum, so one
+   render cannot produce two branches, and askama checks the arms for exhaustiveness at compile
+   time. `{:.4}` similarity formatting stays in Rust -- askama renders an `f64` with plain
+   `Display`, which would print `0.5` where the legacy table printed `0.5000`.
+
+   The sentences in `report.*` and the recall note in `mode_note` are composed in Rust so the
+   tests can assert on exact wording; everything here decides only where they sit. No value is
+   marked raw -- askama escapes `{{ }}`, and the ids in `href` go through `|urlencode`.
 
    Whitespace: the trim marker on each `when` drops the newline before it, and the one on this
    comment's closing delimiter drops the newline after it, so a paragraph branch is exactly
    `<p>...</p>` with nothing around it -- this is swapped into a live div. The only newlines left
    are the ones between `<tr>` and between `<div>` siblings, which no browser renders, and which
    match how `maintenance.html` and `memories.html` lay out their tables. -#}
-{% match fragment %}{%- when Fragment::Error { message } %}<p class="error">{{ message }}</p>
+{% if let Some(note) = mode_note %}<p class="mode-note">{{ note }}</p>{% endif %}
+{%- match fragment %}{%- when Fragment::Error { message } %}<p class="error">{{ message }}</p>
 {%- when Fragment::Notice { message } %}<p>{{ message }}</p>
 {%- when Fragment::Table { heading, rows } %}{% if let Some(title) = heading %}<h3>{{ title }}</h3>{% endif %}<table>
 <tr><th>ID</th><th>Content</th><th>Similarity</th></tr>
@@ -24,4 +29,20 @@
 {%- when Fragment::Clusters { sections } %}<h3>Broad recall</h3>
 {% for cluster in sections %}<div><h3>Cluster {{ cluster.id }} (similarity {{ cluster.similarity }})</h3><ul>{% for content in cluster.contents %}<li>{{ content }}</li>{% endfor %}</ul></div>
 {% endfor %}
+{%- when Fragment::Retrieve { report } %}<dl class="fact-meta query-settings">
+<dt>Server-side floor</dt><dd><code>retrieve.min_similarity</code> = <strong>{{ report.floor }}</strong> (results scoring below this are dropped by the server, whatever the client asked for)</dd>
+<dt>Activation top N</dt><dd><code>activation.top_n</code> = <strong>{{ report.top_n }}</strong></dd>
+</dl>
+<p class="query-window">{{ report.window_note }}</p>
+<p class="query-activation">{{ report.activation_note }}</p>
+<p class="score-bands">Similarity bands for <code>all-MiniLM-L6-v2</code>, measured 2026-09-08 -- model-dependent, so re-measure for any other embedding model: keyword or near-paraphrase hit 0.55-0.76, natural-language question against its matching statement 0.40-0.65, a question sharing no vocabulary with the statement as low as ~0.2, unrelated memories 0.07-0.40.</p>
+<p class="query-scope">The floor is applied <em>after</em> the top-<code>limit</code> truncation, so a dropped row below is one that was ranked inside that window -- this is not every suppressed memory in the database.</p>
+{% if let Some(note) = report.empty_note %}<p>{{ note }}</p>{% else %}<table>
+<tr><th>ID</th><th>Content</th><th>Similarity</th></tr>
+{% for row in report.kept %}<tr><td><a class="link" href="/debug/memories/{{ row.id|urlencode }}">{{ row.id }}</a></td><td>{{ row.content }}</td><td>{{ row.similarity }}</td></tr>
+{% endfor %}</table>{% endif %}
+{% if !report.dropped.is_empty() %}<section class="dropped-by-floor"><h3>Dropped by min_similarity</h3><table>
+<tr><th>ID</th><th>Content</th><th>Similarity</th></tr>
+{% for row in report.dropped %}<tr class="dropped"><td><a class="link" href="/debug/memories/{{ row.id|urlencode }}">{{ row.id }}</a></td><td>{{ row.content }}</td><td>{{ row.similarity }}</td></tr>
+{% endfor %}</table></section>{% endif %}
 {%- endmatch %}

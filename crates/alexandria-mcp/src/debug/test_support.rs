@@ -31,6 +31,69 @@ pub(super) async fn test_server() -> AlexandriaServer {
     AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0)
 }
 
+/// The floor [`banded_server`] runs with.
+///
+/// `StubEmbedding` returns one constant vector, so every similarity in those tests is 1.0 and the
+/// floor can never filter anything — which makes it useless for testing *what the floor drops*.
+/// [`BandedEmbedding`] exists for exactly that, and `banded_server` pairs it with a floor its
+/// bands straddle.
+pub(super) const BANDED_FLOOR: f32 = 0.30;
+
+/// Stub that turns a keyword in the text into an exact cosine similarity to the query.
+///
+/// Every vector is the 2-D unit vector `[s, sqrt(1 - s²)]` and an unlabelled text — which is what
+/// a query is — gets `s = 1`, i.e. `[1, 0]`. Cosine against `[1, 0]` is just `s`, so the
+/// similarities are hand-computable and exact: `"strong"` scores [`STRONG_SIMILARITY`], `"weak"`
+/// scores [`WEAK_SIMILARITY`], and those two straddle [`BANDED_FLOOR`] by 0.30 either side.
+///
+/// Deliberately a separate stub from [`StubEmbedding`]/`test_server()`: 40+ existing debug tests
+/// assume every similarity is 1.0.
+pub(super) struct BandedEmbedding;
+
+/// Cosine similarity a text containing "strong" gets against the query.
+pub(super) const STRONG_SIMILARITY: f32 = 0.60;
+/// Cosine similarity a text containing "weak" gets against the query — below [`BANDED_FLOOR`].
+pub(super) const WEAK_SIMILARITY: f32 = 0.20;
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for BandedEmbedding {
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                let s = if t.contains("strong") {
+                    STRONG_SIMILARITY
+                } else if t.contains("weak") {
+                    WEAK_SIMILARITY
+                } else {
+                    1.0
+                };
+                vec![s, (1.0 - s * s).sqrt()]
+            })
+            .collect())
+    }
+    fn dimensions(&self) -> usize {
+        2
+    }
+    fn model_id(&self) -> &str {
+        "banded-stub"
+    }
+}
+
+/// A server whose retrieval scores are predictable *and* split by the floor: content naming
+/// "strong" lands at 0.60, content naming "weak" at 0.20, against a 0.30 floor.
+///
+/// The stored memories are written through this same stub, so their embeddings are the band
+/// vectors — the ranking is deterministic from the content alone.
+pub(super) async fn banded_server() -> AlexandriaServer {
+    let db = Database::connect_embedded().await.unwrap();
+    alexandria_storage::schema::migrate(db.inner())
+        .await
+        .unwrap();
+    AlexandriaServer::new(Arc::new(db), Arc::new(BandedEmbedding), 0.75, 86400.0)
+        .with_retrieve_min_similarity(BANDED_FLOOR)
+}
+
 /// The plain average of a set of embeddings — the centroid the cluster detail page *used* to
 /// judge cohesion with, before it was pointed at the stored one.
 ///

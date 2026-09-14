@@ -34,6 +34,19 @@ dl.fact-meta dd { margin: 0; }
 .bar { flex: 1 1 auto; display: block; height: 10px; background: #21262d; border-radius: 3px; }
 .bar-fill { display: block; height: 10px; background: #1f6feb; border-radius: 3px; }
 .bar-count { flex: 0 0 48px; text-align: right; }
+/* Query Tester result fragment. `query_results.html` is an htmx-swapped body fragment that does
+   not extend this layout, so these rules reach it through the Query Tester page that hosts it. */
+.mode-note { color: #8b949e; font-size: 14px; }
+.query-window, .query-activation, .query-scope { color: #8b949e; font-size: 14px; margin: 6px 0; }
+.query-settings code, .query-scope code { color: #c9d1d9; }
+/* The score-band legend is the only place a bare similarity number gets a meaning, so it is set
+   apart from the notes without being louder than the results themselves. */
+.score-bands { color: #8b949e; font-size: 13px; border-left: 3px solid #30363d; padding-left: 10px; margin: 10px 0; }
+/* Results the similarity floor suppressed: kept in the same table shape for comparison, but
+   visibly not-part-of-the-answer. */
+section.dropped-by-floor { margin-top: 16px; padding: 4px 12px 12px; border: 1px solid #6e2020; border-radius: 6px; }
+section.dropped-by-floor h3 { color: #f85149; margin-bottom: 0; }
+tr.dropped td { opacity: 0.55; }
 </style>
 </head>
 <body>
