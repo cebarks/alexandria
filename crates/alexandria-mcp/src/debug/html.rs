@@ -53,6 +53,33 @@ pub fn page<T: Template>(tpl: T) -> Response {
     }
 }
 
+/// The one status every debug **detail** page answers with when storage fails.
+///
+/// Promoted from a private helper in `clusters.rs`. One failure class had four spellings:
+/// `clusters` 500, `memories` 500 inlined by hand, and `sessions` 500 for a failed
+/// `find_by_external_id` but `error_page`'s **200** for a failed `get_memories` — the same fault on
+/// one page returning two different statuses depending on which query tripped. A 200-with-error-text
+/// beside a 500 is a lie in one direction or the other: the 200 tells a monitoring probe that the
+/// diagnostic surface is healthy while storage is not. This keeps the status `clusters.rs` already
+/// returned rather than inventing a third.
+///
+/// Deliberately scoped to the detail pages, whose entire content *is* the record that failed to
+/// load. A list handler still answers `error_page`'s 200, because its filters, column headers and
+/// nav remain useful context and that has always been its contract.
+pub const UNAVAILABLE_STATUS: StatusCode = StatusCode::INTERNAL_SERVER_ERROR;
+
+/// Renders the shared error page for a storage failure on a detail page, with
+/// [`UNAVAILABLE_STATUS`]. `context` names which query failed, so a session that could not be read
+/// is distinguishable from a session whose memories could not.
+pub fn unavailable(nav: &'static str, context: &str, err: impl std::fmt::Display) -> Response {
+    let mut response = error_page(
+        nav,
+        &format!("storage error while loading {context}: {err}"),
+    );
+    *response.status_mut() = UNAVAILABLE_STATUS;
+    response
+}
+
 /// Data-layer failure (DB unreachable, bad record id) rendered through the layout.
 ///
 /// Returns **200**. Callers that must preserve a legacy non-200 (cluster detail 500,

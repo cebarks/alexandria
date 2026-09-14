@@ -1,9 +1,8 @@
 use askama::Template;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::response::Response;
 
-use super::html::{error_page, page};
+use super::html::{error_page, page, unavailable};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
@@ -145,23 +144,15 @@ pub(super) fn embeddings_of(members: &[alexandria_storage::models::Fact]) -> Vec
     members.iter().map(|f| f.embedding.clone()).collect()
 }
 
-/// Data-layer failure on a page that has historically answered with 500 rather than the 200
-/// `error_page` returns on its own (the list handlers are the 200 ones).
-fn unavailable(message: &str) -> Response {
-    let mut response = error_page("clusters", message);
-    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-    response
-}
-
 pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<String>) -> Response {
     let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
     let cluster = match cluster_repo.get(&id).await {
         Ok(cluster) => cluster,
-        Err(e) => return unavailable(&e.to_string()),
+        Err(e) => return unavailable("clusters", "cluster", e),
     };
     let members = match cluster_repo.get_members(&id).await {
         Ok(m) => m,
-        Err(e) => return unavailable(&e.to_string()),
+        Err(e) => return unavailable("clusters", "cluster members", e),
     };
 
     let cohesion = match &cluster {
@@ -399,6 +390,56 @@ mod tests {
         assert!(
             at_relaxed_floor.contains("Healthy"),
             "a 0.4 cohesion_floor must report the same cluster as healthy, got: {at_relaxed_floor}"
+        );
+    }
+
+    /// Storage failure ⇒ `html::UNAVAILABLE_STATUS`, asserted on bytes the handler produced.
+    ///
+    /// Forced by handing the handler a database that was never migrated: the first repo call then
+    /// fails for real, with no mock and no change to `alexandria-storage`. The body assertion matters
+    /// as much as the status one — it is what proves this page goes through `html::unavailable`
+    /// rather than re-inlining `error_page` plus a `status_mut` (the old `memories.rs` shape), which
+    /// would keep the status identical and only change the wording.
+    #[tokio::test]
+    async fn test_cluster_storage_failure_answers_with_the_one_status() {
+        let db = alexandria_storage::Database::connect_embedded()
+            .await
+            .unwrap();
+        let server = crate::AlexandriaServer::new(
+            std::sync::Arc::new(db),
+            std::sync::Arc::new(super::super::test_support::StubEmbedding),
+            0.75,
+            86400.0,
+        );
+        let app = crate::debug::router(server);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/clusters/cluster:absent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The literal, not `html::UNAVAILABLE_STATUS`: asserting against the constant would pass no
+        // matter what status it names, which is the opposite of pinning one.
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "a storage failure must answer with the one detail-page status"
+        );
+        assert_eq!(
+            response.status(),
+            super::super::html::UNAVAILABLE_STATUS,
+            "…and the shared constant must still name it"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("storage error while loading cluster"),
+            "the page must name what failed, via the shared helper; got: {text}"
         );
     }
 }

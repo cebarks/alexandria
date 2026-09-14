@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use super::html::{self, error_page, page};
+use super::html::{self, error_page, page, unavailable};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
@@ -162,18 +162,17 @@ pub async fn detail(
             *response.status_mut() = StatusCode::NOT_FOUND;
             return response;
         }
-        Err(e) => {
-            let mut response = error_page("sessions", &e.to_string());
-            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            return response;
-        }
+        // A storage failure is not the 404 above: the record may exist and still be unreadable.
+        Err(e) => return unavailable("sessions", "session", e),
     };
 
     // `get_memories` already filters `deleted = false`, so the detail page cannot show a memory
     // the list's derived `memory_count` refused to count.
     let memories = match repo.get_memories(&external_id).await {
         Ok(m) => m,
-        Err(e) => return error_page("sessions", &e.to_string()),
+        // Used to take `error_page`'s 200 while the branch above answered 500 — one page, one
+        // fault class, two statuses.
+        Err(e) => return unavailable("sessions", "session memories", e),
     };
 
     let memories = memories
@@ -809,5 +808,55 @@ mod tests {
             assert!(!page.contains("hx-post"), "no htmx write triggers allowed");
             assert!(!page.contains("<input"), "no inputs allowed");
         }
+    }
+
+    /// Storage failure ⇒ `html::UNAVAILABLE_STATUS`, asserted on bytes the handler produced.
+    ///
+    /// Forced by handing the handler a database that was never migrated: the first repo call then
+    /// fails for real, with no mock and no change to `alexandria-storage`. The body assertion matters
+    /// as much as the status one — it is what proves this page goes through `html::unavailable`
+    /// rather than re-inlining `error_page` plus a `status_mut` (the old `memories.rs` shape), which
+    /// would keep the status identical and only change the wording.
+    #[tokio::test]
+    async fn test_session_storage_failure_answers_with_the_one_status() {
+        let db = alexandria_storage::Database::connect_embedded()
+            .await
+            .unwrap();
+        let server = crate::AlexandriaServer::new(
+            std::sync::Arc::new(db),
+            std::sync::Arc::new(super::super::test_support::StubEmbedding),
+            0.75,
+            86400.0,
+        );
+        let app = crate::debug::router(server);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/sessions/pi%3Asess-7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The literal, not `html::UNAVAILABLE_STATUS`: asserting against the constant would pass no
+        // matter what status it names, which is the opposite of pinning one.
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "a storage failure must answer with the one detail-page status"
+        );
+        assert_eq!(
+            response.status(),
+            super::super::html::UNAVAILABLE_STATUS,
+            "…and the shared constant must still name it"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("storage error while loading session"),
+            "the page must name what failed, via the shared helper; got: {text}"
+        );
     }
 }
