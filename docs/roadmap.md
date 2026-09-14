@@ -1,6 +1,6 @@
 # Roadmap
 
-**Current state:** 8 MCP tools, 116 tests, schema `v005`, HTTP + stdio + Docker deployment, one
+**Current state:** 8 MCP tools, 223 tests, schema `v006`, HTTP + stdio + Docker deployment, one
 crate per layer and two client-side pi integrations under `contrib/pi/`.
 
 ## Completed
@@ -121,6 +121,51 @@ finished the loop:
 - Server config keys `server.transport` / `host` / `port` became env-overridable, which is what makes
   the image config-file-free
 
+### v0.2.7 — Debug UI Overhaul (2026-09-14)
+
+The debug UI could answer "how many records are there" and almost nothing else. This turned it into a
+diagnostic surface that can answer "what is this server actually doing, and why did that retrieval
+look like that?" — and made the foundation scale past hand-built strings:
+
+- All six pages migrated from `format!`-concatenated HTML to **askama 0.16** compile-time templates
+  (`crates/alexandria-mcp/templates/`). `html::layout()` and `html::esc()` deleted: escaping is now
+  structural, so there is no call site left that can forget to escape
+- htmx 2.0.10 and vis-network 10.1.2 **vendored** into the binary (`include_bytes!`, served from a
+  closed `match` allowlist at `/debug/assets/:name`), with `SHA256SUMS` enforced by
+  `just verify-assets`. No page loads anything from a CDN any more, so the UI renders air-gapped and
+  never executes unsigned third-party script
+- New **Sessions** views (`/debug/sessions`, `/debug/sessions/:external_id`) — the biggest functional
+  hole closed: sessions are a first-class table and two of the eight tools, and had no view at all
+- Dashboard gained an **effective-configuration** panel (values read off the live server and embedding
+  provider, rendered beside what the TOML asked for, because "asked" vs "loaded" disagreeing *is* the
+  finding), plus cluster-health / session / top-tag / heat-distribution rollups and applied-vs-compiled-in
+  schema version. Where a value structurally cannot reach the crate — stdio mode, and every test — the
+  row says "unavailable outside HTTP mode" rather than showing a zero
+- Query Tester gained `session_id` scoping, a **Dry run** toggle, the effective `min_similarity` floor,
+  a "dropped by min_similarity" section, whether activation fired and on which top-N, and a measured
+  score-band legend
+- Graph gained content-snippet node labels, id + hop tooltips, colour/shape by table, edge styling by
+  `edge_type` with strength banded into width, a generated legend, click-through to memory detail, an
+  adjustable `?hops=1..3` radius clamped server-side, and a 200-node cap that reports truncation
+- **Fixed:** `retrieve.min_similarity` had two divergent defaults — 0.10 in `RetrieveConfig`, 0.30 in
+  `AlexandriaServer::new`'s fallback. Production ran 0.10; every other construction path silently
+  applied a floor three times higher. Both now derive from `alexandria_engine::search::DEFAULT_MIN_SIMILARITY`,
+  as `cohesion_floor` does from `DEFAULT_COHESION_FLOOR`
+- **Fixed:** cluster cohesion in the UI was recomputed as a member-average while the maintenance loop
+  uses the cluster's stored centroid, so `/debug/clusters/:id` could report "Healthy" for a cluster
+  about to be split. It now reads the stored centroid
+- **Fixed:** session listing ordered by `ended_at DESC` alone, leaving the NULL tail unspecified — with
+  `LIMIT`/`START` pagination that let page 2 repeat a row page 1 showed while dropping another. Order is
+  now `ended_at DESC, external_id ASC`
+- Storage additions: `SessionRepo::list`/`count`/`count_finalized` (memory counts **derived** from the
+  `contains_session_memory` traversal, since v006 dropped the column), `Stats::session_count`,
+  `HeatRepo::heat_histogram`, `MemoryRepo::top_tags`, `ClusterRepo::get`
+- Session-scoped soft-delete filtering — closed on 2026-09-08 — is now pinned a second time, at the UI
+  layer, so the sessions pages cannot drift from what `get_session` returns
+- `.github/workflows/ci.yml` runs `just verify-assets` in its `test` job — the workflow has four
+  separate jobs and does not call `just ci`, so a justfile-only gate would never have reached it
+- 223 tests
+
 ## Planned
 
 ### v0.2.x — Known Gaps From Shipped Work
@@ -128,11 +173,11 @@ finished the loop:
 Small, concrete, and already visible in the codebase — worth clearing before the next feature
 milestone:
 
-- **Session-scoped search ignores soft-deletes.** `SessionRepo::get_memories()` → `get_fact()` never
-  checks `deleted = false`, unlike the unscoped path, so deleted memories surface in `get_session`
-  and session-filtered `retrieve_memories`.
+- ~~**Session-scoped search ignores soft-deletes.**~~ Done 2026-09-08 — `SessionRepo::get_memories()`
+  filters `deleted = false`, matching the unscoped path.
 - **No session enumeration.** `get_session` needs an id you already know; there is no `list_sessions`,
-  and `recall` walks clusters rather than sessions.
+  and `recall` walks clusters rather than sessions. `/debug/sessions` (v0.2.7) lists them in the browser;
+  the MCP surface still cannot.
 - **`session.agent_id` / `session.model` are dead columns.** Present in schema and model, never
   populated — either wire them to a tool parameter or drop them.
 - **No tests for the pi extension.** The detector regexes and extraction prompt have no coverage, so
