@@ -88,6 +88,10 @@ pub async fn list(
             search.map(|s| s.as_str()),
             tag.map(|s| s.as_str()),
             include_deleted,
+            // Fixed for now: this is what the query did before column sorting existed, so the
+            // storage change is behaviour-preserving and the handler can adopt `?sort=` separately.
+            alexandria_storage::repos::FactSort::CreatedAt,
+            alexandria_storage::repos::SortDir::Desc,
             limit,
             offset,
         )

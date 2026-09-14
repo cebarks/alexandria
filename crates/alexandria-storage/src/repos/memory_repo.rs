@@ -6,6 +6,78 @@ use surrealdb::types::{RecordId, SurrealValue, ToSql};
 use crate::models::Fact;
 use crate::record_id_to_string;
 
+/// A sortable column for [`MemoryRepo::list`].
+///
+/// SurrealQL cannot bind an `ORDER BY` column name — bind parameters carry *values* only — so the
+/// ordering expression has to be written into the query string. That is an injection shape, and the
+/// answer here is structural rather than defensive: every variant maps to one `&'static str` literal
+/// that is written down in this file (see [`FactSort::order_expr`]), and no caller-supplied string
+/// ever reaches the clause. A new variant means a new literal here; the expression must never become
+/// a `format!` over a name passed in by a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactSort {
+    CreatedAt,
+    Confidence,
+    Content,
+    /// The record key itself — already unique, so it needs no tie-break.
+    Id,
+    /// How many tags a fact carries, not the tag strings: an array has no natural order, so
+    /// "sort by tags" is only meaningful as a count.
+    TagCount,
+}
+
+impl FactSort {
+    /// The ORDER BY expression. A closed set of literals — never interpolated from input.
+    fn order_expr(self) -> &'static str {
+        match self {
+            Self::CreatedAt => "created_at",
+            Self::Confidence => "confidence",
+            Self::Content => "content",
+            Self::Id => "id",
+            // SurrealDB 3.2 will not parse `ORDER BY array::len(tags)` ("Unexpected token `::`,
+            // expected Eof" — ORDER BY takes a field path, not an expression), so the count is
+            // projected under an alias and ordered by that name. Same computed-field trick as
+            // [`MemoryRepo::all_ids_and_content`], which projects `created_at` only so ORDER BY
+            // has it. The alias is not a `Fact` field, and serde drops unknown fields on read.
+            Self::TagCount => "tag_count",
+        }
+    }
+
+    /// The extra projection [`Self::order_expr`] needs, empty for the plain column sorts.
+    fn projection(self) -> &'static str {
+        match self {
+            Self::TagCount => ", array::len(tags) AS tag_count",
+            _ => "",
+        }
+    }
+
+    /// The complete ORDER BY clause, including the tie-break documented on [`MemoryRepo::list`].
+    fn order_clause(self, dir: SortDir) -> String {
+        let primary = format!("{} {}", self.order_expr(), dir.sql());
+        if self == Self::Id {
+            primary
+        } else {
+            format!("{primary}, id ASC")
+        }
+    }
+}
+
+/// Sort direction for [`FactSort`] — also a closed set of literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Asc => "ASC",
+            Self::Desc => "DESC",
+        }
+    }
+}
+
 pub struct MemoryRepo<'a> {
     db: &'a Surreal<Any>,
 }
@@ -114,16 +186,83 @@ impl<'a> MemoryRepo<'a> {
         Ok(updated)
     }
 
-    /// List facts with optional content search, tag filter, and deleted-inclusion.
-    /// `search` does a case-insensitive substring match against content.
+    /// List facts with optional content search, tag filter, deleted-inclusion, column sorting
+    /// and offset pagination.
+    ///
+    /// The sort is server-side on purpose: the caller pages through a corpus far larger than one
+    /// page, so reordering only the rows already in hand would disagree with the header claiming
+    /// the table is sorted by that column.
+    ///
+    /// The guaranteed ordering is `<column> <dir>, id ASC` — except for [`FactSort::Id`], whose
+    /// primary key is already unique:
+    /// 1. The requested column, in the requested direction.
+    /// 2. Ties break on the record id ascending. Ids are unique, so the pair is a total order and
+    ///    `LIMIT`/`START` cannot repeat or skip a row between pages.
+    ///
+    /// The secondary key is load-bearing, not cosmetic. `confidence` is `DEFAULT 0.5`
+    /// (`v001_initial.surql`), so a confidence-ordered table is mostly one big tie group; sorting
+    /// by it alone leaves that group in an unspecified relative order and page 2 can repeat a row
+    /// page 1 showed while silently dropping another — the same bug already fixed for sessions in
+    /// [`SessionRepo::list`](crate::repos::SessionRepo::list).
+    ///
+    /// (SurrealDB's `mem://` sort currently happens to be stable over a key-ascending scan, so an
+    /// all-tied group comes back in id order with or without the tie-break; see
+    /// `test_list_confidence_tiebreak_pages_without_gaps` for what that costs the tests.)
+    ///
+    /// `created_at` is nullable in the Rust model (`Option<DateTime<Utc>>`). Checked against
+    /// SurrealDB 3.2: `ORDER BY ... NULLS LAST` and `ORDER BY type::coalesce(...)` both fail to
+    /// parse in an ORDER BY, so there is nothing to fix here — nulls sort smaller than any
+    /// datetime, i.e. first ascending and last descending, and the row is never dropped. Pinned by
+    /// `test_list_sorts_null_created_at_without_dropping_the_row`.
+    ///
+    /// Behaviour-preserving defaults for the debug UI's current view: `FactSort::CreatedAt` with
+    /// `SortDir::Desc` is what this query hardcoded before column sorting existed.
+    // Eight arguments, so clippy's threshold trips. Both filter sets and the page are already
+    // cohesive; bundling them into a params struct would move the arity rather than reduce it, and
+    // the debug handler reads better passing all six knobs by name.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list(
         &self,
         search: Option<&str>,
         tag: Option<&str>,
         include_deleted: bool,
+        sort: FactSort,
+        dir: SortDir,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Fact>> {
+        let query = Self::list_query(search, tag, include_deleted, sort, dir);
+
+        let mut q = self
+            .db
+            .query(&query)
+            .bind(("limit", limit as i64))
+            .bind(("offset", offset as i64));
+        if let Some(s) = search {
+            q = q.bind(("search", s.to_string()));
+        }
+        if let Some(t) = tag {
+            q = q.bind(("tag", t.to_string()));
+        }
+
+        let mut response = q.await?;
+        let facts: Vec<Fact> = response.take(0)?;
+        Ok(facts)
+    }
+
+    /// Builds the exact query string [`Self::list`] runs. Split out so a test can print what the
+    /// engine is actually sent rather than what the reviewer guesses it is.
+    ///
+    /// Everything interpolated here is a literal chosen by this module: the WHERE fragments are
+    /// fixed strings selected by `Option::is_some` (their *values* stay bound), and the ORDER BY
+    /// clause comes from the closed [`FactSort::order_clause`] allowlist.
+    fn list_query(
+        search: Option<&str>,
+        tag: Option<&str>,
+        include_deleted: bool,
+        sort: FactSort,
+        dir: SortDir,
+    ) -> String {
         let mut conditions = Vec::new();
         if !include_deleted {
             conditions.push("deleted = false".to_string());
@@ -142,25 +281,11 @@ impl<'a> MemoryRepo<'a> {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        let query = format!(
-            "SELECT * FROM fact {where_clause} ORDER BY created_at DESC LIMIT $limit START $offset"
-        );
-
-        let mut q = self
-            .db
-            .query(&query)
-            .bind(("limit", limit as i64))
-            .bind(("offset", offset as i64));
-        if let Some(s) = search {
-            q = q.bind(("search", s.to_string()));
-        }
-        if let Some(t) = tag {
-            q = q.bind(("tag", t.to_string()));
-        }
-
-        let mut response = q.await?;
-        let facts: Vec<Fact> = response.take(0)?;
-        Ok(facts)
+        format!(
+            "SELECT *{} FROM fact {where_clause} ORDER BY {} LIMIT $limit START $offset",
+            sort.projection(),
+            sort.order_clause(dir),
+        )
     }
 
     /// Count facts matching the same filters as `list` (ignoring limit/offset).
@@ -303,20 +428,48 @@ mod tests {
         repo.soft_delete_fact(&deleted_id).await.unwrap();
 
         // Default: excludes deleted
-        let all = repo.list(None, None, false, 10, 0).await.unwrap();
+        let all = repo
+            .list(None, None, false, FactSort::CreatedAt, SortDir::Desc, 10, 0)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 2);
 
         // include_deleted = true picks up all 3
-        let with_deleted = repo.list(None, None, true, 10, 0).await.unwrap();
+        let with_deleted = repo
+            .list(None, None, true, FactSort::CreatedAt, SortDir::Desc, 10, 0)
+            .await
+            .unwrap();
         assert_eq!(with_deleted.len(), 3);
 
         // search filters by content substring
-        let searched = repo.list(Some("alpha"), None, false, 10, 0).await.unwrap();
+        let searched = repo
+            .list(
+                Some("alpha"),
+                None,
+                false,
+                FactSort::CreatedAt,
+                SortDir::Desc,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
         assert_eq!(searched.len(), 1);
         assert_eq!(searched[0].content, "alpha content");
 
         // tag filters
-        let tagged = repo.list(None, Some("tag2"), false, 10, 0).await.unwrap();
+        let tagged = repo
+            .list(
+                None,
+                Some("tag2"),
+                false,
+                FactSort::CreatedAt,
+                SortDir::Desc,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
         assert_eq!(tagged.len(), 1);
         assert_eq!(tagged[0].content, "beta content");
 
@@ -325,8 +478,14 @@ mod tests {
         assert_eq!(count, 2);
 
         // limit/offset paginate
-        let page1 = repo.list(None, None, false, 1, 0).await.unwrap();
-        let page2 = repo.list(None, None, false, 1, 1).await.unwrap();
+        let page1 = repo
+            .list(None, None, false, FactSort::CreatedAt, SortDir::Desc, 1, 0)
+            .await
+            .unwrap();
+        let page2 = repo
+            .list(None, None, false, FactSort::CreatedAt, SortDir::Desc, 1, 1)
+            .await
+            .unwrap();
         assert_eq!(page1.len(), 1);
         assert_eq!(page2.len(), 1);
         assert_ne!(page1[0].content, page2[0].content);
@@ -456,5 +615,469 @@ mod tests {
         assert_eq!(top3.len(), 3);
         assert_eq!(top3[0].0, "common");
         assert_eq!(top3, all[..3]);
+    }
+
+    // ---- column sorting -----------------------------------------------
+
+    /// Seeds a fact and pins `created_at` to a fixed day. The schema defaults it to
+    /// `time::now()`, so facts created inside one test share a timestamp and cannot prove a time
+    /// ordering at all. `day` is a `u32` formatted into a datetime literal, so the only text that
+    /// reaches the query is built from an integer here.
+    async fn create_at(
+        repo: &MemoryRepo<'_>,
+        db: &Surreal<Any>,
+        content: &str,
+        confidence: f64,
+        tags: &[&str],
+        day: u32,
+    ) -> String {
+        let id = repo
+            .create_fact(
+                content,
+                confidence,
+                &[0.1],
+                &tags.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        if day > 0 {
+            let response = db
+                .query(format!(
+                    "UPDATE type::record($id) SET created_at = d'2024-01-{day:02}T00:00:00Z'"
+                ))
+                .bind(("id", id.clone()))
+                .await
+                .unwrap();
+            response.check().unwrap();
+        }
+        id
+    }
+
+    async fn sorted_contents(repo: &MemoryRepo<'_>, sort: FactSort, dir: SortDir) -> Vec<String> {
+        repo.list(None, None, false, sort, dir, 100, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.content)
+            .collect()
+    }
+
+    async fn sorted_ids(repo: &MemoryRepo<'_>, sort: FactSort, dir: SortDir) -> Vec<String> {
+        repo.list(None, None, false, sort, dir, 100, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| record_id_to_string(f.id.as_ref().expect("a listed fact has an id")))
+            .collect()
+    }
+
+    /// Every key orders correctly in both directions, against an expectation written down here
+    /// rather than read back from the database.
+    #[tokio::test]
+    async fn test_list_each_sort_key_orders_in_both_directions() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        // (content, confidence, tags, created_at day) picked so that content, confidence and tag
+        // count each give a *different* order — no key can pass by borrowing another's result —
+        // and so that a direction which ignores `SortDir` cannot pass either.
+        let fixture = [
+            ("aa", 0.9, &["p", "q", "r"][..], 4),
+            ("bb", 0.1, &["p"][..], 2),
+            ("cc", 0.7, &[][..], 1),
+            ("dd", 0.3, &["p", "q"][..], 3),
+        ];
+        let mut seeded = Vec::new();
+        for (content, confidence, tags, day) in fixture {
+            seeded.push(create_at(&repo, db.inner(), content, confidence, tags, day).await);
+        }
+        assert_eq!(seeded.len(), 4, "fixture ids must be distinct");
+        seeded.sort();
+        assert_eq!(
+            seeded
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4,
+            "the generated ids must be distinct: {seeded:?}"
+        );
+
+        assert_eq!(
+            sorted_contents(&repo, FactSort::CreatedAt, SortDir::Desc).await,
+            vec!["aa", "dd", "bb", "cc"]
+        );
+        assert_eq!(
+            sorted_contents(&repo, FactSort::CreatedAt, SortDir::Asc).await,
+            vec!["cc", "bb", "dd", "aa"]
+        );
+        assert_eq!(
+            sorted_contents(&repo, FactSort::Confidence, SortDir::Desc).await,
+            vec!["aa", "cc", "dd", "bb"]
+        );
+        assert_eq!(
+            sorted_contents(&repo, FactSort::Confidence, SortDir::Asc).await,
+            vec!["bb", "dd", "cc", "aa"]
+        );
+        assert_eq!(
+            sorted_contents(&repo, FactSort::Content, SortDir::Desc).await,
+            vec!["dd", "cc", "bb", "aa"]
+        );
+        assert_eq!(
+            sorted_contents(&repo, FactSort::Content, SortDir::Asc).await,
+            vec!["aa", "bb", "cc", "dd"]
+        );
+        // Tag count: 3, 2, 1, 0. The zero-tag row sorts first ascending rather than erroring on
+        // `array::len([])` or being dropped from the result set.
+        assert_eq!(
+            sorted_contents(&repo, FactSort::TagCount, SortDir::Desc).await,
+            vec!["aa", "dd", "bb", "cc"]
+        );
+        assert_eq!(
+            sorted_contents(&repo, FactSort::TagCount, SortDir::Asc).await,
+            vec!["cc", "bb", "dd", "aa"]
+        );
+
+        // The id key is generated, so its expected order is Rust's own ordering of the ids that
+        // creation returned. `FactSort::Id` is also the one key that takes no tie-break.
+        let asc = sorted_ids(&repo, FactSort::Id, SortDir::Asc).await;
+        let desc = sorted_ids(&repo, FactSort::Id, SortDir::Desc).await;
+        let expected = seeded.clone();
+        assert_eq!(asc.len(), 4, "every fact must be returned, got {asc:?}");
+        assert_eq!(asc, expected, "`id ASC` must order by the record key");
+        let mut reversed = expected;
+        reversed.reverse();
+        assert_eq!(desc, reversed, "`id DESC` must be the exact reverse");
+    }
+
+    /// The back-compat guarantee: `FactSort::CreatedAt` + `SortDir::Desc` must return exactly what
+    /// the query returned before column sorting existed, replayed here as the old SQL string.
+    #[tokio::test]
+    async fn test_list_default_matches_the_pre_sorting_query_exactly() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        for (content, day) in [("one", 1), ("two", 5), ("three", 3)] {
+            create_at(&repo, db.inner(), content, 0.5, &[], day).await;
+        }
+        let gone = create_at(&repo, db.inner(), "deleted", 0.5, &[], 6).await;
+        repo.soft_delete_fact(&gone).await.unwrap();
+
+        let mut response = db
+            .inner()
+            .query(
+                "SELECT * FROM fact WHERE deleted = false \
+                 ORDER BY created_at DESC LIMIT $limit START $offset",
+            )
+            .bind(("limit", 100i64))
+            .bind(("offset", 0i64))
+            .await
+            .unwrap();
+        let legacy: Vec<Fact> = response.take(0).unwrap();
+
+        let current = repo
+            .list(
+                None,
+                None,
+                false,
+                FactSort::CreatedAt,
+                SortDir::Desc,
+                100,
+                0,
+            )
+            .await
+            .unwrap();
+
+        fn key(rows: &[Fact]) -> Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> {
+            rows.iter()
+                .map(|f| (f.content.clone(), f.created_at))
+                .collect()
+        }
+        assert_eq!(key(&current), key(&legacy));
+        // And both are the order the UI showed: newest first, the soft-deleted row absent.
+        assert_eq!(
+            current
+                .iter()
+                .map(|f| f.content.clone())
+                .collect::<Vec<_>>(),
+            vec!["two", "three", "one"]
+        );
+    }
+
+    /// Paging through a tie group is the property the tie-break exists for.
+    ///
+    /// Seven facts all sitting on the schema's `DEFAULT 0.5` confidence is the common case on a
+    /// real corpus, not an edge case. The no-duplicates/no-gaps check is what the operator would
+    /// notice, but on its own it does NOT catch a missing tie-break — an in-memory store scans a
+    /// tie group in one stable order per process. The exact-sequence assertion is what pins the
+    /// contract, which is why both are here (same reasoning as sessions'
+    /// `test_list_untouched_tail_pages_in_one_stable_total_order`).
+    ///
+    /// Caveat, established by mutation: on `mem://` the assertions below still pass with the
+    /// `, id ASC` tie-break deleted, because SurrealDB's sort is stable over a key-ascending scan,
+    /// so an all-tied group happens to come back in id order anyway. The tie-break turns that
+    /// accident into a guarantee — an index scan, a reverse scan or a top-K rewrite would each
+    /// reshuffle the group and reopen the duplicate/drop bug on the second page — and
+    /// `test_fact_sort_order_expr_is_a_closed_allowlist` is the assertion that actually fails when
+    /// it is removed.
+    #[tokio::test]
+    async fn test_list_confidence_tiebreak_pages_without_gaps() {
+        const PAGE: usize = 2;
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let mut seeded = Vec::new();
+        for index in 0..7 {
+            seeded.push(create_at(&repo, db.inner(), &format!("tied {index}"), 0.5, &[], 0).await);
+        }
+        let mut expected = seeded.clone();
+        expected.sort();
+        assert_eq!(expected.len(), 7);
+
+        let mut concatenated: Vec<String> = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = repo
+                .list(
+                    None,
+                    None,
+                    false,
+                    FactSort::Confidence,
+                    SortDir::Desc,
+                    PAGE,
+                    offset,
+                )
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(
+                page.len() <= PAGE,
+                "LIMIT must cap every page, got {} at offset {offset}",
+                page.len()
+            );
+            concatenated.extend(
+                page.into_iter()
+                    .map(|f| record_id_to_string(f.id.as_ref().expect("listed fact has an id"))),
+            );
+            offset += PAGE;
+            assert!(offset <= 7 * PAGE, "pagination did not terminate");
+        }
+
+        let mut dedup = concatenated.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(
+            dedup.len(),
+            concatenated.len(),
+            "a fact appeared on two pages: {concatenated:?}"
+        );
+        assert_eq!(
+            dedup, expected,
+            "the pages must cover every fact exactly once"
+        );
+        assert_eq!(
+            concatenated, expected,
+            "the tie group must be ordered by id ASC, not by whatever the scan yielded"
+        );
+    }
+
+    /// The ORDER BY text can only ever be one of ten literals, which is the whole injection
+    /// argument: there is no code path from a caller's string to this clause.
+    ///
+    /// `expected_expr`'s exhaustive match is the guard on the claim — adding a `FactSort` variant
+    /// without giving it a literal stops this test compiling, so the closed set cannot drift open.
+    #[test]
+    fn test_fact_sort_order_expr_is_a_closed_allowlist() {
+        fn expected_expr(sort: FactSort) -> &'static str {
+            match sort {
+                FactSort::CreatedAt => "created_at",
+                FactSort::Confidence => "confidence",
+                FactSort::Content => "content",
+                FactSort::Id => "id",
+                FactSort::TagCount => "tag_count",
+            }
+        }
+        let all = [
+            FactSort::CreatedAt,
+            FactSort::Confidence,
+            FactSort::Content,
+            FactSort::Id,
+            FactSort::TagCount,
+        ];
+        let allowed = [
+            "created_at ASC, id ASC",
+            "created_at DESC, id ASC",
+            "confidence ASC, id ASC",
+            "confidence DESC, id ASC",
+            "content ASC, id ASC",
+            "content DESC, id ASC",
+            "id ASC",
+            "id DESC",
+            "tag_count ASC, id ASC",
+            "tag_count DESC, id ASC",
+        ];
+        let forbidden = [
+            ";", "--", "/*", "$", "'", "\"", "
+", "(", ")",
+        ];
+        for sort in all {
+            assert_eq!(sort.order_expr(), expected_expr(sort));
+            for dir in [SortDir::Asc, SortDir::Desc] {
+                let clause = sort.order_clause(dir);
+                assert!(
+                    allowed.contains(&clause.as_str()),
+                    "built clause {clause:?} is not one of the closed set"
+                );
+                for bad in forbidden {
+                    assert!(
+                        !clause.contains(bad),
+                        "clause {clause:?} must not contain {bad:?}"
+                    );
+                }
+                // Only `Id` skips the secondary key, because it is already unique. The match is on
+                // the comma so an `Id` clause is not credited with a tie-break it does not have.
+                assert_eq!(
+                    clause.matches(", id ASC").count(),
+                    usize::from(sort != FactSort::Id),
+                    "the tie-break must be appended to every key but the id itself: {clause:?}"
+                );
+            }
+            // The projection is a literal too, and non-empty only for the computed key.
+            assert_eq!(
+                sort.projection(),
+                if sort == FactSort::TagCount {
+                    ", array::len(tags) AS tag_count"
+                } else {
+                    ""
+                }
+            );
+            for bad in forbidden {
+                assert!(!sort.projection().contains(bad) || sort == FactSort::TagCount);
+            }
+        }
+        assert_eq!(SortDir::Asc.sql(), "ASC");
+        assert_eq!(SortDir::Desc.sql(), "DESC");
+
+        // A hostile filter value cannot change the query text at all, because values are bound and
+        // never interpolated — the built string is byte-identical to the benign one.
+        let benign = MemoryRepo::list_query(
+            Some("alpha"),
+            Some("tag1"),
+            false,
+            FactSort::Content,
+            SortDir::Asc,
+        );
+        let hostile = MemoryRepo::list_query(
+            Some("a'; DROP TABLE fact; --"),
+            Some("tag1, id DESC"),
+            false,
+            FactSort::Content,
+            SortDir::Asc,
+        );
+        assert_eq!(benign, hostile);
+        assert!(!benign.contains(';'));
+    }
+
+    /// Proves the TagCount path runs with both filters active, and prints the exact SQL the
+    /// engine is sent (cargo captures it unless a test fails or `--nocapture` is used).
+    #[tokio::test]
+    async fn test_list_tag_count_with_search_and_tag_filter() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        create_at(
+            &repo,
+            db.inner(),
+            "alpha three",
+            0.5,
+            &["keep", "a", "b"],
+            1,
+        )
+        .await;
+        create_at(&repo, db.inner(), "alpha one", 0.5, &["keep"], 2).await;
+        create_at(&repo, db.inner(), "alpha two", 0.5, &["keep", "a"], 3).await;
+        // Matches the search only, and the tag only: both must be filtered out.
+        create_at(&repo, db.inner(), "alpha untagged", 0.5, &[], 4).await;
+        create_at(&repo, db.inner(), "zulu", 0.5, &["keep"], 5).await;
+
+        let sql = MemoryRepo::list_query(
+            Some("alp"),
+            Some("keep"),
+            false,
+            FactSort::TagCount,
+            SortDir::Desc,
+        );
+        println!("LIST QUERY sort=TagCount dir=Desc search+tag: {sql}");
+
+        let rows = repo
+            .list(
+                Some("alp"),
+                Some("keep"),
+                false,
+                FactSort::TagCount,
+                SortDir::Desc,
+                50,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|f| f.content.clone()).collect::<Vec<_>>(),
+            vec!["alpha three", "alpha two", "alpha one"]
+        );
+        assert_eq!(
+            repo.count(Some("alp"), Some("keep"), false).await.unwrap(),
+            rows.len(),
+            "count() must agree with the filtered list"
+        );
+    }
+
+    /// A null `created_at` must sort without erroring and without losing its row.
+    ///
+    /// `fact.created_at` ships as `TYPE datetime DEFAULT time::now()`, which cannot hold a null —
+    /// but `Fact.created_at` is an `Option` and a row that predates or bypasses the default has to
+    /// survive the ORDER BY. So this test overwrites the field on *its own* in-memory database to
+    /// reach that state; no migration is involved. Checked on SurrealDB 3.2: `NULLS LAST` and
+    /// `type::coalesce` do not parse inside ORDER BY, and nulls sort smaller than any datetime —
+    /// first ascending, last descending. That is the placement we accept, and assert.
+    #[tokio::test]
+    async fn test_list_sorts_null_created_at_without_dropping_the_row() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        db.inner()
+            .query("DEFINE FIELD OVERWRITE created_at ON fact TYPE option<datetime>")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        create_at(&repo, db.inner(), "jan", 0.5, &[], 1).await;
+        create_at(&repo, db.inner(), "mar", 0.5, &[], 3).await;
+        let nulled = create_at(&repo, db.inner(), "null", 0.5, &[], 0).await;
+
+        // The fixture really does produce a null, or the test proves nothing.
+        let stored = repo.get_fact(&nulled).await.unwrap().unwrap();
+        assert_eq!(stored.created_at, None);
+
+        let asc = sorted_contents(&repo, FactSort::CreatedAt, SortDir::Asc).await;
+        assert_eq!(asc, vec!["null", "jan", "mar"]);
+        let desc = sorted_contents(&repo, FactSort::CreatedAt, SortDir::Desc).await;
+        assert_eq!(desc, vec!["mar", "jan", "null"]);
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            assert_eq!(
+                sorted_contents(&repo, FactSort::Confidence, dir)
+                    .await
+                    .len(),
+                3,
+                "a null created_at must not affect other sorts"
+            );
+        }
     }
 }
