@@ -106,15 +106,47 @@ impl<'a> EdgeRepo<'a> {
     }
 
     /// Get neighbors up to max_hops away via BFS.
+    ///
+    /// The unbounded walk: every record reachable inside the radius is visited, and each visit
+    /// costs a round trip. That is what spreading activation needs — a truncated neighbourhood
+    /// would silently warm less heat than a full one — so it delegates to [`Self::get_neighbors_capped`]
+    /// with `usize::MAX` rather than owning a second implementation. A caller that only has to
+    /// *draw* the graph, and must not be able to cost thousands of queries, wants
+    /// [`Self::get_neighbors_capped`] instead.
     pub async fn get_neighbors(&self, id: &str, max_hops: u32) -> Result<Vec<Neighbor>> {
+        self.get_neighbors_capped(id, max_hops, usize::MAX)
+            .await
+            .map(|(neighbors, _truncated)| neighbors)
+    }
+
+    /// BFS to `max_hops`, visiting at most `max_nodes` records — the start node included, so the
+    /// neighbor list it returns can hold at most `max_nodes - 1` entries.
+    ///
+    /// The second element of the tuple says whether that bound is what stopped the walk: `false`
+    /// means the traversal completed for the requested radius, `true` means the result is a prefix
+    /// of the ego-graph rather than the whole of it. Callers must not present the two alike.
+    ///
+    /// The bound exists because each visited node costs two queries
+    /// ([`Self::get_direct_neighbors`] reads outgoing and incoming edges separately) and the only
+    /// other limit on the frontier is the graph's connectivity: one hub with thousands of edges
+    /// turns a single request into thousands of round trips. `usize::MAX` therefore means "no
+    /// bound", not "a very large one" — the check is `>=`, and a real traversal can never grow
+    /// `visited` that far, so the capped walk is the uncapped walk for that input.
+    pub async fn get_neighbors_capped(
+        &self,
+        id: &str,
+        max_hops: u32,
+        max_nodes: usize,
+    ) -> Result<(Vec<Neighbor>, bool)> {
         let mut all_neighbors = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let start_id = surrealdb::types::RecordId::parse_simple(id)?;
         visited.insert(format!("{:?}", start_id));
 
         let mut frontier = vec![(id.to_string(), 0u32)];
+        let mut truncated = false;
 
-        while let Some((current_id, current_hop)) = frontier.pop() {
+        'walk: while let Some((current_id, current_hop)) = frontier.pop() {
             if current_hop >= max_hops {
                 continue;
             }
@@ -124,6 +156,14 @@ impl<'a> EdgeRepo<'a> {
                 let neighbor_key = format!("{:?}", neighbor.id);
                 if visited.contains(&neighbor_key) {
                     continue;
+                }
+                if visited.len() >= max_nodes {
+                    // A genuinely new node we cannot visit: stop the whole walk rather than just
+                    // skipping it. The queued frontier would otherwise still be drained — two
+                    // queries per entry, each of which can only be refused — which is precisely
+                    // the fan-out the bound exists to prevent.
+                    truncated = true;
+                    break 'walk;
                 }
                 visited.insert(neighbor_key);
 
@@ -148,7 +188,7 @@ impl<'a> EdgeRepo<'a> {
             }
         }
 
-        Ok(all_neighbors)
+        Ok((all_neighbors, truncated))
     }
 }
 

@@ -29,13 +29,26 @@ fn apply_node_cap(ordered: &mut Vec<(u32, String)>, cap: usize) -> bool {
 /// picture, and the client would pay for it in layout time.
 ///
 /// What this bounds is rendering plus the per-node work that feeds it — one `get_edges_for` and
-/// one `get_fact` per *retained* node. What it does **not** bound is the traversal that produces
-/// the node list: `EdgeRepo::get_neighbors` runs the complete BFS, issuing two queries per node it
-/// reaches and with no limit on its frontier, and only its finished output reaches the cap here.
-/// A hub session or cluster at `?hops=3` therefore costs thousands of round trips even though 200
-/// nodes survive — `MAX_HOPS` limits the radius, never the width. Tracked in
-/// `docs/roadmap.md` ("Known Gaps From Shipped Work"); the bound belongs in `EdgeRepo`.
+/// one `get_fact` per *retained* node. It does not bound the traversal that produces the node list,
+/// and never did: an uncapped `EdgeRepo` BFS walks the complete ego-graph, two queries per node it
+/// reaches, and only its finished output ever reached the cap here — `MAX_HOPS` limits the radius,
+/// never the width. The width is [`GRAPH_VISIT_CAP`]'s job.
 const GRAPH_NODE_CAP: usize = 200;
+
+/// Ceiling on how many records the traversal may **visit**, as a multiple of [`GRAPH_NODE_CAP`].
+///
+/// A different number with a different job. `GRAPH_NODE_CAP` bounds what is drawn (and so the
+/// per-node edge/content reads afterwards); this bounds the BFS in front of it, which is the part
+/// the render cap never touched — `EdgeRepo::get_neighbors_capped` pays two SurrealDB queries per
+/// visited node, so on a hub this is the cost of the request.
+///
+/// It has to sit comfortably above the render cap: the BFS reaches everything within the radius and
+/// only then does [`apply_node_cap`] cut to the nearest `GRAPH_NODE_CAP` by hop-then-id, so a visit
+/// bound near 200 would drop nodes the page could have drawn and quietly change *which* slice of
+/// the ego-graph an operator sees. Four times the cap keeps a genuine 800-node neighbourhood
+/// intact at `?hops=3` while holding one request to roughly 1 600 queries instead of an unbounded
+/// fan-out. When it does trip, the page says so distinctly — see `traversal_truncated`.
+const GRAPH_VISIT_CAP: usize = GRAPH_NODE_CAP * 4;
 
 /// Effective hop radius for a raw `?hops` value. Absent, empty, non-numeric and out-of-range all
 /// resolve inside `1..=MAX_HOPS`, so no input can ask for a wider traversal than the cap allows.
@@ -116,16 +129,24 @@ async fn api_graph_with_radius(
 ) -> Json<serde_json::Value> {
     let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
 
-    // Collect the node set: the center plus everything within `hops` hops.
+    // Collect the node set: the center plus everything within `hops` hops, up to the visit bound.
     let mut node_ids: HashSet<String> = HashSet::new();
     let mut hop_of: HashMap<String, u32> = HashMap::new();
     node_ids.insert(id.to_string());
     hop_of.insert(id.to_string(), 0);
-    let neighbors = edge_repo.get_neighbors(id, hops).await.unwrap_or_default();
+    let (neighbors, traversal_truncated) = edge_repo
+        // Bounded here rather than in storage's caller-visible shape: `get_neighbors` stays the
+        // untruncated walk that spreading activation depends on. The `false` on the error path is
+        // not a guess — a traversal that returned `Err` cannot have reported hitting the bound,
+        // and it keeps the page's pre-existing "an unparseable id reads as an empty
+        // neighbourhood" behaviour intact.
+        .get_neighbors_capped(id, hops, GRAPH_VISIT_CAP)
+        .await
+        .unwrap_or((Vec::new(), false));
     for n in &neighbors {
         let neighbor_id = record_id_to_string(&n.id);
-        // A node reached by several paths keeps the shortest distance: `get_neighbors` reports a
-        // node once per path, so the first `hop` seen is not necessarily the closest.
+        // A node reached by several paths keeps the shortest distance: the BFS reports a node once
+        // per path, so the first `hop` seen is not necessarily the closest.
         let entry = hop_of.entry(neighbor_id.clone()).or_insert(n.hop);
         *entry = (*entry).min(n.hop);
         node_ids.insert(neighbor_id);
@@ -143,13 +164,9 @@ async fn api_graph_with_radius(
     let node_ids: Vec<String> = ordered.into_iter().map(|(_, nid)| nid).collect();
 
     // TODO(debt): this handler costs one `get_edges_for` plus one `get_fact` per node, so the
-    // round trips here are O(nodes) — bounded by GRAPH_NODE_CAP, which is what this loop covers,
-    // but still the first thing to revisit if graph pages feel slow. A batch-by-ids read in
-    // storage would collapse both. It does *not* cover the traversal above: `get_neighbors` has
-    // already walked the whole ego-graph, two queries per reachable node and no frontier limit,
-    // before the cap gets to discard any of it, so on a hub node that BFS — not this loop — is
-    // the dominant cost. See the GRAPH_NODE_CAP doc comment and the roadmap entry; the fix is a
-    // visited-node bound inside `EdgeRepo`.
+    // round trips here are O(nodes) — bounded now by GRAPH_NODE_CAP but still the first thing to
+    // revisit if graph pages feel slow. A batch-by-ids read in storage would collapse both. (The
+    // traversal above has its own bound, [`GRAPH_VISIT_CAP`]; this loop is the remaining debt.)
     //
     // Collect edges among the node set by querying each node's direct edges and
     // keeping only those whose both endpoints are in `node_ids` (dedup by in/out/type).
@@ -222,6 +239,11 @@ async fn api_graph_with_radius(
         "node_count": node_ids.len(),
         "node_cap": GRAPH_NODE_CAP,
         "truncated": truncated,
+        // Distinct from `truncated` on purpose: that one says "the nearest 200 of these nodes are
+        // all you get to see", this one says "there were more nodes to find, at all". Only the
+        // render cap has a cap to quote, so the notice has to word them differently.
+        "traversal_truncated": traversal_truncated,
+        "visit_cap": GRAPH_VISIT_CAP,
         // Legend data, derived from the same consts that style the canvas.
         "node_types": node_type_legend(),
         "edge_types": edge_type_legend(),
@@ -366,9 +388,9 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        DEFAULT_HOPS, EDGE_STYLES, GRAPH_NODE_CAP, GraphTemplate, MAX_HOPS, NODE_STYLES,
-        UNKNOWN_EDGE_STYLE, UNKNOWN_NODE_STYLE, apply_node_cap, edge_style_of, label_snippet,
-        node_style_of, node_table_of, resolve_hops, strength_band,
+        DEFAULT_HOPS, EDGE_STYLES, GRAPH_NODE_CAP, GRAPH_VISIT_CAP, GraphTemplate, MAX_HOPS,
+        NODE_STYLES, UNKNOWN_EDGE_STYLE, UNKNOWN_NODE_STYLE, apply_node_cap, edge_style_of,
+        label_snippet, node_style_of, node_table_of, resolve_hops, strength_band,
     };
     use crate::AlexandriaServer;
     use askama::Template;
@@ -927,9 +949,10 @@ mod tests {
         );
     }
 
-    /// The live path reports the cap it used and that it did not bite. The truncation flag itself
-    /// is asserted through [`apply_node_cap`] instead: exceeding 200 nodes end-to-end would mean
-    /// a 201-memory fixture, and the cap is deliberately not injectable in production.
+    /// The live path reports the caps it used and that neither bit. The flags themselves are now
+    /// pinned end-to-end as well: a fixture big enough to exceed [`GRAPH_NODE_CAP`] is only ~250
+    /// memories, which [`test_api_graph_render_cap_truncates_while_the_traversal_completed`] pays
+    /// for, so the render cap is no longer reachable solely through [`apply_node_cap`].
     #[tokio::test]
     async fn test_api_graph_reports_cap_state_when_not_truncated() {
         let server = super::super::test_support::test_server().await;
@@ -942,5 +965,78 @@ mod tests {
         assert_eq!(json["truncated"], serde_json::json!(false));
         assert_eq!(json["node_count"], serde_json::json!(1));
         assert_eq!(json["node_cap"], serde_json::json!(GRAPH_NODE_CAP));
+        assert_eq!(json["traversal_truncated"], serde_json::json!(false));
+        assert_eq!(json["visit_cap"], serde_json::json!(GRAPH_VISIT_CAP));
+    }
+
+    /// A hub with `leaves` single-hop neighbours — the shape that makes either cap bite, because
+    /// the count that matters (visited, or drawn) is `leaves + 1` and the radius is one hop.
+    /// Session and cluster hubs are exactly this.
+    async fn seed_star(server: &AlexandriaServer, leaves: usize) -> String {
+        let memory_repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
+        let centre = memory_repo
+            .create_fact("hub centre", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        for i in 0..leaves {
+            let leaf = memory_repo
+                .create_fact(&format!("hub leaf {i}"), 0.5, &[0.3, 0.4], &[])
+                .await
+                .unwrap();
+            edge_repo
+                .create_edge(&centre, &leaf, "relates_to", 1.0)
+                .await
+                .unwrap();
+        }
+        centre
+    }
+
+    /// `truncated` alone must not be read as "the traversal ran out": a hub past the render cap but
+    /// inside [`GRAPH_VISIT_CAP`] is a *complete* BFS whose picture is merely cut. The two flags are
+    /// asserted against each other here, which is what keeps them distinguishable — if they ever
+    /// collapsed into one boolean, this is the test that says so.
+    #[tokio::test]
+    async fn test_api_graph_render_cap_truncates_while_the_traversal_completed() {
+        let server = super::super::test_support::test_server().await;
+        let centre = seed_star(&server, GRAPH_NODE_CAP + 50).await;
+
+        let json = graph_json(&server, &centre, "").await;
+        assert_eq!(json["node_count"], serde_json::json!(GRAPH_NODE_CAP));
+        assert_eq!(
+            json["truncated"],
+            serde_json::json!(true),
+            "251 nodes within 2 hops must exceed the render cap; got {json}"
+        );
+        assert_eq!(
+            json["traversal_truncated"],
+            serde_json::json!(false),
+            "the walk reached all 251 records, well inside the {GRAPH_VISIT_CAP}-record bound; got \
+             {json}"
+        );
+    }
+
+    /// The other half: past [`GRAPH_VISIT_CAP`] the walk stops early, so the page has not seen the
+    /// whole radius. `truncated` cannot say that on its own — the render cap bites at 200 either
+    /// way — which is why the response carries a second flag.
+    #[tokio::test]
+    async fn test_api_graph_reports_the_visit_bound_separately() {
+        let server = super::super::test_support::test_server().await;
+        let centre = seed_star(&server, GRAPH_VISIT_CAP + 1).await;
+
+        let json = graph_json(&server, &centre, "").await;
+        assert_eq!(
+            json["traversal_truncated"],
+            serde_json::json!(true),
+            "a hub with {} reachable records must trip the {}-record visit bound; got {json}",
+            GRAPH_VISIT_CAP + 2,
+            GRAPH_VISIT_CAP
+        );
+        assert_eq!(
+            json["truncated"],
+            serde_json::json!(true),
+            "the render cap necessarily bites once the walk has visited {GRAPH_VISIT_CAP} records"
+        );
+        assert_eq!(json["node_count"], serde_json::json!(GRAPH_NODE_CAP));
     }
 }

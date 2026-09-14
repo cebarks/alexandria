@@ -121,8 +121,16 @@ function renderNotice(data) {
   }
   const notice = document.getElementById("graph-notice");
   notice.hidden = false;
-  notice.textContent = "Graph truncated: showing " + data.node_count + " of the nodes within "
+  let message = "Graph truncated: showing " + data.node_count + " of the nodes within "
     + data.hops + " hops (cap " + data.node_cap + "). Lower the hop count for a clearer picture.";
+  // Two caps, two sentences. `node_cap` cut the node list down to what is drawn, which means the
+  // full set was found. `visit_cap` stopped the search itself, so this page has not counted the
+  // whole neighbourhood and must not imply it has. textContent, so the numbers stay text.
+  if (data.traversal_truncated) {
+    message += " The search also stopped early, after visiting " + data.visit_cap
+      + " nodes: more lie within " + data.hops + " hops than were ever found.";
+  }
+  notice.textContent = message;
 }
 </script>
 {% endblock %}
