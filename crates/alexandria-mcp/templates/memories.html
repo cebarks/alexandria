@@ -1,15 +1,23 @@
 {% extends "layout.html" %}
 {% import "_pagination.html" as p %}
+{% import "_sort_header.html" as sh %}
 {% block title %}Memories{% endblock %}
 {% block body %}<h1>Memories</h1>
 <form hx-get="/debug/memories" hx-target="#memory-results" hx-trigger="input changed delay:300ms from:input, change from:select">
+{# These two hidden inputs are load-bearing, not decoration: htmx submits only the named fields
+   inside this form, so without them typing in the search box would silently drop the active sort
+   and the table would jump back to newest-first under the operator's fingers. They carry the wire
+   forms of the current sort (same values `?sort=`/`?dir=` take and same values the header hrefs
+   emit), so filtering preserves the ordering the headers advertised. #}
+<input type="hidden" name="sort" value="{{ sorts.active }}">
+<input type="hidden" name="dir" value="{{ sorts.dir }}">
 <input type="text" name="search" placeholder="search content..." value="{{ search }}">
 <input type="text" name="tag" placeholder="tag" value="{{ tag }}">
 <label><input type="checkbox" name="include_deleted" value="true" {% if include_deleted %}checked{% endif %}> include deleted</label>
 </form>
 <div id="memory-results">
 <table>
-<tr><th>ID</th><th>Content</th><th>Tags</th><th>Confidence</th><th>Created</th></tr>{# The row emitted by the loop below is deliberately ONE physical line. A newline inside a <td> renders as visible whitespace, and the list XSS assertion matches a whole <td> element, so splitting it breaks both the layout and the test. Do not let a formatter reflow it. #}
+<tr>{{ sh::th(sorts.id, "ID", "id", sorts.active, sorts.dir) }}{{ sh::th(sorts.content, "Content", "content", sorts.active, sorts.dir) }}{{ sh::th(sorts.tags, "Tags (count)", "tags", sorts.active, sorts.dir) }}{{ sh::th(sorts.confidence, "Confidence", "confidence", sorts.active, sorts.dir) }}{{ sh::th(sorts.created, "Created", "created", sorts.active, sorts.dir) }}</tr>{# The row emitted by the loop below is deliberately ONE physical line. A newline inside a <td> renders as visible whitespace, and the list XSS assertion matches a whole <td> element, so splitting it breaks both the layout and the test. Do not let a formatter reflow it. #}
 {% for row in rows %}<tr{% if row.deleted %} class="deleted"{% endif %}><td><a class="link" href="/debug/memories/{{ row.id|urlencode }}">{{ row.id }}</a></td><td>{{ row.preview }}</td><td>{% for tag_name in row.tags %}<span class="badge">{{ tag_name }}</span>{% endfor %}</td><td>{{ row.confidence }}</td><td>{{ row.created }}</td></tr>
 {% endfor %}</table>
 {% if prev_href != "" || next_href != "" %}{{ p::pager(prev_href, next_href, summary) }}{% else %}{# the macro renders nothing when both links are absent, but the legacy page always printed its count line, so the fallback lives here #}<div class="pagination"><span>{{ summary }}</span></div>{% endif %}
