@@ -183,6 +183,15 @@ milestone:
 - **No tests for the pi extension.** The detector regexes and extraction prompt have no coverage, so
   a pattern edit is unguarded.
 - **Extension does not use sessions.** Auto-store writes are ungrouped.
+- **The debug graph's BFS is unbounded.** `GRAPH_NODE_CAP` (200) cuts the node list *after*
+  `EdgeRepo::get_neighbors` has already walked the whole ego-graph — two SurrealDB queries per
+  reachable node, with no limit on the frontier — so one session or cluster that hubs thousands of
+  memories costs thousands of round trips before 200 nodes survive to be drawn. The route is
+  reachable unauthenticated, and the debug UI raised the radius from a fixed 2 hops to a
+  selectable `MAX_HOPS = 3`, which widened it. The cap still bounds what it was built to bound
+  (rendering plus the per-node `get_edges_for` / `get_fact` loop); what is missing is a
+  visited-node bound on the traversal, and `EdgeRepo` is where it belongs — storage owns the
+  queries.
 - **README said MIT.** Corrected to AGPL-3.0-or-later to match `LICENSE` and
   `license.workspace`; verified nothing else in-tree still claims MIT (`deny.toml`'s MIT entries are
   third-party license allow-listing, which is unrelated). If the GitHub repo's advertised license

@@ -24,9 +24,17 @@ fn apply_node_cap(ordered: &mut Vec<(u32, String)>, cap: usize) -> bool {
     truncated
 }
 
-/// Cap on how many nodes one graph view will draw. Beyond it the ego-graph stops expanding and
-/// the page says so: a few hundred nodes on a canvas is a hairball, not a picture, and the
-/// client would pay for it in layout time.
+/// Cap on how many nodes one graph view will **draw**. Past it the node list is cut, in
+/// hop-then-id order, and the page says so: a few hundred nodes on a canvas is a hairball, not a
+/// picture, and the client would pay for it in layout time.
+///
+/// What this bounds is rendering plus the per-node work that feeds it — one `get_edges_for` and
+/// one `get_fact` per *retained* node. What it does **not** bound is the traversal that produces
+/// the node list: `EdgeRepo::get_neighbors` runs the complete BFS, issuing two queries per node it
+/// reaches and with no limit on its frontier, and only its finished output reaches the cap here.
+/// A hub session or cluster at `?hops=3` therefore costs thousands of round trips even though 200
+/// nodes survive — `MAX_HOPS` limits the radius, never the width. Tracked in
+/// `docs/roadmap.md` ("Known Gaps From Shipped Work"); the bound belongs in `EdgeRepo`.
 const GRAPH_NODE_CAP: usize = 200;
 
 /// Effective hop radius for a raw `?hops` value. Absent, empty, non-numeric and out-of-range all
@@ -135,8 +143,13 @@ async fn api_graph_with_radius(
     let node_ids: Vec<String> = ordered.into_iter().map(|(_, nid)| nid).collect();
 
     // TODO(debt): this handler costs one `get_edges_for` plus one `get_fact` per node, so the
-    // round trips are O(nodes) — bounded now by GRAPH_NODE_CAP but still the first thing to
-    // revisit if graph pages feel slow. A batch-by-ids read in storage would collapse both.
+    // round trips here are O(nodes) — bounded by GRAPH_NODE_CAP, which is what this loop covers,
+    // but still the first thing to revisit if graph pages feel slow. A batch-by-ids read in
+    // storage would collapse both. It does *not* cover the traversal above: `get_neighbors` has
+    // already walked the whole ego-graph, two queries per reachable node and no frontier limit,
+    // before the cap gets to discard any of it, so on a hub node that BFS — not this loop — is
+    // the dominant cost. See the GRAPH_NODE_CAP doc comment and the roadmap entry; the fix is a
+    // visited-node bound inside `EdgeRepo`.
     //
     // Collect edges among the node set by querying each node's direct edges and
     // keeping only those whose both endpoints are in `node_ids` (dedup by in/out/type).
