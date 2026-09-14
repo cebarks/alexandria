@@ -1,0 +1,35 @@
+{% extends "layout.html" %}
+{% block title %}Query Tester{% endblock %}
+{% block body %}<h1>Query Tester</h1>
+{# Everything below is a contract with `run` in query.rs, not just presentation:
+   `hx-post` must keep pointing at /debug/query/run, `hx-target` must keep pointing at the
+   #query-results div at the bottom of this block, and the five `name` attributes are the
+   keys `QueryForm` deserializes. Changing any of them silently breaks the swap, because the
+   results fragment (`query_results.html`) is not a page and has no link back to this form.
+   All three retrieve-only controls are labelled as such because `recall` has nowhere to put
+   them: `RecallParams` takes a `scope_handle`, which is not a session id, and it writes nothing,
+   so there is no side effect for `dry_run` to skip. None is hidden when mode=recall is
+   selected, and nothing here is pre-filled from an earlier submission -- `run` answers with a
+   fragment only, so this form is never re-rendered.
+   The dry-run checkbox is `value="true"` and unbound: an unchecked checkbox contributes nothing
+   at all to the body, which is why `QueryForm::dry_run` is an Option<String> rather than a
+   bool. It stays unchecked by default so the tester keeps reproducing what the tool actually
+   does -- including the heat write the note below spells out.
+   The trim marker on this comment's closing delimiter drops the newline after it, because
+   legacy had exactly one newline between `</h1>` and `<form>` and a blank line there renders as
+   extra vertical space. -#}
+<form hx-post="/debug/query/run" hx-target="#query-results">
+<label>Mode:
+<select name="mode">
+<option value="retrieve">retrieve_memories</option>
+<option value="recall">recall</option>
+</select>
+</label>
+<input type="text" name="query" placeholder="query text" required>
+<label>Limit (retrieve only): <input type="number" name="limit" value="10" min="1"></label>
+<label>Session ID (retrieve only): <input type="text" name="session_id" placeholder="external session id, as passed to store_memory(session_id)"></label>
+<label><input type="checkbox" name="dry_run" value="true"> Dry run (retrieve only): skip the heat write</label>
+<p>A retrieve run that is not dry does write: like any real retrieve_memories call, it bumps heat on the top-ranked results.</p>
+<button type="submit">Run</button>
+</form>
+<div id="query-results"></div>{% endblock %}

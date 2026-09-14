@@ -74,7 +74,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_activation_config(activation_config)
     .with_activation_top_n(config.activation.top_n)
-    .with_retrieve_min_similarity(config.retrieve.min_similarity);
+    .with_retrieve_min_similarity(config.retrieve.min_similarity)
+    .with_cohesion_floor(config.cluster.cohesion_floor);
 
     // 5. Serve based on transport config
     match config.server.transport.as_str() {
@@ -289,7 +290,22 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
 
     // Clone `server` for the debug UI router BEFORE it's moved into the MCP service factory
     // closure below — StreamableHttpService::new takes ownership of `server` via `move`.
-    let debug_router = alexandria_mcp::debug::router(server.clone());
+    // The context is built from this same `Config`, so the dashboard cannot report a value
+    // the server was not started with.
+    let debug_ctx = alexandria_mcp::debug::DebugContext {
+        embedding_model: config.embedding.model.clone(),
+        embedding_device: config.embedding.device.clone(),
+        transport: config.server.transport.clone(),
+        bind_host: config.server.host.clone(),
+        bind_port: config.server.port,
+        data_dir: config.database.data_dir.display().to_string(),
+        cluster_merge_threshold: config.cluster.merge_threshold,
+        maintenance_interval_secs: config.cluster.maintenance_interval_secs,
+        // The same list `/mcp` is configured with above, so the debug UI and the MCP endpoint
+        // cannot disagree about what a legitimate Host is.
+        allowed_hosts: config.server.allowed_hosts.clone(),
+    };
+    let debug_router = alexandria_mcp::debug::router_with_context(server.clone(), Some(debug_ctx));
 
     let service: StreamableHttpService<AlexandriaServer, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(server.clone()), Default::default(), http_config);

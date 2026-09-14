@@ -1,0 +1,136 @@
+{% extends "layout.html" %}
+{% block title %}Graph{% endblock %}
+{% block body %}<h1>Graph: {{ id }}</h1>
+<div id="graph-notice" class="graph-notice" hidden></div>
+<p class="graph-controls">
+  Hops:
+  {% if hops == 1 %}<strong>1</strong>{% else %}<a href="/debug/graph/{{ id|urlencode }}?hops=1">1</a>{% endif %}
+  ·
+  {% if hops == 2 %}<strong>2</strong>{% else %}<a href="/debug/graph/{{ id|urlencode }}?hops=2">2</a>{% endif %}
+  ·
+  {% if hops == 3 %}<strong>3</strong>{% else %}<a href="/debug/graph/{{ id|urlencode }}?hops=3">3</a>{% endif %}
+  — click a fact node to open the memory
+</p>
+<div id="graph" style="height: 600px; border: 1px solid #30363d;"></div>
+{# The legend is filled in by the script below from the styling data the API returns, rather
+   than being written out here. A hand-copied legend is a legend that silently lies the first
+   time a node or edge type is added to the server's style tables. #}
+<div id="graph-legend" class="graph-legend"></div>{% endblock %}
+{% block scripts %}{# Both script tags live in this block, in this order, and neither gets
+   `defer`. Do not "optimize" that:
+   1. layout.html defers htmx in <head>. A deferred script runs after the document parses but
+      AFTER any inline script in the body, so deferring vis-network while the code below stays
+      inline means `vis` is still undefined when it runs ("vis is not defined"). Loading it
+      plain and first here makes it execute synchronously before the inline tag, and being at
+      the end of <body> means the #graph div from block body has already been parsed.
+   2. The src is the vendored copy served from /debug/assets/ (see `VIS_NETWORK_URL` in
+      debug/assets.rs), not the third-party CDN this page pointed at before this commit (it
+      loaded 9.1.6 there, so this is also a 9 -> 10 major bump: the standalone UMD global build
+      is unchanged in v10, so `vis.DataSet` / `vis.Network` and every option below are as they
+      were). The filename carries the version, so replacing the asset means editing this line.
+   3. The id below is interpolated INSIDE a JavaScript string literal, where auto-escaping does
+      not help: browsers never decode character references in script text, so `{{ id }}` would
+      put `&#58;`-style garbage into the URL rather than neutralizing anything. `|urlencode`
+      percent-encodes it instead, which cannot produce a quote, a backslash or a `</script>`
+      sequence. This is the same encoding the memory detail page links here with. The <h1> above
+      is ordinary HTML text, so it stays plain `{{ id }}`. The trim marker on this comment's
+      closing delimiter keeps a blank line out of the rendered output.
+   4. `{{ hops }}` is the one other value interpolated here, and it is interpolated bare because
+      it cannot be anything but digits: `resolve_hops` parses it into a `u32` and clamps it to
+      `1..=3` before the template ever sees it, so there is no string to escape. Never widen that
+      to a value that arrives from the request as text. Node labels, tooltips and record ids come
+      from the JSON that `api_graph` returns and are handed to vis-network as parsed data, never
+      spliced into this script — memory content is user-influenced and must not reach script
+      source. -#}
+<script src="/debug/assets/vis-network-10.1.2.min.js"></script>
+<script>
+fetch("/debug/api/graph/{{ id|urlencode }}?hops={{ hops }}")
+  .then(r => r.json())
+  .then(data => {
+    const nodes = new vis.DataSet(data.nodes);
+    // Per-edge colour and dash come from the API (keyed on edge_type, with a default for types
+    // this page has never seen); width comes from the banded strength, because strengths are not
+    // comparable across types so a linear scale would be meaningless.
+    const BAND_WIDTH = { strong: 3.4, medium: 2.2, faint: 1.2 };
+    const styledEdges = data.edges.map(e => ({
+      ...e,
+      color: e.edge_color,
+      dashes: e.edge_dashes,
+      width: BAND_WIDTH[e.strength_band] || 1.6,
+    }));
+    const edges = new vis.DataSet(styledEdges);
+    const container = document.getElementById("graph");
+    const network = new vis.Network(container, { nodes, edges }, {
+      nodes: { font: { color: "#c9d1d9" }, borderWidth: 1 },
+      edges: { font: { color: "#8b949e", face: "monospace", size: 11 }, arrows: "to" },
+      interaction: { hover: true, tooltipDelay: 120 },
+    });
+    // Click-through to the memory. encodeURIComponent, not the template's |urlencode: this id
+    // came back as parsed JSON at click time, so it is escaped in JS against the node it
+    // describes. Only facts have a detail page, and table is "" for an unparsable id.
+    network.on("selectNode", (params) => {
+      if (params.nodes.length === 0) {
+        return;
+      }
+      const node = nodes.get(params.nodes[0]);
+      if (node && node.table === "fact") {
+        window.location.href = "/debug/memories/" + encodeURIComponent(node.id);
+      }
+    });
+
+    renderLegend(data);
+    renderNotice(data);
+  });
+
+// Legend and truncation notice. Both build DOM nodes from parsed JSON with textContent, so
+// record ids and type names can never be parsed as markup.
+function renderLegend(data) {
+  const legend = document.getElementById("graph-legend");
+  const add = (parent, tag, className, text) => {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    el.textContent = text;
+    parent.appendChild(el);
+    return el;
+  };
+  add(legend, "span", "graph-legend-title", "Nodes:");
+  (data.node_types || []).forEach(t => {
+    const swatch = add(legend, "span", "swatch", "");
+    swatch.style.background = t.color;
+    swatch.dataset.shape = t.shape;
+    add(legend, "span", "legend-item", t.table);
+  });
+  const unknown = add(legend, "span", "swatch", "");
+  unknown.dataset.shape = "triangle";
+  add(legend, "span", "legend-item", "other");
+  add(legend, "span", "graph-legend-title", "Edges:");
+  (data.edge_types || []).forEach(t => {
+    const line = add(legend, "span", "line-sample", "");
+    line.style.borderColor = t.color;
+    line.style.borderTopStyle = t.dashes === false ? "solid" : "dashed";
+    add(legend, "span", "legend-item", t.edge_type);
+  });
+  const other = add(legend, "span", "line-sample", "");
+  other.style.borderTopStyle = "dotted";
+  add(legend, "span", "legend-item", "other types (solid width = stronger)");
+}
+
+function renderNotice(data) {
+  if (!data.truncated) {
+    return;
+  }
+  const notice = document.getElementById("graph-notice");
+  notice.hidden = false;
+  let message = "Graph truncated: showing " + data.node_count + " of the nodes within "
+    + data.hops + " hops (cap " + data.node_cap + "). Lower the hop count for a clearer picture.";
+  // Two caps, two sentences. `node_cap` cut the node list down to what is drawn, which means the
+  // full set was found. `visit_cap` stopped the search itself, so this page has not counted the
+  // whole neighbourhood and must not imply it has. textContent, so the numbers stay text.
+  if (data.traversal_truncated) {
+    message += " The search also stopped early, after visiting " + data.visit_cap
+      + " nodes: more lie within " + data.hops + " hops than were ever found.";
+  }
+  notice.textContent = message;
+}
+</script>
+{% endblock %}

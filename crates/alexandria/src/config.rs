@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
+use alexandria_engine::search::DEFAULT_MIN_SIMILARITY;
 use serde::Deserialize;
 
 /// Top-level configuration for Alexandria.
@@ -87,10 +89,11 @@ pub struct ActivationConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RetrieveConfig {
-    /// Server-side hard floor on cosine similarity for `retrieve_memories`
-    /// results. A noise cutoff only: with all-MiniLM-L6-v2 a natural-language
-    /// question against a stored statement scores ~0.2 and unrelated text
-    /// ~0.0, so this must stay low. Default 0.10.
+    /// Server-side hard floor on cosine similarity for `retrieve_memories` results.
+    /// Defaults to `DEFAULT_MIN_SIMILARITY` in `alexandria_engine::search` — read that
+    /// constant, not this comment, for the current number. It is a noise cutoff only:
+    /// with all-MiniLM-L6-v2 a natural-language question against a stored statement
+    /// scores ~0.2 and unrelated text ~0.0, so it must stay low.
     pub min_similarity: f32,
 }
 
@@ -101,7 +104,8 @@ pub struct ClusterConfig {
     pub join_threshold: f32,
     /// Centroid similarity above which two clusters merge. Default 0.9.
     pub merge_threshold: f32,
-    /// Avg member-to-centroid similarity below which a cluster splits. Default 0.6.
+    /// Avg member-to-centroid similarity below which a cluster splits. Defaults to
+    /// `DEFAULT_COHESION_FLOOR` in `alexandria_engine::clusters::maintenance`.
     pub cohesion_floor: f32,
     /// Cluster maintenance check interval in seconds. Default: 300 (5 minutes).
     pub maintenance_interval_secs: u64,
@@ -159,7 +163,7 @@ impl Default for ActivationConfig {
 impl Default for RetrieveConfig {
     fn default() -> Self {
         Self {
-            min_similarity: 0.10,
+            min_similarity: DEFAULT_MIN_SIMILARITY,
         }
     }
 }
@@ -169,7 +173,7 @@ impl Default for ClusterConfig {
         Self {
             join_threshold: 0.75,
             merge_threshold: 0.9,
-            cohesion_floor: 0.6,
+            cohesion_floor: DEFAULT_COHESION_FLOOR,
             maintenance_interval_secs: 300,
         }
     }
@@ -292,6 +296,21 @@ mod tests {
         assert_eq!(config.activation.max_hops, 2);
         assert_eq!(config.retrieve.min_similarity, 0.10);
         assert!(config.database.data_dir.ends_with("data"));
+    }
+
+    /// The binary's TOML defaults and the MCP server's construction fallbacks must not
+    /// diverge — both derive from engine consts. This is the regression that let
+    /// `retrieve.min_similarity` be 0.10 in production and 0.30 everywhere else.
+    #[test]
+    fn test_server_fallback_defaults_match_config_defaults() {
+        assert_eq!(
+            RetrieveConfig::default().min_similarity,
+            alexandria_engine::search::DEFAULT_MIN_SIMILARITY
+        );
+        assert_eq!(
+            ClusterConfig::default().cohesion_floor,
+            alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR
+        );
     }
 
     #[test]

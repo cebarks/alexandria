@@ -1,0 +1,29 @@
+{# One sortable <th>. Called five times from memories.html's header row.
+
+   Every argument is passed explicitly because an askama macro sees only its own parameters, not
+   the calling template's scope: `href` is pre-built in Rust (src/debug/memories.rs `SortLinks`) —
+   the template must not know how a query string is assembled — and `active`/`dir` are the wire
+   forms of the current sort, which are also what the live-filter form posts back.
+
+   `col` is this column's own key; `active` is whichever column the page is ordered by. `col` is
+   quoted at each call site rather than derived from the label because the label is prose ("Tags
+   (count)") and the key is part of a URL. That label is deliberate: the tags column sorts by
+   *number* of tags (`FactSort::TagCount` — an array has no natural order), and a bare "Tags" would
+   promise an alphabetical ordering that does not exist.
+
+   An inactive header gets neither `aria-sort` nor a direction marker: `aria-sort="none"` is the
+   default and repeating it on five columns would tell a screen reader nothing, and five greyed
+   arrows read as noise.
+
+   The marker states the direction the table is *in* (▲ ascending, ▼ descending), matching
+   `aria-sort`, while the href offers the flip. Marking the *result* of the click instead would put
+   an arrow on the column that contradicted its own `aria-sort` — the two attributes a screen reader
+   and a sighted operator check have to agree about the present, not the future.
+
+   No escaping filter is applied here, and none is needed (see the warning in `_pagination.html`):
+   askama escapes `{{ }}`, so the label and the href arrive as text. The href is built from values
+   that are themselves percent-encoded (`encode_query_value`), and the `&` separators render as
+   `&#38;` — correct in an attribute, same as the pager macro. #}
+{% macro th(href, label, col, active, dir) -%}
+<th{% if col == active %} aria-sort="{% if dir == "asc" %}ascending{% else %}descending{% endif %}"{% endif %}><a class="link" href="{{ href }}">{{ label }}{% if col == active %} {% if dir == "asc" %}▲{% else %}▼{% endif %}{% endif %}</a></th>
+{%- endmacro %}

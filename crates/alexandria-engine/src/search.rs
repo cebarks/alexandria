@@ -1,3 +1,10 @@
+/// Default hard floor on cosine similarity for retrieval results.
+///
+/// Single source of truth: both the binary's `RetrieveConfig::default()` and
+/// `AlexandriaServer::new`'s construction fallback read this, so the two cannot drift.
+/// A noise cutoff only — see docs/configuration.md for measured score bands.
+pub const DEFAULT_MIN_SIMILARITY: f32 = 0.10;
+
 /// Cosine similarity between two vectors.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "vectors must have same dimensions");

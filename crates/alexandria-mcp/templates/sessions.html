@@ -1,0 +1,11 @@
+{% extends "layout.html" %}
+{% import "_pagination.html" as p %}
+{% block title %}Sessions{% endblock %}
+{% block body %}<h1>Sessions</h1>
+<table>{# The row emitted by the loop below is deliberately ONE physical line. A newline inside a <td> renders as visible whitespace, and the agent_id XSS assertion matches a whole <td> element, so splitting it breaks both the layout and the test. Do not let a formatter reflow it. #}
+<tr><th>External ID</th><th>Agent</th><th>Model</th><th>Memories</th><th>Started</th><th>Last activity</th><th>State</th></tr>
+{% if rows.is_empty() %}<tr><td colspan="7" class="empty">No sessions match the current filters.</td></tr>{% endif %}
+{% for row in rows %}<tr><td><a class="link" href="/debug/sessions/{{ row.external_id|urlencode }}">{{ row.external_id }}</a></td><td>{{ row.agent }}</td><td>{{ row.model }}</td><td>{{ row.memory_count }}</td><td>{{ row.started }}</td><td>{{ row.last_activity }}</td><td>{% if row.finalized %}<span class="badge">finalized</span>{% else %}<span class="badge">active</span>{% endif %}</td></tr>
+{% endfor %}</table>
+<p>"Last activity" is when the most recent memory was attached, not when the session finished — a live session that has simply gone idle has a last-activity timestamp too. Only the <strong>finalized</strong> state means a summary was written.</p>
+{% if prev_href != "" || next_href != "" %}{{ p::pager(prev_href, next_href, summary) }}{% else %}{# the macro renders nothing when both links are absent, but the page must still say how many rows there are #}<div class="pagination"><span>{{ summary }}</span></div>{% endif %}{% endblock %}
