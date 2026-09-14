@@ -263,6 +263,21 @@ impl<'a> ClusterRepo<'a> {
         Ok(response.take(0)?)
     }
 
+    /// One cluster by id, or `None` if no such record exists.
+    ///
+    /// Exists so display code can read the **stored** `centroid` — the value the background
+    /// maintenance task actually splits on. Averaging members to approximate it makes two
+    /// callers of `check_cohesion` disagree; see `debug::clusters::cohesion_of`.
+    pub async fn get(&self, cluster_id: &str) -> Result<Option<Cluster>> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM type::record($cluster_id)")
+            .bind(("cluster_id", cluster_id.to_string()))
+            .await?;
+        let clusters: Vec<Cluster> = response.take(0)?;
+        Ok(clusters.into_iter().next())
+    }
+
     pub async fn list_with_counts(&self) -> Result<Vec<(Cluster, usize)>> {
         let clusters = self.list().await?;
 
@@ -280,6 +295,37 @@ impl<'a> ClusterRepo<'a> {
 mod tests {
     use super::*;
     use crate::connection::Database;
+
+    #[tokio::test]
+    async fn test_get_returns_the_stored_centroid() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let cluster_repo = ClusterRepo::new(db.inner());
+
+        let cid = cluster_repo
+            .create(Some("readable"), &[0.25, -0.75])
+            .await
+            .unwrap();
+        let cluster = cluster_repo
+            .get(&cid)
+            .await
+            .unwrap()
+            .expect("created cluster must be readable by its own id");
+        assert_eq!(cluster.label.as_deref(), Some("readable"));
+        assert_eq!(cluster.centroid, vec![0.25, -0.75]);
+
+        // A different id must not resolve to this record, and a missing one is `None` rather
+        // than an error — `get_members` reports an empty set for the same case.
+        let other = cluster_repo.create(None, &[1.0, 0.0]).await.unwrap();
+        assert_ne!(other, cid);
+        assert!(
+            cluster_repo
+                .get("cluster:never-created-9f2a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn test_remove_member() {

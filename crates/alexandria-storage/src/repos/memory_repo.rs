@@ -208,6 +208,43 @@ impl<'a> MemoryRepo<'a> {
         Ok(rows.first().map(|r| r.count as usize).unwrap_or(0))
     }
 
+    /// Tag frequencies across live facts, highest first, capped at `limit`.
+    ///
+    /// The cap is the point: the debug dashboard shows a top-N bar chart and must not pay for
+    /// a distinct-tag sweep it will not render. Ties break on the tag name so the same page
+    /// renders the same order twice.
+    ///
+    /// SurrealDB 3.2 cannot group by a value unnested out of an array field — `GROUP BY` over
+    /// a subquery's array column, and `$value` in that position, both collapse to one `NONE`
+    /// group — so the flatten happens in SQL (one row, `array::group` then `array::flatten`)
+    /// and only the tally happens here. That keeps the read to the `tags` column; content and
+    /// embeddings are never pulled.
+    pub async fn top_tags(&self, limit: usize) -> Result<Vec<(String, usize)>> {
+        #[derive(serde::Deserialize, SurrealValue)]
+        struct TagRow {
+            tags: Vec<String>,
+        }
+
+        let mut response = self
+            .db
+            .query(
+                "SELECT array::flatten(array::group(tags)) AS tags \
+                 FROM fact WHERE deleted = false GROUP ALL",
+            )
+            .await?;
+        let row: Option<TagRow> = response.take(0)?;
+
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for tag in row.map(|row| row.tags).unwrap_or_default() {
+            *counts.entry(tag).or_default() += 1;
+        }
+
+        let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        pairs.truncate(limit);
+        Ok(pairs)
+    }
+
     /// Find the cluster containing this fact, if any (reverse traversal of contains_memory).
     pub async fn cluster_for_fact(&self, fact_id: &str) -> Result<Option<crate::models::Cluster>> {
         let mut response = self
@@ -363,5 +400,61 @@ mod tests {
             .unwrap();
         assert_eq!(updated.embedding, vec![9.0, 8.0, 7.0]);
         assert_eq!(updated.content, "first");
+    }
+
+    #[tokio::test]
+    async fn test_top_tags_counts_live_facts_and_caps() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = crate::repos::MemoryRepo::new(db.inner());
+
+        assert!(repo.top_tags(10).await.unwrap().is_empty());
+
+        for (content, tags) in [
+            ("a", &["rare"][..]),
+            ("b", &["common"][..]),
+            ("c", &["common"][..]),
+            ("d", &["common", "other"][..]),
+            ("e", &["zzz", "aaa"][..]),
+            ("f", &["zzz", "aaa"][..]),
+            ("g", &[][..]),
+        ] {
+            repo.create_fact(
+                content,
+                0.5,
+                &[0.1],
+                &tags.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        }
+        // A soft-deleted fact's tags must not be counted: the tally is of live memory.
+        let gone = repo
+            .create_fact("gone", 0.5, &[0.1], &["ghost".to_string()])
+            .await
+            .unwrap();
+        repo.soft_delete_fact(&gone).await.unwrap();
+
+        let all = repo.top_tags(100).await.unwrap();
+        assert_eq!(all[0], ("common".to_string(), 3));
+        assert_eq!(
+            all.iter().find(|(tag, _)| tag == "rare").map(|(_, n)| *n),
+            Some(1)
+        );
+        assert_eq!(
+            all.iter().find(|(tag, _)| tag == "ghost"),
+            None,
+            "a soft-deleted fact still contributed its tag: {all:?}"
+        );
+        // Equal counts break on the name, ascending.
+        let aaa = all.iter().position(|(t, _)| t == "aaa").unwrap();
+        let zzz = all.iter().position(|(t, _)| t == "zzz").unwrap();
+        assert!(aaa < zzz, "tie must resolve by name; got {all:?}");
+
+        // The cap is a cap, and it keeps the highest counts.
+        let top3 = repo.top_tags(3).await.unwrap();
+        assert_eq!(top3.len(), 3);
+        assert_eq!(top3[0].0, "common");
+        assert_eq!(top3, all[..3]);
     }
 }

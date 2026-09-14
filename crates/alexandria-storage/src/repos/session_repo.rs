@@ -223,6 +223,29 @@ impl<'a> SessionRepo<'a> {
         let rows: Vec<CountRow> = response.take(0)?;
         Ok(rows.first().map(|r| r.count as usize).unwrap_or(0))
     }
+
+    /// Sessions that were finalized, i.e. those carrying a `summary`.
+    ///
+    /// `summary` is the only field that distinguishes finished from idle: `touch()` writes
+    /// `ended_at` on every attached memory, so an active session has a non-null `ended_at`
+    /// too. `list()` cannot answer this without walking every row, because it is paginated.
+    ///
+    /// `!= NONE` is the tested form. `IS NOT NULL` reports *every* session as finalized on a
+    /// schema-full table where the absent field reads back as null, and `IS DEFINED` / `IS
+    /// SOME` both over-count for the same reason.
+    pub async fn count_finalized(&self) -> Result<usize> {
+        #[derive(Deserialize, SurrealValue)]
+        struct CountRow {
+            count: i64,
+        }
+
+        let mut response = self
+            .db
+            .query("SELECT count() FROM `session` WHERE summary != NONE GROUP ALL")
+            .await?;
+        let rows: Vec<CountRow> = response.take(0)?;
+        Ok(rows.first().map(|r| r.count as usize).unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
@@ -657,5 +680,38 @@ mod tests {
         // count() is the total, not the page size.
         assert_eq!(repo.list(1, 0).await.unwrap().len(), 1);
         assert_eq!(repo.count().await.unwrap(), 3);
+    }
+
+    /// The finalized/idle split the dashboard reports, pinned against the three shapes that
+    /// must not be confused: never touched, touched but still open, and finalized.
+    #[tokio::test]
+    async fn test_count_finalized_counts_only_sessions_with_a_summary() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = SessionRepo::new(db.inner());
+
+        assert_eq!(repo.count_finalized().await.unwrap(), 0);
+
+        repo.create("live", None, None).await.unwrap();
+        repo.create("visited", None, None).await.unwrap();
+        repo.touch("visited").await.unwrap();
+        assert_eq!(
+            repo.count_finalized().await.unwrap(),
+            0,
+            "ended_at written by touch() must not read as finalized"
+        );
+
+        repo.create("done", None, None).await.unwrap();
+        repo.finalize("done", Some("wrapped up"), None)
+            .await
+            .unwrap();
+        // Finalize with no summary text leaves the session open: only a summary closes one.
+        repo.create("tags-only", None, None).await.unwrap();
+        repo.finalize("tags-only", None, Some(&["tagged".to_string()]))
+            .await
+            .unwrap();
+
+        assert_eq!(repo.count().await.unwrap(), 4);
+        assert_eq!(repo.count_finalized().await.unwrap(), 1);
     }
 }

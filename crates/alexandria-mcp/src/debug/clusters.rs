@@ -6,7 +6,6 @@ use axum::response::Response;
 use super::html::{error_page, page};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
-
 /// One row of the cluster list, flattened out of `Cluster` so the template never has to
 /// deal with `Option<RecordId>` or with how a record id is formatted.
 struct ClusterRow {
@@ -76,56 +75,101 @@ pub async fn list(State(server): State<AlexandriaServer>) -> Response {
     })
 }
 
+/// The three verdicts a cluster can carry, plus the case where neither is reachable.
+///
+/// Shared by the cluster detail page and the dashboard rollup so the two cannot disagree, and
+/// worded so a reader can act on it without knowing what `check_cohesion` returns.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Cohesion {
+    Healthy,
+    NeedsSplit,
+    /// Too few members for the maintenance task to consider a split at all.
+    TooSmall,
+    /// No cluster record, so there is no stored centroid to compare against.
+    NoCentroid,
+}
+
+impl Cohesion {
+    /// Display form. Kept here rather than in the template so the dashboard and the detail
+    /// page render the same words for the same state.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Cohesion::Healthy => "Healthy",
+            Cohesion::NeedsSplit => "Needs split (below cohesion floor)",
+            Cohesion::TooSmall => "N/A (fewer than 4 members)",
+            Cohesion::NoCentroid => "N/A (no cluster record)",
+        }
+    }
+}
+
+/// Cohesion of one cluster, judged from its **stored** centroid.
+///
+/// The stored centroid is the value `alexandria`'s background maintenance task calls
+/// `check_cohesion` with, so it is the only one a diagnostic surface may report on. This used
+/// to average the member embeddings inline, which is a different vector whenever member
+/// magnitudes differ — and a UI that says "Healthy" about a cluster the splitter is about to
+/// divide is worse than a UI that says nothing.
+///
+/// `cluster_id` is carried through to the engine's action only; the verdict discards it.
+pub(super) fn cohesion_of(
+    cluster_id: &str,
+    stored_centroid: &[f32],
+    member_embeddings: &[Vec<f32>],
+    cohesion_floor: f32,
+) -> Cohesion {
+    if member_embeddings.len() < 4 {
+        return Cohesion::TooSmall;
+    }
+    match alexandria_engine::clusters::maintenance::check_cohesion(
+        cluster_id,
+        stored_centroid,
+        member_embeddings,
+        cohesion_floor,
+    ) {
+        alexandria_engine::clusters::maintenance::MaintenanceAction::Healthy => Cohesion::Healthy,
+        alexandria_engine::clusters::maintenance::MaintenanceAction::Split { .. } => {
+            Cohesion::NeedsSplit
+        }
+    }
+}
+
+/// Member embeddings, in the shape [`cohesion_of`] wants.
+pub(super) fn embeddings_of(members: &[alexandria_storage::models::Fact]) -> Vec<Vec<f32>> {
+    members.iter().map(|f| f.embedding.clone()).collect()
+}
+
+/// Data-layer failure on a page that has historically answered with 500 rather than the 200
+/// `error_page` returns on its own (the list handlers are the 200 ones).
+fn unavailable(message: &str) -> Response {
+    let mut response = error_page("clusters", message);
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    response
+}
+
 pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<String>) -> Response {
     let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
+    let cluster = match cluster_repo.get(&id).await {
+        Ok(cluster) => cluster,
+        Err(e) => return unavailable(&e.to_string()),
+    };
     let members = match cluster_repo.get_members(&id).await {
         Ok(m) => m,
-        Err(e) => {
-            // The detail handler has always answered a data-layer failure with 500 (the list
-            // handlers return 200), so keep the status rather than taking `error_page`'s.
-            let mut response = error_page("clusters", &e.to_string());
-            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            return response;
-        }
+        Err(e) => return unavailable(&e.to_string()),
     };
 
-    if members.is_empty() {
-        // Distinguish "cluster with no members" from "cluster doesn't exist" is not possible
-        // via get_members alone (it returns an empty Vec either way); render what we have.
-    }
-
-    let cohesion = if members.len() >= 4 {
-        // Recompute the centroid inline for display purposes (approximate: average of member embeddings).
-        let dims = members[0].embedding.len();
-        let mut centroid = vec![0.0f32; dims];
-        for m in &members {
-            for (i, v) in m.embedding.iter().enumerate() {
-                if i < dims {
-                    centroid[i] += v;
-                }
-            }
-        }
-        let n = members.len() as f32;
-        for v in centroid.iter_mut() {
-            *v /= n;
-        }
-        let embeddings: Vec<Vec<f32>> = members.iter().map(|f| f.embedding.clone()).collect();
-        match alexandria_engine::clusters::maintenance::check_cohesion(
+    let cohesion = match &cluster {
+        Some(cluster) => cohesion_of(
             &id,
-            &centroid,
-            &embeddings,
+            &cluster.centroid,
+            &embeddings_of(&members),
             server.cohesion_floor,
-        ) {
-            alexandria_engine::clusters::maintenance::MaintenanceAction::Healthy => {
-                "Healthy".to_string()
-            }
-            alexandria_engine::clusters::maintenance::MaintenanceAction::Split { .. } => {
-                "Needs split (below cohesion floor)".to_string()
-            }
-        }
-    } else {
-        "N/A (fewer than 4 members)".to_string()
-    };
+        )
+        .label(),
+        // Members can still exist here: `get_members` traverses edges, which outlive the
+        // record they start from. Reporting a computed verdict would be a guess.
+        None => Cohesion::NoCentroid.label(),
+    }
+    .to_string();
 
     let member_count = members.len();
     let rows = members
@@ -154,6 +198,23 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    use crate::AlexandriaServer;
+
+    /// Renders the cluster detail page for `cid` through the real router.
+    async fn detail_html(server: &AlexandriaServer, cid: &str) -> String {
+        let app = crate::debug::router(server.clone());
+        let uri = format!("/debug/clusters/{}", cid.replace(':', "%3A"));
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
 
     #[tokio::test]
     async fn test_clusters_list_shows_labels_and_counts() {
@@ -192,6 +253,54 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("cluster one"));
         assert!(text.contains("cluster two"));
+    }
+
+    /// Pins the cohesion fix: the verdict must come from the cluster's **stored** centroid,
+    /// not from an average of its members. `disagreeing_cluster` is built so the two reach
+    /// opposite answers, and the assertions below re-check that opposition rather than
+    /// trusting it — otherwise a later edit to the fixture could quietly make this test vacuous.
+    #[tokio::test]
+    async fn test_cluster_detail_cohesion_uses_the_stored_centroid() {
+        use alexandria_storage::repos::ClusterRepo;
+
+        let server = super::super::test_support::test_server().await;
+        let cid = super::super::test_support::disagreeing_cluster(&server).await;
+
+        let stored = ClusterRepo::new(server.db.inner())
+            .get(&cid)
+            .await
+            .unwrap()
+            .expect("fixture cluster must exist")
+            .centroid;
+        let members = super::embeddings_of(
+            &ClusterRepo::new(server.db.inner())
+                .get_members(&cid)
+                .await
+                .unwrap(),
+        );
+        let average = super::super::test_support::average_centroid(&members);
+
+        // The fixture guard, stated as the engine's own verdicts.
+        assert_eq!(
+            super::cohesion_of(&cid, &stored, &members, server.cohesion_floor),
+            super::Cohesion::Healthy,
+            "fixture's stored centroid must read as healthy"
+        );
+        assert_eq!(
+            super::cohesion_of(&cid, &average, &members, server.cohesion_floor),
+            super::Cohesion::NeedsSplit,
+            "fixture's member average must read as needing a split, or the test proves nothing"
+        );
+
+        let html = detail_html(&server, &cid).await;
+        assert!(
+            html.contains("Healthy"),
+            "the page must report the stored centroid's verdict"
+        );
+        assert!(
+            !html.contains("Needs split"),
+            "the page rendered the member-average verdict: {html}"
+        );
     }
 
     #[tokio::test]
