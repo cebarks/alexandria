@@ -1,6 +1,15 @@
 {% extends "layout.html" %}
 {% block title %}Graph{% endblock %}
 {% block body %}<h1>Graph: {{ id }}</h1>
+<p>
+  Hops:
+  {% if hops == 1 %}<strong>1</strong>{% else %}<a href="/debug/graph/{{ id|urlencode }}?hops=1">1</a>{% endif %}
+  ·
+  {% if hops == 2 %}<strong>2</strong>{% else %}<a href="/debug/graph/{{ id|urlencode }}?hops=2">2</a>{% endif %}
+  ·
+  {% if hops == 3 %}<strong>3</strong>{% else %}<a href="/debug/graph/{{ id|urlencode }}?hops=3">3</a>{% endif %}
+  — click a fact node to open the memory
+</p>
 <div id="graph" style="height: 600px; border: 1px solid #30363d;"></div>{% endblock %}
 {% block scripts %}{# Both script tags live in this block, in this order, and neither gets
    `defer`. Do not "optimize" that:
@@ -20,18 +29,38 @@
       percent-encodes it instead, which cannot produce a quote, a backslash or a `</script>`
       sequence. This is the same encoding the memory detail page links here with. The <h1> above
       is ordinary HTML text, so it stays plain `{{ id }}`. The trim marker on this comment's
-      closing delimiter keeps a blank line out of the rendered output. -#}
+      closing delimiter keeps a blank line out of the rendered output.
+   4. `{{ hops }}` is the one other value interpolated here, and it is interpolated bare because
+      it cannot be anything but digits: `resolve_hops` parses it into a `u32` and clamps it to
+      `1..=3` before the template ever sees it, so there is no string to escape. Never widen that
+      to a value that arrives from the request as text. Node labels, tooltips and record ids come
+      from the JSON that `api_graph` returns and are handed to vis-network as parsed data, never
+      spliced into this script — memory content is user-influenced and must not reach script
+      source. -#}
 <script src="/debug/assets/vis-network-10.1.2.min.js"></script>
 <script>
-fetch("/debug/api/graph/{{ id|urlencode }}")
+fetch("/debug/api/graph/{{ id|urlencode }}?hops={{ hops }}")
   .then(r => r.json())
   .then(data => {
     const nodes = new vis.DataSet(data.nodes);
     const edges = new vis.DataSet(data.edges);
     const container = document.getElementById("graph");
-    new vis.Network(container, { nodes, edges }, {
+    const network = new vis.Network(container, { nodes, edges }, {
       nodes: { color: "#58a6ff", font: { color: "#c9d1d9" } },
       edges: { color: "#30363d", font: { color: "#8b949e" }, arrows: "to" },
+      interaction: { hover: true, tooltipDelay: 120 },
+    });
+    // Click-through to the memory. encodeURIComponent, not the template's |urlencode: this id
+    // came back as parsed JSON at click time, so it is escaped in JS against the node it
+    // describes. Only facts have a detail page, and table is "" for an unparsable id.
+    network.on("selectNode", (params) => {
+      if (params.nodes.length === 0) {
+        return;
+      }
+      const node = nodes.get(params.nodes[0]);
+      if (node && node.table === "fact") {
+        window.location.href = "/debug/memories/" + encodeURIComponent(node.id);
+      }
     });
   });
 </script>
