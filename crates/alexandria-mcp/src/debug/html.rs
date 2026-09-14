@@ -9,6 +9,34 @@
 use askama::Template;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
+use chrono::{DateTime, Utc};
+
+/// The single placeholder for "this value is absent", across every debug page.
+///
+/// Lives here rather than in a handler because a missing agent id on `/debug/sessions` and a
+/// missing `created_at` on `/debug/memories` must not render two different glyphs; it used to.
+pub const ABSENT: &str = "—";
+
+/// The single timestamp format, across every debug page.
+///
+/// Minute resolution, explicit `UTC` suffix because the value is naive-local to nobody and the
+/// page has no other hint as to the zone. `maintenance` used to print seconds
+/// (`%H:%M:%S UTC`) and an empty cell when the timestamp was absent; losing the seconds there is
+/// deliberate — one concept, one rendering, and the maintenance log's ordering is already the
+/// `created_at` column, so the extra precision was never load-bearing.
+pub const DT_FORMAT: &str = "%Y-%m-%d %H:%M UTC";
+
+/// Renders an optional timestamp with the shared format, so a call site never has to invent its
+/// own placeholder for "never".
+///
+/// This lives here because a timestamp format is a *presentation* decision: with one copy per
+/// handler, four handlers meant four ways to drift, and they drifted (see [`DT_FORMAT`]).
+pub fn format_dt(dt: Option<DateTime<Utc>>) -> String {
+    match dt {
+        Some(dt) => dt.format(DT_FORMAT).to_string(),
+        None => ABSENT.to_string(),
+    }
+}
 
 /// Render a template, mapping render failure to a plain-text 500.
 ///
@@ -61,9 +89,73 @@ struct PagerTemplate {
     summary: String,
 }
 
+/// One fixed instant shared by the per-page render tests, so "the pages agree" is checked against
+/// a single value rather than three fixtures that each happen to look right.
+#[cfg(test)]
+pub(crate) fn example_dt() -> DateTime<Utc> {
+    DateTime::from_timestamp(1_783_252_211, 0).expect("valid unix epoch seconds")
+}
+
+/// Guards the *rendered* pages, not the helper: a page that grew its own formatter would pass
+/// every `format_dt` unit test. Fails if a page prints a seconds-precision timestamp, which is the
+/// signature of the pre-sweep `maintenance.rs` format. A byte-window scan, because a `regex`
+/// dependency for one assertion is not worth it.
+#[cfg(test)]
+pub(crate) fn assert_no_seconds_timestamp(html: &str, rendered_by: &str) {
+    for w in html.as_bytes().windows(8) {
+        if w[2] == b':' && w[5] == b':' && w.iter().all(|b| b.is_ascii_digit() || *b == b':') {
+            panic!("{rendered_by} rendered a seconds-precision timestamp; got: {html}");
+        }
+    }
+}
+
+/// The strong half of the timestamp contract: asserts that every `<td>` cell ending in ` UTC` is
+/// **exactly** the shared minute form, and that at least `min` such cells exist.
+///
+/// Called from handler tests (bytes the handler built), not only from fixture renders — a
+/// `MaintenanceRow` assembled by hand in a test cannot notice that `maintenance.rs` grew its own
+/// `strftime` again, and that is the regression this exists to catch. Catches both historical
+/// failure modes at once: a revert to `%H:%M:%S` shifts the window so the shape check fails, and a
+/// revert to `unwrap_or_default()` leaves no ` UTC` cell for `min` to find.
+#[cfg(test)]
+pub(crate) fn assert_shared_timestamp_cells(html: &str, rendered_by: &str, min: usize) {
+    let mut found = 0usize;
+    for (idx, _) in html.match_indices(" UTC</td>") {
+        let Some(start) = idx.checked_sub(16) else {
+            panic!("{rendered_by} rendered a short timestamp cell; got: {html}");
+        };
+        let cell = &html[start..idx];
+        let shared_shape = cell.chars().enumerate().all(|(i, c)| match i {
+            4 | 7 => c == '-',
+            10 => c == ' ',
+            13 => c == ':',
+            _ => c.is_ascii_digit(),
+        });
+        assert!(
+            shared_shape,
+            "{rendered_by} rendered {cell:?} before \" UTC</td>\", which is not the shared \
+             \"YYYY-MM-DD HH:MM\" form"
+        );
+        found += 1;
+    }
+    assert!(
+        found >= min,
+        "{rendered_by} rendered {found} timestamp cells, expected at least {min}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- timestamps ------------------------------------------------------------
+
+    #[test]
+    fn test_format_dt_renders_the_shared_minute_form_and_the_absent_marker() {
+        assert_eq!(format_dt(Some(example_dt())), "2026-07-05 11:50 UTC");
+        assert_eq!(format_dt(None), ABSENT);
+        assert_eq!(ABSENT, "\u{2014}", "one em-dash, not a hyphen");
+    }
 
     // --- templates -------------------------------------------------------------
 

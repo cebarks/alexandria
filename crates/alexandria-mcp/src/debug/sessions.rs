@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use super::html::{error_page, page};
+use super::html::{self, error_page, page};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
@@ -21,14 +21,8 @@ fn sessions_url(limit: usize, offset: usize) -> String {
     format!("/debug/sessions?limit={limit}&offset={offset}")
 }
 
-/// Absent timestamps and absent optional strings both render as `—`, matching the fallback
-/// `memories.rs` uses for a missing `created_at`, so the two tables read the same way.
-const ABSENT: &str = "—";
-
-fn format_dt(dt: Option<chrono::DateTime<chrono::Utc>>) -> String {
-    dt.map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_else(|| ABSENT.to_string())
-}
+// The `—` placeholder and the timestamp format are shared, not local: `html::ABSENT` and
+// `html::format_dt`. This file used to own a private copy of each, which is how the pages drifted.
 
 /// One row of the sessions table, flattened out of `SessionSummary` so the template never deals
 /// with `Option`, with the timestamps, or with how the state badge is worded.
@@ -86,11 +80,14 @@ pub async fn list(
         .iter()
         .map(|s| SessionRow {
             external_id: s.external_id.clone(),
-            agent: s.agent_id.clone().unwrap_or_else(|| ABSENT.to_string()),
-            model: s.model.clone().unwrap_or_else(|| ABSENT.to_string()),
+            agent: s
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| html::ABSENT.to_string()),
+            model: s.model.clone().unwrap_or_else(|| html::ABSENT.to_string()),
             memory_count: s.memory_count,
-            started: format_dt(s.started_at),
-            last_activity: format_dt(s.ended_at),
+            started: html::format_dt(s.started_at),
+            last_activity: html::format_dt(s.ended_at),
             // Finalized is *only* ever the summary. `ended_at` is written by `touch()` on every
             // attached memory, so a live idle session has one too and would be mislabelled.
             finalized: s.summary.is_some(),
@@ -188,17 +185,17 @@ pub async fn detail(
                 .map(record_id_to_string)
                 .unwrap_or_default(),
             preview: fact.content.chars().take(120).collect(),
-            created: format_dt(fact.created_at),
+            created: html::format_dt(fact.created_at),
         })
         .collect();
 
     page(SessionDetailTemplate {
         nav: "sessions",
         external_id,
-        agent: session.agent_id.unwrap_or_else(|| ABSENT.to_string()),
-        model: session.model.unwrap_or_else(|| ABSENT.to_string()),
-        started: format_dt(session.started_at),
-        last_activity: format_dt(session.ended_at),
+        agent: session.agent_id.unwrap_or_else(|| html::ABSENT.to_string()),
+        model: session.model.unwrap_or_else(|| html::ABSENT.to_string()),
+        started: html::format_dt(session.started_at),
+        last_activity: html::format_dt(session.ended_at),
         finalized: session.summary.is_some(),
         summary: session.summary,
         tags: session.tags,
@@ -278,6 +275,9 @@ mod tests {
         // Column headers, including the deliberate "Last activity" wording.
         assert!(text.contains("Last activity"));
         assert!(text.contains("Started"));
+        // Handler-level, one page of two seeded sessions = at least two `started` cells rendered
+        // by `sessions::list` itself rather than by a test fixture.
+        super::super::html::assert_shared_timestamp_cells(&text, "GET /debug/sessions", 2);
     }
 
     #[tokio::test]
@@ -613,8 +613,8 @@ mod tests {
                 },
                 super::SessionRow {
                     external_id: "sess-idle".into(),
-                    agent: super::ABSENT.into(),
-                    model: super::ABSENT.into(),
+                    agent: super::html::ABSENT.into(),
+                    model: super::html::ABSENT.into(),
                     memory_count: 0,
                     started: "2026-09-11 09:00 UTC".into(),
                     last_activity: "2026-09-11 09:01 UTC".into(),
@@ -629,6 +629,49 @@ mod tests {
 
     /// The list template's only other coverage is through handlers that never finalise anything
     /// on both sides of one page, so the badge branch and the nav highlight would rot silently.
+    /// The shared timestamp contract on both session pages.
+    ///
+    /// `sessions.rs` already agreed with `memories.rs` on the format, but it agreed by
+    /// coincidence: two private copies of the same `strftime` string and the same `—` const. This
+    /// asserts the *rendered* cells; the handler's own bytes are covered by
+    /// `assert_shared_timestamp_cells` in `test_sessions_list_shows_external_ids_and_derived_counts`.
+    #[test]
+    fn test_sessions_pages_use_the_shared_timestamp_format_and_absent_marker() {
+        use crate::debug::html;
+
+        let mut tpl = sessions_template();
+        tpl.rows[0].started = html::format_dt(Some(html::example_dt()));
+        tpl.rows[1].last_activity = html::format_dt(None);
+        let html_list = tpl.render().unwrap();
+        assert!(
+            html_list.contains("<td>2026-07-05 11:50 UTC</td>"),
+            "the shared minute form must appear verbatim; got: {html_list}"
+        );
+        assert!(
+            html_list.contains(&format!("<td>{}</td>", html::ABSENT)),
+            "an absent last-activity must render the shared marker; got: {html_list}"
+        );
+        assert!(
+            !html_list.contains("<td></td>"),
+            "the list must not emit an empty cell; got: {html_list}"
+        );
+        html::assert_no_seconds_timestamp(&html_list, "sessions.html");
+
+        let mut detail = detail_template(None);
+        detail.started = html::format_dt(Some(html::example_dt()));
+        detail.last_activity = html::format_dt(None);
+        let html_detail = detail.render().unwrap();
+        assert!(
+            html_detail.contains("2026-07-05 11:50 UTC"),
+            "got: {html_detail}"
+        );
+        assert!(
+            html_detail.contains(html::ABSENT),
+            "the detail page must use the same marker for a session with no recorded activity; got: {html_detail}"
+        );
+        html::assert_no_seconds_timestamp(&html_detail, "session_detail.html");
+    }
+
     #[test]
     fn test_sessions_template_renders_badge_branch_and_nav_and_urlencodes_ids() {
         let html = sessions_template().render().unwrap();
@@ -664,8 +707,8 @@ mod tests {
         assert!(
             html.contains(&format!(
                 "<td>{}</td><td>{}</td>",
-                super::ABSENT,
-                super::ABSENT
+                super::html::ABSENT,
+                super::html::ABSENT
             )),
             "got: {html}"
         );
@@ -691,10 +734,10 @@ mod tests {
         SessionDetailTemplate {
             nav: "sessions",
             external_id: "pi:sess-7".into(),
-            agent: super::ABSENT.into(),
-            model: super::ABSENT.into(),
+            agent: super::html::ABSENT.into(),
+            model: super::html::ABSENT.into(),
             started: "2026-09-11 10:00 UTC".into(),
-            last_activity: super::ABSENT.into(),
+            last_activity: super::html::ABSENT.into(),
             finalized: summary.is_some(),
             summary: summary.map(String::from),
             tags: vec![],

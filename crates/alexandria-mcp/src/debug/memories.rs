@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use super::html::{error_page, page};
+use super::html::{self, error_page, page};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 use alexandria_storage::repos::{DEFAULT_FACT_LIST_LIMIT, FactListQuery, FactSort, SortDir};
@@ -277,11 +277,9 @@ pub async fn list(
                 }
             };
 
-            // Format created_at as "YYYY-MM-DD HH:MM UTC", fallback to "—"
-            let created = fact
-                .created_at
-                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-                .unwrap_or_else(|| "—".to_string());
+            // Shared timestamp rendering: `html::format_dt` is the only format the debug UI
+            // prints, and `—` the only marker it prints for "never".
+            let created = html::format_dt(fact.created_at);
 
             MemoryRow {
                 id: fact
@@ -452,10 +450,7 @@ pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<Strin
         heat: format!("{:.3}", h.heat),
         stability: format!("{:.3}", h.stability),
         access_count: h.access_count,
-        last_touched: h
-            .last_touched
-            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-            .unwrap_or_else(|| "—".to_string()),
+        last_touched: html::format_dt(h.last_touched),
     });
 
     let cluster = repo
@@ -490,10 +485,7 @@ pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<Strin
         })
         .collect();
 
-    let created_at = fact
-        .created_at
-        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_else(|| "—".to_string());
+    let created_at = html::format_dt(fact.created_at);
 
     page(MemoryDetailTemplate {
         nav: "memories",
@@ -801,6 +793,9 @@ mod tests {
             text.contains("UTC"),
             "expected formatted created_at (with UTC suffix) in list"
         );
+        // Handler-level: these bytes are what `memories::list` formatted, so this is the
+        // assertion that fails if the page ever drifts off `html::format_dt`.
+        super::super::html::assert_shared_timestamp_cells(&text, "GET /debug/memories", 1);
         // Table header should include Created
         assert!(text.contains("Created"), "expected Created column header");
     }
@@ -1030,8 +1025,8 @@ mod tests {
     // ---- column sorting: the handler's `?sort=`/`?dir=`, the encoder, the headers ----
 
     use super::{
-        FactListQuery, FactSort, MemoriesTemplate, MemoryRow, SortDir, SortLinks, dir_key,
-        encode_query_value, parse_dir, parse_sort, sort_key, sort_link,
+        FactListQuery, FactSort, MemoriesTemplate, MemoryDetailTemplate, MemoryRow, SortDir,
+        SortLinks, dir_key, encode_query_value, parse_dir, parse_sort, sort_key, sort_link,
     };
     use askama::Template;
 
@@ -1548,6 +1543,62 @@ mod tests {
             active,
             dir,
         }
+    }
+
+    /// The shared timestamp contract, asserted on this page's markup rather than on
+    /// `html::format_dt` itself: a page that grew a private formatter would still pass the unit
+    /// test, which is why `test_memories_list_shows_created_at` asserts the same shape on bytes the
+    /// handler produced. This test's job is the template: both markers, in the right cell. `/debug/memories` is both the list cell and the detail cell, because the list used to
+    /// build its string inline (`map(|dt| …).unwrap_or_else(|| "—".to_string())`) and the detail
+    /// page repeated that inline block twice (created_at, heat.last_touched).
+    #[test]
+    fn test_memories_pages_use_the_shared_timestamp_format_and_absent_marker() {
+        use crate::debug::html;
+
+        let with_time = memories_template(links("created", "desc"));
+        let with_time = {
+            let mut tpl = with_time;
+            tpl.rows[0].created = html::format_dt(Some(html::example_dt()));
+            tpl
+        }
+        .render()
+        .unwrap();
+        assert!(
+            with_time.contains("<td>2026-07-05 11:50 UTC</td>"),
+            "the shared minute form must appear verbatim in the list cell; got: {with_time}"
+        );
+        html::assert_no_seconds_timestamp(&with_time, "memories.html");
+
+        let mut absent = memories_template(links("created", "desc"));
+        absent.rows[0].created = html::format_dt(None);
+        let absent = absent.render().unwrap();
+        assert!(
+            absent.contains(&format!("<td>{}</td>", html::ABSENT)),
+            "an absent created_at must render the shared marker, not an empty cell; got: {absent}"
+        );
+        assert!(
+            !absent.contains("<td></td>"),
+            "the list must not emit an empty cell; got: {absent}"
+        );
+
+        // The detail page: same two markers, same helper.
+        let detail = MemoryDetailTemplate {
+            nav: "memories",
+            id: "fact:abc".into(),
+            deleted: false,
+            content: "a body".into(),
+            tags: vec![],
+            confidence: "0.50".into(),
+            created_at: html::format_dt(Some(html::example_dt())),
+            heat: None,
+            cluster: None,
+            edges: vec![],
+            metadata: None,
+        }
+        .render()
+        .unwrap();
+        assert!(detail.contains("2026-07-05 11:50 UTC"), "got: {detail}");
+        html::assert_no_seconds_timestamp(&detail, "memory_detail.html");
     }
 
     fn memories_template(sorts: SortLinks) -> MemoriesTemplate {

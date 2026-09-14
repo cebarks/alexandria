@@ -6,6 +6,13 @@ use axum::response::Response;
 use super::html::{error_page, page};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
+
+// No timestamps here, deliberately: neither cluster page prints a time, so neither participates
+// in the shared `html::format_dt` / `html::ABSENT` contract that the memories, sessions and
+// maintenance pages are pinned to (`test_sessions_pages_use_the_shared_timestamp_format_and_absent_marker`
+// and its siblings). The absent-value marker this page does use is `(unlabeled)` for a cluster
+// with no label — that is a *label* placeholder, not a timestamp one, and is left alone.
+
 /// One row of the cluster list, flattened out of `Cluster` so the template never has to
 /// deal with `Option<RecordId>` or with how a record id is formatted.
 struct ClusterRow {

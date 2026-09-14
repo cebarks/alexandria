@@ -2,7 +2,7 @@ use askama::Template;
 use axum::extract::{Query, State};
 use axum::response::Response;
 
-use super::html::{error_page, page};
+use super::html::{self, error_page, page};
 use crate::AlexandriaServer;
 
 #[derive(serde::Deserialize)]
@@ -60,10 +60,11 @@ pub async fn list(
             source_id: log.source_id,
             targets: log.target_ids,
             members_moved: log.members_moved,
-            timestamp: log
-                .created_at
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                .unwrap_or_default(),
+            // Deliberately via the shared `html::format_dt`, so **no seconds**: this page used to
+            // print `%H:%M:%S UTC` and an empty cell for an absent timestamp, which made it the
+            // one page in the UI that disagreed with the others. Do not restore the seconds —
+            // minute resolution is the convention, and `created_at` still orders the table.
+            timestamp: html::format_dt(log.created_at),
         })
         .collect();
 
@@ -195,5 +196,54 @@ mod tests {
             !html.contains("<p>101 entries</p>"),
             "multi-page render must not also emit the single-page fallback; got: {html}"
         );
+    }
+
+    /// The shared timestamp contract, asserted on this page's markup.
+    ///
+    /// `/debug/maintenance` was the one page that disagreed: it printed `%H:%M:%S UTC` and left
+    /// the cell **empty** when `created_at` was NULL. Both halves are pinned here — a revert to
+    /// the seconds form trips `assert_no_seconds_timestamp`, a revert to `unwrap_or_default()`
+    /// trips the `<td></td>` assertion.
+    #[test]
+    fn test_maintenance_template_uses_the_shared_timestamp_format_and_absent_marker() {
+        use super::MaintenanceRow;
+        use crate::debug::html;
+
+        let html = MaintenanceTemplate {
+            nav: "maintenance",
+            logs: vec![
+                MaintenanceRow {
+                    action: "merge".into(),
+                    source_id: "c1".into(),
+                    targets: vec!["c2".into()],
+                    members_moved: 3,
+                    timestamp: html::format_dt(Some(html::example_dt())),
+                },
+                MaintenanceRow {
+                    action: "split".into(),
+                    source_id: "c3".into(),
+                    targets: vec![],
+                    members_moved: 0,
+                    timestamp: html::format_dt(None),
+                },
+            ],
+            prev_href: String::new(),
+            next_href: String::new(),
+            summary: String::new(),
+            total_pages: 1,
+            total: 2,
+        }
+        .render()
+        .unwrap();
+
+        assert!(
+            html.contains("<td>2026-07-05 11:50 UTC</td>"),
+            "the shared minute form must appear verbatim; got: {html}"
+        );
+        assert!(
+            html.contains(&format!("<td>{}</td>", html::ABSENT)),
+            "an absent time must render the shared marker; got: {html}"
+        );
+        html::assert_no_seconds_timestamp(&html, "maintenance.html");
     }
 }
