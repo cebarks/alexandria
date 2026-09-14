@@ -6,7 +6,7 @@ use serde::Deserialize;
 ///
 /// Load order:
 /// 1. Compiled defaults
-/// 2. Config file (see `config_path()` for resolution)
+/// 2. Config file (see `config_path_from()` for resolution)
 /// 3. Individual env var overrides
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -89,9 +89,9 @@ pub struct ActivationConfig {
 #[serde(default)]
 pub struct RetrieveConfig {
     /// Server-side hard floor on cosine similarity for `retrieve_memories`
-    /// results. A conservative defense-in-depth cutoff that drops pure noise
-    /// even if a client is misconfigured; it is intentionally well below the
-    /// auto-recall client threshold. Default 0.30.
+    /// results. A noise cutoff only: with all-MiniLM-L6-v2 a natural-language
+    /// question against a stored statement scores ~0.2 and unrelated text
+    /// ~0.0, so this must stay low. Default 0.10.
     pub min_similarity: f32,
 }
 
@@ -173,7 +173,7 @@ impl Default for ActivationConfig {
 impl Default for RetrieveConfig {
     fn default() -> Self {
         Self {
-            min_similarity: 0.30,
+            min_similarity: 0.10,
         }
     }
 }
@@ -203,9 +203,9 @@ impl Default for RemindersConfig {
 /// 2. `$XDG_CONFIG_HOME/alexandria/config.toml` via `dirs::config_dir()`
 /// 3. `~/.alexandria/config.toml` (legacy fallback)
 /// 4. XDG path (for new installs, even if it doesn't exist yet)
-fn config_path() -> PathBuf {
+fn config_path_from(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
     // Explicit env override wins
-    if let Ok(p) = std::env::var("ALEXANDRIA_CONFIG") {
+    if let Some(p) = env("ALEXANDRIA_CONFIG") {
         return PathBuf::from(p);
     }
 
@@ -242,11 +242,15 @@ impl Config {
     ///
     /// Config file resolution: `ALEXANDRIA_CONFIG` env → XDG config dir → legacy `~/.alexandria/`
     pub fn load() -> anyhow::Result<Self> {
+        Self::load_from(&|k| std::env::var(k).ok())
+    }
+
+    fn load_from(env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         // 1. Start with defaults
         let mut config = Config::default();
 
         // 2. Load config file
-        let config_path = config_path();
+        let config_path = config_path_from(env);
 
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
@@ -255,30 +259,30 @@ impl Config {
         }
 
         // 3. Individual env var overrides
-        if let Ok(transport) = std::env::var("ALEXANDRIA_SERVER_TRANSPORT") {
+        if let Some(transport) = env("ALEXANDRIA_SERVER_TRANSPORT") {
             config.server.transport = transport;
         }
-        if let Ok(host) = std::env::var("ALEXANDRIA_SERVER_HOST") {
+        if let Some(host) = env("ALEXANDRIA_SERVER_HOST") {
             config.server.host = host;
         }
-        if let Ok(port) = std::env::var("ALEXANDRIA_SERVER_PORT") {
+        if let Some(port) = env("ALEXANDRIA_SERVER_PORT") {
             config.server.port = port
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid ALEXANDRIA_SERVER_PORT `{port}`: {e}"))?;
         }
-        if let Ok(dir) = std::env::var("ALEXANDRIA_DATA_DIR") {
+        if let Some(dir) = env("ALEXANDRIA_DATA_DIR") {
             config.database.data_dir = PathBuf::from(dir);
         }
-        if let Ok(model) = std::env::var("ALEXANDRIA_EMBEDDING_MODEL") {
+        if let Some(model) = env("ALEXANDRIA_EMBEDDING_MODEL") {
             config.embedding.model = model;
         }
-        if let Ok(device) = std::env::var("ALEXANDRIA_EMBEDDING_DEVICE") {
+        if let Some(device) = env("ALEXANDRIA_EMBEDDING_DEVICE") {
             config.embedding.device = device;
         }
-        if let Ok(tz) = std::env::var("ALEXANDRIA_REMINDERS_TIMEZONE") {
+        if let Some(tz) = env("ALEXANDRIA_REMINDERS_TIMEZONE") {
             config.reminders.timezone = tz;
         }
-        if let Ok(h) = std::env::var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS") {
+        if let Some(h) = env("ALEXANDRIA_REMINDERS_ESCALATION_HOURS") {
             config.reminders.escalation_hours = h.parse().map_err(|e| {
                 anyhow::anyhow!("invalid ALEXANDRIA_REMINDERS_ESCALATION_HOURS `{h}`: {e}")
             })?;
@@ -297,7 +301,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+
+    fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
 
     #[test]
     fn test_defaults() {
@@ -310,7 +321,7 @@ mod tests {
         assert_eq!(config.cluster.join_threshold, 0.75);
         assert_eq!(config.activation.propagation_factor, 0.3);
         assert_eq!(config.activation.max_hops, 2);
-        assert_eq!(config.retrieve.min_similarity, 0.30);
+        assert_eq!(config.retrieve.min_similarity, 0.10);
         assert!(config.database.data_dir.ends_with("data"));
     }
 
@@ -363,32 +374,28 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_config_path_env_override() {
-        std::env::set_var("ALEXANDRIA_CONFIG", "/tmp/custom/config.toml");
-        let path = config_path();
+        let env = env(&[("ALEXANDRIA_CONFIG", "/tmp/custom/config.toml")]);
+        let path = config_path_from(&env);
         assert_eq!(path, PathBuf::from("/tmp/custom/config.toml"));
-        std::env::remove_var("ALEXANDRIA_CONFIG");
     }
 
     #[test]
-    #[serial]
     fn test_config_path_prefers_xdg_when_no_files_exist() {
-        std::env::remove_var("ALEXANDRIA_CONFIG");
-        // When neither XDG nor legacy config files exist, config_path()
+        // When neither XDG nor legacy config files exist, config_path_from()
         // should return the XDG path (not legacy). We can't guarantee
         // neither file exists on this machine, so we verify the structural
         // property: the returned path is under dirs::config_dir(), not
         // under ~/.alexandria/.
         let xdg_config_dir = dirs::config_dir().unwrap();
         let legacy_dir = dirs::home_dir().unwrap().join(".alexandria");
-        let path = config_path();
+        let path = config_path_from(&env(&[]));
         assert!(path.ends_with("config.toml"));
         // Must be under one of: XDG config dir OR legacy dir
         // (depends on what files exist on this machine)
         assert!(
             path.starts_with(&xdg_config_dir) || path.starts_with(&legacy_dir),
-            "config_path() returned {}, expected it under {} or {}",
+            "config_path_from() returned {}, expected it under {} or {}",
             path.display(),
             xdg_config_dir.display(),
             legacy_dir.display(),
@@ -420,7 +427,7 @@ mod tests {
         assert_eq!(config.cluster.maintenance_interval_secs, 600);
         assert_eq!(config.activation.top_n, 5);
         // retrieve uses default since not specified
-        assert_eq!(config.retrieve.min_similarity, 0.30);
+        assert_eq!(config.retrieve.min_similarity, 0.10);
 
         let toml_retrieve = r#"
             [retrieve]
@@ -431,51 +438,45 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_env_overrides() {
-        // Set env vars
-        std::env::set_var("ALEXANDRIA_DATA_DIR", "/tmp/env-test");
-        std::env::set_var("ALEXANDRIA_EMBEDDING_MODEL", "env-model");
+        let env = env(&[
+            ("ALEXANDRIA_DATA_DIR", "/tmp/env-test"),
+            ("ALEXANDRIA_EMBEDDING_MODEL", "env-model"),
+            ("ALEXANDRIA_EMBEDDING_DEVICE", "env-device"),
+        ]);
 
-        let config = Config::load().unwrap();
+        let config = Config::load_from(&env).unwrap();
         assert_eq!(config.database.data_dir, PathBuf::from("/tmp/env-test"));
         assert_eq!(config.embedding.model, "env-model");
-
-        // Clean up
-        std::env::remove_var("ALEXANDRIA_DATA_DIR");
-        std::env::remove_var("ALEXANDRIA_EMBEDDING_MODEL");
+        assert_eq!(config.embedding.device, "env-device");
     }
 
     #[test]
-    #[serial]
     fn test_server_env_overrides() {
-        std::env::set_var("ALEXANDRIA_SERVER_TRANSPORT", "http");
-        std::env::set_var("ALEXANDRIA_SERVER_HOST", "0.0.0.0");
-        std::env::set_var("ALEXANDRIA_SERVER_PORT", "8080");
+        let env = env(&[
+            ("ALEXANDRIA_SERVER_TRANSPORT", "http"),
+            ("ALEXANDRIA_SERVER_HOST", "0.0.0.0"),
+            ("ALEXANDRIA_SERVER_PORT", "8080"),
+        ]);
 
-        let config = Config::load().unwrap();
+        let config = Config::load_from(&env).unwrap();
         assert_eq!(config.server.transport, "http");
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
-
-        std::env::remove_var("ALEXANDRIA_SERVER_TRANSPORT");
-        std::env::remove_var("ALEXANDRIA_SERVER_HOST");
-        std::env::remove_var("ALEXANDRIA_SERVER_PORT");
     }
 
     #[test]
-    #[serial]
     fn test_server_env_invalid_port() {
-        std::env::set_var("ALEXANDRIA_SERVER_PORT", "not-a-port");
+        let env = env(&[("ALEXANDRIA_SERVER_PORT", "not-a-port")]);
 
-        let result = Config::load();
+        let result = Config::load_from(&env);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("ALEXANDRIA_SERVER_PORT"));
-
-        std::env::remove_var("ALEXANDRIA_SERVER_PORT");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("ALEXANDRIA_SERVER_PORT")
+        );
     }
 
     #[test]
@@ -498,24 +499,21 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_reminders_env_overrides() {
-        std::env::set_var("ALEXANDRIA_REMINDERS_TIMEZONE", "America/New_York");
-        std::env::set_var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS", "12");
+        let env = env(&[
+            ("ALEXANDRIA_REMINDERS_TIMEZONE", "America/New_York"),
+            ("ALEXANDRIA_REMINDERS_ESCALATION_HOURS", "12"),
+        ]);
 
-        let config = Config::load().unwrap();
+        let config = Config::load_from(&env).unwrap();
         assert_eq!(config.reminders.timezone, "America/New_York");
         assert_eq!(config.reminders.escalation_hours, 12);
-
-        std::env::remove_var("ALEXANDRIA_REMINDERS_TIMEZONE");
-        std::env::remove_var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS");
     }
 
     #[test]
-    #[serial]
     fn test_reminders_env_invalid_hours() {
-        std::env::set_var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS", "soon");
-        let result = Config::load();
+        let env = env(&[("ALEXANDRIA_REMINDERS_ESCALATION_HOURS", "soon")]);
+        let result = Config::load_from(&env);
         // Name the variable that failed, not just "load errored": an unqualified
         // `is_err()` here would also pass on an unrelated config-file failure.
         let err = result.expect_err("a non-numeric escalation window must not load");
@@ -524,6 +522,5 @@ mod tests {
                 .contains("ALEXANDRIA_REMINDERS_ESCALATION_HOURS"),
             "the error must name the offending variable: {err:#}"
         );
-        std::env::remove_var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS");
     }
 }

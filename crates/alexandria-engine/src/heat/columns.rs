@@ -1,5 +1,5 @@
-use super::decay::projected_heat;
 use super::decay::HeatState;
+use super::decay::projected_heat;
 
 /// Struct-of-arrays layout for cache-friendly / SIMD-friendly bulk heat computation.
 pub struct HeatColumns {

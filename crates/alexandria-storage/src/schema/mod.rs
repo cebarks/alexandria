@@ -1,7 +1,7 @@
 use anyhow::Result;
+use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::SurrealValue;
-use surrealdb::Surreal;
 
 /// All migrations in version order. Each is (version, name, SQL).
 const MIGRATIONS: &[(u32, &str, &str)] = &[
@@ -14,8 +14,16 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         include_str!("v004_maintenance_log.surql"),
     ),
     (5, "session", include_str!("v005_session.surql")),
-    (6, "reminder", include_str!("v006_reminder.surql")),
+    (
+        6,
+        "drop_session_memory_count",
+        include_str!("v006_drop_session_memory_count.surql"),
+    ),
+    (7, "reminder", include_str!("v007_reminder.surql")),
 ];
+
+/// Version a fully migrated database reports in `system_config.schema_version`.
+pub const LATEST_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
 /// Run all pending migrations. Safe to call on every startup.
 ///
@@ -83,4 +91,48 @@ async fn set_version(db: &Surreal<Any>, version: u32) -> Result<()> {
 #[derive(Debug, serde::Deserialize, surrealdb::types::SurrealValue)]
 struct SystemConfigRow {
     value: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Session;
+
+    /// Rows written before v006 carry a memory_count value; the migration must
+    /// clear it and the field-less Session struct must still read them back.
+    #[tokio::test]
+    async fn v006_clears_legacy_memory_count() {
+        let db = crate::connection::Database::connect_embedded()
+            .await
+            .unwrap();
+        let db = db.inner();
+
+        for (_, _, sql) in MIGRATIONS.iter().filter(|(v, _, _)| *v <= 5) {
+            db.query(*sql).await.unwrap().check().unwrap();
+        }
+        set_version(db, 5).await.unwrap();
+        db.query("CREATE `session` SET external_id = 'legacy', memory_count = 3, tags = []")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        migrate(db).await.unwrap();
+
+        let rows: Vec<Session> = db
+            .query("SELECT * FROM `session`")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].external_id, "legacy");
+        let leftover: Option<serde_json::Value> = db
+            .query("SELECT VALUE memory_count FROM ONLY `session` WHERE external_id = 'legacy' LIMIT 1")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert!(leftover.is_none() || leftover == Some(serde_json::Value::Null));
+    }
 }

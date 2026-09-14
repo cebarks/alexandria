@@ -7,7 +7,7 @@ Alexandria loads server config with this precedence:
    - `ALEXANDRIA_CONFIG` env var (explicit path override)
    - `$XDG_CONFIG_HOME/alexandria/config.toml` (default: `~/.config/alexandria/config.toml` on Linux, `~/Library/Application Support/alexandria/config.toml` on macOS)
    - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
-3. **Individual env vars** — `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
+3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
 
 ## Full Example
 
@@ -24,7 +24,7 @@ sse_keep_alive_secs = 15      # SSE keep-alive interval in seconds (default: 15)
 # data_dir = "/home/you/.local/share/alexandria/data"  # Storage path; ":memory:" for ephemeral (default: $XDG_DATA_HOME/alexandria/data)
 
 [embedding]
-model = "sentence-transformers/all-MiniLM-L6-v2"   # HuggingFace model ID (no default — required)
+model = "sentence-transformers/all-MiniLM-L6-v2"   # HuggingFace model ID (default shown; omit to use it)
 device = "cpu"                                       # "cpu" only for now (default: "cpu")
 
 [heat]
@@ -42,7 +42,7 @@ cohesion_floor = 0.6               # Avg member-to-centroid similarity below whi
 maintenance_interval_secs = 300    # Cluster maintenance check interval in seconds (default: 300)
 
 [retrieve]
-min_similarity = 0.30              # Server-side hard floor on cosine similarity for retrieve_memories (default: 0.30)
+min_similarity = 0.10              # Server-side hard floor on cosine similarity for retrieve_memories (default: 0.10)
 
 [reminders]
 timezone = "Europe/Stockholm"      # IANA name for naive datetimes + pattern/cron evaluation; "" = system-local (default: "")
@@ -74,10 +74,12 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `model` | string | `"sentence-transformers/all-MiniLM-L6-v2"` | HuggingFace model ID. Must be a BERT-family model compatible with candle. |
+| `model` | string | `"sentence-transformers/all-MiniLM-L6-v2"` | HuggingFace model ID. Must be a BERT-family model compatible with candle. Pooling mode (CLS or mean) is read from the model repo's `1_Pooling/config.json`; models without it use mean pooling. |
 | `device` | string | `"cpu"` | Compute device. Only `"cpu"` is currently supported. |
 
-**Model locking:** On first boot, the model name and dimension count are stored in the database. Changing the model in config without wiping the database will cause a startup error with instructions to either revert the model or run a migration.
+**Switching models on an existing database:** stop the server, set the new `model`, run `alexandria migrate-embeddings` (re-embeds every memory and cluster centroid, then updates the lock), and start the server again. Thresholds (`[cluster]` and `[retrieve] min_similarity`) are tuned to the default model; retune them if you switch. The migration is not transactional: if it fails partway, rerun it. Do not revert `model` in config afterwards, the database may hold a mix of old and new vectors.
+
+**Model locking:** On first boot, the model name and dimension count are stored in the database. Changing the model in config without wiping the database will cause a startup error with instructions to either revert the model or run `alexandria migrate-embeddings`.
 
 **First run:** The model weights (~80MB for all-MiniLM-L6-v2) are downloaded from HuggingFace Hub and cached in `~/.cache/huggingface/`.
 
@@ -114,7 +116,7 @@ Controls server-side filtering of `retrieve_memories` results.
 
 | Key | Type | Default | Description |
 | ----- | ------ | --------- | ------------- |
-| `min_similarity` | f32 | `0.30` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A conservative defense-in-depth cutoff that removes pure noise even if a client sets a lax threshold. Note this is model-dependent: for `all-MiniLM-L6-v2`, genuine matches score ~0.6+, weak-but-plausible matches ~0.3–0.5, and unrelated text stays below ~0.15. Keep this well below the auto-recall client threshold so deliberate agent lookups still surface marginal results. |
+| `min_similarity` | f32 | `0.10` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A noise cutoff only. Model-dependent: for `all-MiniLM-L6-v2` (measured 2026-09-08), a keyword or near-paraphrase hit scores 0.55–0.76, a natural-language question against its matching statement 0.40–0.65, and a question sharing no vocabulary with the statement as low as ~0.2. Unrelated memories score 0.07–0.40. The floor stays below the vocabulary-free cases; client thresholds do the real filtering. |
 
 ### `[reminders]`
 
@@ -132,20 +134,29 @@ These env vars override individual config values after the TOML file is loaded:
 | Variable | Overrides |
 | --- | --- |
 | `ALEXANDRIA_CONFIG` | Path to an alternate config TOML file |
+| `ALEXANDRIA_SERVER_TRANSPORT` | `server.transport` (`"stdio"` or `"http"`) |
+| `ALEXANDRIA_SERVER_HOST` | `server.host` |
+| `ALEXANDRIA_SERVER_PORT` | `server.port` — a non-numeric value fails startup with an error naming the variable |
 | `ALEXANDRIA_DATA_DIR` | `database.data_dir` |
 | `ALEXANDRIA_EMBEDDING_MODEL` | `embedding.model` |
 | `ALEXANDRIA_EMBEDDING_DEVICE` | `embedding.device` |
 | `ALEXANDRIA_REMINDERS_TIMEZONE` | `reminders.timezone` |
-| `ALEXANDRIA_REMINDERS_ESCALATION_HOURS` | `reminders.escalation_hours` |
+| `ALEXANDRIA_REMINDERS_ESCALATION_HOURS` | `reminders.escalation_hours` — a non-numeric value fails startup with an error naming the variable |
 
-Other config keys can only be set via the TOML file.
+The `ALEXANDRIA_SERVER_*` variables exist so a container can be configured entirely by environment
+(the bundled [Dockerfile](../Dockerfile) uses them to default to HTTP on `0.0.0.0:3000`) without
+shipping a config file.
+
+Everything else — `[heat]`, `[activation]`, `[cluster]`, `[retrieve]`, CORS, and SSE keep-alive —
+can only be set via the TOML file.
 
 ---
 
 ## Client Configuration
 
 The Pi companion extension (recall / store / reminders) loads its own config from
-`$XDG_CONFIG_HOME/alexandria/client.toml`.
+`$XDG_CONFIG_HOME/alexandria/client.toml`. It is a separate file with separate keys — the server
+never reads it and the extension never reads `config.toml`.
 
 Precedence: defaults → `client.toml` → `ALEXANDRIA_CLIENT_CONFIG` env var (path to alt TOML) → individual `ALEXANDRIA_*` env vars.
 
@@ -182,7 +193,7 @@ project = "alexandria"
 | ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_AUTO_RECALL=off` | Enable auto-recall on every prompt. |
 | `limit` | number | `5` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. |
-| `min_similarity` | number | `0.58` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. Model-dependent: for `all-MiniLM-L6-v2`, genuine matches score ~0.6+ while loosely-topical noise clears ~0.5, so `0.58` blocks near-noise while keeping real hits. Sits above the server-side `[retrieve] min_similarity` floor. |
+| `min_similarity` | number | `0.58` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. **Recommended: `0.35`.** The `0.58` Pi default predates measurement and assumed genuine matches score 0.6+; on `all-MiniLM-L6-v2` (measured 2026-09-08, synthetic pairs) question-vs-matching-statement scores 0.40–0.65 and unrelated memories 0.07–0.40, so `0.58` drops most real hits. `0.35` keeps them and admits only topically adjacent memories. The Claude Code hook (`contrib/claude`) already defaults to `0.35`; the Pi default is left at `0.58` pending a change to the extension. |
 
 ### `[store]`
 

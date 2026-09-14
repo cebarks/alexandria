@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use anyhow::Result;
-use surrealdb::engine::any::Any;
 use surrealdb::Surreal;
+use surrealdb::engine::any::Any;
 
 pub struct Database {
     db: Surreal<Any>,

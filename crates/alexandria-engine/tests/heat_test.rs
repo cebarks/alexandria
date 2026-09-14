@@ -1,4 +1,4 @@
-use alexandria_engine::heat::{on_access, projected_heat, HeatColumns, HeatState};
+use alexandria_engine::heat::{HeatColumns, HeatState, on_access, projected_heat};
 
 #[test]
 fn test_new_memory_decays_fast() {

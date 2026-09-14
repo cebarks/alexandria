@@ -3,8 +3,8 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 
 use super::html::{esc, layout};
-use crate::server::record_id_to_string;
 use crate::AlexandriaServer;
+use crate::server::record_id_to_string;
 
 /// Default cohesion floor used only for the debug UI's health display.
 /// `AlexandriaServer` doesn't carry the configured value, so this mirrors
@@ -19,7 +19,7 @@ pub async fn list(State(server): State<AlexandriaServer>) -> Html<String> {
             return Html(layout(
                 "Clusters",
                 &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
-            ))
+            ));
         }
     };
 
@@ -66,7 +66,7 @@ pub async fn detail(
                     "Error",
                     &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
                 )),
-            )
+            );
         }
     };
 

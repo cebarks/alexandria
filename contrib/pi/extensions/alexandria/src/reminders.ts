@@ -33,7 +33,7 @@ export interface DueReminder {
 	missed_occurrences?: number;
 	/** RFC 3339, Z-suffixed. */
 	due_at?: string;
-	/** Human-readable schedule, e.g. "every day at 09:00". */
+	/** Human-readable schedule, e.g. "daily at 09:00". */
 	schedule?: string;
 	note?: string | null;
 	provenance?: { project?: string | null; session_id?: string | null };

@@ -1,0 +1,105 @@
+# yamllint disable rule:line-length
+# Pinned actions carry a 40-char SHA plus Dependabot's `# vN` annotation; that
+# line cannot wrap and shortening it would weaken the pin.
+---
+name: Container
+
+# A separate workflow, not a fifth job in ci.yml: `paths:` filters apply to the
+# whole workflow, so putting them in ci.yml would skip fmt/clippy/test on every
+# docs-only push. It also leaves ci.yml's pins untouched, so an in-flight
+# Dependabot bump cannot collide with this file.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - .github/workflows/container.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - .github/workflows/container.yml
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: alexandria:ci
+
+jobs:
+  build:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # ubuntu-latest ships Docker 28 + buildx 0.36 preinstalled, so this needs no
+      # third-party action. The image compiles the workspace in release mode, so
+      # this step dominates the job's runtime.
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      # Building proves almost nothing on its own. The entrypoint still has to
+      # resolve config defaults with no config.toml mounted, open SurrealKV in the
+      # volume, download and load the ~80MB Candle model, and bind 0.0.0.0:3000.
+      # Mirrors the documented `docker run -v alexandria-data:/data` invocation on
+      # purpose: a named volume, not a bind mount, because the image's chown of
+      # /data only carries into a fresh named volume.
+      - name: Boot smoke test
+        run: |
+          docker run -d --name smoke -p 3000:3000 -v alexandria-ci-data:/data "$IMAGE"
+          for i in $(seq 1 150); do
+            if ! docker ps -q --filter name=smoke | grep -q .; then
+              echo "::error::container exited before becoming healthy"
+              docker logs smoke
+              exit 1
+            fi
+            if curl -sf http://127.0.0.1:3000/debug | grep -q "Alexandria Debug"; then
+              echo "healthy after $((i * 2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::/debug never returned the dashboard within 300s"
+          docker logs smoke
+          exit 1
+
+      # The actual product surface: an MCP initialize handshake, over the same
+      # Streamable HTTP transport clients use. The response is SSE-framed, so the
+      # assertion is on the payload substring rather than on parsing JSON.
+      - name: MCP initialize handshake
+        run: |
+          response=$(curl -sf -X POST http://127.0.0.1:3000/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"container-smoke","version":"0"}}}')
+          echo "$response" | grep -q '"serverInfo"' || {
+            echo "::error::initialize returned no serverInfo"
+            echo "$response"
+            exit 1
+          }
+          echo "$response" | grep -q '"instructions"' || {
+            echo "::error::server no longer advertises usage instructions"
+            exit 1
+          }
+          echo "MCP handshake OK"
+
+      - name: Show container logs
+        if: always()
+        run: docker logs smoke 2>&1 | tail -40 || true
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm -f smoke >/dev/null 2>&1 || true
+          docker volume rm alexandria-ci-data >/dev/null 2>&1 || true

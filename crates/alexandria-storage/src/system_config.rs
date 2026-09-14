@@ -1,7 +1,7 @@
 use anyhow::Result;
+use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::SurrealValue;
-use surrealdb::Surreal;
 
 #[derive(Debug, serde::Deserialize, SurrealValue)]
 struct ConfigRow {
@@ -64,9 +64,9 @@ pub async fn check_embedding_model(
                      Mixing models produces garbage search results.\n\
                      \n\
                      Options:\n\
-                     1. Change your config back to: {stored_m}\n\
-                     2. Delete the database and start fresh\n\
-                     3. (Future) Run `alexandria migrate-embeddings` to re-embed everything"
+                     1. Change your config back to: {stored_m} (only if no migration has been attempted)\n\
+                     2. Run `alexandria migrate-embeddings` with the server stopped to re-embed everything with {model}\n\
+                     3. Delete the database and start fresh"
                 );
             }
             let stored_dim: usize = stored_d.parse().unwrap_or(0);

@@ -46,3 +46,17 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
     dot / (norm_a * norm_b)
 }
+
+#[tokio::test]
+async fn test_candle_cls_pooled_model_loads_and_normalises() {
+    // BAAI/bge-small-en-v1.5 ships 1_Pooling/config.json with pooling_mode_cls_token = true.
+    let provider = CandleProvider::new("BAAI/bge-small-en-v1.5", "cpu")
+        .await
+        .unwrap();
+    assert_eq!(provider.dimensions(), 384);
+
+    let vectors = provider.embed(&["hello world"]).await.unwrap();
+    assert_eq!(vectors[0].len(), 384);
+    let norm: f32 = vectors[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
+}

@@ -1,11 +1,15 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- Build stage ----
-# Workspace MSRV is 1.88, but locked deps (fastnum 0.7.5) require rustc 1.94.
-FROM rust:1.94-alpine3.22 AS builder
+# Workspace rust-version is 1.98 (edition 2024 + dep requirements); keep this base
+# at or above it or cargo refuses the build. No rust-toolchain.toml in-tree — the
+# Dockerfile pins the compiler, dev machines choose their own.
+FROM rust:1.98.1-alpine3.22 AS builder
 
-# g++/make for C++ build scripts (tokenizers' esaxx), openssl-dev for openssl-sys.
-RUN apk add --no-cache musl-dev g++ make pkgconfig openssl-dev
+# g++/make for C++ build scripts (tokenizers' esaxx, aws-lc-sys' C sources).
+# No openssl-dev: as of the hf-hub 1.0 bump the network stack is rustls +
+# aws-lc-sys; openssl-sys is gone from the lockfile (verified via cargo tree).
+RUN apk add --no-cache musl-dev g++ make
 
 # Link musl dynamically: proc-macro and cc-based crates misbehave with the
 # musl target's default crt-static, and the alpine runtime image provides musl.
@@ -25,9 +29,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ---- Runtime stage ----
 FROM alpine:3.22
 
-# libstdc++/libgcc for the statically-built C++ objects' runtime, libssl for
-# openssl-sys, ca-certificates for the Hugging Face model download.
-RUN apk add --no-cache libssl3 libcrypto3 libstdc++ libgcc ca-certificates \
+# libstdc++/libgcc for the statically-built C++ objects' runtime, ca-certificates
+# for the Hugging Face model download (trust store read by rustls-native-certs).
+# libssl3/libcrypto3 dropped: nothing links OpenSSL anymore.
+RUN apk add --no-cache libstdc++ libgcc ca-certificates \
     && adduser -S -u 10001 -h /home/alexandria alexandria
 
 COPY --from=builder /usr/local/bin/alexandria /usr/local/bin/alexandria

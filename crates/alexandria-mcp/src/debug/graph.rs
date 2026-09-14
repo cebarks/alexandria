@@ -4,8 +4,8 @@ use axum::extract::{Path, State};
 use axum::response::{Html, Json};
 
 use super::html::{esc, layout};
-use crate::server::record_id_to_string;
 use crate::AlexandriaServer;
+use crate::server::record_id_to_string;
 
 /// JSON node/edge data backing the graph page, shaped for vis-network's DataSet format.
 pub async fn api_graph(

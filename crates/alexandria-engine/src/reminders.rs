@@ -228,10 +228,12 @@ fn compiled_schedule(spec: &ScheduleSpec) -> Result<Schedule> {
 /// (wall-clock semantics); the cron crate + chrono-tz handle DST. `cron`
 /// iterates local date/time fields and skips local times that don't exist, so
 /// a daily 09:00 stays 09:00 local across a transition (verified by
-/// `daily_series_across_dst_spring_forward`) — no manual chrono-tz fallback
-/// needed. On a fall-back day a local time inside the repeated hour is yielded
-/// twice by `cron` (both offsets); coalescing in `occurrences_between` absorbs
-/// the duplicate rather than dropping a fire.
+/// `daily_series_across_dst_spring_forward` and
+/// `daily_series_across_dst_fall_back`) — no manual chrono-tz fallback needed.
+/// On a fall-back day a local time inside the repeated hour is yielded twice by
+/// `cron` (both offsets), and `occurrences_between` counts both, so coalescing
+/// absorbs the duplicate rather than dropping a fire (verified by
+/// `dst_fall_back_repeated_hour_yields_both_instants_and_coalesces`).
 pub fn next_fire(
     spec: &ScheduleSpec,
     after: DateTime<Utc>,
@@ -788,6 +790,59 @@ mod tests {
         assert_eq!(ups[1], utc(2026, 3, 7, 14, 0));
         assert_eq!(ups[2], utc(2026, 3, 8, 13, 0));
         assert_eq!(ups[3], utc(2026, 3, 9, 13, 0));
+    }
+
+    #[test]
+    fn daily_series_across_dst_fall_back() {
+        use chrono::Datelike;
+        // America/New_York falls back 2026-11-01 02:00 EDT -> 01:00 EST.
+        // A daily 09:00 sits outside the repeated hour, so it must keep firing
+        // exactly once per day across the fold — the mirror of the spring-forward
+        // series test, and the reason that test's shape is worth duplicating here.
+        let spec = ScheduleSpec::Pattern {
+            freq: Freq::Daily,
+            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            weekdays: vec![],
+            day_of_month: 1,
+        };
+        let ups = upcoming(&spec, utc(2026, 10, 30, 12, 0), nyc(), 4).unwrap();
+        assert_eq!(ups.len(), 4);
+        assert!(ups.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(ups.iter().map(|d| d.date_naive().day()).collect::<Vec<_>>(), vec![30, 31, 1, 2], "one fire per local day, no duplicate on the fold day");
+        // Oct 30, 31 = EDT (UTC-4) -> 13:00 UTC; Nov 1, 2 = EST (UTC-5) -> 14:00 UTC.
+        assert_eq!(ups[0], utc(2026, 10, 30, 13, 0));
+        assert_eq!(ups[1], utc(2026, 10, 31, 13, 0));
+        assert_eq!(ups[2], utc(2026, 11, 1, 14, 0));
+        assert_eq!(ups[3], utc(2026, 11, 2, 14, 0));
+    }
+
+    #[test]
+    fn dst_fall_back_repeated_hour_yields_both_instants_and_coalesces() {
+        // A wall-clock time inside the fold (01:30 exists twice on 2026-11-01)
+        // is yielded twice by `cron` — once per offset — rather than dropped or
+        // collapsed. That is what makes the doc comment on `next_fire` true, and
+        // what `occurrences_between` then absorbs into one missed-occurrence
+        // count instead of two separate deliveries.
+        let spec = ScheduleSpec::Pattern {
+            freq: Freq::Daily,
+            time: NaiveTime::from_hms_opt(1, 30, 0).unwrap(),
+            weekdays: vec![],
+            day_of_month: 1,
+        };
+        let ups = upcoming(&spec, utc(2026, 10, 31, 12, 0), nyc(), 3).unwrap();
+        assert_eq!(ups.len(), 3);
+        assert!(ups.windows(2).all(|w| w[0] < w[1]), "strictly increasing: {ups:?}");
+        // Nov 1 01:30 EDT = 05:30 UTC and Nov 1 01:30 EST = 06:30 UTC — the fold.
+        assert_eq!(ups[0], utc(2026, 11, 1, 5, 30));
+        assert_eq!(ups[1], utc(2026, 11, 1, 6, 30));
+        assert_eq!(ups[2], utc(2026, 11, 2, 6, 30));
+        // A daily schedule whose next fire was already consumed before the fold
+        // counts both fold instants when it comes back overdue, so the
+        // coalesced delivery reports the real number of elapsed occurrences.
+        assert_eq!(
+            occurrences_between(&spec, utc(2026, 10, 31, 12, 0), utc(2026, 11, 1, 23, 59), nyc()).unwrap(),
+            2
+        );
     }
 
     #[test]

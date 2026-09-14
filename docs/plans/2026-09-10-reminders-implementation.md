@@ -13,6 +13,7 @@
 **Worktree:** `~/code/.worktrees/alexandria/feature/reminders` (branch `feature/reminders`).
 
 **Conventions (from AGENTS.md/CLAUDE.md — read before starting):**
+
 - SurrealDB 3.2 gotchas: never `SELECT value`; `DELETE reminder WHERE ...` (no FROM); bind pre-parsed `RecordId`s (never inline `type::record()` in RELATE); result structs need `#[derive(SurrealValue)]`; format ids with `record_id_to_string()`.
 - Run `just check` / `just test` / `just lint` (clippy with `-Dwarnings`) before each commit; `just ci` at the end.
 - Tool descriptions in `server.rs` are directive-style ("call this when...") — keep new ones consistent.
@@ -23,6 +24,7 @@
 ### Task 1: Workspace dependencies
 
 **Files:**
+
 - Modify: `Cargo.toml` (workspace root)
 - Modify: `crates/alexandria-engine/Cargo.toml`
 - Modify: `crates/alexandria-mcp/Cargo.toml`
@@ -37,6 +39,7 @@ iana-time-zone = "0.1"
 ```
 
 **Step 2: Wire into crates.**
+
 - `crates/alexandria-engine/Cargo.toml` `[dependencies]`: add `chrono-tz = { workspace = true }` and `cron = { workspace = true }`
 - `crates/alexandria-mcp/Cargo.toml` `[dependencies]`: add `chrono-tz = { workspace = true }`
 - `crates/alexandria/Cargo.toml` `[dependencies]`: add `chrono-tz = { workspace = true }` and `iana-time-zone = { workspace = true }`
@@ -60,6 +63,7 @@ git commit -m "chore(deps): add cron, chrono-tz, iana-time-zone for reminders"
 Pure logic, no DB. TDD.
 
 **Files:**
+
 - Create: `crates/alexandria-engine/src/reminders.rs`
 - Modify: `crates/alexandria-engine/src/lib.rs` (add `pub mod reminders;` keeping alphabetical order)
 
@@ -359,6 +363,7 @@ git commit -m "feat(engine): reminder schedule spec, validation, datetime parsin
 ### Task 3: Engine — next-fire, upcoming preview, occurrence coalescing
 
 **Files:**
+
 - Modify: `crates/alexandria-engine/src/reminders.rs`
 
 **Step 1: Write the failing tests** (append to the test module):
@@ -604,6 +609,7 @@ git commit -m "feat(engine): next-fire computation, occurrence coalescing, DST-s
 ### Task 4: Storage — migration v006 + Reminder model
 
 **Files:**
+
 - Create: `crates/alexandria-storage/src/schema/v006_reminder.surql`
 - Modify: `crates/alexandria-storage/src/schema/mod.rs` (MIGRATIONS const)
 - Create: `crates/alexandria-storage/src/models/reminder.rs`
@@ -724,6 +730,7 @@ git commit -m "feat(storage): reminder table (migration v006) and model"
 ### Task 5: Storage — ReminderRepo
 
 **Files:**
+
 - Create: `crates/alexandria-storage/src/repos/reminder_repo.rs`
 - Modify: `crates/alexandria-storage/src/repos/mod.rs` (`mod reminder_repo;` + `pub use reminder_repo::ReminderRepo;`)
 
@@ -1046,6 +1053,7 @@ git commit -m "feat(storage): ReminderRepo with due queries, delivery recording,
 ### Task 6: Engine — Reminder → ScheduleSpec conversion
 
 **Files:**
+
 - Modify: `crates/alexandria-engine/src/reminders.rs`
 
 **Step 1: Write the failing test** (append):
@@ -1144,6 +1152,7 @@ git commit -m "feat(engine): reconstruct ScheduleSpec from stored Reminder rows"
 ### Task 7: Server config — `[reminders]` section
 
 **Files:**
+
 - Modify: `crates/alexandria/src/config.rs`
 
 **Step 1: Write the failing tests** (append to `mod tests`):
@@ -1253,6 +1262,7 @@ git commit -m "feat(config): [reminders] section (timezone, escalation_hours) wi
 ### Task 8: MCP — params, server settings, main.rs wiring
 
 **Files:**
+
 - Create: `crates/alexandria-mcp/src/tools/set_reminder.rs`
 - Create: `crates/alexandria-mcp/src/tools/check_reminders.rs`
 - Create: `crates/alexandria-mcp/src/tools/list_reminders.rs`
@@ -1412,6 +1422,7 @@ git commit -m "feat(mcp): reminder tool params, RemindersSettings, main.rs wirin
 ### Task 9: MCP — `set_reminder`
 
 **Files:**
+
 - Modify: `crates/alexandria-mcp/src/server.rs`
 - Create: `crates/alexandria/tests/reminders_test.rs`
 - Modify: `crates/alexandria/Cargo.toml` (dev-dep `async-trait = "0.1"`)
@@ -1707,6 +1718,7 @@ git commit -m "feat(mcp): set_reminder with set-time validation and next-fire pr
 ### Task 10: MCP — `check_reminders` (delivery + consumption)
 
 **Files:**
+
 - Modify: `crates/alexandria-mcp/src/server.rs`
 - Modify: `crates/alexandria/tests/reminders_test.rs`
 
@@ -1933,6 +1945,7 @@ git commit -m "feat(mcp): check_reminders with targeting, escalation, coalescing
 ### Task 11: MCP — `list_reminders` + `cancel_reminder`
 
 **Files:**
+
 - Modify: `crates/alexandria-mcp/src/server.rs`
 - Modify: `crates/alexandria/tests/reminders_test.rs`
 
@@ -2103,6 +2116,7 @@ git commit -m "feat(mcp): list_reminders and cancel_reminder"
 ### Task 12: MCP — read-only `due_reminders` piggyback on retrieve/recall
 
 **Files:**
+
 - Modify: `crates/alexandria-mcp/src/server.rs` (`do_retrieve_memories`, `do_recall`)
 - Modify: `crates/alexandria/tests/reminders_test.rs`
 
@@ -2184,6 +2198,7 @@ async fn piggyback_lists_due_reminders_without_consuming() {
 ```
 
 In `do_retrieve_memories`:
+
 - the `facts.is_empty()` early return becomes `Ok(serde_json::json!({ "results": [], "due_reminders": self.due_reminders_summary(5).await }))`
 - the final response gains `"due_reminders": self.due_reminders_summary(5).await`
 
@@ -2203,6 +2218,7 @@ git commit -m "feat(mcp): piggyback read-only due_reminders onto retrieve/recall
 ### Task 13: Instructions, skill, docs
 
 **Files:**
+
 - Modify: `crates/alexandria-mcp/src/server.rs` (`#[tool_handler(instructions = ...)]`)
 - Modify: `contrib/pi/skills/alexandria-memory/SKILL.md`
 - Modify: `README.md` (root — read it first; add reminders to the tools overview + a `[reminders]` config row)
@@ -2240,6 +2256,7 @@ git commit -m "docs: reminder tool instructions, skill guidance, README + CLAUDE
 ### Task 14: Extension — generalize to `alexandria/` with feature toggles
 
 **Files:**
+
 - Rename: `contrib/pi/extensions/alexandria-auto-recall/` → `contrib/pi/extensions/alexandria/` (`git mv`)
 - Modify: `contrib/pi/extensions/alexandria/package.json`, `src/mcp-client.ts` (client name), `src/config.ts`, `src/index.ts`
 - Modify: `contrib/pi/README.md`, extension `README.md`
@@ -2256,27 +2273,27 @@ In `package.json`: `"name": "alexandria"`, `"version": "2.1.0"`. In `src/mcp-cli
 
 ```ts
 interface ClientToml {
-	server?: { url?: string };
-	recall?: { enabled?: boolean; limit?: number; min_similarity?: number };
-	store?: {
-		enabled?: boolean;
-		extract_model?: string;
-		extract_timeout_ms?: number;
-	};
-	reminders?: { enabled?: boolean; project?: string };
+ server?: { url?: string };
+ recall?: { enabled?: boolean; limit?: number; min_similarity?: number };
+ store?: {
+  enabled?: boolean;
+  extract_model?: string;
+  extract_timeout_ms?: number;
+ };
+ reminders?: { enabled?: boolean; project?: string };
 }
 ```
 
 Add to `CONFIG` (mirrors the existing `storeDisabled` precedence shape — env wins, TOML `enabled=false` honored only when env is unset):
 
 ```ts
-	remindersDisabled:
-		process.env.ALEXANDRIA_REMINDERS === "off" ||
-		(toml.reminders?.enabled === false &&
-			process.env.ALEXANDRIA_REMINDERS === undefined),
+ remindersDisabled:
+  process.env.ALEXANDRIA_REMINDERS === "off" ||
+  (toml.reminders?.enabled === false &&
+   process.env.ALEXANDRIA_REMINDERS === undefined),
 
-	remindersProject:
-		process.env.ALEXANDRIA_REMINDERS_PROJECT ?? toml.reminders?.project,
+ remindersProject:
+  process.env.ALEXANDRIA_REMINDERS_PROJECT ?? toml.reminders?.project,
 ```
 
 > **Design-doc deviation (intentional):** the design doc sketched `[features.recall]`-style nesting; the existing client.toml already uses flat `[recall]`/`[store]` sections with `enabled` keys, so `[reminders]` follows suit. Same user-visible capability, zero churn. Legacy `ALEXANDRIA_AUTO_RECALL=off` alias already works — untouched.
@@ -2298,140 +2315,140 @@ import { CONFIG } from "./config.js";
 const execFileAsync = promisify(execFile);
 
 export interface DueReminder {
-	id: string;
-	message: string;
-	target?: string;
-	escalated?: boolean;
-	recurring?: boolean;
-	missed_occurrences?: number;
-	due_at?: string;
-	schedule?: string;
-	note?: string | null;
-	provenance?: { project?: string | null; session_id?: string | null };
+ id: string;
+ message: string;
+ target?: string;
+ escalated?: boolean;
+ recurring?: boolean;
+ missed_occurrences?: number;
+ due_at?: string;
+ schedule?: string;
+ note?: string | null;
+ provenance?: { project?: string | null; session_id?: string | null };
 }
 
 /** Project hint for delivery targeting. Env override wins (direnv-friendly,
  *  also fixes git-worktree dirs whose basename differs from the project). */
 export async function getProjectHint(): Promise<string | undefined> {
-	if (CONFIG.remindersProject) return CONFIG.remindersProject;
-	try {
-		const { stdout } = await execFileAsync(
-			"git",
-			["rev-parse", "--show-toplevel"],
-			{ timeout: 2000 },
-		);
-		const root = stdout.trim();
-		return root ? basename(root) : undefined;
-	} catch {
-		return undefined; // not a repo, git missing — global reminders still work
-	}
+ if (CONFIG.remindersProject) return CONFIG.remindersProject;
+ try {
+  const { stdout } = await execFileAsync(
+   "git",
+   ["rev-parse", "--show-toplevel"],
+   { timeout: 2000 },
+  );
+  const root = stdout.trim();
+  return root ? basename(root) : undefined;
+ } catch {
+  return undefined; // not a repo, git missing — global reminders still work
+ }
 }
 
 export async function checkReminders(
-	project?: string,
+ project?: string,
 ): Promise<DueReminder[]> {
-	const args: Record<string, unknown> = project ? { project } : {};
-	const result = await callToolWithRetry("check_reminders", args);
-	const text = extractTextContent(result.content);
-	if (!text) return [];
-	try {
-		const parsed = JSON.parse(text) as { delivered?: DueReminder[] };
-		return parsed.delivered ?? [];
-	} catch {
-		return [];
-	}
+ const args: Record<string, unknown> = project ? { project } : {};
+ const result = await callToolWithRetry("check_reminders", args);
+ const text = extractTextContent(result.content);
+ if (!text) return [];
+ try {
+  const parsed = JSON.parse(text) as { delivered?: DueReminder[] };
+  return parsed.delivered ?? [];
+ } catch {
+  return [];
+ }
 }
 
 export function formatDueBlock(items: DueReminder[]): string {
-	const lines = items.map((r) => {
-		const bits: string[] = [`- ${r.message}`];
-		if (r.target && r.target !== "global") bits.push(`[target ${r.target}]`);
-		if (r.escalated) bits.push("[OVERDUE — escalated from project targeting]");
-		if (r.missed_occurrences && r.missed_occurrences > 0)
-			bits.push(`(missed ${r.missed_occurrences} earlier occurrence(s))`);
-		if (r.schedule) bits.push(`(${r.schedule})`);
-		if (r.note) bits.push(`note: ${r.note}`);
-		const prov = r.provenance;
-		if (prov?.project || prov?.session_id)
-			bits.push(`[set in ${prov.project ?? "unknown project"}${prov.session_id ? `, session ${prov.session_id}` : ""}]`);
-		return bits.join(" ");
-	});
-	return [
-		"⏰ Due reminders from Alexandria (delivered once — act on them or tell the user, then they're gone):",
-		...lines,
-	].join("\n");
+ const lines = items.map((r) => {
+  const bits: string[] = [`- ${r.message}`];
+  if (r.target && r.target !== "global") bits.push(`[target ${r.target}]`);
+  if (r.escalated) bits.push("[OVERDUE — escalated from project targeting]");
+  if (r.missed_occurrences && r.missed_occurrences > 0)
+   bits.push(`(missed ${r.missed_occurrences} earlier occurrence(s))`);
+  if (r.schedule) bits.push(`(${r.schedule})`);
+  if (r.note) bits.push(`note: ${r.note}`);
+  const prov = r.provenance;
+  if (prov?.project || prov?.session_id)
+   bits.push(`[set in ${prov.project ?? "unknown project"}${prov.session_id ? `, session ${prov.session_id}` : ""}]`);
+  return bits.join(" ");
+ });
+ return [
+  "⏰ Due reminders from Alexandria (delivered once — act on them or tell the user, then they're gone):",
+  ...lines,
+ ].join("\n");
 }
 ```
 
 **Step 4: Rewrite the `before_agent_start` recall handler in `index.ts` as a single dispatcher** that runs recall + reminders concurrently with per-feature failure isolation. (One merged handler keeps the ordering deterministic and injects exactly one message per prompt — pi does collect a `message` from each `before_agent_start` handler, so this is a choice, not a workaround.) Replace the existing `if (!CONFIG.recallDisabled) { pi.on("before_agent_start", ...) }` block with:
 
 ```ts
-	// ── Combined injection dispatcher (recall + reminders) ──────────────
-	if (!CONFIG.recallDisabled || !CONFIG.remindersDisabled) {
-		pi.on("before_agent_start", async (event, ctx) => {
-			const query = event.prompt?.trim();
+ // ── Combined injection dispatcher (recall + reminders) ──────────────
+ if (!CONFIG.recallDisabled || !CONFIG.remindersDisabled) {
+  pi.on("before_agent_start", async (event, ctx) => {
+   const query = event.prompt?.trim();
 
-			const recallTask: Promise<string | null> =
-				!CONFIG.recallDisabled && query
-					? (async () => {
-							const memories = await retrieveMemories(query);
-							return memories.length > 0 ? formatMemoriesBlock(memories) : null;
-						})()
-					: Promise.resolve(null);
+   const recallTask: Promise<string | null> =
+    !CONFIG.recallDisabled && query
+     ? (async () => {
+       const memories = await retrieveMemories(query);
+       return memories.length > 0 ? formatMemoriesBlock(memories) : null;
+      })()
+     : Promise.resolve(null);
 
-			const remindersTask: Promise<{ block: string | null; count: number }> =
-				!CONFIG.remindersDisabled
-					? (async () => {
-							const project = await getProjectHint();
-							const due = await checkReminders(project);
-							return {
-								block: due.length > 0 ? formatDueBlock(due) : null,
-								count: due.length,
-							};
-						})()
-					: Promise.resolve({ block: null, count: 0 });
+   const remindersTask: Promise<{ block: string | null; count: number }> =
+    !CONFIG.remindersDisabled
+     ? (async () => {
+       const project = await getProjectHint();
+       const due = await checkReminders(project);
+       return {
+        block: due.length > 0 ? formatDueBlock(due) : null,
+        count: due.length,
+       };
+      })()
+     : Promise.resolve({ block: null, count: 0 });
 
-			// Per-feature failure isolation: one failing never suppresses the other
-			const [recallRes, remindersRes] = await Promise.allSettled([
-				recallTask,
-				remindersTask,
-			]);
+   // Per-feature failure isolation: one failing never suppresses the other
+   const [recallRes, remindersRes] = await Promise.allSettled([
+    recallTask,
+    remindersTask,
+   ]);
 
-			const blocks: string[] = [];
-			if (recallRes.status === "fulfilled" && recallRes.value) {
-				blocks.push(recallRes.value);
-			} else if (recallRes.status === "rejected") {
-				resetClient();
-				ctx.ui.notify(
-					`Alexandria auto-recall failed (${recallRes.reason instanceof Error ? recallRes.reason.message : String(recallRes.reason)}); continuing without it.`,
-					"warning",
-				);
-			}
-			if (remindersRes.status === "fulfilled") {
-				if (remindersRes.value.block) {
-					blocks.push(remindersRes.value.block);
-					ctx.ui.notify(
-						`⏰ ${remindersRes.value.count} Alexandria reminder(s) due`,
-						"info",
-					);
-				}
-			} else {
-				ctx.ui.notify(
-					`Alexandria reminders check failed (${remindersRes.reason instanceof Error ? remindersRes.reason.message : String(remindersRes.reason)}); continuing without it.`,
-					"warning",
-				);
-			}
+   const blocks: string[] = [];
+   if (recallRes.status === "fulfilled" && recallRes.value) {
+    blocks.push(recallRes.value);
+   } else if (recallRes.status === "rejected") {
+    resetClient();
+    ctx.ui.notify(
+     `Alexandria auto-recall failed (${recallRes.reason instanceof Error ? recallRes.reason.message : String(recallRes.reason)}); continuing without it.`,
+     "warning",
+    );
+   }
+   if (remindersRes.status === "fulfilled") {
+    if (remindersRes.value.block) {
+     blocks.push(remindersRes.value.block);
+     ctx.ui.notify(
+      `⏰ ${remindersRes.value.count} Alexandria reminder(s) due`,
+      "info",
+     );
+    }
+   } else {
+    ctx.ui.notify(
+     `Alexandria reminders check failed (${remindersRes.reason instanceof Error ? remindersRes.reason.message : String(remindersRes.reason)}); continuing without it.`,
+     "warning",
+    );
+   }
 
-			if (blocks.length === 0) return;
-			return {
-				message: {
-					customType: "alexandria",
-					content: blocks.join("\n\n"),
-					display: true,
-				},
-			};
-		});
-	}
+   if (blocks.length === 0) return;
+   return {
+    message: {
+     customType: "alexandria",
+     content: blocks.join("\n\n"),
+     display: true,
+    },
+   };
+  });
+ }
 ```
 
 Imports to add at top of `index.ts`:
@@ -2460,6 +2477,7 @@ git commit -m "feat(extension): generalize to alexandria companion with reminder
 ### Task 15: Extension smoke tests + final verification
 
 **Files:**
+
 - Create: `contrib/pi/extensions/alexandria/tests/reminders.test.ts`
 - Create: `contrib/pi/extensions/alexandria/tests/config.test.ts`
 - Modify: `contrib/pi/extensions/alexandria/package.json` (test script + tsx devDep)
@@ -2483,19 +2501,19 @@ import assert from "node:assert/strict";
 import { formatDueBlock, type DueReminder } from "../src/reminders.js";
 
 test("formatDueBlock renders message, target, escalation, missed count", () => {
-	const block = formatDueBlock([
-		{ id: "reminder:1", message: "renew cert", target: "project:infra", escalated: true, missed_occurrences: 2 },
-		{ id: "reminder:2", message: "standup", schedule: "every Friday at 09:00" },
-	]);
-	assert.match(block, /⏰ Due reminders/);
-	assert.match(block, /renew cert/);
-	assert.match(block, /OVERDUE/);
-	assert.match(block, /missed 2 earlier/);
-	assert.match(block, /every Friday at 09:00/);
+ const block = formatDueBlock([
+  { id: "reminder:1", message: "renew cert", target: "project:infra", escalated: true, missed_occurrences: 2 },
+  { id: "reminder:2", message: "standup", schedule: "every Friday at 09:00" },
+ ]);
+ assert.match(block, /⏰ Due reminders/);
+ assert.match(block, /renew cert/);
+ assert.match(block, /OVERDUE/);
+ assert.match(block, /missed 2 earlier/);
+ assert.match(block, /every Friday at 09:00/);
 });
 
 test("formatDueBlock empty list still renders header", () => {
-	assert.match(formatDueBlock([]), /Due reminders/);
+ assert.match(formatDueBlock([]), /Due reminders/);
 });
 ```
 
@@ -2506,22 +2524,22 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 test("legacy ALEXANDRIA_AUTO_RECALL=off disables recall", async () => {
-	process.env.ALEXANDRIA_AUTO_RECALL = "off";
-	const { CONFIG } = await import("../src/config.js?" + Date.now()); // bust module cache
-	assert.equal(CONFIG.recallDisabled, true);
-	delete process.env.ALEXANDRIA_AUTO_RECALL;
+ process.env.ALEXANDRIA_AUTO_RECALL = "off";
+ const { CONFIG } = await import("../src/config.js?" + Date.now()); // bust module cache
+ assert.equal(CONFIG.recallDisabled, true);
+ delete process.env.ALEXANDRIA_AUTO_RECALL;
 });
 
 test("ALEXANDRIA_REMINDERS=off disables reminders", async () => {
-	process.env.ALEXANDRIA_REMINDERS = "off";
-	const { CONFIG } = await import("../src/config.js?" + Date.now());
-	assert.equal(CONFIG.remindersDisabled, true);
-	delete process.env.ALEXANDRIA_REMINDERS;
+ process.env.ALEXANDRIA_REMINDERS = "off";
+ const { CONFIG } = await import("../src/config.js?" + Date.now());
+ assert.equal(CONFIG.remindersDisabled, true);
+ delete process.env.ALEXANDRIA_REMINDERS;
 });
 
 test("reminders enabled by default", async () => {
-	const { CONFIG } = await import("../src/config.js?" + Date.now());
-	assert.equal(CONFIG.remindersDisabled, false);
+ const { CONFIG } = await import("../src/config.js?" + Date.now());
+ assert.equal(CONFIG.remindersDisabled, false);
 });
 ```
 
@@ -2562,3 +2580,9 @@ git commit -m "test(extension): reminders formatting + config toggle tests; fina
 - **Client config shape**: flat `[reminders] enabled/project` in client.toml instead of `[features.*]` nesting — matches the existing `[recall]`/`[store]` convention (same capability).
 - **No `Feature` interface abstraction**: features are config-guarded modules dispatched from one handler; a formal interface would be premature abstraction for three features (AGENTS.md minimal-abstraction rule). The dispatcher still delivers per-feature failure isolation as designed.
 - **Single merged injection handler**: recall + reminders blocks are merged into one `before_agent_start` injection (customType `alexandria`) for deterministic ordering and exactly one injected message per prompt. pi does merge messages from several handlers, so this is a design choice rather than a limitation.
+- **`status` gained a third value**: the design specified `pending | cancelled` with "no separate delivered state"; the implementation stores `status = 'delivered'` for consumed one-shots (v007 schema `ASSERT`, the `Reminder` model comment, and the `list_reminders` filter). Defensible because a NULL `next_due_at` is still matched by `next_due_at <= $now` in SurrealQL, so `'delivered'` is the only honest terminal marker — but it is both a schema change and a user-facing surface change.
+- **Preview-first `next_fire_preview`**: `set_reminder` returns a `next_fire_preview` of 3 fire times whose first element *is* `next_due_at`, where the design asked for "next_due_at plus the next 3 fire times". Same instants, one fewer duplicate, and the field the caller confirms against is the first thing they see.
+- **Flat `project` param**: `check_reminders` takes a flat `project` where the design specified `context: { project }` — matches the flat params of the other reminder tools and avoids a one-key wrapper object.
+- **Inclusive escalation boundary**: a project-targeted reminder escalates at `>= escalation_hours` overdue where the design text said "longer than". The inclusive form is what makes `escalation_hours = 0` mean "escalate as soon as overdue" instead of never.
+- **Claude Code client has no automatic delivery** (2026-09-14 merge): `contrib/claude/hooks/alexandria-recall.sh` injects auto-recall only, so a Claude Code user sees the read-only `due_reminders` piggyback on `retrieve_memories`/`recall` but gets no `check_reminders` consumption unless the agent calls the tool itself. Implementing delivery in the hook was left out of scope; the Pi companion extension is the shipped delivery path.
+- **Migration renumbered v006 → v007** (2026-09-14 merge): main claimed version 6 for `drop_session_memory_count` while this branch was open, so the reminder table shipped as `schema/v007_reminder.surql`. `migrate()` only applies `version > current_version`, so leaving it at 6 would have made every database already migrated past main's v6 silently skip the reminder schema. Steps 4/6/12 below still say v006 — that is what was written and executed at the time.

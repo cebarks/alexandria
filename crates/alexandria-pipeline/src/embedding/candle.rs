@@ -3,10 +3,19 @@ use async_trait::async_trait;
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::HFClientSync;
 use tokenizers::Tokenizer;
 
 use super::provider::EmbeddingProvider;
+
+/// sentence-transformers models ship `1_Pooling/config.json`. Only the CLS flag
+/// matters to us; anything else (missing file, missing key, bad JSON) means mean pooling.
+fn cls_pooling_from_json(s: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(s)
+        .ok()
+        .and_then(|v| v.get("pooling_mode_cls_token")?.as_bool())
+        .unwrap_or(false)
+}
 
 pub struct CandleProvider {
     model: BertModel,
@@ -14,6 +23,7 @@ pub struct CandleProvider {
     device: Device,
     model_id: String,
     dimensions: usize,
+    cls_pooling: bool,
 }
 
 impl CandleProvider {
@@ -22,10 +32,13 @@ impl CandleProvider {
         let device_str_owned = device_str.to_string();
 
         // Model loading is CPU-bound, run in blocking task
-        let (model, tokenizer, device, dimensions) = tokio::task::spawn_blocking(move || {
-            Self::load_model(&model_id_owned, &device_str_owned)
-        })
-        .await??;
+        let (model, tokenizer, device, dimensions, cls_pooling) =
+            tokio::task::spawn_blocking(move || {
+                Self::load_model(&model_id_owned, &device_str_owned)
+            })
+            .await??;
+
+        tracing::info!("Pooling: {}", if cls_pooling { "cls" } else { "mean" });
 
         Ok(Self {
             model,
@@ -33,30 +46,49 @@ impl CandleProvider {
             device,
             model_id: model_id.to_string(),
             dimensions,
+            cls_pooling,
         })
     }
 
     fn load_model(
         model_id: &str,
         device_str: &str,
-    ) -> Result<(BertModel, Tokenizer, Device, usize)> {
+    ) -> Result<(BertModel, Tokenizer, Device, usize, bool)> {
         let device = match device_str {
             "cpu" => Device::Cpu,
             _ => Device::Cpu, // fallback to CPU
         };
 
-        let api = Api::new().context("Failed to create HuggingFace Hub API")?;
-        let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
+        let client = HFClientSync::new().context("Failed to create HuggingFace Hub client")?;
+        // Short-form ids like "gpt2" have no owner.
+        let (owner, name) = model_id.split_once('/').unwrap_or(("", model_id));
+        let repo = client.model(owner, name);
+        // Cache first, as hf-hub 0.5 did. Without this, 1.0 revalidates every
+        // cached file against the Hub on each boot and retries when offline.
+        let get = |file: &str| {
+            repo.download_file()
+                .filename(file)
+                .local_files_only(true)
+                .send()
+                .or_else(|_| repo.download_file().filename(file).send())
+        };
 
-        let config_path = repo
-            .get("config.json")
-            .context("Failed to download config.json")?;
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .context("Failed to download tokenizer.json")?;
-        let weights_path = repo
-            .get("model.safetensors")
-            .context("Failed to download model.safetensors")?;
+        let config_path = get("config.json").context("Failed to download config.json")?;
+        let tokenizer_path = get("tokenizer.json").context("Failed to download tokenizer.json")?;
+        let weights_path =
+            get("model.safetensors").context("Failed to download model.safetensors")?;
+
+        // Optional: pooling config. Not every repo has it; absence means mean pooling.
+        let cls_pooling = get("1_Pooling/config.json")
+            .inspect_err(|e| {
+                tracing::warn!(
+                    "could not load 1_Pooling/config.json for {model_id} ({e}); assuming mean pooling"
+                )
+            })
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| cls_pooling_from_json(&s))
+            .unwrap_or(false);
 
         let config_str = std::fs::read_to_string(&config_path)?;
         let config: BertConfig = serde_json::from_str(&config_str)?;
@@ -65,12 +97,14 @@ impl CandleProvider {
         let tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)?
-        };
+        let vb = VarBuilder::from_buffered_safetensors(
+            std::fs::read(&weights_path)?,
+            candle_core::DType::F32,
+            &device,
+        )?;
         let model = BertModel::load(vb, &config)?;
 
-        Ok((model, tokenizer, device, dimensions))
+        Ok((model, tokenizer, device, dimensions, cls_pooling))
     }
 
     fn embed_sync(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -97,28 +131,33 @@ impl CandleProvider {
                 .model
                 .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
 
-            // Mean pooling over sequence length (dim 1), respecting attention mask
-            let mask = attention_mask
-                .unsqueeze(2)?
-                .to_dtype(candle_core::DType::F32)?
-                .broadcast_as(output.shape())?;
-            let masked = (output * mask)?;
-            let summed = masked.sum(1)?;
-            let counts = attention_mask
-                .to_dtype(candle_core::DType::F32)?
-                .sum(1)?
-                .unsqueeze(1)?
-                .broadcast_as(summed.shape())?;
-            let mean_pooled = (summed / counts)?;
+            let pooled = if self.cls_pooling {
+                // CLS pooling: hidden state of the first token. Shape (1, hidden).
+                output.narrow(1, 0, 1)?.squeeze(1)?
+            } else {
+                // Mean pooling over sequence length (dim 1), respecting attention mask
+                let mask = attention_mask
+                    .unsqueeze(2)?
+                    .to_dtype(candle_core::DType::F32)?
+                    .broadcast_as(output.shape())?;
+                let masked = (output * mask)?;
+                let summed = masked.sum(1)?;
+                let counts = attention_mask
+                    .to_dtype(candle_core::DType::F32)?
+                    .sum(1)?
+                    .unsqueeze(1)?
+                    .broadcast_as(summed.shape())?;
+                (summed / counts)?
+            };
 
             // L2 normalize
-            let norm = mean_pooled
+            let norm = pooled
                 .sqr()?
                 .sum(1)?
                 .sqrt()?
                 .unsqueeze(1)?
-                .broadcast_as(mean_pooled.shape())?;
-            let normalized = (mean_pooled / norm)?;
+                .broadcast_as(pooled.shape())?;
+            let normalized = (pooled / norm)?;
 
             let embedding: Vec<f32> = normalized.squeeze(0)?.to_vec1()?;
             all_embeddings.push(embedding);
@@ -142,5 +181,45 @@ impl EmbeddingProvider for CandleProvider {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CandleProvider, cls_pooling_from_json};
+
+    /// Same model, same text: flipping the pooling flag must change the vector,
+    /// proving the CLS branch is actually taken rather than falling back to mean.
+    #[tokio::test]
+    async fn cls_and_mean_pooling_differ() {
+        let mut provider = CandleProvider::new("sentence-transformers/all-MiniLM-L6-v2", "cpu")
+            .await
+            .unwrap();
+        assert!(!provider.cls_pooling, "MiniLM ships mean pooling");
+        let mean = provider.embed_sync(&["hello world"]).unwrap().remove(0);
+        provider.cls_pooling = true;
+        let cls = provider.embed_sync(&["hello world"]).unwrap().remove(0);
+        assert_eq!(mean.len(), cls.len());
+        assert_ne!(mean, cls);
+    }
+
+    #[test]
+    fn cls_true_when_flag_set() {
+        let json = r#"{"word_embedding_dimension": 384, "pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false}"#;
+        assert!(cls_pooling_from_json(json));
+    }
+
+    #[test]
+    fn mean_when_flag_false() {
+        let json = r#"{"word_embedding_dimension": 384, "pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}"#;
+        assert!(!cls_pooling_from_json(json));
+    }
+
+    #[test]
+    fn mean_when_key_missing_or_unparseable() {
+        assert!(!cls_pooling_from_json(
+            r#"{"pooling_mode_mean_tokens": true}"#
+        ));
+        assert!(!cls_pooling_from_json("not json"));
     }
 }

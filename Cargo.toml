@@ -9,8 +9,26 @@ members = [
 ]
 
 [workspace.package]
-rust-version = "1.88"
+edition = "2024"
+rust-version = "1.98"
 license = "AGPL-3.0-or-later"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+codegen-units = 1
+debug = false
+strip = true
+
+[profile.dev]
+opt-level = 1
+codegen-units = 16
+
+[profile.dev.package."*"]
+opt-level = 3
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -29,16 +47,16 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 thiserror = "2"
 anyhow = "1"
-dirs = "6"
-toml = "0.8"
+dirs = "7"
+toml = "1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 cron = "0.17"
 iana-time-zone = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-base64 = "0.22"
+base64 = "0.23"
 candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"
-tokenizers = "0.22"
-hf-hub = "0.5"
+tokenizers = "0.23"
+hf-hub = { version = "1", features = ["blocking"] }

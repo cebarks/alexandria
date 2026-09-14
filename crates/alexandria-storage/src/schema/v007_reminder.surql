@@ -1,4 +1,4 @@
--- v006: Reminders
+-- v007: Reminders
 
 DEFINE TABLE reminder SCHEMAFULL;
 DEFINE FIELD message          ON reminder TYPE string;

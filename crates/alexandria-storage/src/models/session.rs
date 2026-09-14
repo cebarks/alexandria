@@ -11,6 +11,5 @@ pub struct Session {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub summary: Option<String>,
-    pub memory_count: i64,
     pub tags: Vec<String>,
 }

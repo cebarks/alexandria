@@ -1,19 +1,45 @@
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::model::CallToolResult;
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 // Re-exported from alexandria_storage where it's now defined.
 pub use alexandria_storage::record_id_to_string;
 
-use alexandria_engine::clusters::{assign_to_cluster, update_centroid, ClusterInfo};
-use alexandria_engine::heat::{compute_activation_targets, ActivationConfig};
+/// Wrap a `do_*` result (a JSON string by construction) into a structured MCP
+/// tool result. `CallToolResult::structured()` mirrors the same JSON into a
+/// text block, so clients that only read `content[].text` (Pi extension,
+/// Claude hooks) are unaffected. A payload that fails to parse means a `do_*`
+/// returned non-JSON — a bug — so it is kept as a plain text result rather
+/// than fabricated JSON and logged loudly.
+fn tool_json(result: anyhow::Result<String>) -> CallToolResult {
+    match result {
+        Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(v) => CallToolResult::structured(v),
+            Err(e) => {
+                tracing::error!("tool returned non-JSON payload ({e}); passing through as text");
+                CallToolResult::success(vec![rmcp::model::ContentBlock::text(s)])
+            }
+        },
+        // `error_message` (not `to_string`) so the whole anyhow chain reaches the
+        // caller: reminder validation wraps the underlying parser's reason, and
+        // `to_string()` would surface only the top-level context.
+        Err(e) => CallToolResult::structured_error(serde_json::json!({
+            "status": "error",
+            "message": error_message(&e)
+        })),
+    }
+}
+
+use alexandria_engine::clusters::{ClusterInfo, assign_to_cluster, update_centroid};
+use alexandria_engine::heat::{ActivationConfig, compute_activation_targets};
 use alexandria_engine::recall::{
-    broad_recall, focused_recall, ClusterWithMembers, FactSummary, ScopeHandle,
+    ClusterWithMembers, FactSummary, ScopeHandle, broad_recall, focused_recall,
 };
 use alexandria_engine::search::rank_by_similarity;
 use alexandria_pipeline::embedding::EmbeddingProvider;
-use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo, SessionRepo};
 use alexandria_storage::Database;
+use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo, SessionRepo};
 use chrono::{DateTime, SecondsFormat, Utc, Weekday};
 
 use crate::tools::{
@@ -115,23 +141,36 @@ impl AlexandriaServer {
     #[tool(
         description = "Soft-delete a memory by ID. Use when the user explicitly says a stored memory is wrong, outdated, or should be forgotten — prefer update_memory for corrections that should be preserved as lineage."
     )]
-    async fn delete_memory(&self, Parameters(params): Parameters<DeleteMemoryParams>) -> String {
+    async fn delete_memory(
+        &self,
+        Parameters(params): Parameters<DeleteMemoryParams>,
+    ) -> CallToolResult {
         let repo = MemoryRepo::new(self.db.inner());
         match repo.soft_delete_fact(&params.id).await {
-            Ok(_) => format!("Deleted memory {}", params.id),
-            Err(e) => format!("Error: {e}"),
+            Ok(_) => CallToolResult::structured(serde_json::json!({
+                "status": "ok",
+                "id": params.id
+            })),
+            Err(e) => CallToolResult::structured_error(serde_json::json!({
+                "status": "error",
+                "message": e.to_string()
+            })),
         }
     }
 
     #[tool(
         description = "Persist a durable fact, decision, preference, or correction so future sessions/agents can recall it. Call this proactively whenever you learn something worth remembering — a user preference, an architectural decision and its rationale, a resolved bug's root cause, a gotcha you just discovered — not only when explicitly told to 'remember this'. Cheap and idempotent-ish (dedup happens via clustering); prefer storing over losing context. Write content as a standalone statement that makes sense without the current conversation."
     )]
-    async fn store_memory(&self, Parameters(params): Parameters<StoreMemoryParams>) -> String {
+    async fn store_memory(
+        &self,
+        Parameters(params): Parameters<StoreMemoryParams>,
+    ) -> CallToolResult {
         match self.do_store_memory(params).await {
-            Ok(id) => serde_json::json!({ "status": "ok", "id": id }).to_string(),
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
-            }
+            Ok(id) => CallToolResult::structured(serde_json::json!({ "status": "ok", "id": id })),
+            Err(e) => CallToolResult::structured_error(serde_json::json!({
+                "status": "error",
+                "message": e.to_string()
+            })),
         }
     }
 
@@ -141,38 +180,32 @@ impl AlexandriaServer {
     async fn retrieve_memories(
         &self,
         Parameters(params): Parameters<RetrieveMemoriesParams>,
-    ) -> String {
+    ) -> CallToolResult {
+        // `structured()` also puts the same JSON in a text block, so clients that
+        // only read `content[].text` (Pi extension, Claude hook) are unaffected.
         match self.do_retrieve_memories(params).await {
-            Ok(results) => serde_json::to_string(&results)
-                .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string()),
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
-            }
+            Ok(results) => CallToolResult::structured(results),
+            Err(e) => CallToolResult::structured_error(
+                serde_json::json!({ "status": "error", "message": e.to_string() }),
+            ),
         }
     }
 
     #[tool(
         description = "Progressive two-phase recall for open-ended or broad questions ('what do we know about X', 'what's the state of Y'): first call with no scope_handle to get candidate clusters, then call again with the returned scope_handle to narrow into the most relevant one. Prefer this over retrieve_memories when the query is exploratory rather than a specific lookup."
     )]
-    async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> String {
-        match self.do_recall(params).await {
-            Ok(result) => result,
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
-            }
-        }
+    async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> CallToolResult {
+        tool_json(self.do_recall(params).await)
     }
 
     #[tool(
         description = "Correct or refine an existing memory in place (content, tags, or confidence) instead of storing a duplicate. Content changes trigger re-embedding and preserve the old version via a derived_from lineage edge. Use this the moment you discover a previously stored memory is stale or wrong."
     )]
-    async fn update_memory(&self, Parameters(params): Parameters<UpdateMemoryParams>) -> String {
-        match self.do_update_memory(params).await {
-            Ok(result) => result,
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
-            }
-        }
+    async fn update_memory(
+        &self,
+        Parameters(params): Parameters<UpdateMemoryParams>,
+    ) -> CallToolResult {
+        tool_json(self.do_update_memory(params).await)
     }
 
     #[tool(
@@ -181,25 +214,18 @@ impl AlexandriaServer {
     async fn import_document(
         &self,
         Parameters(params): Parameters<ImportDocumentParams>,
-    ) -> String {
-        match self.do_import_document(params).await {
-            Ok(result) => result,
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
-            }
-        }
+    ) -> CallToolResult {
+        tool_json(self.do_import_document(params).await)
     }
 
     #[tool(
         description = "Retrieve a session and all its memories. Use this to review what happened in a specific session — returns the session metadata (summary, tags, memory count, timestamps) plus every memory stored during that session."
     )]
-    async fn get_session(&self, Parameters(params): Parameters<GetSessionParams>) -> String {
-        match self.do_get_session(params).await {
-            Ok(result) => result,
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
-            }
-        }
+    async fn get_session(
+        &self,
+        Parameters(params): Parameters<GetSessionParams>,
+    ) -> CallToolResult {
+        tool_json(self.do_get_session(params).await)
     }
 
     #[tool(
@@ -208,25 +234,18 @@ impl AlexandriaServer {
     async fn finalize_session(
         &self,
         Parameters(params): Parameters<FinalizeSessionParams>,
-    ) -> String {
-        match self.do_finalize_session(params).await {
-            Ok(result) => result,
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": e.to_string() }).to_string()
-            }
-        }
+    ) -> CallToolResult {
+        tool_json(self.do_finalize_session(params).await)
     }
 
     #[tool(
         description = "Schedule a reminder to be delivered on a future interaction — one-shot (due_at) or recurring (pattern/cron). Use this when the user asks to be reminded of something later, when they say 'remind me', 'don't let me forget', or when a follow-up action will be needed at a specific time ('check the deploy at 3pm', 'ping me about this tomorrow morning'). Reminders are delivered to both the agent context and the user on the next interaction after they come due; project-targeted reminders escalate to global delivery if they stay overdue, so they are never silently lost. The response includes the next fire times — confirm them with the user when the schedule was parsed from natural language."
     )]
-    async fn set_reminder(&self, Parameters(params): Parameters<SetReminderParams>) -> String {
-        match self.do_set_reminder(params).await {
-            Ok(result) => result,
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": error_message(&e) }).to_string()
-            }
-        }
+    async fn set_reminder(
+        &self,
+        Parameters(params): Parameters<SetReminderParams>,
+    ) -> CallToolResult {
+        tool_json(self.do_set_reminder(params).await)
     }
 
     #[tool(
@@ -235,25 +254,18 @@ impl AlexandriaServer {
     async fn check_reminders(
         &self,
         Parameters(params): Parameters<CheckRemindersParams>,
-    ) -> String {
-        match self.do_check_reminders(params).await {
-            Ok(result) => result,
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": error_message(&e) }).to_string()
-            }
-        }
+    ) -> CallToolResult {
+        tool_json(self.do_check_reminders(params).await)
     }
 
     #[tool(
         description = "List reminders (pending by default; filter by status 'pending'|'delivered'|'cancelled'|'all' and/or target project). Use when the user asks what reminders exist, or to find an ID before cancelling."
     )]
-    async fn list_reminders(&self, Parameters(params): Parameters<ListRemindersParams>) -> String {
-        match self.do_list_reminders(params).await {
-            Ok(result) => result,
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": error_message(&e) }).to_string()
-            }
-        }
+    async fn list_reminders(
+        &self,
+        Parameters(params): Parameters<ListRemindersParams>,
+    ) -> CallToolResult {
+        tool_json(self.do_list_reminders(params).await)
     }
 
     #[tool(
@@ -262,13 +274,8 @@ impl AlexandriaServer {
     async fn cancel_reminder(
         &self,
         Parameters(params): Parameters<CancelReminderParams>,
-    ) -> String {
-        match self.do_cancel_reminder(params).await {
-            Ok(result) => result,
-            Err(e) => {
-                serde_json::json!({ "status": "error", "message": error_message(&e) }).to_string()
-            }
-        }
+    ) -> CallToolResult {
+        tool_json(self.do_cancel_reminder(params).await)
     }
 }
 
@@ -276,7 +283,7 @@ impl AlexandriaServer {
     instructions = "Alexandria is a persistent agent memory system — use it proactively, not just when explicitly asked to 'remember' or 'recall' something.\n\n\
 When to READ memory (retrieve_memories / recall): at the start of a task in a project or domain you've likely worked in before; whenever the user references past context ('last time', 'we decided', 'like before'); before re-deriving a decision or re-debugging something that may have been solved already. Use retrieve_memories for a specific lookup, recall for open-ended/broad exploration (call it once broad, then again with the returned scope_handle to narrow).\n\n\
 When to WRITE memory (store_memory): as soon as you learn a durable fact worth keeping past this conversation — a user preference, an architectural decision and its rationale, a bug's root cause, a non-obvious gotcha, a correction the user gives you. Do this unprompted; don't wait to be told to remember. Write standalone statements that make sense without today's conversation.\n\n\
-Session memory: pass session_id to store_memory to group memories by session. Use get_session to review all memories from a session. Use finalize_session at the end of a session to attach a summary and tags.\n\n\
+Session memory: pass session_id to store_memory or import_document to group memories by session. Use get_session to review all memories from a session. Use finalize_session at the end of a session to attach a summary and tags.\n\n\
 Use update_memory (not store_memory) when correcting something already stored — it preserves lineage. Use import_document for bulk reference material (specs, READMEs, notes). Use delete_memory only when the user wants something actually forgotten.\n\n\
 Reminders: use set_reminder when the user asks to be reminded of something later or a follow-up will be needed at a specific time. Omit target_project for anything the user should see anywhere; set it for repo-bound follow-ups (exact, case-sensitive match). The response carries next_fire_preview and the timezone the schedule was parsed in — confirm those with the user whenever the schedule came from natural language. Due reminders are delivered when a client calls check_reminders at the start of an interaction — the server runs no timer, so nothing fires on its own. check_reminders is the only tool that consumes them (recurring ones advance; missed fires coalesce rather than trickle); call it yourself when the user asks whether anything is due, or when a reminder they expected has not shown up.\n\n\
 Reminder delivery: retrieve_memories and recall responses also carry a due_reminders array: a read-only, untargeted view of what is currently due (a short oldest-due sample, each entry has a target of global or project:<name>) that consumes nothing. An entry targeting another project is informational there; it reaches the user through the next check_reminders, which also delivers project reminders once they are overdue by more than the server's escalation window. Use list_reminders to review what is scheduled and cancel_reminder when a reminder is no longer needed."
@@ -445,6 +452,23 @@ impl AlexandriaServer {
         let mut import_tags = tags;
         import_tags.push(format!("import_batch:{batch_id}"));
 
+        // Session linkage (implicit create on first use), resolved once for all chunks
+        let session_repo = SessionRepo::new(self.db.inner());
+        let session_rid = match params.session_id {
+            Some(ref session_id) => {
+                if session_repo
+                    .find_by_external_id(session_id)
+                    .await?
+                    .is_none()
+                {
+                    session_repo.create(session_id, None, None).await?;
+                }
+                let session = session_repo.find_by_external_id(session_id).await?.unwrap();
+                Some(session.id.map(|r| record_id_to_string(&r)).unwrap())
+            }
+            None => None,
+        };
+
         for chunk in &chunks {
             // Embed
             let embeddings = self.embedding.embed(&[chunk.as_str()]).await?;
@@ -468,7 +492,15 @@ impl AlexandriaServer {
             self.assign_to_cluster_and_update(embedding, &fact_id)
                 .await?;
 
+            if let Some(ref session_rid) = session_rid {
+                session_repo.add_memory(session_rid, &fact_id).await?;
+            }
+
             created_ids.push(fact_id);
+        }
+
+        if let Some(ref session_id) = params.session_id {
+            session_repo.touch(session_id).await?;
         }
 
         Ok(serde_json::json!({
@@ -590,7 +622,7 @@ impl AlexandriaServer {
         } else {
             // Broad recall
             let clusters = self.load_all_clusters_with_members().await?;
-            let result = broad_recall(query_emb, &clusters, 5);
+            let result = broad_recall(query_emb, &clusters, 5, self.retrieve_min_similarity);
 
             let cluster_results: Vec<serde_json::Value> = result
                 .clusters
@@ -656,7 +688,7 @@ impl AlexandriaServer {
                 "started_at": session.started_at,
                 "ended_at": session.ended_at,
                 "summary": session.summary,
-                "memory_count": session.memory_count,
+                "memory_count": memories.len(),
                 "tags": session.tags,
             },
             "memories": memory_list,
@@ -1689,6 +1721,106 @@ mod get_info_tests {
     }
 
     #[tokio::test]
+    async fn get_session_hides_deleted_and_reports_live_count() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        let _kept = server
+            .do_store_memory(StoreMemoryParams {
+                content: "kept fact".to_string(),
+                tags: None,
+                session_id: Some("sess-del".to_string()),
+            })
+            .await
+            .unwrap();
+        let gone = server
+            .do_store_memory(StoreMemoryParams {
+                content: "deleted fact".to_string(),
+                tags: None,
+                session_id: Some("sess-del".to_string()),
+            })
+            .await
+            .unwrap();
+        MemoryRepo::new(server.db.inner())
+            .soft_delete_fact(&gone)
+            .await
+            .unwrap();
+
+        let session_json = server
+            .do_get_session(GetSessionParams {
+                session_id: "sess-del".to_string(),
+            })
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&session_json).unwrap();
+        let memories = parsed["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0]["content"], "kept fact");
+        assert_eq!(parsed["session"]["memory_count"], 1);
+
+        // Session-scoped search shares the same path and must hide it too.
+        let result = server
+            .do_retrieve_memories(RetrieveMemoriesParams {
+                query: "fact".to_string(),
+                limit: Some(10),
+                session_id: Some("sess-del".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["results"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_document_links_chunks_to_session() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        server
+            .do_store_memory(StoreMemoryParams {
+                content: "unrelated fact outside the session".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+        server
+            .do_import_document(ImportDocumentParams {
+                content: "first paragraph\n\nsecond paragraph".to_string(),
+                mode: None,
+                chunk_strategy: Some("paragraph".to_string()),
+                tags: None,
+                session_id: Some("sess-import".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let session_json = server
+            .do_get_session(GetSessionParams {
+                session_id: "sess-import".to_string(),
+            })
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&session_json).unwrap();
+        assert_eq!(parsed["memories"].as_array().unwrap().len(), 2);
+
+        let result = server
+            .do_retrieve_memories(RetrieveMemoriesParams {
+                query: "paragraph".to_string(),
+                limit: Some(10),
+                session_id: Some("sess-import".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["results"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn session_memory_store_retrieve_finalize() {
         let db = Database::connect_embedded().await.unwrap();
         alexandria_storage::schema::migrate(db.inner())
@@ -1785,5 +1917,245 @@ mod get_info_tests {
             })
             .await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn retrieve_memories_tool_returns_structured_content() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server =
+            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0);
+        server
+            .do_store_memory(StoreMemoryParams {
+                content: "a near match memory".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .retrieve_memories(Parameters(RetrieveMemoriesParams {
+                query: "anything".to_string(),
+                limit: Some(10),
+                session_id: None,
+            }))
+            .await;
+
+        let structured = result.structured_content.expect("structuredContent set");
+        assert_eq!(structured["results"].as_array().unwrap().len(), 1);
+        // Text block carries the same JSON so clients reading content[].text keep working.
+        let rmcp::model::ContentBlock::Text(t) = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&t.text).unwrap(),
+            structured
+        );
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    fn check_structured(label: &str, result: &CallToolResult) {
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "{label}: unexpected error result"
+        );
+        let structured = result
+            .structured_content
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: structuredContent missing"));
+        // The same JSON must stay in the text block for text-only consumers.
+        let rmcp::model::ContentBlock::Text(t) = result
+            .content
+            .first()
+            .unwrap_or_else(|| panic!("{label}: no content block"))
+        else {
+            panic!("{label}: expected text block");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&t.text).unwrap(),
+            *structured,
+            "{label}: text block and structuredContent diverged"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_tool_returns_structured_content_matching_text() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        let stored = server
+            .store_memory(Parameters(StoreMemoryParams {
+                content: "the project uses SurrealDB".to_string(),
+                tags: Some(vec!["db".to_string()]),
+                session_id: Some("sess-struct".to_string()),
+            }))
+            .await;
+        check_structured("store_memory", &stored);
+        let id = stored.structured_content.as_ref().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        check_structured(
+            "recall",
+            &server
+                .recall(Parameters(RecallParams {
+                    query: "database".to_string(),
+                    scope_handle: None,
+                }))
+                .await,
+        );
+        check_structured(
+            "update_memory",
+            &server
+                .update_memory(Parameters(UpdateMemoryParams {
+                    id: id.clone(),
+                    content: Some("the project uses SurrealDB 3.2".to_string()),
+                    tags: None,
+                    confidence: None,
+                }))
+                .await,
+        );
+        check_structured(
+            "import_document",
+            &server
+                .import_document(Parameters(ImportDocumentParams {
+                    content: "first paragraph\n\nsecond paragraph".to_string(),
+                    mode: None,
+                    chunk_strategy: Some("paragraph".to_string()),
+                    tags: None,
+                    session_id: Some("sess-struct".to_string()),
+                }))
+                .await,
+        );
+        check_structured(
+            "get_session",
+            &server
+                .get_session(Parameters(GetSessionParams {
+                    session_id: "sess-struct".to_string(),
+                }))
+                .await,
+        );
+        check_structured(
+            "finalize_session",
+            &server
+                .finalize_session(Parameters(FinalizeSessionParams {
+                    session_id: "sess-struct".to_string(),
+                    summary: Some("structured-content exercise".to_string()),
+                    tags: None,
+                }))
+                .await,
+        );
+        check_structured(
+            "delete_memory",
+            &server
+                .delete_memory(Parameters(DeleteMemoryParams { id }))
+                .await,
+        );
+        // The four reminder tools were converted to `tool_json` after this test
+        // was written, so they are the ones most likely to drift back — every
+        // `do_*` here returns a JSON string by construction and must keep
+        // mirroring it into structuredContent.
+        let set = server
+            .set_reminder(Parameters(SetReminderParams {
+                message: "water the plants".to_string(),
+                due_at: Some("2030-01-01T12:00:00Z".to_string()),
+                pattern: None,
+                cron: None,
+                target_project: Some("struct".to_string()),
+                prov_project: None,
+                session_id: None,
+                note: None,
+            }))
+            .await;
+        check_structured("set_reminder", &set);
+        let reminder_id = set.structured_content.as_ref().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        check_structured(
+            "check_reminders",
+            &server
+                .check_reminders(Parameters(CheckRemindersParams {
+                    project: Some("struct".to_string()),
+                }))
+                .await,
+        );
+        check_structured(
+            "list_reminders",
+            &server
+                .list_reminders(Parameters(ListRemindersParams {
+                    status: None,
+                    target_project: None,
+                }))
+                .await,
+        );
+        check_structured(
+            "cancel_reminder",
+            &server
+                .cancel_reminder(Parameters(CancelReminderParams { id: reminder_id }))
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_errors_are_flagged_structured() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        let result = server
+            .update_memory(Parameters(UpdateMemoryParams {
+                id: "fact:does-not-exist".to_string(),
+                content: Some("x".to_string()),
+                tags: None,
+                confidence: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structuredContent set");
+        assert_eq!(structured["status"], "error");
+        assert!(
+            structured["message"]
+                .as_str()
+                .unwrap()
+                .contains("does-not-exist")
+        );
+
+        // The error arm flattens the whole anyhow chain, not just the top-level
+        // context: reminder validation wraps the parser's reason, and
+        // `to_string()` would drop it.
+        let bad_cron = server
+            .set_reminder(Parameters(SetReminderParams {
+                message: "x".to_string(),
+                due_at: None,
+                pattern: None,
+                cron: Some("61 99 * * *".to_string()),
+                target_project: None,
+                prov_project: None,
+                session_id: None,
+                note: None,
+            }))
+            .await;
+        assert_eq!(bad_cron.is_error, Some(true));
+        let msg = bad_cron.structured_content.expect("structuredContent set")["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(msg.contains("61 99 * * *"), "must echo the input: {msg}");
+        assert!(
+            msg.contains("Minutes must be less than 59"),
+            "must carry the cron crate's reason: {msg}"
+        );
     }
 }

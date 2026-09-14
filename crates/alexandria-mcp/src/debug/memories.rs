@@ -5,8 +5,8 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 
 use super::html::{esc, layout};
-use crate::server::record_id_to_string;
 use crate::AlexandriaServer;
+use crate::server::record_id_to_string;
 
 /// Build a URL back to the memories list with the given params.
 /// Simple encoding — debug UI only, not production.
@@ -68,7 +68,7 @@ pub async fn list(
             return Html(layout(
                 "Memories",
                 &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
-            ))
+            ));
         }
     };
 
@@ -197,7 +197,7 @@ pub async fn detail(
             return (
                 StatusCode::NOT_FOUND,
                 Html(layout("Not Found", "<p>Memory not found.</p>")),
-            )
+            );
         }
         Err(e) => {
             return (
@@ -206,7 +206,7 @@ pub async fn detail(
                     "Error",
                     &format!(r#"<p class="error">{}</p>"#, esc(&e.to_string())),
                 )),
-            )
+            );
         }
     };
 

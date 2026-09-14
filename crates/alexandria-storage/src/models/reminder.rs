@@ -4,7 +4,7 @@ use surrealdb::types::{RecordId, SurrealValue};
 
 /// `Reminder::schedule_kind` discriminators. Single source of truth for the
 /// string set that is also asserted by `DEFINE FIELD schedule_kind ... ASSERT
-/// $value IN [...]` in `schema/v006_reminder.surql`; writers and
+/// $value IN [...]` in `schema/v007_reminder.surql`; writers and
 /// `alexandria_engine::reminders::spec_from_reminder` match on these constants
 /// so the two sides can't drift silently.
 pub mod schedule_kind {

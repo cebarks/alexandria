@@ -166,13 +166,13 @@ fn kmeans_split(embeddings: &[Vec<f32>]) -> (Vec<usize>, Vec<usize>, Vec<f32>, V
     let group_a: Vec<usize> = assignments
         .iter()
         .enumerate()
-        .filter(|(_, &a)| a == 0)
+        .filter(|&(_, &a)| a == 0)
         .map(|(i, _)| i)
         .collect();
     let group_b: Vec<usize> = assignments
         .iter()
         .enumerate()
-        .filter(|(_, &a)| a == 1)
+        .filter(|&(_, &a)| a == 1)
         .map(|(i, _)| i)
         .collect();
 

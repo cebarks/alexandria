@@ -1,0 +1,19 @@
+---
+version: 2
+
+updates:
+  # Actions are pinned to full commit SHAs in ci.yml, which is the right hygiene
+  # but means a pin that upstream moves or prunes silently red-lines every job.
+  # This surfaces those as bump PRs instead.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait past Dependabot's 3-day default before opening a bump PR, so a newly
+    # published action release has time to be flagged before we auto-consume it.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(ci)'
+    target-branch: main

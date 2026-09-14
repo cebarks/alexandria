@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use alexandria_storage::{schema, Database};
+use alexandria_storage::{Database, schema};
 
 #[tokio::test]
 async fn test_persistent_storage_round_trip() {

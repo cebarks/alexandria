@@ -12,4 +12,8 @@ pub struct ImportDocumentParams {
     pub chunk_strategy: Option<String>,
     #[schemars(description = "Tags applied to all resulting memories")]
     pub tags: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional session ID to group the imported chunks into a session context. Auto-creates the session on first use."
+    )]
+    pub session_id: Option<String>,
 }
