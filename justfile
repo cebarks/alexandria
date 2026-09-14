@@ -45,8 +45,21 @@ vendor-assets:
     sha256sum -c SHA256SUMS
 
 # Check vendored debug-UI assets against SHA256SUMS
+#
+# Two independent halves, and the second is the one that used to be missing. `sha256sum -c` only
+# reads the files SHA256SUMS *names*, so a third .js dropped into this directory with no checksum
+# line passed every gate — including the CI step — and shipped unverified bytes under a
+# `max-age=31536000, immutable` header. `*.js` is the complete set of checksummed extensions that
+# exist today (assets/README.md is prose, SHA256SUMS is the manifest); widen the glob if a new
+# vendored kind is ever added.
 verify-assets:
-    cd crates/alexandria-mcp/assets && sha256sum -c SHA256SUMS
+    cd crates/alexandria-mcp/assets && \
+    sha256sum -c SHA256SUMS && \
+    for f in *.js; do \
+      [ -e "$f" ] || continue; \
+      awk -v "f=$f" '$2 == f { hit = 1 } END { exit !hit }' SHA256SUMS || \
+        { echo "verify-assets: $f has no checksum line in SHA256SUMS - add one, or delete the file" >&2; exit 1; }; \
+    done
 
 # Full CI suite locally — run before pushing
 ci: fmt lint test deny verify-assets
