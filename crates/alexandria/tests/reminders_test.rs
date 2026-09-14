@@ -9,7 +9,7 @@ use alexandria_mcp::tools::{
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::models::schedule_kind;
 use alexandria_storage::repos::{NewReminder, ReminderRepo};
-use alexandria_storage::{schema, Database};
+use alexandria_storage::{Database, schema};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
@@ -1084,9 +1084,11 @@ async fn list_status_and_project_filters() {
     assert_eq!(one_delivered["status"], "delivered");
     // Delivery history survives: the list is where a user sees "fired 1 time".
     assert_eq!(one_delivered["delivered_count"], 1);
-    assert!(one_delivered["last_delivered_at"]
-        .as_str()
-        .is_some_and(|s| s.ends_with('Z')));
+    assert!(
+        one_delivered["last_delivered_at"]
+            .as_str()
+            .is_some_and(|s| s.ends_with('Z'))
+    );
     // Consumption retires a one-shot by flipping `status`, not by clearing
     // `next_due_at` (due-ness is `status = 'pending' AND next_due_at <= now`), so
     // the list still reports the time it fired at — which is the answer to "when

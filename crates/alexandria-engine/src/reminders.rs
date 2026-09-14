@@ -2,7 +2,7 @@
 //! occurrence counting. No DB, no async — engine crate rules.
 
 use alexandria_storage::models::schedule_kind;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDateTime, NaiveTime, Utc, Weekday};
 use chrono_tz::Tz;
 use cron::Schedule;
@@ -808,7 +808,11 @@ mod tests {
         let ups = upcoming(&spec, utc(2026, 10, 30, 12, 0), nyc(), 4).unwrap();
         assert_eq!(ups.len(), 4);
         assert!(ups.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(ups.iter().map(|d| d.date_naive().day()).collect::<Vec<_>>(), vec![30, 31, 1, 2], "one fire per local day, no duplicate on the fold day");
+        assert_eq!(
+            ups.iter().map(|d| d.date_naive().day()).collect::<Vec<_>>(),
+            vec![30, 31, 1, 2],
+            "one fire per local day, no duplicate on the fold day"
+        );
         // Oct 30, 31 = EDT (UTC-4) -> 13:00 UTC; Nov 1, 2 = EST (UTC-5) -> 14:00 UTC.
         assert_eq!(ups[0], utc(2026, 10, 30, 13, 0));
         assert_eq!(ups[1], utc(2026, 10, 31, 13, 0));
@@ -831,7 +835,10 @@ mod tests {
         };
         let ups = upcoming(&spec, utc(2026, 10, 31, 12, 0), nyc(), 3).unwrap();
         assert_eq!(ups.len(), 3);
-        assert!(ups.windows(2).all(|w| w[0] < w[1]), "strictly increasing: {ups:?}");
+        assert!(
+            ups.windows(2).all(|w| w[0] < w[1]),
+            "strictly increasing: {ups:?}"
+        );
         // Nov 1 01:30 EDT = 05:30 UTC and Nov 1 01:30 EST = 06:30 UTC — the fold.
         assert_eq!(ups[0], utc(2026, 11, 1, 5, 30));
         assert_eq!(ups[1], utc(2026, 11, 1, 6, 30));
@@ -840,7 +847,13 @@ mod tests {
         // counts both fold instants when it comes back overdue, so the
         // coalesced delivery reports the real number of elapsed occurrences.
         assert_eq!(
-            occurrences_between(&spec, utc(2026, 10, 31, 12, 0), utc(2026, 11, 1, 23, 59), nyc()).unwrap(),
+            occurrences_between(
+                &spec,
+                utc(2026, 10, 31, 12, 0),
+                utc(2026, 11, 1, 23, 59),
+                nyc()
+            )
+            .unwrap(),
             2
         );
     }
