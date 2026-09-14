@@ -39,6 +39,13 @@ pub struct QueryForm {
     /// left blank posts the key with an empty value, so this is `Some("")` rather than `None`
     /// when the operator does not fill it in; [`run`] normalizes that away.
     pub session_id: Option<String>,
+    /// Retrieve-only. The template posts this as `<input type="checkbox" value="true">`, which is
+    /// **absent from the body entirely** when unchecked rather than present-and-empty, so serde
+    /// gives `Some("true")` or `None` — never `Some(false)`. [`run`] normalizes that pair down to
+    /// a `bool` at the point of use, the same shape `memories::list` uses for its `include_deleted`
+    /// checkbox. Deliberately not a field on `RetrieveMemoriesParams`, which is the public MCP tool
+    /// schema.
+    pub dry_run: Option<String>,
 }
 
 /// One row of the ID / Content / Similarity table. `retrieve_memories` results and focused
@@ -198,6 +205,12 @@ struct QueryResultsTemplate {
 pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryForm>) -> Response {
     let fragment = match form.mode.as_str() {
         "retrieve" => {
+            // A checkbox sends `dry_run=true` when checked and nothing at all when not, so
+            // "present and `true`" is the whole yes test — and anything else a hand-crafted body
+            // could carry (`dry_run=1`) reads as not-dry, which is the safe direction to guess:
+            // it leaves the run doing what the real tool does rather than quietly suppressing a
+            // write the operator did not ask to suppress.
+            let dry_run = form.dry_run.as_deref() == Some("true");
             // A blank text input still submits `session_id=`, which deserializes to `Some("")`
             // (and `Some("   ")` for spaces). Scoping to that would walk the edges of a session
             // whose external id is empty, find nothing, and report "No results." — a false
@@ -210,7 +223,17 @@ pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryF
                 limit: form.limit,
                 session_id,
             };
-            match server.do_retrieve_memories(params).await {
+            // Spreading activation writes heat, so a retrieve run is the one debug route that
+            // mutates. The template says so out loud; the checkbox routes around it for an
+            // operator who wants an answer that a previous test query did not bias. The params
+            // are built once above and moved into whichever path is taken, so the two cannot drift
+            // apart in what they search for.
+            let retrieval = if dry_run {
+                server.do_retrieve_memories_dry(params).await
+            } else {
+                server.do_retrieve_memories(params).await
+            };
+            match retrieval {
                 Ok(value) => Fragment::retrieve(&value),
                 Err(e) => Fragment::error(e.to_string()),
             }
@@ -218,7 +241,10 @@ pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryF
         // recall mode intentionally ignores `limit` and `session_id`: RecallParams has no limit
         // field, and its `scope_handle` is an opaque handle returned by a previous broad recall
         // that narrows into one cluster — a different concept from a session id, so there is
-        // nothing honest to map a session onto. The form says "(retrieve only)" for both fields.
+        // nothing honest to map a session onto. It also ignores `dry_run`, for a reason worth
+        // stating before anyone adds a branch: `do_recall` writes nothing at all (no activation,
+        // no heat), so there is no side effect left for a dry run to skip. The form says
+        // "(retrieve only)" for all three fields.
         "recall" => {
             let params = RecallParams {
                 query: form.query.clone(),
@@ -476,7 +502,7 @@ mod tests {
             "the swap targets are part of the contract with `run`; got: {html}"
         );
         // One `name` per QueryForm field, so the struct stays submittable in full.
-        for name in ["mode", "query", "limit", "session_id"] {
+        for name in ["mode", "query", "limit", "session_id", "dry_run"] {
             assert!(
                 html.contains(&format!(r#"name="{name}""#)),
                 "`name=\"{name}\"` missing from the form; got: {html}"
@@ -497,6 +523,156 @@ mod tests {
         assert!(
             !html.contains(r#"session_id" value="#),
             "the form must not pretend to persist submissions; got: {html}"
+        );
+        // The dry-run control must be a checkbox carrying exactly the value [`QueryForm`] expects
+        // to see when it is present: a text input posting "" would make the absent-vs-empty
+        // distinction the handler relies on unreachable through the real form.
+        assert!(
+            html.contains(r##"type="checkbox" name="dry_run" value="true""##),
+            "dry run must be a checkbox posting `true`; got: {html}"
+        );
+        // Recall writes nothing, so the knob means nothing there — the label has to say so.
+        assert!(
+            html.contains("Dry run (retrieve only)"),
+            "the dry-run label must be marked retrieve-only; got: {html}"
+        );
+        // The mutating default is surfaced without the operator having to read `server.rs`.
+        assert!(
+            html.contains("it bumps heat on the top-ranked results"),
+            "the form must warn that a non-dry retrieve run writes heat; got: {html}"
+        );
+        assert!(
+            !html.contains(r#"name="dry_run" value="true" checked"#),
+            "dry run must start unchecked, so the tester keeps the real tool's behaviour; got: {html}"
+        );
+    }
+
+    // --- The dry-run checkbox, end to end ---------------------------------------
+    //
+    // `server.rs` already proves `do_retrieve_memories_dry` does not write heat. The paired
+    // wet/dry tests below prove the *form field* is what selects it: a handler that read `dry_run`
+    // into a variable and then called the activating path anyway would pass every server-level
+    // test while lying to the operator.
+
+    /// A two-memory graph with a real edge between them, which is what spreading activation walks.
+    /// Same construction the server-level fixture uses: `create_fact` alone is not enough, because
+    /// `HeatRepo::add_heat` updates an existing `heat_state` row and silently matches nothing when
+    /// there is none — so these go through `do_store_memory`, which creates one.
+    async fn seed_edge_pair(server: &crate::AlexandriaServer) -> (String, String) {
+        let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
+        let mut ids = Vec::new();
+        for content in ["alpha project decision", "beta project decision"] {
+            // `do_store_memory` so each fact gets its `heat_state` row; the stub embedding makes
+            // every similarity 1.0, so both memories are always above the retrieve floor.
+            ids.push(
+                server
+                    .do_store_memory(crate::tools::StoreMemoryParams {
+                        content: content.to_string(),
+                        tags: None,
+                        session_id: None,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        edge_repo
+            .create_edge(&ids[0], &ids[1], "relates_to", 1.0)
+            .await
+            .unwrap();
+        (ids[0].clone(), ids[1].clone())
+    }
+
+    /// Heat of both seeded memories. Read through `HeatRepo` — no raw query from a route test.
+    async fn seeded_heat(
+        server: &crate::AlexandriaServer,
+        ids: &(String, String),
+    ) -> (Option<f64>, Option<f64>) {
+        let heat_repo = alexandria_storage::repos::HeatRepo::new(server.db.inner());
+        (
+            heat_repo.get(&ids.0).await.unwrap().map(|h| h.heat),
+            heat_repo.get(&ids.1).await.unwrap().map(|h| h.heat),
+        )
+    }
+
+    /// The control: the default (non-dry) submission must still behave like the real tool, heat
+    /// write included, and it is what stops the dry assertion below passing on a fixture that
+    /// cannot activate at all.
+    #[tokio::test]
+    async fn test_query_run_retrieve_writes_heat_without_dry_run() {
+        let server = super::super::test_support::test_server().await;
+        let ids = seed_edge_pair(&server).await;
+        let before = seeded_heat(&server, &ids).await;
+        assert_eq!(
+            before,
+            (Some(1.0), Some(1.0)),
+            "each seeded memory starts at heat 1.0"
+        );
+
+        let app = crate::debug::router(server.clone());
+        let fragment = run_form(app, "mode=retrieve&query=project+decision&limit=10").await;
+        assert!(
+            fragment.contains("alpha project decision")
+                && fragment.contains("beta project decision"),
+            "the query must actually retrieve the seeded pair; got: {fragment}"
+        );
+
+        let after = seeded_heat(&server, &ids).await;
+        // One hop at the default propagation factor: 1.0 * 0.3^1 * edge strength 1.0.
+        let warmed = |h: Option<f64>| h.is_some_and(|h| (h - 1.3).abs() < 1e-3);
+        assert!(
+            warmed(after.0) && warmed(after.1),
+            "a non-dry retrieve run must warm both ends of the edge, exactly as \
+             retrieve_memories does; before {before:?}, after {after:?}"
+        );
+    }
+
+    /// `dry_run=true` in the form body must reach `do_retrieve_memories_dry`.
+    #[tokio::test]
+    async fn test_query_run_retrieve_dry_run_does_not_write_heat() {
+        let server = super::super::test_support::test_server().await;
+        let ids = seed_edge_pair(&server).await;
+        let before = seeded_heat(&server, &ids).await;
+
+        let app = crate::debug::router(server.clone());
+        let fragment = run_form(
+            app,
+            "mode=retrieve&query=project+decision&limit=10&dry_run=true",
+        )
+        .await;
+        assert!(
+            fragment.contains("alpha project decision")
+                && fragment.contains("beta project decision"),
+            "dry must still run the retrieval and show its results; got: {fragment}"
+        );
+        assert_eq!(
+            seeded_heat(&server, &ids).await,
+            before,
+            "a dry retrieve run must leave heat exactly where it was"
+        );
+    }
+
+    /// Recall writes nothing, so the checkbox must not change its behaviour: same results with
+    /// and without it. If a dry branch were ever added to recall, this is the test that says it
+    /// bought nothing.
+    #[tokio::test]
+    async fn test_query_run_recall_ignores_dry_run() {
+        let server = super::super::test_support::test_server().await;
+        server
+            .do_store_memory(crate::tools::StoreMemoryParams {
+                content: "a recallable fact".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::debug::router(server.clone());
+
+        let plain = run_form(app.clone(), "mode=recall&query=recallable+fact").await;
+        let dry = run_form(app, "mode=recall&query=recallable+fact&dry_run=true").await;
+        assert_eq!(
+            sorted_lines(&plain),
+            sorted_lines(&dry),
+            "recall writes nothing, so dry_run must be a no-op there"
         );
     }
 }

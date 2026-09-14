@@ -438,6 +438,36 @@ impl AlexandriaServer {
         &self,
         params: RetrieveMemoriesParams,
     ) -> anyhow::Result<serde_json::Value> {
+        self.retrieve_core(params, true).await
+    }
+
+    /// Non-mutating retrieval for the debug UI's dry-run mode.
+    ///
+    /// Identical results to [`Self::do_retrieve_memories`] — the only difference is that the
+    /// spreading-activation write is skipped, so a diagnostic query stops perturbing the heat
+    /// that feeds the ranking it is trying to explain.
+    pub async fn do_retrieve_memories_dry(
+        &self,
+        params: RetrieveMemoriesParams,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.retrieve_core(params, false).await
+    }
+
+    /// Shared retrieval implementation. `activate` controls the spreading-activation side
+    /// effect *only*; every other step — embedding, loading, ranking, the similarity floor,
+    /// result building — is the same code on both paths, which is what makes dry results equal
+    /// wet results.
+    ///
+    /// `do_retrieve_memories` must keep its exact signature: `#[tool] retrieve_memories` calls
+    /// it, and the rmcp derives are sensitive to the shape of tool-adjacent methods. The knob is
+    /// deliberately a Rust parameter rather than a field on [`RetrieveMemoriesParams`] — that
+    /// struct is the public MCP tool schema advertised to every LLM client, and a `dry_run`
+    /// field there would be a debug-only affordance that agents could set.
+    async fn retrieve_core(
+        &self,
+        params: RetrieveMemoriesParams,
+        activate: bool,
+    ) -> anyhow::Result<serde_json::Value> {
         let limit = params.limit.unwrap_or(10);
 
         // 1. Embed query
@@ -472,13 +502,22 @@ impl AlexandriaServer {
             .filter(|(_, sim)| *sim >= self.retrieve_min_similarity)
             .collect();
 
-        // 4. Trigger spreading activation for top results
-        for (idx, _) in ranked.iter().take(self.activation_top_n) {
-            let fact = &facts[*idx];
-            if let Some(ref id) = fact.id {
-                let fact_id_str = record_id_to_string(id);
-                // Fire-and-forget activation — don't block on it
-                let _ = self.trigger_activation(&fact_id_str, 1.0).await;
+        // 4. Trigger spreading activation for top results.
+        //
+        // Order matters and is load-bearing (AGENTS.md documents it): this runs after ranking
+        // and after the `retrieve_min_similarity` filter dropped the noise, so it warms the
+        // results a caller actually sees — never a row they did not.
+        //
+        // Every `add_heat` it issues is a real database write, which is why the debug UI's
+        // dry-run mode passes `activate: false` rather than calling this unconditionally.
+        if activate {
+            for (idx, _) in ranked.iter().take(self.activation_top_n) {
+                let fact = &facts[*idx];
+                if let Some(ref id) = fact.id {
+                    let fact_id_str = record_id_to_string(id);
+                    // Fire-and-forget activation — don't block on it
+                    let _ = self.trigger_activation(&fact_id_str, 1.0).await;
+                }
             }
         }
 
@@ -996,6 +1035,168 @@ mod get_info_tests {
             "only the above-floor memory should survive"
         );
         assert!(results[0]["content"].as_str().unwrap().contains("above"));
+    }
+
+    // --- Dry-run vs wet retrieval: the heat side effect -------------------------
+    //
+    // Spreading activation only writes anything if three things all line up, so these tests
+    // share one fixture built to satisfy every one of them:
+    //   1. the retrieved fact must have a `memory_edge` neighbour (`trigger_activation` returns
+    //      early when `get_neighbors` comes back empty);
+    //   2. that neighbour must be within `max_hops` (2 by default) and its heat delta must clear
+    //      `compute_activation_targets`' 0.001 negligible floor (edge strength 1.0 at hop 1 is
+    //      1.0 * 0.3 * 1.0 = 0.3);
+    //   3. that neighbour must already have a `heat_state` row, because `HeatRepo::add_heat` is
+    //      an `UPDATE heat_state ... WHERE memory = ...` that silently matches nothing — and the
+    //      caller discards the result with `.ok()` — when there is no row to warm.
+    // Point 3 is why the fixture stores through `do_store_memory` (which creates the row at 1.0)
+    // rather than `MemoryRepo::create_fact`.
+
+    /// Two memories joined by a real `memory_edge` — the graph activation actually walks.
+    async fn seed_edge_pair(server: &AlexandriaServer) -> (String, String) {
+        let a = server
+            .do_store_memory(StoreMemoryParams {
+                content: "seed alpha".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+        let b = server
+            .do_store_memory(StoreMemoryParams {
+                content: "seed beta".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+        EdgeRepo::new(server.db.inner())
+            .create_edge(&a, &b, "relates_to", 1.0)
+            .await
+            .unwrap();
+        (a, b)
+    }
+
+    /// Heat of both seeded memories, read through `HeatRepo` rather than a query of the test's
+    /// own. `None` would mean the row vanished, which is also a change worth failing on.
+    async fn seeded_heat(
+        server: &AlexandriaServer,
+        ids: &(String, String),
+    ) -> (Option<f64>, Option<f64>) {
+        let heat_repo = HeatRepo::new(server.db.inner());
+        (
+            heat_repo.get(&ids.0).await.unwrap().map(|h| h.heat),
+            heat_repo.get(&ids.1).await.unwrap().map(|h| h.heat),
+        )
+    }
+
+    /// One `RetrieveMemoriesParams` shared by every call in these three tests, so a difference
+    /// in what they assert can only come from the code path, never from the arguments.
+    fn seeded_retrieve_params() -> RetrieveMemoriesParams {
+        RetrieveMemoriesParams {
+            query: "anything at all".to_string(),
+            limit: Some(10),
+            session_id: None,
+        }
+    }
+
+    /// A server with the seeded pair already in it, plus the seeded ids.
+    async fn server_with_seeded_edge() -> (AlexandriaServer, (String, String)) {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let ids = seed_edge_pair(&server).await;
+        (server, ids)
+    }
+
+    /// The control for `test_dry_run_does_not_write_heat`: this fixture really can produce a
+    /// heat write. Without it the dry assertion could pass vacuously on a fixture where nothing
+    /// ever activates.
+    #[tokio::test]
+    async fn test_wet_run_does_write_heat() {
+        let (server, ids) = server_with_seeded_edge().await;
+        let before = seeded_heat(&server, &ids).await;
+        assert_eq!(
+            before,
+            (Some(1.0), Some(1.0)),
+            "each `do_store_memory` seeds heat at 1.0, so the fixture starts from a known place"
+        );
+
+        server
+            .do_retrieve_memories(seeded_retrieve_params())
+            .await
+            .unwrap();
+
+        let after = seeded_heat(&server, &ids).await;
+        // One hop of propagation at the default factor: 1.0 * 0.3^1 * strength 1.0. Compared with
+        // a tolerance because that delta is computed in f32 and widened to f64 on the way in.
+        let warmed = |h: Option<f64>| h.is_some_and(|h| (h - 1.3).abs() < 1e-3);
+        assert!(
+            warmed(after.0) && warmed(after.1),
+            "a wet retrieve must warm both endpoints of the seeded edge; before {before:?}, after {after:?}"
+        );
+    }
+
+    /// The load-bearing one: the same query through the dry path leaves heat exactly where it
+    /// was, even though the control test above proves it moves.
+    #[tokio::test]
+    async fn test_dry_run_does_not_write_heat() {
+        let (server, ids) = server_with_seeded_edge().await;
+        let before = seeded_heat(&server, &ids).await;
+
+        let result = server
+            .do_retrieve_memories_dry(seeded_retrieve_params())
+            .await
+            .unwrap();
+        assert_eq!(
+            result["results"].as_array().unwrap().len(),
+            2,
+            "the dry path must still run the retrieval, not short-circuit it"
+        );
+        assert_eq!(
+            seeded_heat(&server, &ids).await,
+            before,
+            "a dry retrieve must not write heat anywhere it touches"
+        );
+    }
+
+    /// Pinning the equivalence property the split depends on: dry and wet differ *only* in the
+    /// side effect. Whole-`Value` comparison, so ids, contents, similarities, tags and row order
+    /// are all in scope.
+    #[tokio::test]
+    async fn test_dry_and_wet_return_identical_results() {
+        let (server, _ids) = server_with_seeded_edge().await;
+
+        let dry = server
+            .do_retrieve_memories_dry(seeded_retrieve_params())
+            .await
+            .unwrap();
+        let wet = server
+            .do_retrieve_memories(seeded_retrieve_params())
+            .await
+            .unwrap();
+        // A second dry run *after* the wet one, to show the heat the wet run wrote does not leak
+        // into what the dry path reports.
+        let dry_again = server
+            .do_retrieve_memories_dry(seeded_retrieve_params())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dry["results"].as_array().unwrap().len(),
+            2,
+            "an empty result set would make the comparisons below tautological"
+        );
+        assert_eq!(
+            dry, wet,
+            "dry and wet retrieval must return identical results"
+        );
+        assert_eq!(
+            dry_again, wet,
+            "a dry run after a wet one must return the same results as before it"
+        );
     }
 
     #[tokio::test]
