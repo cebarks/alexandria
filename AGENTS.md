@@ -50,7 +50,23 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Session-scoped retrieval filters soft-deleted memories: `SessionRepo::get_memories()` carries `WHERE deleted = false`, so `get_session` and `retrieve_memories(session_id: ...)` agree with the unscoped path. This was a known gap and is now closed; it is pinned at the storage layer by `test_get_memories_excludes_deleted` and again at the UI layer by `test_session_detail_excludes_soft_deleted_memories` — don't "simplify" either filter away.
 - Schema migrations are forward-only, numbered (`v001`, `v002`, ...), tracked in `system_config` table. Current head is `v006_drop_session_memory_count.surql`; `schema::LATEST_VERSION` is derived from the `MIGRATIONS` table, so it cannot drift from the list. `/debug` renders applied-vs-compiled-in version and calls out a mismatch.
 - Embedding model is locked on first boot — changing `config.toml` model without wiping data will refuse to start.
-- The **debug UI is read-only with exactly one sanctioned exception**: the Query Tester's non-dry `retrieve` run performs spreading activation, so it writes heat just as a real `retrieve_memories` call does. **Dry run** uses `do_retrieve_memories_unfiltered`/`_dry` and writes nothing. That exception is disclosed in the UI and load-bearing for its no-auth posture — README's "publish the port only behind a reverse proxy" warning rests on "nothing mutates except that one disclosed heat write". Adding any other write route breaks the argument and needs that paragraph rewritten first.
+- The **debug UI is read-only with exactly one sanctioned exception**: the Query Tester's non-dry
+  `retrieve` run performs spreading activation, so it writes heat just as a real
+  `retrieve_memories` call does. Dry run uses
+  `do_retrieve_memories_unfiltered`/`_dry` and writes nothing. That exception is disclosed in the UI
+  and load-bearing for its no-auth posture — README's "publish the port only behind a reverse proxy"
+  warning rests on "nothing mutates except that one disclosed heat write". Adding any other write
+  route breaks the argument and needs that paragraph rewritten first.
+- The debug router is guarded by `debug/guard.rs`, applied as a single `middleware::from_fn_with_state`
+  layer over the whole router returned by `router_with_context`. **The CSRF half is unconditional** (any
+  non-`GET`/`HEAD` request carrying `Sec-Fetch-Site: cross-site`/`cross-origin` gets 403; an absent
+  header is allowed, because that is curl and every test) and the **Host half is opt-in** via
+  `DebugContext::allowed_hosts`, empty or `"*"` meaning off so the default is unchanged. It is split
+  that way on purpose: deriving the CSRF check from `ctx: Some(..)` would give every `router()` caller
+  the weaker build silently. **Any new debug route must be added inside `router_with_context`, above
+  that `.layer()` call** — a route registered after it, or served by a different router that merges
+  this one, escapes both checks. `guard.rs`'s `test_every_debug_route_is_guarded` enumerates every
+  guarded path for exactly that reason; extend its list with the route.
 - Cluster cohesion in the debug UI comes from the cluster's **stored centroid** (`ClusterRepo::get`), never a recomputed member-average. `main.rs`'s maintenance loop uses the stored centroid, so an approximation made `/debug/clusters/:id` report "Healthy" for a cluster the background task was about to split — a diagnostic surface that disagrees with the mechanism it diagnoses is worse than showing nothing.
 - `debug::router(server)` passes `None` for `DebugContext`; only HTTP mode via `router_with_context` populates it. The dashboard's config panel therefore renders an explicit "unavailable outside HTTP mode" state instead of bogus zeros, because `ClusterConfig` lives in the binary crate and structurally cannot reach `alexandria-mcp`. **Do not change `router()`'s signature** — all 61 of its call sites are inside `#[cfg(test)]` modules under `src/debug/`; production is the single `router_with_context` caller (`main.rs`).
 

@@ -301,6 +301,9 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
         data_dir: config.database.data_dir.display().to_string(),
         cluster_merge_threshold: config.cluster.merge_threshold,
         maintenance_interval_secs: config.cluster.maintenance_interval_secs,
+        // The same list `/mcp` is configured with above, so the debug UI and the MCP endpoint
+        // cannot disagree about what a legitimate Host is.
+        allowed_hosts: config.server.allowed_hosts.clone(),
     };
     let debug_router = alexandria_mcp::debug::router_with_context(server.clone(), Some(debug_ctx));
 

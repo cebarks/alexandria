@@ -539,6 +539,9 @@ mod tests {
             data_dir: "/tmp/data-dir-9".to_string(),
             cluster_merge_threshold: 0.875,
             maintenance_interval_secs: 1234,
+            // Host checking is off for this test: `render` below issues a bare `Request::builder()`
+            // GET with no Host header, which an armed check would (correctly) refuse.
+            allowed_hosts: vec![],
         };
         let html = render(crate::debug::router_with_context(server, Some(ctx))).await;
 

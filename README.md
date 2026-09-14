@@ -134,6 +134,18 @@ putting a reverse proxy/auth layer in front of it. That tradeoff is defensible b
 the page mutates except the one disclosed heat write above; if a mutating route is ever added, this
 paragraph is the thing that has to change first.
 
+Two guards in `debug/guard.rs` narrow that boundary. Every non-`GET` request that arrives with
+`Sec-Fetch-Site: cross-site` or `cross-origin` is refused with `403`, so a hidden auto-submitting
+form on a page you visit cannot drive the Query Tester into writing heat on an attacker-chosen
+query — this check is unconditional and needs no configuration. Separately, **binding to loopback
+is not by itself a security boundary**: DNS rebinding lets a remote page resolve its own domain to
+`127.0.0.1` and then read `/debug/sessions` — session summaries and tags — as same-origin. Setting
+`allowed_hosts` in `[server]` now guards the debug UI as well as `/mcp`, accepting a `Host` either
+with or without its port, and requests with no `Host` at all are refused while it is armed. The
+Host half is opt-in, so the shipped default of `["*"]` behaves exactly as before; prefer setting
+`allowed_hosts` explicitly (for example `["localhost", "127.0.0.1"]`) over leaving the wildcard,
+especially when `host = "0.0.0.0"`.
+
 ## Deployment
 
 ### As a systemd user service (recommended)

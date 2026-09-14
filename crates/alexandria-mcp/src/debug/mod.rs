@@ -2,6 +2,7 @@ pub mod assets;
 pub mod clusters;
 pub mod dashboard;
 pub mod graph;
+mod guard;
 pub mod html;
 pub mod maintenance;
 pub mod memories;
@@ -38,6 +39,13 @@ pub struct DebugContext {
     pub data_dir: String,
     pub cluster_merge_threshold: f32,
     pub maintenance_interval_secs: u64,
+    /// `[server] allowed_hosts`, verbatim.
+    ///
+    /// The debug UI has no auth, so its only server-side signal that a request is not what it
+    /// claims to be is the `Host` header — see `debug/guard.rs`. Empty or wildcarded means the
+    /// Host check is off, which keeps the shipped default (`["*"]`) behaving exactly as it did
+    /// before.
+    pub allowed_hosts: Vec<String>,
 }
 
 /// Existing entry point, unchanged: tests and stdio mode use this, and the dashboard's
@@ -51,7 +59,22 @@ pub fn router(server: AlexandriaServer) -> Router {
 /// `ctx` travels as a request `Extension` layered on the dashboard route alone. The
 /// alternative — a wider `State` struct — would rewrite the extractor signature of every
 /// handler on the strength of one page needing one extra value.
+///
+/// **Every debug route must be added here**, below the `guard` layer: the layer is applied to
+/// the routes registered above it, so a route bolted on after `.layer()` — or served by a
+/// different router that merges this one — silently escapes both checks. `guard.rs`'s
+/// `test_every_debug_route_is_guarded` is the tripwire for exactly that.
 pub fn router_with_context(server: AlexandriaServer, ctx: Option<DebugContext>) -> Router {
+    // The Host half is configured; the CSRF half is not, on purpose. Deriving it from `ctx` being
+    // `Some` would mean every caller of `router()` — stdio mode, and all 60+ tests — got the
+    // weaker build without anyone having to decide that.
+    let allowed_hosts = ctx
+        .as_ref()
+        .map(|ctx| guard::Guard {
+            allowed_hosts: ctx.allowed_hosts.clone(),
+        })
+        .unwrap_or_default();
+
     Router::new()
         .route("/debug", get(dashboard::handler).layer(Extension(ctx)))
         .route("/debug/assets/{name}", get(assets::asset))
@@ -67,4 +90,10 @@ pub fn router_with_context(server: AlexandriaServer, ctx: Option<DebugContext>) 
         .route("/debug/query", get(query::form))
         .route("/debug/query/run", post(query::run))
         .with_state(server)
+        // Over the whole router, after state is applied, so it covers `/debug/assets/*` and the
+        // 403-on-GET case of the rebinding attack just as thoroughly as the CSRF-carrying POST.
+        .layer(axum::middleware::from_fn_with_state(
+            allowed_hosts,
+            guard::enforce,
+        ))
 }
