@@ -6,6 +6,7 @@ pub mod html;
 pub mod maintenance;
 pub mod memories;
 pub mod query;
+pub mod sessions;
 
 #[cfg(test)]
 mod test_support;
@@ -23,6 +24,8 @@ pub fn router(server: AlexandriaServer) -> Router {
         .route("/debug/memories/{id}", get(memories::detail))
         .route("/debug/clusters", get(clusters::list))
         .route("/debug/clusters/{id}", get(clusters::detail))
+        .route("/debug/sessions", get(sessions::list))
+        .route("/debug/sessions/{external_id}", get(sessions::detail))
         .route("/debug/graph/{id}", get(graph::page))
         .route("/debug/api/graph/{id}", get(graph::api_graph))
         .route("/debug/maintenance", get(maintenance::list))
