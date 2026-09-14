@@ -4,8 +4,10 @@ use axum::extract::State;
 use axum::response::Response;
 
 use super::DebugContext;
+use super::clusters::{Cohesion, cohesion_of, embeddings_of};
 use super::html::{error_page, page};
 use crate::AlexandriaServer;
+use crate::server::record_id_to_string;
 
 /// Shown in place of any row this process cannot answer.
 ///
@@ -13,6 +15,10 @@ use crate::AlexandriaServer;
 /// diagnostic surface rendering a *plausible* wrong number, so "we do not know" has to look
 /// nothing like a value — hence no `0`, no empty cell, no `—`.
 const UNAVAILABLE: &str = "unavailable outside HTTP mode";
+
+/// Cap for the top-tags rollup. Named, because the section heading has to state it: ten tags
+/// from a database with more is a *sample*, and a UI that implies otherwise is wrong.
+const TAG_LIMIT: usize = 10;
 
 /// One row of the effective-configuration table. `label` is the `config.toml` key so an
 /// operator can grep the file for what they are looking at; `value` is already a display
@@ -35,6 +41,12 @@ struct DashboardTemplate {
     config_rows: Vec<ConfigRow>,
     /// Prominent only when the applied and compiled-in schema versions disagree.
     schema_note: String,
+    cluster_health: ClusterHealth,
+    sessions: SessionRollup,
+    tags: BarSection,
+    heat: BarSection,
+    /// Echoes [`TAG_LIMIT`] so the heading cannot drift from the cap the query applies.
+    tag_limit: usize,
 }
 
 /// Values the running server itself holds. Available in every mode, including stdio and
@@ -142,6 +154,196 @@ fn schema_note(applied: &Result<Option<String>, anyhow::Error>, head: &str) -> S
     }
 }
 
+/// Shown in place of a rollup whose data could not be read.
+///
+/// Deliberately different wording from [`UNAVAILABLE`]: that means "this process mode has no
+/// answer", this means "the read failed", and an operator triaging a page needs to tell the
+/// two apart. The cause travels with it because a dashboard that hides *why* it is blind is
+/// only half a diagnostic.
+fn rollup_unavailable(what: &str, error: &anyhow::Error) -> String {
+    format!("{what} could not be read: {error}")
+}
+
+/// Maps one rollup's `Result` to the pair every rollup section is built from: its data, and
+/// the reason there is none.
+///
+/// This is the dashboard's degradation contract, and it is a function rather than four matches
+/// so that a fifth rollup cannot forget it. A page that 500s because one stat failed is worse
+/// than one that shows that stat as unavailable and the other three normally, so `?` is not
+/// available at these call sites. On failure the section's [`Default`] — an empty state — is
+/// returned, which the template shows only behind the error sentence, never as a plausible `0`.
+fn degrade<T: Default>(what: &'static str, source: Result<T, anyhow::Error>) -> (T, String) {
+    match source {
+        Ok(data) => (data, String::new()),
+        Err(e) => {
+            tracing::warn!(rollup = what, error = %e, "dashboard rollup unavailable");
+            (T::default(), rollup_unavailable(what, &e))
+        }
+    }
+}
+
+/// Cluster-health counts. The three verdict rows sum to the cluster count in the table above.
+#[derive(Default)]
+struct ClusterHealth {
+    error: String,
+    healthy: usize,
+    needs_split: usize,
+    too_few: usize,
+}
+
+/// Session counts, split the only way the data model supports: a summary or not.
+#[derive(Default)]
+struct SessionRollup {
+    error: String,
+    total: usize,
+    finalized: usize,
+    idle: usize,
+}
+
+/// One horizontal bar. `label` is rendered through `{{ }}` (escaped); `width` is an integer
+/// percentage computed by [`bars`], and is the only thing here that reaches a `style`
+/// attribute.
+struct BarRow {
+    label: String,
+    count: usize,
+    width: u32,
+}
+
+/// A bar-chart section. Shared by top tags and heat distribution, which differ only in where
+/// their `(label, count)` pairs come from — the markup, and the degradation, are the same.
+#[derive(Default)]
+struct BarSection {
+    error: String,
+    rows: Vec<BarRow>,
+}
+
+/// Healthy vs needs-split, judged through [`cohesion_of`] from each cluster's **stored**
+/// centroid — the same vector the background maintenance task splits on, so this rollup and
+/// `clusters.rs`' detail page cannot render opposite verdicts for one cluster.
+async fn cluster_health(server: &AlexandriaServer) -> Result<ClusterHealth, anyhow::Error> {
+    let repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
+    let mut section = ClusterHealth::default();
+
+    for (cluster, member_count) in repo.list_with_counts().await? {
+        // `list_with_counts` already carries the stored centroid, so the only extra reads here
+        // are member embeddings — skipped entirely for a cluster with no members, which has no
+        // verdict to compute either way.
+        //
+        // TODO(debt): O(clusters) round trips per dashboard render — and `list_with_counts`
+        // itself walks every cluster to count members, so this is twice over. The repo's own
+        // notes name cluster-count growth as the first thing to revisit; when it bites the fix
+        // is one grouped query inside `alexandria-storage`, not a cache in this handler.
+        if member_count == 0 {
+            section.too_few += 1;
+            continue;
+        }
+        let id = cluster
+            .id
+            .as_ref()
+            .map(record_id_to_string)
+            .unwrap_or_default();
+        let members = repo.get_members(&id).await?;
+        match cohesion_of(
+            &id,
+            &cluster.centroid,
+            &embeddings_of(&members),
+            server.cohesion_floor,
+        ) {
+            Cohesion::Healthy => section.healthy += 1,
+            Cohesion::NeedsSplit => section.needs_split += 1,
+            // Fewer members than the engine will judge. `NoCentroid` is unreachable here —
+            // every row came from a real cluster record — but counting it rather than
+            // dropping it keeps the three rows summing to the cluster total.
+            Cohesion::TooSmall | Cohesion::NoCentroid => section.too_few += 1,
+        }
+    }
+    Ok(section)
+}
+
+/// `total` is the already-gathered [`alexandria_storage::stats::Stats::session_count`] rather
+/// than a second count query, so this section can never disagree with the counts table above
+/// it. Only the finalized read can fail.
+async fn session_rollup(
+    server: &AlexandriaServer,
+    total: usize,
+) -> Result<SessionRollup, anyhow::Error> {
+    let finalized = alexandria_storage::repos::SessionRepo::new(server.db.inner())
+        .count_finalized()
+        .await?;
+    Ok(SessionRollup {
+        error: String::new(),
+        total,
+        finalized,
+        // Idle is the remainder, and is never inferred from `ended_at`: `SessionRepo::touch()`
+        // bumps that on every attached memory, so it means last activity, not completion. A
+        // non-null `summary` — what `count_finalized` selects on — is the only discriminator.
+        idle: total.saturating_sub(finalized),
+    })
+}
+
+/// The ten most-used tags, as bars. The cap is stated in the section heading, because a list of
+/// ten that is presented as complete would be a quiet lie about a database with two thousand.
+async fn tag_bars(server: &AlexandriaServer) -> Result<BarSection, anyhow::Error> {
+    let pairs = alexandria_storage::repos::MemoryRepo::new(server.db.inner())
+        .top_tags(TAG_LIMIT)
+        .await?;
+    Ok(bars(pairs))
+}
+
+async fn heat_bars(server: &AlexandriaServer) -> Result<BarSection, anyhow::Error> {
+    let counts = alexandria_storage::repos::HeatRepo::new(server.db.inner())
+        .heat_histogram()
+        .await?;
+    // Positional against `HEAT_BANDS`, which is documented as being in the histogram's order.
+    // `zip` stops at the shorter side on purpose: a band rendering without a count (or vice
+    // versa) after one of the two changes is a quieter failure than panicking on a diagnostic
+    // page whose whole job is to stay legible.
+    Ok(bars(
+        alexandria_storage::repos::heat_repo::HEAT_BANDS
+            .into_iter()
+            .zip(counts)
+            .map(|(band, count)| (band.to_string(), count))
+            .collect(),
+    ))
+}
+
+/// Turns `(label, count)` pairs into bars.
+///
+/// The arithmetic lives here rather than in the template for two reasons: `dashboard.html` does
+/// no arithmetic, and a `style` attribute assembled from data would be an injection point — tag
+/// names are user-supplied. Only an integer crosses into markup.
+fn bars(pairs: Vec<(String, usize)>) -> BarSection {
+    // Scaled to the section's own largest count, not an absolute ceiling: in a database whose
+    // most-used tag appears four times, that tag should read as a full bar rather than a sliver.
+    let max = pairs.iter().map(|(_, count)| *count).max().unwrap_or(0);
+    let rows = pairs
+        .into_iter()
+        .map(|(label, count)| BarRow {
+            label,
+            count,
+            width: bar_width(count, max),
+        })
+        .collect();
+    BarSection {
+        error: String::new(),
+        rows,
+    }
+}
+
+/// Width as an integer percentage, rounded down.
+///
+/// `count <= max` by construction, so the result cannot exceed 100. `max == 0` — an empty
+/// section, or one where every count is zero — returns 0 instead of dividing by zero. Any
+/// non-zero count gets at least 1, so a rare tag renders as a visible sliver rather than as a
+/// row that looks empty.
+fn bar_width(count: usize, max: usize) -> u32 {
+    if max == 0 {
+        return 0;
+    }
+    let percent = ((count as u64 * 100) / max as u64) as u32;
+    if count > 0 { percent.max(1) } else { percent }
+}
+
 fn row<T: std::fmt::Display>(label: &'static str, value: &T) -> ConfigRow {
     ConfigRow {
         label,
@@ -172,6 +374,20 @@ pub async fn handler(
     config_rows.extend(context_rows(ctx.as_ref()));
     config_rows.extend(schema_rows(&applied, &head));
 
+    // Every rollup goes through `degrade`, so one unavailable stat costs the reader one section
+    // and nothing else.
+    let (data, error) = degrade("Cluster health", cluster_health(&server).await);
+    let cluster_health = ClusterHealth { error, ..data };
+    let (data, error) = degrade(
+        "Sessions",
+        session_rollup(&server, stats.session_count).await,
+    );
+    let sessions = SessionRollup { error, ..data };
+    let (data, error) = degrade("Top tags", tag_bars(&server).await);
+    let tags = BarSection { error, ..data };
+    let (data, error) = degrade("Heat distribution", heat_bars(&server).await);
+    let heat = BarSection { error, ..data };
+
     page(DashboardTemplate {
         nav: "dashboard",
         fact_count: stats.fact_count,
@@ -182,6 +398,11 @@ pub async fn handler(
         session_count: stats.session_count,
         config_rows,
         schema_note,
+        cluster_health,
+        sessions,
+        tags,
+        heat,
+        tag_limit: TAG_LIMIT,
     })
 }
 
@@ -399,5 +620,300 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("Alexandria Debug Dashboard"));
         assert!(text.contains("Facts (active)"));
+    }
+
+    // --- rollups ---------------------------------------------------------------
+
+    use super::{
+        BarSection, ClusterHealth, DashboardTemplate, SessionRollup, TAG_LIMIT, bars, degrade,
+    };
+    use askama::Template as _;
+
+    /// The full markup one bar row renders to. Asserting the whole row — rather than a label,
+    /// a width and a count separately — is what ties them together, so a bar scaled against the
+    /// wrong maximum, or paired with the wrong label, cannot pass.
+    fn bar_row(label: &str, width: u32, count: usize) -> String {
+        format!(
+            r#"<div class="bar-row"><span class="bar-name">{label}</span><span class="bar"><span class="bar-fill" style="width: {width}%"></span></span><span class="bar-count">{count}</span></div>"#
+        )
+    }
+
+    /// Four members mirrored about the x-axis, at cosine 0.56 from their own **stored**
+    /// centroid `[0.56, 0]` — below the 0.6 default floor, so the stored centroid itself says
+    /// "split".
+    async fn needs_split_cluster(server: &crate::AlexandriaServer, label: &str) {
+        use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
+
+        let cluster_repo = ClusterRepo::new(server.db.inner());
+        let memory_repo = MemoryRepo::new(server.db.inner());
+        let cid = cluster_repo
+            .create(Some(label), &[0.56, 0.0])
+            .await
+            .unwrap();
+        for (index, embedding) in [
+            [0.56_f32, 0.8285],
+            [0.56, 0.8285],
+            [0.56, -0.8285],
+            [0.56, -0.8285],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let fact = memory_repo
+                .create_fact(&format!("{label} member {index}"), 0.5, embedding, &[])
+                .await
+                .unwrap();
+            cluster_repo.add_member(&cid, &fact).await.unwrap();
+        }
+    }
+
+    /// 2 healthy / 1 needs split / 1 too few members.
+    ///
+    /// The healthy two come from `disagreeing_cluster`, whose *member average* centroid reads
+    /// Needs split — so this exact 2/1 is also the guard that the rollup judges cohesion the way
+    /// the maintenance task does. Roll the rollup onto an averaged centroid and it reports 1/2.
+    #[tokio::test]
+    async fn test_dashboard_cluster_health_counts_verdicts() {
+        let server = super::super::test_support::test_server().await;
+        super::super::test_support::disagreeing_cluster(&server).await;
+        super::super::test_support::disagreeing_cluster(&server).await;
+        needs_split_cluster(&server, "diffuse-cluster").await;
+        alexandria_storage::repos::ClusterRepo::new(server.db.inner())
+            .create(Some("empty-cluster"), &[0.25, -0.75])
+            .await
+            .unwrap();
+
+        let html = render(crate::debug::router(server)).await;
+        for (label, value) in [
+            ("Healthy", 2),
+            ("Needs split", 1),
+            ("Too few members to judge", 1),
+        ] {
+            let row = format!("<tr><th>{label}</th><td>{value}</td></tr>");
+            assert!(
+                html.contains(&row),
+                "expected {row:?}; cluster rows on the page: {:?}",
+                headings_in(&html)
+            );
+        }
+    }
+
+    /// Five sessions: two finalized with a summary, three merely touched.
+    ///
+    /// `touch()` writes `ended_at`, so the three idle ones already *look* ended to anything
+    /// reading that column. A 2/3 split is only reachable through `summary`, which is the point
+    /// of the fixture.
+    #[tokio::test]
+    async fn test_dashboard_session_rollup_separates_finalized_from_idle() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::SessionRepo::new(server.db.inner());
+        for index in 1..=5 {
+            repo.create(&format!("sess-roll-{index}"), None, None)
+                .await
+                .unwrap();
+        }
+        for index in 1..=3 {
+            repo.touch(&format!("sess-roll-{index}")).await.unwrap();
+        }
+        for index in 4..=5 {
+            repo.finalize(&format!("sess-roll-{index}"), Some("rollup summary"), None)
+                .await
+                .unwrap();
+        }
+
+        let html = render(crate::debug::router(server)).await;
+        for (label, value) in [("Total", 5), ("Finalized", 2), ("Idle", 3)] {
+            let row = format!("<tr><th>{label}</th><td>{value}</td></tr>");
+            assert!(
+                html.contains(&row),
+                "expected {row:?}; touched-but-not-finalized sessions must not count as \
+                 finalized. Rows: {:?}",
+                headings_in(&html)
+            );
+        }
+    }
+
+    /// Three tags used 3 / 2 / 1 times: bars scale to the section's own maximum, so 100% /
+    /// 66% / 33%. One tag name is markup, to prove it cannot reach the page raw.
+    #[tokio::test]
+    async fn test_dashboard_top_tags_bars_scale_to_the_section_max() {
+        let server = super::super::test_support::test_server().await;
+        let memory_repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        for (tag, times) in [("alpha-tag-3x", 3), ("beta-tag-2x", 2), ("<evil-tag>", 1)] {
+            for index in 0..times {
+                memory_repo
+                    .create_fact(
+                        &format!("tagged fact {tag} {index}"),
+                        0.5,
+                        &[0.1, 0.2],
+                        &[tag.to_string()],
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let html = render(crate::debug::router(server)).await;
+        assert!(
+            html.contains(&bar_row("alpha-tag-3x", 100, 3)),
+            "got: {html}"
+        );
+        assert!(html.contains(&bar_row("beta-tag-2x", 66, 2)), "got: {html}");
+        // The escaped form, which also proves the width came from a number rather than from the
+        // label: a `style` attribute built out of tag text would put attacker-controlled CSS
+        // (or a second attribute) on the page.
+        assert!(
+            html.contains(&bar_row("&#60;evil-tag&#62;", 33, 1)),
+            "the escaped tag row is missing; raw name in markup: {}",
+            html.contains("<evil-tag>")
+        );
+        assert!(
+            html.contains("<h2>Top tags (up to 10)</h2>"),
+            "the cap has to be stated where the list is shown"
+        );
+    }
+
+    /// One heat state in each of three bands and two in the top band, so the counts are
+    /// 1/1/1/2 — only `3 and above` can be the full-width bar, and every band must appear.
+    #[tokio::test]
+    async fn test_dashboard_heat_bars_span_every_band() {
+        let server = super::super::test_support::test_server().await;
+        let heat_repo = alexandria_storage::repos::HeatRepo::new(server.db.inner());
+        let memory_repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        for (index, heat) in [0.4_f64, 1.4, 2.4, 3.5, 9.75].iter().enumerate() {
+            let fact = memory_repo
+                .create_fact(&format!("heat fixture {index}"), 0.5, &[0.1, 0.2], &[])
+                .await
+                .unwrap();
+            heat_repo.create_for_memory(&fact, *heat).await.unwrap();
+        }
+
+        let html = render(crate::debug::router(server)).await;
+        for (band, width, count) in [
+            ("below 1", 50, 1),
+            ("1 to 2", 50, 1),
+            ("2 to 3", 50, 1),
+            ("3 and above", 100, 2),
+        ] {
+            assert!(
+                html.contains(&bar_row(band, width, count)),
+                "missing bar row for band {band:?}: {}",
+                headings_in(&html).len()
+            );
+        }
+    }
+
+    /// The empty-database path, through the live router. This is what catches a rollup query
+    /// that errors on "no rows" instead of returning zeros, and it checks all four sections
+    /// appear on a page whose data is entirely absent.
+    #[tokio::test]
+    async fn test_dashboard_rollups_render_on_an_empty_database() {
+        let server = super::super::test_support::test_server().await;
+        let html = render(crate::debug::router(server)).await;
+        for heading in [
+            "<h2>Cluster health</h2>",
+            "<h2>Sessions</h2>",
+            "<h2>Top tags (up to 10)</h2>",
+            "<h2>Heat distribution</h2>",
+        ] {
+            assert!(html.contains(heading), "missing section {heading:?}");
+        }
+        assert!(
+            !html.contains("could not be read"),
+            "nothing failed on an empty database, so no section may say it did: {html}"
+        );
+        assert!(html.contains("No tags recorded."), "empty state missing");
+    }
+
+    /// `degrade` is the only place a rollup's failure is decided, so both of its shapes get
+    /// tested directly — including for a second section type, since the point is that the rule
+    /// is written once and applies to any rollup.
+    #[test]
+    fn test_degrade_turns_a_failed_read_into_a_sentence() {
+        let (section, error) =
+            degrade::<BarSection>("Top tags", Err(anyhow::anyhow!("tag tally failed-9")));
+        assert_eq!(error, "Top tags could not be read: tag tally failed-9");
+        assert!(
+            section.rows.is_empty(),
+            "a failed rollup must fall back to its empty state"
+        );
+        assert!(
+            !error.contains(UNAVAILABLE),
+            "a data failure must not borrow the wording that means \"this mode cannot answer\""
+        );
+
+        let (health, error) = degrade::<ClusterHealth>(
+            "Cluster health",
+            Err(anyhow::anyhow!("cluster read failed-4")),
+        );
+        assert!(error.contains("cluster read failed-4"));
+        assert!(
+            health.error.is_empty(),
+            "the sentence travels back separately, so `degrade` must not half-fill the section"
+        );
+
+        let (section, error) =
+            degrade::<BarSection>("Top tags", Ok(bars(vec![("tag-a".to_string(), 4)])));
+        assert_eq!(error, "", "a successful read has nothing to apologise for");
+        assert_eq!(section.rows.len(), 1);
+    }
+
+    /// The property, at page level: one rollup's read fails and the rest of the dashboard still
+    /// renders — headings, counts, bars.
+    ///
+    /// Driven through [`degrade`] rather than by hand-writing an error string, so the page sees
+    /// exactly the pair the handler sees. A router-level version would need a genuinely failing
+    /// query, and the only way to cause one from a test is raw SQL inside `src/debug/` — which
+    /// the storage boundary forbids; [`test_dashboard_rollups_render_on_an_empty_database`]
+    /// covers the live path instead.
+    #[test]
+    fn test_one_failed_rollup_leaves_the_other_sections_rendering() {
+        let (sessions, error) = degrade::<SessionRollup>(
+            "Sessions",
+            Err(anyhow::anyhow!("session store unreachable-7")),
+        );
+        let html = DashboardTemplate {
+            nav: "dashboard",
+            fact_count: 71,
+            deleted_fact_count: 72,
+            cluster_count: 73,
+            edge_count: 74,
+            raw_count: 75,
+            session_count: 76,
+            config_rows: Vec::new(),
+            schema_note: String::new(),
+            cluster_health: ClusterHealth {
+                error: String::new(),
+                healthy: 7,
+                needs_split: 8,
+                too_few: 9,
+            },
+            sessions: SessionRollup { error, ..sessions },
+            tags: bars(vec![("tag-keep-me".to_string(), 5)]),
+            heat: bars(vec![("below 1".to_string(), 3)]),
+            tag_limit: TAG_LIMIT,
+        }
+        .render()
+        .expect("the page must render even with a broken rollup");
+
+        // The failed section admits it, in its own place in the page.
+        assert!(
+            html.contains("session store unreachable-7"),
+            "the broken section must say why: {html}"
+        );
+        assert!(html.contains("<h2>Sessions</h2>"));
+        // ...and shows no numbers a reader could take for real ones: its `Default` is zeros, and
+        // zeros are exactly the plausible wrong values this page exists to avoid.
+        assert!(
+            !html.contains("<tr><th>Total</th>") && !html.contains("<tr><th>Idle</th>"),
+            "a degraded section must render its sentence, not its default zeros: {html}"
+        );
+        // The other three are untouched.
+        assert!(html.contains("<tr><th>Healthy</th><td>7</td></tr>"));
+        assert!(html.contains("<tr><th>Needs split</th><td>8</td></tr>"));
+        assert!(html.contains(&bar_row("tag-keep-me", 100, 5)));
+        assert!(html.contains(&bar_row("below 1", 100, 3)));
+        assert!(html.contains("<h2>Top tags (up to 10)</h2>"));
+        assert!(html.contains("Facts (active)"));
     }
 }

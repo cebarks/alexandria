@@ -27,6 +27,13 @@ pre.content-block { background: #161b22; border: 1px solid #30363d; border-radiu
 dl.fact-meta { display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px; margin: 12px 0; }
 dl.fact-meta dt { color: #8b949e; font-weight: 600; }
 dl.fact-meta dd { margin: 0; }
+/* Dashboard rollup bars. The fill's width arrives as a precomputed inline percentage, so these
+   rules only shape it — no charting library, and no arithmetic in the templates. */
+.bar-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.bar-name { flex: 0 0 200px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #8b949e; }
+.bar { flex: 1 1 auto; display: block; height: 10px; background: #21262d; border-radius: 3px; }
+.bar-fill { display: block; height: 10px; background: #1f6feb; border-radius: 3px; }
+.bar-count { flex: 0 0 48px; text-align: right; }
 </style>
 </head>
 <body>
