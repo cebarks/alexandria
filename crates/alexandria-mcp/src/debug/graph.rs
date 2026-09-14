@@ -15,6 +15,19 @@ pub const DEFAULT_HOPS: u32 = 2;
 /// Ceiling on the hop radius. Memory graphs are dense, so `?hops=99` must not turn into an
 /// unbounded traversal of the whole database.
 const MAX_HOPS: u32 = 3;
+/// Drop everything past `cap` nodes from an already-sorted node list, reporting whether anything
+/// was dropped. Split out because the alternative — testing through `api_graph` — would need a
+/// 201-node fixture, and making the cap injectable in production just for a test is worse.
+fn apply_node_cap(ordered: &mut Vec<(u32, String)>, cap: usize) -> bool {
+    let truncated = ordered.len() > cap;
+    ordered.truncate(cap);
+    truncated
+}
+
+/// Cap on how many nodes one graph view will draw. Beyond it the ego-graph stops expanding and
+/// the page says so: a few hundred nodes on a canvas is a hairball, not a picture, and the
+/// client would pay for it in layout time.
+const GRAPH_NODE_CAP: usize = 200;
 
 /// Effective hop radius for a raw `?hops` value. Absent, empty, non-numeric and out-of-range all
 /// resolve inside `1..=MAX_HOPS`, so no input can ask for a wider traversal than the cap allows.
@@ -44,6 +57,24 @@ fn label_snippet(content: &str) -> String {
     }
 }
 
+/// Width/opacity band for an edge, derived from its strength.
+///
+/// Strengths are not comparable across edge types — `relates_to` stores a 0..=1 similarity while
+/// `contains_session_memory` stores an unbounded counter — so they are banded into three steps
+/// rather than scaled linearly. `""` means "no signal": unknown band, missing or zero strength,
+/// and the client then falls back to the type's default styling.
+fn strength_band(strength: f64) -> &'static str {
+    if !strength.is_finite() || strength <= 0.0 {
+        ""
+    } else if strength < 0.34 {
+        "faint"
+    } else if strength < 0.67 {
+        "medium"
+    } else {
+        "strong"
+    }
+}
+
 /// Tooltip: everything a 40-character label gives up — the full record id and the hop distance.
 fn node_tooltip(id: &str, hop: u32) -> String {
     let table = node_table_of(id);
@@ -68,7 +99,7 @@ pub async fn api_graph(
     .await
 }
 
-/// Shared traversal, parameterised by radius. [`api_graph`] and the page's own control resolve
+/// Shared traversal, parameterised by radius. [`api_graph`] and the page's control resolve
 /// `?hops` through the same [`resolve_hops`], so they cannot disagree about what is drawn.
 async fn api_graph_with_radius(
     server: &AlexandriaServer,
@@ -92,6 +123,21 @@ async fn api_graph_with_radius(
         node_ids.insert(neighbor_id);
     }
 
+    // Cap the node set before any per-node work happens, so an oversized ego-graph costs one
+    // traversal rather than hundreds of queries. Ordered by hop then id so the cut is the same
+    // set every time — a HashSet's iteration order would make the dropped half arbitrary.
+    let mut ordered: Vec<(u32, String)> = node_ids
+        .iter()
+        .map(|nid| (hop_of.get(nid).copied().unwrap_or(hops), nid.clone()))
+        .collect();
+    ordered.sort();
+    let truncated = apply_node_cap(&mut ordered, GRAPH_NODE_CAP);
+    let node_ids: Vec<String> = ordered.into_iter().map(|(_, nid)| nid).collect();
+
+    // TODO(debt): this handler costs one `get_edges_for` plus one `get_fact` per node, so the
+    // round trips are O(nodes) — bounded now by GRAPH_NODE_CAP but still the first thing to
+    // revisit if graph pages feel slow. A batch-by-ids read in storage would collapse both.
+    //
     // Collect edges among the node set by querying each node's direct edges and
     // keeping only those whose both endpoints are in `node_ids` (dedup by in/out/type).
     let mut edges_seen: HashSet<(String, String, String)> = HashSet::new();
@@ -122,6 +168,9 @@ async fn api_graph_with_radius(
                 "label": e.edge_type,
                 "edge_type": e.edge_type,
                 "strength": e.strength,
+                "strength_band": strength_band(e.strength),
+                "edge_color": edge_style_of(&e.edge_type).0,
+                "edge_dashes": dashes_json(edge_style_of(&e.edge_type).1),
             }));
         }
     }
@@ -130,6 +179,8 @@ async fn api_graph_with_radius(
     let nodes_json: Vec<serde_json::Value> = node_ids
         .iter()
         .map(|nid| {
+            let table = node_table_of(nid);
+            let (shape, color) = node_style_of(table);
             let hop = hop_of.get(nid).copied().unwrap_or(hops);
             serde_json::json!({
                 "id": nid,
@@ -139,7 +190,11 @@ async fn api_graph_with_radius(
                     .get(nid)
                     .map(|text| label_snippet(text))
                     .unwrap_or_else(|| nid.clone()),
-                "table": node_table_of(nid),
+                "table": table,
+                // Shape *and* colour are keyed on the table, so a node's kind survives a
+                // colour-blind viewer or a grey-scale print.
+                "shape": shape,
+                "color": color,
                 "hop": hop,
                 "title": node_tooltip(nid, hop),
             })
@@ -151,7 +206,91 @@ async fn api_graph_with_radius(
         "edges": edges_json,
         "centre": id,
         "hops": hops,
+        "node_count": node_ids.len(),
+        "node_cap": GRAPH_NODE_CAP,
+        "truncated": truncated,
+        // Legend data, derived from the same consts that style the canvas.
+        "node_types": node_type_legend(),
+        "edge_types": edge_type_legend(),
     }))
+}
+
+/// How each known node table is drawn: `(table, shape, colour)`.
+///
+/// This list is the only place those choices exist — it is emitted as `node_types` alongside the
+/// nodes so the page's legend is generated from it rather than restated by hand.
+const NODE_STYLES: [(&str, &str, &str); 3] = [
+    ("fact", "dot", "#58a6ff"),
+    ("cluster", "diamond", "#d29922"),
+    ("raw", "square", "#3fb950"),
+];
+
+/// Everything unrecognised — an unknown table, or an id with no table at all — draws like this.
+/// Deliberately not folded into `fact`, so a new edge endpoint type shows up as odd rather than
+/// masquerading as a memory.
+const UNKNOWN_NODE_STYLE: (&str, &str) = ("triangle", "#8b949e");
+
+/// How each known edge type is drawn: `(edge_type, colour, dash)`. `None` dash means solid.
+///
+/// Open-ended on purpose: `edge_type` is a plain string column, so a type nobody has taught the
+/// page about still renders, via [`UNKNOWN_EDGE_STYLE`].
+const EDGE_STYLES: [(&str, &str, Option<[f64; 2]>); 4] = [
+    ("relates_to", "#58a6ff", None),
+    ("derived_from", "#f85149", Some([6.0, 4.0])),
+    ("extracted_from", "#3fb950", Some([2.0, 4.0])),
+    ("contains_session_memory", "#d2a8ff", Some([10.0, 3.0])),
+];
+
+const UNKNOWN_EDGE_STYLE: (&str, Option<[f64; 2]>) = ("#8b949e", Some([1.0, 3.0]));
+
+/// Node shape and fill for a table name (see [`NODE_STYLES`]).
+fn node_style_of(table: &str) -> (&'static str, &'static str) {
+    NODE_STYLES
+        .iter()
+        .find(|(name, _, _)| *name == table)
+        .map(|(_, shape, color)| (*shape, *color))
+        .unwrap_or(UNKNOWN_NODE_STYLE)
+}
+
+/// Edge colour and dash pattern for an edge type (see [`EDGE_STYLES`]).
+fn edge_style_of(edge_type: &str) -> (&'static str, Option<[f64; 2]>) {
+    EDGE_STYLES
+        .iter()
+        .find(|(name, _, _)| *name == edge_type)
+        .map(|(_, color, dash)| (*color, *dash))
+        .unwrap_or(UNKNOWN_EDGE_STYLE)
+}
+
+/// vis-network's `dashes` value for a dash pattern: an array, or `false` for a solid line.
+fn dashes_json(dash: Option<[f64; 2]>) -> serde_json::Value {
+    match dash {
+        Some([on, off]) => serde_json::json!([on, off]),
+        None => serde_json::json!(false),
+    }
+}
+
+/// Legend entries for node types, straight out of [`NODE_STYLES`] so they cannot drift.
+fn node_type_legend() -> Vec<serde_json::Value> {
+    NODE_STYLES
+        .iter()
+        .map(|(table, shape, color)| {
+            serde_json::json!({"table": table, "shape": shape, "color": color})
+        })
+        .collect()
+}
+
+/// Legend entries for edge types, straight out of [`EDGE_STYLES`].
+fn edge_type_legend() -> Vec<serde_json::Value> {
+    EDGE_STYLES
+        .iter()
+        .map(|(edge_type, color, dash)| {
+            serde_json::json!({
+                "edge_type": edge_type,
+                "color": color,
+                "dashes": dashes_json(*dash),
+            })
+        })
+        .collect()
 }
 
 /// Content for node labels, one [`MemoryRepo::get_fact`] per fact node.
@@ -161,7 +300,7 @@ async fn api_graph_with_radius(
 /// id rather than failing the graph: a missing label is cosmetic, a 500 is not.
 async fn load_fact_content(
     server: &AlexandriaServer,
-    node_ids: &HashSet<String>,
+    node_ids: &[String],
 ) -> HashMap<String, String> {
     let fact_repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
     let mut content = HashMap::new();
@@ -211,8 +350,12 @@ pub async fn page(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{
-        DEFAULT_HOPS, GraphTemplate, MAX_HOPS, label_snippet, node_table_of, resolve_hops,
+        DEFAULT_HOPS, EDGE_STYLES, GRAPH_NODE_CAP, GraphTemplate, MAX_HOPS, NODE_STYLES,
+        UNKNOWN_EDGE_STYLE, UNKNOWN_NODE_STYLE, apply_node_cap, edge_style_of, label_snippet,
+        node_style_of, node_table_of, resolve_hops, strength_band,
     };
     use crate::AlexandriaServer;
     use askama::Template;
@@ -628,5 +771,163 @@ mod tests {
             !snippet.contains('\t') && !snippet.contains("  "),
             "whitespace must collapse so a label fits one line: {snippet:?}"
         );
+    }
+    /// The encoding has to be readable without colour, and an unknown type must degrade to a
+    /// default rather than vanish or panic.
+    #[test]
+    fn test_node_and_edge_styles_cover_known_types_and_default_the_rest() {
+        assert_eq!(node_style_of("fact"), ("dot", "#58a6ff"));
+        assert_eq!(node_style_of("cluster"), ("diamond", "#d29922"));
+        assert_eq!(node_style_of("raw"), ("square", "#3fb950"));
+        assert_eq!(
+            node_style_of("widget"),
+            UNKNOWN_NODE_STYLE,
+            "an unknown table must fall back to one shared style, not to `fact`"
+        );
+        assert_eq!(node_style_of(""), UNKNOWN_NODE_STYLE);
+
+        // Three distinguishable shapes plus one for the unknowns: the kinds are tellable apart
+        // without relying on colour.
+        let shapes: HashSet<&str> = ["fact", "cluster", "raw", "widget"]
+            .map(|table| node_style_of(table).0)
+            .into_iter()
+            .collect();
+        assert_eq!(shapes.len(), 4, "shapes must distinguish every kind");
+        let colors: HashSet<&str> = ["fact", "cluster", "raw"]
+            .map(|table| node_style_of(table).1)
+            .into_iter()
+            .collect();
+        assert_eq!(colors.len(), 3);
+
+        assert_eq!(edge_style_of("relates_to"), ("#58a6ff", None));
+        assert_eq!(edge_style_of("derived_from").1, Some([6.0, 4.0]));
+        assert_eq!(edge_style_of("extracted_from").1, Some([2.0, 4.0]));
+        assert_eq!(
+            edge_style_of("contains_session_memory").1,
+            Some([10.0, 3.0])
+        );
+        assert_eq!(
+            edge_style_of("something_new"),
+            UNKNOWN_EDGE_STYLE,
+            "a type nobody taught the page about must still be drawable"
+        );
+        assert_ne!(
+            edge_style_of("relates_to").0,
+            edge_style_of("derived_from").0,
+            "the two most common types must not look identical"
+        );
+    }
+
+    #[test]
+    fn test_strength_band_maps_strengths_to_widths() {
+        assert_eq!(strength_band(0.9), "strong");
+        assert_eq!(strength_band(0.67), "strong");
+        assert_eq!(strength_band(0.5), "medium");
+        assert_eq!(strength_band(0.34), "medium");
+        assert_eq!(strength_band(0.01), "faint");
+        // "" is the "no signal" band: the client then uses the type's default width.
+        assert_eq!(strength_band(0.0), "");
+        assert_eq!(strength_band(-3.0), "");
+        assert_eq!(strength_band(f64::NAN), "");
+        assert_eq!(strength_band(f64::INFINITY), "");
+        // An unbounded strength (session counters) saturates at the top band instead of asking
+        // for an infinite line width.
+        assert_eq!(strength_band(19_000.0), "strong");
+    }
+
+    #[tokio::test]
+    async fn test_api_graph_emits_style_data_and_legend_entries() {
+        let server = super::super::test_support::test_server().await;
+        let memory_repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
+        let a = memory_repo
+            .create_fact("styled node alpha", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let b = memory_repo
+            .create_fact("styled node beta", 0.5, &[0.3, 0.4], &[])
+            .await
+            .unwrap();
+        edge_repo
+            .create_edge(&a, &b, "extracted_from", 0.9)
+            .await
+            .unwrap();
+
+        let json = graph_json(&server, &a, "").await;
+        let node = node_by_id(&json, &a);
+        assert_eq!(node["shape"], serde_json::json!("dot"));
+        assert_eq!(node["color"], serde_json::json!("#58a6ff"));
+        let edge = &json["edges"][0];
+        assert_eq!(edge["edge_type"], serde_json::json!("extracted_from"));
+        assert_eq!(edge["edge_color"], serde_json::json!("#3fb950"));
+        assert_eq!(edge["edge_dashes"], serde_json::json!([2.0, 4.0]));
+        assert_eq!(edge["strength_band"], serde_json::json!("strong"));
+
+        // The legend is generated from the server's own style tables, so it cannot drift, and the
+        // colour it advertises is the colour that was drawn.
+        let node_types = json["node_types"].as_array().unwrap();
+        assert_eq!(node_types.len(), NODE_STYLES.len());
+        assert_eq!(node_types[0]["table"], serde_json::json!("fact"));
+        assert_eq!(node_types[0]["color"], node["color"]);
+        let edge_types = json["edge_types"].as_array().unwrap();
+        assert_eq!(edge_types.len(), EDGE_STYLES.len());
+        assert!(
+            edge_types
+                .iter()
+                .any(|t| t["edge_type"] == serde_json::json!("contains_session_memory"))
+        );
+    }
+
+    #[test]
+    fn test_apply_node_cap_keeps_the_nearest_nodes() {
+        // Sorted by (hop, id) upstream, so truncating keeps the closest nodes and drops the far
+        // ones — the same set every time, not whatever a HashSet happened to yield first.
+        let mut ordered: Vec<(u32, String)> = [
+            (0, "fact:a".to_string()),
+            (1, "fact:b".to_string()),
+            (1, "fact:c".to_string()),
+            (2, "fact:d".to_string()),
+            (2, "fact:e".to_string()),
+        ]
+        .into();
+        assert!(
+            !apply_node_cap(&mut ordered, 5),
+            "at the cap nothing is dropped"
+        );
+        assert_eq!(ordered.len(), 5);
+        assert!(apply_node_cap(&mut ordered, 3), "past the cap it is");
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(_, id)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fact:a", "fact:b", "fact:c"],
+            "the far nodes must be the ones dropped"
+        );
+        assert!(
+            !apply_node_cap(&mut ordered, 3),
+            "a set already at the cap is not truncated"
+        );
+        assert!(
+            !apply_node_cap(&mut Vec::new(), 0),
+            "an empty set is never over the cap"
+        );
+    }
+
+    /// The live path reports the cap it used and that it did not bite. The truncation flag itself
+    /// is asserted through [`apply_node_cap`] instead: exceeding 200 nodes end-to-end would mean
+    /// a 201-memory fixture, and the cap is deliberately not injectable in production.
+    #[tokio::test]
+    async fn test_api_graph_reports_cap_state_when_not_truncated() {
+        let server = super::super::test_support::test_server().await;
+        let memory_repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let fact = memory_repo
+            .create_fact("uncapped small graph", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let json = graph_json(&server, &fact, "").await;
+        assert_eq!(json["truncated"], serde_json::json!(false));
+        assert_eq!(json["node_count"], serde_json::json!(1));
+        assert_eq!(json["node_cap"], serde_json::json!(GRAPH_NODE_CAP));
     }
 }

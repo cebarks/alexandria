@@ -47,6 +47,22 @@ dl.fact-meta dd { margin: 0; }
 section.dropped-by-floor { margin-top: 16px; padding: 4px 12px 12px; border: 1px solid #6e2020; border-radius: 6px; }
 section.dropped-by-floor h3 { color: #f85149; margin-bottom: 0; }
 tr.dropped td { opacity: 0.55; }
+/* Graph page. The ego-graph canvas is unreadable without two things: a radius control and a key
+   for what a blob of colour means. The legend's *content* is rendered by graph.html's script from
+   the same style tables the server uses to draw nodes and edges, so these rules only shape it —
+   the colours and dash patterns arrive as inline styles from that data and are deliberately not
+   restated here. */
+.graph-controls { color: #8b949e; font-size: 14px; }
+.graph-notice { margin: 8px 0; padding: 6px 12px; border: 1px solid #6e2020; border-radius: 6px; color: #f85149; font-size: 14px; }
+.graph-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; color: #8b949e; font-size: 13px; margin: 10px 0; border-left: 3px solid #30363d; padding-left: 10px; }
+.graph-legend-title { color: #c9d1d9; font-weight: 600; }
+.graph-legend .legend-item { margin-right: 4px; }
+/* Swatches echo the canvas shapes, so the legend keeps working without colour perception. */
+.graph-legend .swatch { display: inline-block; width: 12px; height: 12px; background: #8b949e; margin-right: 5px; }
+.graph-legend .swatch[data-shape="dot"] { border-radius: 50%; }
+.graph-legend .swatch[data-shape="diamond"] { transform: rotate(45deg); }
+.graph-legend .swatch[data-shape="triangle"] { clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.graph-legend .line-sample { display: inline-block; width: 26px; border-top: 2px solid #8b949e; margin-right: 5px; vertical-align: 3px; }
 </style>
 </head>
 <body>

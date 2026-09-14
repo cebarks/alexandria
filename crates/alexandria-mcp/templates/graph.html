@@ -1,7 +1,8 @@
 {% extends "layout.html" %}
 {% block title %}Graph{% endblock %}
 {% block body %}<h1>Graph: {{ id }}</h1>
-<p>
+<div id="graph-notice" class="graph-notice" hidden></div>
+<p class="graph-controls">
   Hops:
   {% if hops == 1 %}<strong>1</strong>{% else %}<a href="/debug/graph/{{ id|urlencode }}?hops=1">1</a>{% endif %}
   ·
@@ -10,7 +11,11 @@
   {% if hops == 3 %}<strong>3</strong>{% else %}<a href="/debug/graph/{{ id|urlencode }}?hops=3">3</a>{% endif %}
   — click a fact node to open the memory
 </p>
-<div id="graph" style="height: 600px; border: 1px solid #30363d;"></div>{% endblock %}
+<div id="graph" style="height: 600px; border: 1px solid #30363d;"></div>
+{# The legend is filled in by the script below from the styling data the API returns, rather
+   than being written out here. A hand-copied legend is a legend that silently lies the first
+   time a node or edge type is added to the server's style tables. #}
+<div id="graph-legend" class="graph-legend"></div>{% endblock %}
 {% block scripts %}{# Both script tags live in this block, in this order, and neither gets
    `defer`. Do not "optimize" that:
    1. layout.html defers htmx in <head>. A deferred script runs after the document parses but
@@ -43,11 +48,21 @@ fetch("/debug/api/graph/{{ id|urlencode }}?hops={{ hops }}")
   .then(r => r.json())
   .then(data => {
     const nodes = new vis.DataSet(data.nodes);
-    const edges = new vis.DataSet(data.edges);
+    // Per-edge colour and dash come from the API (keyed on edge_type, with a default for types
+    // this page has never seen); width comes from the banded strength, because strengths are not
+    // comparable across types so a linear scale would be meaningless.
+    const BAND_WIDTH = { strong: 3.4, medium: 2.2, faint: 1.2 };
+    const styledEdges = data.edges.map(e => ({
+      ...e,
+      color: e.edge_color,
+      dashes: e.edge_dashes,
+      width: BAND_WIDTH[e.strength_band] || 1.6,
+    }));
+    const edges = new vis.DataSet(styledEdges);
     const container = document.getElementById("graph");
     const network = new vis.Network(container, { nodes, edges }, {
-      nodes: { color: "#58a6ff", font: { color: "#c9d1d9" } },
-      edges: { color: "#30363d", font: { color: "#8b949e" }, arrows: "to" },
+      nodes: { font: { color: "#c9d1d9" }, borderWidth: 1 },
+      edges: { font: { color: "#8b949e", face: "monospace", size: 11 }, arrows: "to" },
       interaction: { hover: true, tooltipDelay: 120 },
     });
     // Click-through to the memory. encodeURIComponent, not the template's |urlencode: this id
@@ -62,6 +77,52 @@ fetch("/debug/api/graph/{{ id|urlencode }}?hops={{ hops }}")
         window.location.href = "/debug/memories/" + encodeURIComponent(node.id);
       }
     });
+
+    renderLegend(data);
+    renderNotice(data);
   });
+
+// Legend and truncation notice. Both build DOM nodes from parsed JSON with textContent, so
+// record ids and type names can never be parsed as markup.
+function renderLegend(data) {
+  const legend = document.getElementById("graph-legend");
+  const add = (parent, tag, className, text) => {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    el.textContent = text;
+    parent.appendChild(el);
+    return el;
+  };
+  add(legend, "span", "graph-legend-title", "Nodes:");
+  (data.node_types || []).forEach(t => {
+    const swatch = add(legend, "span", "swatch", "");
+    swatch.style.background = t.color;
+    swatch.dataset.shape = t.shape;
+    add(legend, "span", "legend-item", t.table);
+  });
+  const unknown = add(legend, "span", "swatch", "");
+  unknown.dataset.shape = "triangle";
+  add(legend, "span", "legend-item", "other");
+  add(legend, "span", "graph-legend-title", "Edges:");
+  (data.edge_types || []).forEach(t => {
+    const line = add(legend, "span", "line-sample", "");
+    line.style.borderColor = t.color;
+    line.style.borderTopStyle = t.dashes === false ? "solid" : "dashed";
+    add(legend, "span", "legend-item", t.edge_type);
+  });
+  const other = add(legend, "span", "line-sample", "");
+  other.style.borderTopStyle = "dotted";
+  add(legend, "span", "legend-item", "other types (solid width = stronger)");
+}
+
+function renderNotice(data) {
+  if (!data.truncated) {
+    return;
+  }
+  const notice = document.getElementById("graph-notice");
+  notice.hidden = false;
+  notice.textContent = "Graph truncated: showing " + data.node_count + " of the nodes within "
+    + data.hops + " hops (cap " + data.node_cap + "). Lower the hop count for a clearer picture.";
+}
 </script>
 {% endblock %}
