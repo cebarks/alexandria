@@ -940,6 +940,82 @@ mod get_info_tests {
         );
     }
 
+    /// The eight public MCP tools, by name — the exact set `AGENTS.md` and `README.md` document.
+    ///
+    /// Deliberately a closed list rather than a count. `do_retrieve_memories_dry` and
+    /// `do_retrieve_memories_unfiltered` are `#[tool]`-less wrappers over `retrieve_core` used only
+    /// by the debug Query Tester, and a *count* check would keep passing if someone renamed a real
+    /// tool and registered one of those as the ninth: the advertised surface would change while the
+    /// total stayed eight. Names are what an MCP client actually calls.
+    const PUBLIC_TOOLS: [&str; 8] = [
+        "store_memory",
+        "retrieve_memories",
+        "recall",
+        "update_memory",
+        "import_document",
+        "delete_memory",
+        "get_session",
+        "finalize_session",
+    ];
+
+    /// Guards the "exactly 8 MCP tools" invariant in `AGENTS.md`/`README.md`.
+    ///
+    /// Until now that claim was verified by a human counting `#[tool]` attributes, so a future
+    /// `#[tool]` on a debug-only wrapper — or a rename — would silently widen or shift the
+    /// advertised surface and CI would pass. This asks the server what it advertises and compares
+    /// the sorted name set against [`PUBLIC_TOOLS`] exactly.
+    ///
+    /// The advertised list is `ToolRouter::list_all()` because that is literally what the generated
+    /// `ServerHandler::list_tools` returns (`tools: Self::tool_router().list_all()`); the trait
+    /// method itself takes a `RequestContext<RoleServer>`, which carries a live `Peer<RoleServer>`
+    /// and so cannot be built in a unit test. `get_tool` is the other half of the handler surface
+    /// and takes only a `&str`, so it is checked here too — a name the router lists but the handler
+    /// cannot resolve would be advertised and then rejected at call time.
+    #[tokio::test]
+    async fn test_advertised_tool_set_is_exactly_the_eight_public_tools() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        let mut advertised: Vec<String> = AlexandriaServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        advertised.sort();
+        let mut expected: Vec<String> = PUBLIC_TOOLS.iter().map(|s| (*s).to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            advertised, expected,
+            "the advertised MCP tool set must be exactly the eight documented public tools"
+        );
+        assert_eq!(
+            advertised.len(),
+            8,
+            "asserting the exact set is the point; a duplicate name would hide a ninth tool"
+        );
+
+        for name in PUBLIC_TOOLS {
+            assert!(
+                server.get_tool(name).is_some(),
+                "{name} must resolve through ServerHandler::get_tool, not just appear in the list"
+            );
+        }
+        // The closed set really is closed: the debug-only wrappers are not reachable this way.
+        for not_a_tool in [
+            "retrieve_memories_dry",
+            "retrieve_memories_unfiltered",
+            "do_retrieve_memories_dry",
+        ] {
+            assert!(
+                server.get_tool(not_a_tool).is_none(),
+                "{not_a_tool} must not be advertised or resolvable as an MCP tool"
+            );
+        }
+    }
+
     /// Stub that maps content/query text to fixed embeddings so we can assert
     /// the retrieve floor deterministically: text containing "far" -> [0, 1]
     /// (orthogonal to the query, cosine 0), everything else -> [1, 0] (aligned
