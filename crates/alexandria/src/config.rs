@@ -113,9 +113,11 @@ pub struct ClusterConfig {
 pub struct RemindersConfig {
     /// IANA timezone for naive datetime input and pattern/cron evaluation.
     /// Empty string = system-local (resolved via iana-time-zone at startup).
+    /// Default: empty (system-local).
     pub timezone: String,
     /// Project-targeted reminders escalate to global delivery after being
-    /// overdue this long. Default 48.
+    /// overdue this many hours. 0 = escalate as soon as overdue.
+    /// Default: 48 (2 days).
     pub escalation_hours: u64,
 }
 
@@ -514,7 +516,14 @@ mod tests {
     fn test_reminders_env_invalid_hours() {
         std::env::set_var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS", "soon");
         let result = Config::load();
-        assert!(result.is_err());
+        // Name the variable that failed, not just "load errored": an unqualified
+        // `is_err()` here would also pass on an unrelated config-file failure.
+        let err = result.expect_err("a non-numeric escalation window must not load");
+        assert!(
+            err.to_string()
+                .contains("ALEXANDRIA_REMINDERS_ESCALATION_HOURS"),
+            "the error must name the offending variable: {err:#}"
+        );
         std::env::remove_var("ALEXANDRIA_REMINDERS_ESCALATION_HOURS");
     }
 }

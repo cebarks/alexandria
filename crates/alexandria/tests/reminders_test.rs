@@ -943,6 +943,7 @@ async fn list_and_cancel_roundtrip() {
     // default status filter = pending
     let list = list_json(&server, list_filter(None, None)).await;
     assert_eq!(list["count"], 1);
+    assert_eq!(list["timezone"], "UTC", "the envelope names the zone");
     assert_eq!(list["reminders"][0]["message"], "water plants");
     assert_eq!(
         list["reminders"][0]["schedule"],
@@ -954,6 +955,19 @@ async fn list_and_cancel_roundtrip() {
     // Every datetime in a reminder response keeps the Z-suffixed UTC spelling
     // (`to_rfc3339()` would write `+00:00`), including the set-time stamp.
     assert_eq!(list["reminders"][0]["next_due_at"], "2030-01-01T12:00:00Z");
+    // The UTC time is paired with the local rendering the user thinks in, and a
+    // one-shot says so: `schedule` renders one-shots in UTC but patterns in
+    // local wall clock, so neither field alone answers "when does this fire?".
+    assert_eq!(
+        list["reminders"][0]["next_due_at_local"],
+        "2030-01-01 12:00 UTC"
+    );
+    assert_eq!(list["reminders"][0]["recurring"], false);
+    assert!(
+        list["reminders"][0]["provenance"]["project"].is_null(),
+        "an unset provenance is null, not an invented value: {}",
+        list["reminders"][0]["provenance"]
+    );
     assert!(
         list["reminders"][0]["created_at"]
             .as_str()
@@ -993,6 +1007,33 @@ async fn list_and_cancel_roundtrip() {
         err.to_string().contains("Reminder not found"),
         "the error must name the failure: {err:#}"
     );
+
+    // The recurring half of the parity, plus provenance: a weekly reminder set
+    // from a project and session must report what it is (`recurring`), when it
+    // fires in the reader's own terms (`next_due_at_local`, matching what `set`
+    // promised), and where it came from — every one of those is a field another
+    // reminder response already carries, so the management view dropping them was
+    // an omission, not a narrower design.
+    let mut standup = weekly_params("standup");
+    standup.prov_project = Some("dashboard".to_string());
+    standup.session_id = Some("session-7".to_string());
+    let set: serde_json::Value =
+        serde_json::from_str(&server.do_set_reminder(standup).await.unwrap()).unwrap();
+
+    let pending = list_json(&server, list_filter(None, None)).await;
+    assert_eq!(
+        pending["count"], 1,
+        "the cancelled row stays out of pending"
+    );
+    assert_eq!(pending["timezone"], "UTC");
+    let row = &pending["reminders"][0];
+    assert_eq!(row["message"], "standup");
+    assert_eq!(row["schedule"], "every Friday at 09:00");
+    assert_eq!(row["recurring"], true);
+    assert_eq!(row["next_due_at"], set["next_due_at"]);
+    assert_eq!(row["next_due_at_local"], set["next_due_at_local"]);
+    assert_eq!(row["provenance"]["project"], "dashboard");
+    assert_eq!(row["provenance"]["session_id"], "session-7");
 }
 
 /// The filter semantics the tool description promises: `pending` is the default,
@@ -1075,10 +1116,12 @@ async fn list_status_and_project_filters() {
 /// Cancelling is unconditional and idempotent, which is what makes it safe for a
 /// client to retry: a reminder that already fired, or already was cancelled, is
 /// in a state the caller could accept, so it is a success rather than an error.
-/// What cancel must not do is undo delivery history or touch a different row.
+/// What cancel must not do is undo delivery history, touch a different row, or
+/// re-stamp the retirement time of a row that is already cancelled.
 #[tokio::test]
 async fn cancel_is_soft_and_idempotent() {
     let server = setup().await;
+    let repo = ReminderRepo::new(server.db.inner());
     let fired = server
         .do_set_reminder(once_params_overdue("renew cert", 60))
         .await
@@ -1106,7 +1149,17 @@ async fn cancel_is_soft_and_idempotent() {
     .unwrap();
     assert_eq!(cancel["status"], "ok", "a delivered row is cancellable");
 
-    // Repeating it is still a success, and the row keeps what it already recorded.
+    // The first cancel is what stamps the retirement time.
+    let first_cancelled_at = {
+        let row = repo.get(&fired).await.unwrap().unwrap();
+        assert_eq!(row.status, "cancelled");
+        row.cancelled_at.expect("a cancel must stamp cancelled_at")
+    };
+
+    // Repeating it is still a success — a client may retry — but it has to be a
+    // true no-op: `ReminderRepo::cancel` writes `cancelled_at` unconditionally,
+    // so a repeat that reached the repo would move the stamp while reporting the
+    // same "ok".
     let again: serde_json::Value = serde_json::from_str(
         &server
             .do_cancel_reminder(CancelReminderParams { id: fired.clone() })
@@ -1115,22 +1168,19 @@ async fn cancel_is_soft_and_idempotent() {
     )
     .unwrap();
     assert_eq!(again["status"], "ok");
+    assert_eq!(again["id"].as_str().unwrap(), fired);
 
-    let row = ReminderRepo::new(server.db.inner())
-        .get(&fired)
-        .await
-        .unwrap()
-        .unwrap();
+    let row = repo.get(&fired).await.unwrap().unwrap();
     assert_eq!(row.status, "cancelled");
     assert_eq!(row.delivered_count, 1, "cancel must not rewind delivery");
-    assert!(row.cancelled_at.is_some());
+    assert_eq!(
+        row.cancelled_at,
+        Some(first_cancelled_at),
+        "a repeat cancel must not re-stamp cancelled_at"
+    );
 
     // Only the named row is touched, and the cancelled one stays listable.
-    let other_row = ReminderRepo::new(server.db.inner())
-        .get(&other)
-        .await
-        .unwrap()
-        .unwrap();
+    let other_row = repo.get(&other).await.unwrap().unwrap();
     assert_eq!(other_row.status, "pending");
     assert_eq!(
         list_json(&server, list_filter(Some("cancelled"), None)).await["count"],
@@ -1265,6 +1315,83 @@ async fn piggyback_lists_due_reminders_without_consuming() {
     assert_eq!(out["due_reminders"][0]["message"], "nag me");
 
     // NOT consumed — check_reminders still delivers it
+    let chk: serde_json::Value =
+        serde_json::from_str(&server.do_check_reminders(check(None)).await.unwrap()).unwrap();
+    assert_eq!(chk["count"], 1);
+}
+
+/// The same safety net on the recall path: `recall` carries `due_reminders` in
+/// both of its modes, and this is the mode an agent reaches for first (no scope
+/// handle yet). Read-only for the same reason as `retrieve_memories` — the check
+/// afterwards must still see the row as due.
+#[tokio::test]
+async fn piggyback_recall_broad_lists_due_reminders_without_consuming() {
+    let server = setup().await;
+    server
+        .do_set_reminder(once_params("nag me too", "2020-01-01T12:00:00Z"))
+        .await
+        .unwrap();
+    server
+        .do_store_memory(alexandria_mcp::tools::StoreMemoryParams {
+            content: "the search index is built with tantivy".to_string(),
+            tags: None,
+            session_id: None,
+        })
+        .await
+        .unwrap();
+
+    let out: serde_json::Value = serde_json::from_str(
+        &server
+            .do_recall(alexandria_mcp::tools::RecallParams {
+                query: "search index".to_string(),
+                scope_handle: None,
+            })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(out["mode"], "broad", "no scope handle is the broad pass");
+    assert_eq!(out["due_reminders"].as_array().unwrap().len(), 1);
+    assert_eq!(out["due_reminders"][0]["message"], "nag me too");
+
+    // NOT consumed — check_reminders still delivers it
+    let chk: serde_json::Value =
+        serde_json::from_str(&server.do_check_reminders(check(None)).await.unwrap()).unwrap();
+    assert_eq!(chk["count"], 1);
+}
+
+/// The path a due reminder is most likely to ride in on: a lookup that finds
+/// nothing at all. `do_retrieve_memories` returns early when no fact matches,
+/// so if that branch forgot the piggyback the safety net would disappear
+/// exactly when the agent has nothing else on its mind. `results` is empty and
+/// `due_reminders` is not, and the row is still pending afterwards.
+#[tokio::test]
+async fn piggyback_empty_retrieve_still_lists_due_reminders() {
+    let server = setup().await;
+    server
+        .do_set_reminder(once_params("nag on empty search", "2020-01-01T12:00:00Z"))
+        .await
+        .unwrap();
+
+    // No memory is ever stored, so the query matches nothing and the response
+    // comes from the empty-results early return rather than the ranked path.
+    let out = server
+        .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+            query: "nothing about this at all".to_string(),
+            limit: Some(5),
+            session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        out["results"].as_array().unwrap().len(),
+        0,
+        "a server with no facts must return no results: {out}"
+    );
+    assert_eq!(out["due_reminders"].as_array().unwrap().len(), 1);
+    assert_eq!(out["due_reminders"][0]["message"], "nag on empty search");
+
+    // Read-only: the empty-results branch consumed nothing either.
     let chk: serde_json::Value =
         serde_json::from_str(&server.do_check_reminders(check(None)).await.unwrap()).unwrap();
     assert_eq!(chk["count"], 1);

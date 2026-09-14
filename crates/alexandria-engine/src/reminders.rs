@@ -170,10 +170,11 @@ fn weekday_full_name(w: Weekday) -> &'static str {
 }
 
 /// Parse an ISO-8601-ish datetime. Explicit offsets are honored; naive
-/// timestamps are interpreted in `tz` (documented server behavior).
-/// Errors on nonexistent local times (DST gaps) and on ambiguous ones (folds)
-/// rather than guessing — callers get a clear message and can pick an
-/// unambiguous time.
+/// timestamps are interpreted in `tz` (documented server behavior). Errors on
+/// nonexistent local times (a spring-forward gap) and on ambiguous ones (a
+/// fall-back fold) rather than guessing. The two need opposite fixes, so they
+/// get opposite messages: a gap time has to be moved, a fold time only has to
+/// be pinned to an offset.
 pub fn parse_datetime(input: &str, tz: Tz) -> Result<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(input) {
         return Ok(dt.with_timezone(&Utc));
@@ -190,12 +191,16 @@ pub fn parse_datetime(input: &str, tz: Tz) -> Result<DateTime<Utc>> {
         .with_context(|| {
             format!("could not parse datetime {input:?}; use ISO-8601, e.g. 2026-09-10T15:00:00Z")
         })?;
-    use chrono::TimeZone;
-    let local = tz
-        .from_local_datetime(&naive)
-        .single()
-        .with_context(|| format!("local time {input:?} is ambiguous or does not exist in {tz}"))?;
-    Ok(local.with_timezone(&Utc))
+    use chrono::{LocalResult, TimeZone};
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(local) => Ok(local.with_timezone(&Utc)),
+        LocalResult::None => bail!(
+            "local time {input:?} does not exist in {tz} (spring-forward gap); pick a time after the transition"
+        ),
+        LocalResult::Ambiguous(..) => bail!(
+            "local time {input:?} is ambiguous in {tz} (fall-back fold); specify a UTC offset instead"
+        ),
+    }
 }
 
 /// Compile any recurring spec to a `cron::Schedule`.
@@ -499,19 +504,36 @@ mod tests {
         assert_eq!(dt, dt2);
     }
 
+    /// A spring-forward gap has no such instant: the message must say so and
+    /// point at the fix (move the time), and must not read like the fold case.
     #[test]
     fn parse_datetime_rejects_nonexistent_dst_gap_time() {
         // America/New_York springs forward 2026-03-08: 02:30 local does not exist
         let tz: Tz = "America/New_York".parse().unwrap();
-        assert!(parse_datetime("2026-03-08T02:30", tz).is_err());
+        let err = parse_datetime("2026-03-08T02:30", tz)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.contains("spring-forward gap"), "{err}");
+        assert!(err.contains("pick a time after the transition"), "{err}");
+        // The fold wording belongs to the other failure mode only.
+        assert!(!err.contains("ambiguous"), "{err}");
     }
 
+    /// A fall-back fold names two instants, so moving the time would not help:
+    /// the message must say it is ambiguous and point at the offset fix.
     #[test]
     fn parse_datetime_rejects_ambiguous_dst_fold_time() {
         // America/New_York falls back 2026-11-01: 01:30 local occurs twice.
-        // Strict `.single()` must reject it — a regression to `.earliest()`
-        // would silently pick one of the two instants.
-        assert!(parse_datetime("2026-11-01T01:30", nyc()).is_err());
+        // Strict branch on `LocalResult` must reject it — a regression to
+        // `.earliest()` would silently pick one of the two instants.
+        let err = parse_datetime("2026-11-01T01:30", nyc())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is ambiguous"), "{err}");
+        assert!(err.contains("fall-back fold"), "{err}");
+        assert!(err.contains("specify a UTC offset instead"), "{err}");
+        assert!(!err.contains("does not exist"), "{err}");
     }
 
     fn nyc() -> Tz {
@@ -582,6 +604,61 @@ mod tests {
         assert!(ups[0] < ups[1] && ups[1] < ups[2]);
         use chrono::Datelike;
         assert!(ups.iter().all(|d| d.weekday() == Weekday::Fri));
+    }
+
+    /// The set-time path reads the next fire out of the same `upcoming` walk it
+    /// uses for the preview, so the two must agree on the first element for every
+    /// spec kind and zone — otherwise which function a caller happened to use
+    /// would decide the stored `next_due_at`.
+    #[test]
+    fn next_fire_is_the_first_element_of_upcoming() {
+        let daily = || NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let specs = [
+            ScheduleSpec::Once {
+                due_at: utc(2026, 9, 10, 15, 0),
+            },
+            // A one-shot already in the past: no future fire in either form.
+            ScheduleSpec::Once {
+                due_at: utc(2020, 1, 1, 0, 0),
+            },
+            ScheduleSpec::Pattern {
+                freq: Freq::Daily,
+                time: daily(),
+                weekdays: vec![],
+                day_of_month: 1,
+            },
+            ScheduleSpec::Pattern {
+                freq: Freq::Weekly,
+                time: daily(),
+                weekdays: vec![Weekday::Fri],
+                day_of_month: 1,
+            },
+            // Monthly on the 31st: most months are skipped, so the walk matters.
+            ScheduleSpec::Pattern {
+                freq: Freq::Monthly,
+                time: daily(),
+                weekdays: vec![],
+                day_of_month: 31,
+            },
+            // Pinned to a year already past: never fires again.
+            ScheduleSpec::Cron {
+                expr: "0 0 12 * * * 2020".to_string(),
+            },
+            // 01:30 local: the one window where a DST fold yields two instants.
+            ScheduleSpec::Cron {
+                expr: "0 30 1 * * *".to_string(),
+            },
+        ];
+        let from = utc(2026, 3, 7, 12, 0);
+        for spec in &specs {
+            for zone in [Tz::UTC, nyc()] {
+                assert_eq!(
+                    next_fire(spec, from, zone).unwrap(),
+                    upcoming(spec, from, zone, 3).unwrap().first().copied(),
+                    "{spec:?} in {zone}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -838,10 +838,16 @@ impl AlexandriaServer {
                 )
             };
 
-        // Next fire + preview; recurring specs are evaluated in the configured
-        // timezone (wall-clock semantics — cron/chrono-tz handle DST).
-        let next = sched::next_fire(&spec, now, tz)?;
+        // Next fire + preview from one walk of the schedule: `upcoming` returns
+        // the fires strictly after `now`, oldest first, so its first element *is*
+        // what `next_fire` would compute — calling both would compile and iterate
+        // the same cron expression twice for one request. Recurring specs are
+        // evaluated in the configured timezone (wall-clock semantics —
+        // cron/chrono-tz handle DST), and `Once` yields `[due_at]` only while it
+        // is still in the future, which keeps the past-one-shot warning below on
+        // the same condition `next_fire` used to test.
         let preview = sched::upcoming(&spec, now, tz, 3)?;
+        let next = preview.first().copied();
         // A recurring schedule with no future fire would be stored with
         // next_due_at = NULL, and `list_due` filters on `next_due_at <= $now`, so
         // such a row can never be delivered or escalated — a silent loss.
@@ -1150,8 +1156,15 @@ impl AlexandriaServer {
     /// operator cleaning up after a migration), so it is listed with the failure
     /// named in its `schedule` field. Only that one row degrades — one corrupt
     /// row must not hide every healthy reminder behind it.
+    ///
+    /// Rows carry the fields the set and deliver responses established — the
+    /// local rendering of `next_due_at` and the envelope's `timezone` from set,
+    /// `recurring` and `provenance` from deliver — so the management view answers
+    /// "what is scheduled, and when does it fire in my time?" on its own terms
+    /// rather than a narrower subset of them.
     pub async fn do_list_reminders(&self, params: ListRemindersParams) -> anyhow::Result<String> {
         use alexandria_engine::reminders as sched;
+        use alexandria_storage::models::schedule_kind;
         use alexandria_storage::repos::ReminderRepo;
 
         // `pending` is the default because it is what "what reminders do I have?"
@@ -1163,6 +1176,7 @@ impl AlexandriaServer {
             Some("all") => None,
             s @ Some(_) => s,
         };
+        let tz = self.reminders.tz;
         let repo = ReminderRepo::new(self.db.inner());
         let rows = repo.list(status, params.target_project.as_deref()).await?;
 
@@ -1183,34 +1197,68 @@ impl AlexandriaServer {
                         .map(sched::human_readable)
                         .unwrap_or_else(|e| format!("<invalid schedule: {e}>")),
                     "next_due_at": r.next_due_at.map(rfc3339_utc),
+                    // The bridge `do_set_reminder` gives: `schedule` renders a
+                    // recurring reminder in local wall clock while `next_due_at`
+                    // is UTC, so a reader needs the local spelling of that instant
+                    // to recognise its own schedule.
+                    "next_due_at_local": r
+                        .next_due_at
+                        .map(|d| d.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z").to_string()),
+                    // From the stored discriminator, not the reconstructed spec: a
+                    // corrupt row has no spec to ask, and it is still owed an
+                    // answer. For every readable row this is what
+                    // `do_check_reminders` reports.
+                    "recurring": matches!(
+                        r.schedule_kind.as_str(),
+                        schedule_kind::PATTERN | schedule_kind::CRON
+                    ),
                     "delivered_count": r.delivered_count,
                     "last_delivered_at": r.last_delivered_at.map(rfc3339_utc),
                     "note": r.note,
+                    "provenance": {
+                        "project": r.prov_project,
+                        "session_id": r.prov_session_id,
+                    },
                     "created_at": r.created_at.map(rfc3339_utc),
                 })
             })
             .collect();
 
-        Ok(serde_json::json!({ "count": reminders.len(), "reminders": reminders }).to_string())
+        Ok(serde_json::json!({
+            "count": reminders.len(),
+            // The zone every `next_due_at_local` above is rendered in: without it
+            // a reader cannot tell whether the local times are theirs.
+            "timezone": tz.name().to_string(),
+            "reminders": reminders,
+        })
+        .to_string())
     }
 
     /// Retire a reminder by ID.
     ///
-    /// A soft cancel, and unconditional: the row keeps existing (under
-    /// `status = 'cancelled'`, visible in `do_list_reminders`) because it is the
-    /// only record that the reminder was ever set, and the write is not guarded
-    /// by the current status, so cancelling a delivered or already-cancelled
-    /// reminder is an idempotent success rather than an error. Only an ID that
-    /// matches no row is a failure — that is a typo or a stale reference, and
-    /// silently "cancelling" nothing would tell the user their reminder was
+    /// A soft cancel: the row keeps existing (under `status = 'cancelled'`,
+    /// visible in `do_list_reminders`) because it is the only record that the
+    /// reminder was ever set. Every other status is cancellable — a delivered
+    /// reminder can be retired, which is a success rather than an error — but a
+    /// row that is already cancelled is a true no-op, because
+    /// `ReminderRepo::cancel` stamps `cancelled_at` unconditionally and
+    /// re-issuing that write would move the record of *when* the reminder was
+    /// retired while still reporting the success of the first cancel. Only an ID
+    /// that matches no row is a failure — that is a typo or a stale reference,
+    /// and silently "cancelling" nothing would tell the user their reminder was
     /// taken care of when it was not.
     pub async fn do_cancel_reminder(&self, params: CancelReminderParams) -> anyhow::Result<String> {
         use alexandria_storage::repos::ReminderRepo;
 
         let repo = ReminderRepo::new(self.db.inner());
-        let existing = repo.get(&params.id).await?;
-        if existing.is_none() {
+        let Some(existing) = repo.get(&params.id).await? else {
             anyhow::bail!("Reminder not found: {}", params.id);
+        };
+        // Read-only exit for the already-cancelled row: the response is the same
+        // success a first cancel returned, because from the caller's side nothing
+        // is left to do.
+        if existing.status == "cancelled" {
+            return Ok(serde_json::json!({ "status": "ok", "id": params.id }).to_string());
         }
         repo.cancel(&params.id).await?;
         Ok(serde_json::json!({ "status": "ok", "id": params.id }).to_string())
