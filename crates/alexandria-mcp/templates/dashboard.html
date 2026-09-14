@@ -1,0 +1,45 @@
+{% extends "layout.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block body %}<h1>Alexandria Debug Dashboard</h1>
+<h2>Counts</h2>
+<table>
+<tr><th>Facts (active)</th><td>{{ fact_count }}</td></tr>
+<tr><th>Facts (deleted)</th><td>{{ deleted_fact_count }}</td></tr>
+<tr><th>Clusters</th><td>{{ cluster_count }}</td></tr>
+<tr><th>Edges</th><td>{{ edge_count }}</td></tr>
+<tr><th>Raw documents</th><td>{{ raw_count }}</td></tr>
+<tr><th>Sessions</th><td>{{ session_count }}</td></tr>
+</table>
+{% if schema_note != "" %}<p class="error">{{ schema_note }}</p>{% endif %}
+<h2>Effective configuration</h2>
+<table>
+<tr><th>Setting</th><th>Value</th></tr>{# Every row is emitted on ONE physical line and the dashboard tests read a value by matching `<tr><th>label</th><td>` through to `</td>`, so a reflow inside a row breaks both the layout and the assertions. Do not let a formatter split these. #}
+{% for row in config_rows %}<tr><th>{{ row.label }}</th><td>{{ row.value }}</td></tr>
+{% endfor %}</table>
+<h2>Cluster health</h2>
+{% if cluster_health.error != "" %}<p class="error">{{ cluster_health.error }}</p>{% else %}
+<table>
+<tr><th>Healthy</th><td>{{ cluster_health.healthy }}</td></tr>
+<tr><th>Needs split</th><td>{{ cluster_health.needs_split }}</td></tr>
+<tr><th>Too few members to judge</th><td>{{ cluster_health.too_few }}</td></tr>
+</table>
+{% endif %}
+<h2>Sessions</h2>
+{% if sessions.error != "" %}<p class="error">{{ sessions.error }}</p>{% else %}
+<table>
+<tr><th>Total</th><td>{{ sessions.total }}</td></tr>
+<tr><th>Finalized</th><td>{{ sessions.finalized }}</td></tr>
+<tr><th>Idle</th><td>{{ sessions.idle }}</td></tr>
+</table>
+{% endif %}
+<h2>Top tags (up to {{ tag_limit }})</h2>
+{% if tags.error != "" %}<p class="error">{{ tags.error }}</p>{% else %}
+{% if tags.rows.is_empty() %}<p>No tags recorded.</p>{% else %}
+{# Each bar is ONE physical line because the tests assert a whole row, which is the only way to pin label ↔ width ↔ count together; a reflow inside a row breaks those assertions. #}
+{% for bar in tags.rows %}<div class="bar-row"><span class="bar-name">{{ bar.label }}</span><span class="bar"><span class="bar-fill" style="width: {{ bar.width }}%"></span></span><span class="bar-count">{{ bar.count }}</span></div>
+{% endfor %}{% endif %}{% endif %}
+<h2>Heat distribution</h2>
+{% if heat.error != "" %}<p class="error">{{ heat.error }}</p>{% else %}
+{% if heat.rows.is_empty() %}<p>No heat states recorded.</p>{% else %}
+{% for bar in heat.rows %}<div class="bar-row"><span class="bar-name">{{ bar.label }}</span><span class="bar"><span class="bar-fill" style="width: {{ bar.width }}%"></span></span><span class="bar-count">{{ bar.count }}</span></div>
+{% endfor %}{% endif %}{% endif %}{% endblock %}

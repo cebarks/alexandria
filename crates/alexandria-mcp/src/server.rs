@@ -31,12 +31,13 @@ fn tool_json(result: anyhow::Result<String>) -> CallToolResult {
     }
 }
 
+use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
 use alexandria_engine::clusters::{ClusterInfo, assign_to_cluster, update_centroid};
 use alexandria_engine::heat::{ActivationConfig, compute_activation_targets};
 use alexandria_engine::recall::{
     ClusterWithMembers, FactSummary, ScopeHandle, broad_recall, focused_recall,
 };
-use alexandria_engine::search::rank_by_similarity;
+use alexandria_engine::search::{DEFAULT_MIN_SIMILARITY, rank_by_similarity};
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::Database;
 use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo, SessionRepo};
@@ -93,6 +94,9 @@ pub struct AlexandriaServer {
     pub activation_top_n: usize,
     /// Hard floor on cosine similarity for retrieve_memories results.
     pub retrieve_min_similarity: f32,
+    /// Avg member-to-centroid similarity below which a cluster is reported as needing a
+    /// split. Carried here so the debug UI shows the same verdict the maintenance task acts on.
+    pub cohesion_floor: f32,
     pub reminders: RemindersSettings,
 }
 
@@ -110,7 +114,8 @@ impl AlexandriaServer {
             heat_spacing_halflife,
             activation_config: ActivationConfig::default(),
             activation_top_n: 3,
-            retrieve_min_similarity: 0.30,
+            retrieve_min_similarity: DEFAULT_MIN_SIMILARITY,
+            cohesion_floor: DEFAULT_COHESION_FLOOR,
             reminders: RemindersSettings::default(),
         }
     }
@@ -127,6 +132,11 @@ impl AlexandriaServer {
 
     pub fn with_retrieve_min_similarity(mut self, min_similarity: f32) -> Self {
         self.retrieve_min_similarity = min_similarity;
+        self
+    }
+
+    pub fn with_cohesion_floor(mut self, cohesion_floor: f32) -> Self {
+        self.cohesion_floor = cohesion_floor;
         self
     }
 
@@ -289,6 +299,19 @@ Reminders: use set_reminder when the user asks to be reminded of something later
 Reminder delivery: retrieve_memories and recall responses also carry a due_reminders array: a read-only, untargeted view of what is currently due (a short oldest-due sample, each entry has a target of global or project:<name>) that consumes nothing. An entry targeting another project is informational there; it reaches the user through the next check_reminders, which also delivers project reminders once they are overdue by more than the server's escalation window. Use list_reminders to review what is scheduled and cancel_reminder when a reminder is no longer needed."
 )]
 impl ServerHandler for AlexandriaServer {}
+
+/// Which optional stages a retrieval run performs.
+///
+/// A Rust-side parameter rather than fields on [`RetrieveMemoriesParams`], because that struct is
+/// the public MCP tool schema advertised to every LLM client — a debug-only knob there would be
+/// something agents could set.
+#[derive(Debug, Clone, Copy)]
+struct RetrieveOptions {
+    /// Fire spreading activation for the kept top-`top_n` results, i.e. write heat.
+    activate: bool,
+    /// Drop ranked results below `retrieve_min_similarity`.
+    apply_floor: bool,
+}
 
 // Implementation details
 impl AlexandriaServer {
@@ -517,6 +540,71 @@ impl AlexandriaServer {
         &self,
         params: RetrieveMemoriesParams,
     ) -> anyhow::Result<serde_json::Value> {
+        self.retrieve_core(
+            params,
+            RetrieveOptions {
+                activate: true,
+                apply_floor: true,
+            },
+        )
+        .await
+    }
+
+    /// Non-mutating retrieval for the debug UI's dry-run mode.
+    ///
+    /// Identical results to [`Self::do_retrieve_memories`] — the only difference is that the
+    /// spreading-activation write is skipped, so a diagnostic query stops perturbing the heat
+    /// that feeds the ranking it is trying to explain.
+    pub async fn do_retrieve_memories_dry(
+        &self,
+        params: RetrieveMemoriesParams,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.retrieve_core(
+            params,
+            RetrieveOptions {
+                activate: false,
+                apply_floor: true,
+            },
+        )
+        .await
+    }
+
+    /// The ranked window *before* the similarity floor, for the debug Query Tester.
+    ///
+    /// Non-mutating (`activate: false`), so unlike [`Self::do_retrieve_memories`] it never warms
+    /// heat — the honest default for a surface that exists to explain a ranking rather than change
+    /// it. Returning the unfiltered window is what lets the tester name the results the floor
+    /// suppressed. Note the window is still only the top `limit` rows: the tool truncates to
+    /// `limit` *before* filtering, so neither path can see anything ranked below that.
+    pub async fn do_retrieve_memories_unfiltered(
+        &self,
+        params: RetrieveMemoriesParams,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.retrieve_core(
+            params,
+            RetrieveOptions {
+                activate: false,
+                apply_floor: false,
+            },
+        )
+        .await
+    }
+
+    /// Shared retrieval implementation. `options` selects the two optional stages — the
+    /// spreading-activation write and the similarity floor — and nothing else; every other step
+    /// (embedding, loading, ranking, result building) is the same code on every path, which is
+    /// what makes dry results equal wet results and the unfiltered window a superset of both.
+    ///
+    /// `do_retrieve_memories` must keep its exact signature: `#[tool] retrieve_memories` calls
+    /// it, and the rmcp derives are sensitive to the shape of tool-adjacent methods. The knob is
+    /// deliberately a Rust parameter rather than a field on [`RetrieveMemoriesParams`] — that
+    /// struct is the public MCP tool schema advertised to every LLM client, and a `dry_run`
+    /// field there would be a debug-only affordance that agents could set.
+    async fn retrieve_core(
+        &self,
+        params: RetrieveMemoriesParams,
+        options: RetrieveOptions,
+    ) -> anyhow::Result<serde_json::Value> {
         let limit = params.limit.unwrap_or(10);
 
         // 1. Embed query
@@ -544,23 +632,36 @@ impl AlexandriaServer {
             }));
         }
 
-        // 3. Rank by similarity, then drop results below the server-side floor.
+        // 3. Rank by similarity, then — for the tool and the dry run — drop results below the
+        // server-side floor.
         // This is a conservative defense-in-depth cutoff: it removes pure noise
         // even if a client sets a lax threshold, without changing semantics for
         // deliberate agent lookups (the floor sits well below plausible matches).
+        // It is skipped only by the unfiltered debug path, which needs the suppressed rows back.
         let embeddings: Vec<Vec<f32>> = facts.iter().map(|f| f.embedding.clone()).collect();
-        let ranked: Vec<(usize, f32)> = rank_by_similarity(query_emb, &embeddings, limit)
-            .into_iter()
-            .filter(|(_, sim)| *sim >= self.retrieve_min_similarity)
-            .collect();
+        let mut ranked: Vec<(usize, f32)> = rank_by_similarity(query_emb, &embeddings, limit);
+        if options.apply_floor {
+            // `retain` keeps the rank order, so the activation loop below sees exactly the rows the
+            // old `into_iter().filter()` chain produced.
+            ranked.retain(|(_, sim)| *sim >= self.retrieve_min_similarity);
+        }
 
-        // 4. Trigger spreading activation for top results
-        for (idx, _) in ranked.iter().take(self.activation_top_n) {
-            let fact = &facts[*idx];
-            if let Some(ref id) = fact.id {
-                let fact_id_str = record_id_to_string(id);
-                // Fire-and-forget activation — don't block on it
-                let _ = self.trigger_activation(&fact_id_str, 1.0).await;
+        // 4. Trigger spreading activation for top results.
+        //
+        // Order matters and is load-bearing (AGENTS.md documents it): this runs after ranking
+        // and after the `retrieve_min_similarity` filter dropped the noise, so it warms the
+        // results a caller actually sees — never a row they did not.
+        //
+        // Every `add_heat` it issues is a real database write, which is why the debug UI's
+        // dry-run mode passes `activate: false` rather than calling this unconditionally.
+        if options.activate {
+            for (idx, _) in ranked.iter().take(self.activation_top_n) {
+                let fact = &facts[*idx];
+                if let Some(ref id) = fact.id {
+                    let fact_id_str = record_id_to_string(id);
+                    // Fire-and-forget activation — don't block on it
+                    let _ = self.trigger_activation(&fact_id_str, 1.0).await;
+                }
             }
         }
 
@@ -1571,6 +1672,107 @@ mod get_info_tests {
         assert!(info.capabilities.tools.is_some());
     }
 
+    /// `new()` is the construction path every test harness and any non-`main.rs` embedder
+    /// takes, so its fallbacks must be the engine's tuned constants rather than local
+    /// literals that can drift from what production actually runs.
+    #[tokio::test]
+    async fn test_new_uses_engine_default_thresholds() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        assert_eq!(
+            server.retrieve_min_similarity,
+            alexandria_engine::search::DEFAULT_MIN_SIMILARITY
+        );
+        assert_eq!(
+            server.cohesion_floor,
+            alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR
+        );
+    }
+
+    /// The twelve public MCP tools, by name — the exact set `AGENTS.md` and `README.md` document.
+    ///
+    /// Deliberately a closed list rather than a count. `do_retrieve_memories_dry` and
+    /// `do_retrieve_memories_unfiltered` are `#[tool]`-less wrappers over `retrieve_core` used only
+    /// by the debug Query Tester, and a *count* check would keep passing if someone renamed a real
+    /// tool and registered one of those as the thirteenth: the advertised surface would change while
+    /// the total stayed twelve. Names are what an MCP client actually calls.
+    const PUBLIC_TOOLS: [&str; 12] = [
+        "store_memory",
+        "retrieve_memories",
+        "recall",
+        "update_memory",
+        "import_document",
+        "delete_memory",
+        "get_session",
+        "finalize_session",
+        "set_reminder",
+        "check_reminders",
+        "list_reminders",
+        "cancel_reminder",
+    ];
+
+    /// Guards the "exactly 12 MCP tools" invariant in `AGENTS.md`/`README.md`.
+    ///
+    /// Until now that claim was verified by a human counting `#[tool]` attributes, so a future
+    /// `#[tool]` on a debug-only wrapper — or a rename — would silently widen or shift the
+    /// advertised surface and CI would pass. This asks the server what it advertises and compares
+    /// the sorted name set against [`PUBLIC_TOOLS`] exactly.
+    ///
+    /// The advertised list is `ToolRouter::list_all()` because that is literally what the generated
+    /// `ServerHandler::list_tools` returns (`tools: Self::tool_router().list_all()`); the trait
+    /// method itself takes a `RequestContext<RoleServer>`, which carries a live `Peer<RoleServer>`
+    /// and so cannot be built in a unit test. `get_tool` is the other half of the handler surface
+    /// and takes only a `&str`, so it is checked here too — a name the router lists but the handler
+    /// cannot resolve would be advertised and then rejected at call time.
+    #[tokio::test]
+    async fn test_advertised_tool_set_is_exactly_the_twelve_public_tools() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        let mut advertised: Vec<String> = AlexandriaServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        advertised.sort();
+        let mut expected: Vec<String> = PUBLIC_TOOLS.iter().map(|s| (*s).to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            advertised, expected,
+            "the advertised MCP tool set must be exactly the twelve documented public tools"
+        );
+        assert_eq!(
+            advertised.len(),
+            12,
+            "asserting the exact set is the point; a duplicate name would hide a thirteenth tool"
+        );
+
+        for name in PUBLIC_TOOLS {
+            assert!(
+                server.get_tool(name).is_some(),
+                "{name} must resolve through ServerHandler::get_tool, not just appear in the list"
+            );
+        }
+        // The closed set really is closed: the debug-only wrappers are not reachable this way.
+        for not_a_tool in [
+            "retrieve_memories_dry",
+            "retrieve_memories_unfiltered",
+            "do_retrieve_memories_dry",
+        ] {
+            assert!(
+                server.get_tool(not_a_tool).is_none(),
+                "{not_a_tool} must not be advertised or resolvable as an MCP tool"
+            );
+        }
+    }
+
     /// Stub that maps content/query text to fixed embeddings so we can assert
     /// the retrieve floor deterministically: text containing "far" -> [0, 1]
     /// (orthogonal to the query, cosine 0), everything else -> [1, 0] (aligned
@@ -1718,6 +1920,168 @@ mod get_info_tests {
             "only the above-floor memory should survive"
         );
         assert!(results[0]["content"].as_str().unwrap().contains("above"));
+    }
+
+    // --- Dry-run vs wet retrieval: the heat side effect -------------------------
+    //
+    // Spreading activation only writes anything if three things all line up, so these tests
+    // share one fixture built to satisfy every one of them:
+    //   1. the retrieved fact must have a `memory_edge` neighbour (`trigger_activation` returns
+    //      early when `get_neighbors` comes back empty);
+    //   2. that neighbour must be within `max_hops` (2 by default) and its heat delta must clear
+    //      `compute_activation_targets`' 0.001 negligible floor (edge strength 1.0 at hop 1 is
+    //      1.0 * 0.3 * 1.0 = 0.3);
+    //   3. that neighbour must already have a `heat_state` row, because `HeatRepo::add_heat` is
+    //      an `UPDATE heat_state ... WHERE memory = ...` that silently matches nothing — and the
+    //      caller discards the result with `.ok()` — when there is no row to warm.
+    // Point 3 is why the fixture stores through `do_store_memory` (which creates the row at 1.0)
+    // rather than `MemoryRepo::create_fact`.
+
+    /// Two memories joined by a real `memory_edge` — the graph activation actually walks.
+    async fn seed_edge_pair(server: &AlexandriaServer) -> (String, String) {
+        let a = server
+            .do_store_memory(StoreMemoryParams {
+                content: "seed alpha".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+        let b = server
+            .do_store_memory(StoreMemoryParams {
+                content: "seed beta".to_string(),
+                tags: None,
+                session_id: None,
+            })
+            .await
+            .unwrap();
+        EdgeRepo::new(server.db.inner())
+            .create_edge(&a, &b, "relates_to", 1.0)
+            .await
+            .unwrap();
+        (a, b)
+    }
+
+    /// Heat of both seeded memories, read through `HeatRepo` rather than a query of the test's
+    /// own. `None` would mean the row vanished, which is also a change worth failing on.
+    async fn seeded_heat(
+        server: &AlexandriaServer,
+        ids: &(String, String),
+    ) -> (Option<f64>, Option<f64>) {
+        let heat_repo = HeatRepo::new(server.db.inner());
+        (
+            heat_repo.get(&ids.0).await.unwrap().map(|h| h.heat),
+            heat_repo.get(&ids.1).await.unwrap().map(|h| h.heat),
+        )
+    }
+
+    /// One `RetrieveMemoriesParams` shared by every call in these three tests, so a difference
+    /// in what they assert can only come from the code path, never from the arguments.
+    fn seeded_retrieve_params() -> RetrieveMemoriesParams {
+        RetrieveMemoriesParams {
+            query: "anything at all".to_string(),
+            limit: Some(10),
+            session_id: None,
+        }
+    }
+
+    /// A server with the seeded pair already in it, plus the seeded ids.
+    async fn server_with_seeded_edge() -> (AlexandriaServer, (String, String)) {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let ids = seed_edge_pair(&server).await;
+        (server, ids)
+    }
+
+    /// The control for `test_dry_run_does_not_write_heat`: this fixture really can produce a
+    /// heat write. Without it the dry assertion could pass vacuously on a fixture where nothing
+    /// ever activates.
+    #[tokio::test]
+    async fn test_wet_run_does_write_heat() {
+        let (server, ids) = server_with_seeded_edge().await;
+        let before = seeded_heat(&server, &ids).await;
+        assert_eq!(
+            before,
+            (Some(1.0), Some(1.0)),
+            "each `do_store_memory` seeds heat at 1.0, so the fixture starts from a known place"
+        );
+
+        server
+            .do_retrieve_memories(seeded_retrieve_params())
+            .await
+            .unwrap();
+
+        let after = seeded_heat(&server, &ids).await;
+        // One hop of propagation at the default factor: 1.0 * 0.3^1 * strength 1.0. Compared with
+        // a tolerance because that delta is computed in f32 and widened to f64 on the way in.
+        let warmed = |h: Option<f64>| h.is_some_and(|h| (h - 1.3).abs() < 1e-3);
+        assert!(
+            warmed(after.0) && warmed(after.1),
+            "a wet retrieve must warm both endpoints of the seeded edge; before {before:?}, after {after:?}"
+        );
+    }
+
+    /// The load-bearing one: the same query through the dry path leaves heat exactly where it
+    /// was, even though the control test above proves it moves.
+    #[tokio::test]
+    async fn test_dry_run_does_not_write_heat() {
+        let (server, ids) = server_with_seeded_edge().await;
+        let before = seeded_heat(&server, &ids).await;
+
+        let result = server
+            .do_retrieve_memories_dry(seeded_retrieve_params())
+            .await
+            .unwrap();
+        assert_eq!(
+            result["results"].as_array().unwrap().len(),
+            2,
+            "the dry path must still run the retrieval, not short-circuit it"
+        );
+        assert_eq!(
+            seeded_heat(&server, &ids).await,
+            before,
+            "a dry retrieve must not write heat anywhere it touches"
+        );
+    }
+
+    /// Pinning the equivalence property the split depends on: dry and wet differ *only* in the
+    /// side effect. Whole-`Value` comparison, so ids, contents, similarities, tags and row order
+    /// are all in scope.
+    #[tokio::test]
+    async fn test_dry_and_wet_return_identical_results() {
+        let (server, _ids) = server_with_seeded_edge().await;
+
+        let dry = server
+            .do_retrieve_memories_dry(seeded_retrieve_params())
+            .await
+            .unwrap();
+        let wet = server
+            .do_retrieve_memories(seeded_retrieve_params())
+            .await
+            .unwrap();
+        // A second dry run *after* the wet one, to show the heat the wet run wrote does not leak
+        // into what the dry path reports.
+        let dry_again = server
+            .do_retrieve_memories_dry(seeded_retrieve_params())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dry["results"].as_array().unwrap().len(),
+            2,
+            "an empty result set would make the comparisons below tautological"
+        );
+        assert_eq!(
+            dry, wet,
+            "dry and wet retrieval must return identical results"
+        );
+        assert_eq!(
+            dry_again, wet,
+            "a dry run after a wet one must return the same results as before it"
+        );
     }
 
     #[tokio::test]

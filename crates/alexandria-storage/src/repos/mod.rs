@@ -8,6 +8,6 @@ pub mod session_repo;
 pub use cluster_repo::ClusterRepo;
 pub use edge_repo::EdgeRepo;
 pub use heat_repo::HeatRepo;
-pub use memory_repo::MemoryRepo;
+pub use memory_repo::{DEFAULT_FACT_LIST_LIMIT, FactListQuery, FactSort, MemoryRepo, SortDir};
 pub use reminder_repo::{NewReminder, ReminderRepo};
-pub use session_repo::SessionRepo;
+pub use session_repo::{SessionRepo, SessionSummary};

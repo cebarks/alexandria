@@ -1,0 +1,23 @@
+{% extends "layout.html" %}
+{% block title %}Memory Detail{% endblock %}
+{% block body %}<p><a class="link" href="/debug/memories">← Back to memories</a></p>
+<h1>Memory {{ id }} {% if deleted %}<span class="badge-deleted">⚠ Deleted</span>{% endif %}</h1>
+<p><a class="link" href="/debug/graph/{{ id|urlencode }}">View graph →</a></p>
+<pre class="content-block">{{ content }}</pre>
+<dl class="fact-meta">
+  <dt>Tags</dt><dd>{% for tag_name in tags %}<span class="badge">{{ tag_name }}</span>{% endfor %}</dd>
+  <dt>Confidence</dt><dd>{{ confidence }}</dd>
+  <dt>Created</dt><dd>{{ created_at }}</dd>
+</dl>
+<h2>Heat</h2>
+{% if let Some(heat) = heat %}<dl class="fact-meta">
+  <dt>Heat</dt><dd>{{ heat.heat }}</dd>
+  <dt>Stability</dt><dd>{{ heat.stability }}</dd>
+  <dt>Access count</dt><dd>{{ heat.access_count }}</dd>
+  <dt>Last touched</dt><dd>{{ heat.last_touched }}</dd>
+</dl>{% else %}<p>No heat state recorded.</p>{% endif %}
+<h2>Cluster</h2>
+<p>{% if let Some(cluster) = cluster %}<a class="link" href="/debug/clusters/{{ cluster.id|urlencode }}">{{ cluster.label }}</a> <span class="badge">{{ cluster.id }}</span>{% else %}None{% endif %}</p>
+<h2>Edges</h2>
+{% if edges.is_empty() %}<p>No edges.</p>{% else %}<ul>{% for edge in edges %}<li><span class="badge">{{ edge.edge_type }}</span> <a class="link" href="/debug/memories/{{ edge.in_id|urlencode }}">{{ edge.in_id }}</a> → <a class="link" href="/debug/memories/{{ edge.out_id|urlencode }}">{{ edge.out_id }}</a> (strength {{ edge.strength }})</li>{% endfor %}</ul>{% endif %}
+{% if let Some(metadata) = metadata %}<h2>Metadata</h2><pre class="content-block">{{ metadata }}</pre>{% else %}<h2>Metadata</h2><p>None</p>{% endif %}{% endblock %}

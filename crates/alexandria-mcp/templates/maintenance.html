@@ -1,0 +1,19 @@
+{% extends "layout.html" %}
+{% import "_pagination.html" as p %}
+{% block title %}Maintenance Log{% endblock %}
+{% block body %}<h1>Maintenance Log</h1>
+{# The `{% for %}`/`{% if %}` lines below are deliberately kept on ONE physical line each:
+   newlines inside a <td> render as visible whitespace, and the `, ` separator between target
+   links must not gain a stray space before </td>. Do not let a formatter reflow them. #}
+<table>
+<tr><th>Action</th><th>Source</th><th>Target(s)</th><th>Members Moved</th><th>Time</th></tr>
+{% if logs.is_empty() %}<tr><td colspan="5" class="empty">No maintenance events recorded.</td></tr>{% endif %}
+{% for log in logs %}<tr>
+<td>{% if log.action == "merge" %}<span class="badge" style="background:#1a3d2a;color:#3fb950;">merge</span>{% elif log.action == "split" %}<span class="badge" style="background:#3d2f1a;color:#d29922;">split</span>{% else %}<span class="badge">unknown</span>{% endif %}</td>
+<td>{{ log.source_id }}</td>
+<td>{% for target in log.targets %}<a class="link" href="/debug/clusters/{{ target|urlencode }}">{{ target }}</a>{% if !loop.last %}, {% endif %}{% endfor %}</td>
+<td>{{ log.members_moved }}</td>
+<td>{{ log.timestamp }}</td>
+</tr>
+{% endfor %}</table>
+{% if total_pages > 1 %}{# the macro emits nothing when both hrefs are empty, so this page owns the single-page wording #}{{ p::pager(prev_href, next_href, summary) }}{% else %}<p>{{ total }} entries</p>{% endif %}{% endblock %}

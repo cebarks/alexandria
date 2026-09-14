@@ -12,9 +12,12 @@ pub struct Stats {
     pub cluster_count: usize,
     pub edge_count: usize,
     pub raw_count: usize,
+    pub session_count: usize,
 }
 
 async fn count_table(db: &Surreal<Any>, table: &str, where_clause: &str) -> Result<usize> {
+    // `table` is interpolated verbatim, so reserved-word tables must arrive already
+    // backticked by the caller (see the `session` entry in `gather`).
     #[derive(serde::Deserialize, surrealdb::types::SurrealValue)]
     struct CountRow {
         count: i64,
@@ -33,6 +36,7 @@ pub async fn gather(db: &Surreal<Any>) -> Result<Stats> {
         cluster_count: count_table(db, "cluster", "").await?,
         edge_count: count_table(db, "memory_edge", "").await?,
         raw_count: count_table(db, "raw", "").await?,
+        session_count: count_table(db, "`session`", "").await?,
     })
 }
 
@@ -48,6 +52,22 @@ mod tests {
         let stats = gather(db.inner()).await.unwrap();
         assert_eq!(stats.fact_count, 0);
         assert_eq!(stats.cluster_count, 0);
+        assert_eq!(stats.session_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_gather_counts_sessions() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = crate::repos::SessionRepo::new(db.inner());
+        repo.create("sess-1", None, None).await.unwrap();
+        repo.create("sess-2", None, None).await.unwrap();
+
+        // `session` is a SurrealDB reserved word, so this also proves count_table()'s
+        // interpolation path passes the backticked name through unescaped.
+        let stats = gather(db.inner()).await.unwrap();
+        assert_eq!(stats.session_count, 2);
+        assert_eq!(stats.fact_count, 0);
     }
 
     #[tokio::test]

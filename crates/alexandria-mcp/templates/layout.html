@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}Debug{% endblock %} — Alexandria Debug</title>
+<script src="/debug/assets/htmx-2.0.10.min.js" defer></script>
+<style>
+body { font-family: system-ui, sans-serif; margin: 0; padding: 0; background: #0d1117; color: #c9d1d9; }
+nav { background: #161b22; padding: 12px 24px; border-bottom: 1px solid #30363d; }
+nav a { color: #58a6ff; margin-right: 16px; text-decoration: none; }
+nav a.active { color: #c9d1d9; font-weight: 600; }
+main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+th, td { text-align: left; padding: 8px; border-bottom: 1px solid #30363d; }
+th { color: #8b949e; font-weight: 600; }
+input, select, textarea, button { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; padding: 6px 8px; border-radius: 4px; }
+button { cursor: pointer; }
+.badge { display: inline-block; background: #21262d; padding: 2px 8px; border-radius: 12px; font-size: 12px; margin-right: 4px; }
+a.link { color: #58a6ff; }
+.error { color: #f85149; }
+.empty { color: #8b949e; font-style: italic; }
+tr.deleted td { opacity: 0.45; text-decoration: line-through; }
+tr.deleted td:first-child { text-decoration: none; }
+.pagination { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; color: #8b949e; font-size: 14px; }
+.pagination a { margin: 0 4px; }
+.badge-deleted { background: #3d1a1a; color: #f85149; border: 1px solid #6e2020; padding: 2px 10px; border-radius: 12px; font-size: 13px; margin-left: 8px; }
+pre.content-block { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow-y: auto; }
+dl.fact-meta { display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px; margin: 12px 0; }
+dl.fact-meta dt { color: #8b949e; font-weight: 600; }
+dl.fact-meta dd { margin: 0; }
+/* Dashboard rollup bars. The fill's width arrives as a precomputed inline percentage, so these
+   rules only shape it — no charting library, and no arithmetic in the templates. */
+.bar-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.bar-name { flex: 0 0 200px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #8b949e; }
+.bar { flex: 1 1 auto; display: block; height: 10px; background: #21262d; border-radius: 3px; }
+.bar-fill { display: block; height: 10px; background: #1f6feb; border-radius: 3px; }
+.bar-count { flex: 0 0 48px; text-align: right; }
+/* Query Tester result fragment. `query_results.html` is an htmx-swapped body fragment that does
+   not extend this layout, so these rules reach it through the Query Tester page that hosts it. */
+.mode-note { color: #8b949e; font-size: 14px; }
+.query-window, .query-activation, .query-scope { color: #8b949e; font-size: 14px; margin: 6px 0; }
+.query-settings code, .query-scope code { color: #c9d1d9; }
+/* The score-band legend is the only place a bare similarity number gets a meaning, so it is set
+   apart from the notes without being louder than the results themselves. */
+.score-bands { color: #8b949e; font-size: 13px; border-left: 3px solid #30363d; padding-left: 10px; margin: 10px 0; }
+/* Results the similarity floor suppressed: kept in the same table shape for comparison, but
+   visibly not-part-of-the-answer. */
+section.dropped-by-floor { margin-top: 16px; padding: 4px 12px 12px; border: 1px solid #6e2020; border-radius: 6px; }
+section.dropped-by-floor h3 { color: #f85149; margin-bottom: 0; }
+tr.dropped td { opacity: 0.55; }
+/* Graph page. The ego-graph canvas is unreadable without two things: a radius control and a key
+   for what a blob of colour means. The legend's *content* is rendered by graph.html's script from
+   the same style tables the server uses to draw nodes and edges, so these rules only shape it —
+   the colours and dash patterns arrive as inline styles from that data and are deliberately not
+   restated here. */
+.graph-controls { color: #8b949e; font-size: 14px; }
+.graph-notice { margin: 8px 0; padding: 6px 12px; border: 1px solid #6e2020; border-radius: 6px; color: #f85149; font-size: 14px; }
+.graph-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; color: #8b949e; font-size: 13px; margin: 10px 0; border-left: 3px solid #30363d; padding-left: 10px; }
+.graph-legend-title { color: #c9d1d9; font-weight: 600; }
+.graph-legend .legend-item { margin-right: 4px; }
+/* Swatches echo the canvas shapes, so the legend keeps working without colour perception. */
+.graph-legend .swatch { display: inline-block; width: 12px; height: 12px; background: #8b949e; margin-right: 5px; }
+.graph-legend .swatch[data-shape="dot"] { border-radius: 50%; }
+.graph-legend .swatch[data-shape="diamond"] { transform: rotate(45deg); }
+.graph-legend .swatch[data-shape="triangle"] { clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.graph-legend .line-sample { display: inline-block; width: 26px; border-top: 2px solid #8b949e; margin-right: 5px; vertical-align: 3px; }
+</style>
+</head>
+<body>
+<nav>
+<a href="/debug" {% if nav == "dashboard" %}class="active"{% endif %}>Dashboard</a>
+<a href="/debug/memories" {% if nav == "memories" %}class="active"{% endif %}>Memories</a>
+<a href="/debug/clusters" {% if nav == "clusters" %}class="active"{% endif %}>Clusters</a>
+<a href="/debug/sessions" {% if nav == "sessions" %}class="active"{% endif %}>Sessions</a>
+<a href="/debug/maintenance" {% if nav == "maintenance" %}class="active"{% endif %}>Maintenance Log</a>
+<a href="/debug/query" {% if nav == "query" %}class="active"{% endif %}>Query Tester</a>
+</nav>
+<main>
+{% block body %}{% endblock %}
+</main>
+{% block scripts %}{% endblock %}
+</body>
+</html>

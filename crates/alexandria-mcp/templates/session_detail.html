@@ -1,0 +1,22 @@
+{% extends "layout.html" %}
+{% block title %}Session Detail{% endblock %}
+{% block body %}<p><a class="link" href="/debug/sessions">← Back to sessions</a></p>
+<h1>Session {{ external_id }}</h1>
+<dl class="fact-meta">
+  <dt>Agent</dt><dd>{{ agent }}</dd>
+  <dt>Model</dt><dd>{{ model }}</dd>
+  <dt>Started</dt><dd>{{ started }}</dd>
+  <dt>Last activity</dt><dd>{{ last_activity }}</dd>
+  <dt>State</dt><dd>{% if finalized %}<span class="badge">finalized</span>{% else %}<span class="badge">active</span>{% endif %}</dd>
+  <dt>Tags</dt><dd>{% for tag_name in tags %}<span class="badge">{{ tag_name }}</span>{% endfor %}</dd>
+</dl>
+{# The summary block is the only proof of finalization; "Last activity" is not, because touch() writes it on every attached memory. #}
+<h2>Summary</h2>
+{% if let Some(summary) = summary %}<pre class="content-block">{{ summary }}</pre>{% else %}<p>Not finalized — no summary recorded. The "Last activity" value above is when the most recent memory was attached, not when the session ended.</p>{% endif %}
+<h2>Memories</h2>
+<table>{# ONE physical line per row, as in memories.html: newlines inside a <td> render as visible whitespace. #}
+<tr><th>ID</th><th>Content</th><th>Created</th></tr>
+{% if memories.is_empty() %}<tr><td colspan="3" class="empty">No memories in this session.</td></tr>{% endif %}
+{% for m in memories %}<tr><td><a class="link" href="/debug/memories/{{ m.id|urlencode }}">{{ m.id }}</a></td><td>{{ m.preview }}</td><td>{{ m.created }}</td></tr>
+{% endfor %}</table>
+{% endblock %}
