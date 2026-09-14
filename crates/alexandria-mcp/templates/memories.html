@@ -18,6 +18,7 @@
 <div id="memory-results">
 <table>
 <tr>{{ sh::th(sorts.id, "ID", "id", sorts.active, sorts.dir) }}{{ sh::th(sorts.content, "Content", "content", sorts.active, sorts.dir) }}{{ sh::th(sorts.tags, "Tags (count)", "tags", sorts.active, sorts.dir) }}{{ sh::th(sorts.confidence, "Confidence", "confidence", sorts.active, sorts.dir) }}{{ sh::th(sorts.created, "Created", "created", sorts.active, sorts.dir) }}</tr>{# The row emitted by the loop below is deliberately ONE physical line. A newline inside a <td> renders as visible whitespace, and the list XSS assertion matches a whole <td> element, so splitting it breaks both the layout and the test. Do not let a formatter reflow it. #}
+{% if rows.is_empty() %}<tr><td colspan="5" class="empty">No memories match the current filters.</td></tr>{% endif %}
 {% for row in rows %}<tr{% if row.deleted %} class="deleted"{% endif %}><td><a class="link" href="/debug/memories/{{ row.id|urlencode }}">{{ row.id }}</a></td><td>{{ row.preview }}</td><td>{% for tag_name in row.tags %}<span class="badge">{{ tag_name }}</span>{% endfor %}</td><td>{{ row.confidence }}</td><td>{{ row.created }}</td></tr>
 {% endfor %}</table>
 {% if prev_href != "" || next_href != "" %}{{ p::pager(prev_href, next_href, summary) }}{% else %}{# the macro renders nothing when both links are absent, but the legacy page always printed its count line, so the fallback lives here #}<div class="pagination"><span>{{ summary }}</span></div>{% endif %}

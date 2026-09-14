@@ -246,4 +246,27 @@ mod tests {
         );
         html::assert_no_seconds_timestamp(&html, "maintenance.html");
     }
+
+    #[test]
+    fn test_maintenance_template_empty_state_keeps_the_header_and_marks_the_gap() {
+        let html = MaintenanceTemplate {
+            nav: "maintenance",
+            logs: vec![],
+            prev_href: String::new(),
+            next_href: String::new(),
+            summary: "0 entries".into(),
+            total_pages: 1,
+            total: 0,
+        }
+        .render()
+        .unwrap();
+        assert!(
+            html.contains("<th>Action</th>"),
+            "the header row must survive an empty log; got: {html}"
+        );
+        assert!(
+            html.contains("<td colspan=\"5\" class=\"empty\">No maintenance events recorded.</td>"),
+            "the shared empty-state row must stand in for the missing rows; got: {html}"
+        );
+    }
 }

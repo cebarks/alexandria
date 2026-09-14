@@ -7,6 +7,7 @@
    links must not gain a stray space before </td>. Do not let a formatter reflow them. #}
 <table>
 <tr><th>Action</th><th>Source</th><th>Target(s)</th><th>Members Moved</th><th>Time</th></tr>
+{% if logs.is_empty() %}<tr><td colspan="5" class="empty">No maintenance events recorded.</td></tr>{% endif %}
 {% for log in logs %}<tr>
 <td>{% if log.action == "merge" %}<span class="badge" style="background:#1a3d2a;color:#3fb950;">merge</span>{% elif log.action == "split" %}<span class="badge" style="background:#3d2f1a;color:#d29922;">split</span>{% else %}<span class="badge">unknown</span>{% endif %}</td>
 <td>{{ log.source_id }}</td>

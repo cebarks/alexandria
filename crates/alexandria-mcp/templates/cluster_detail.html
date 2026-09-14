@@ -4,6 +4,7 @@
 <p>Cohesion: {{ cohesion }}</p>
 <table>
 <tr><th>ID</th><th>Content</th></tr>
+{% if members.is_empty() %}<tr><td colspan="2" class="empty">No members in this cluster.</td></tr>{% endif %}
 {% for member in members %}<tr><td><a class="link" href="/debug/memories/{{ member.id|urlencode }}">{{ member.id }}</a></td><td>{{ member.preview }}</td></tr>
 {% endfor %}</table>
 <p>{{ member_count }} members</p>{% endblock %}

@@ -193,10 +193,12 @@ pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<Strin
 
 #[cfg(test)]
 mod tests {
+    use askama::Template;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
+    use super::ClusterDetailTemplate;
     use crate::AlexandriaServer;
 
     /// Renders the cluster detail page for `cid` through the real router.
@@ -440,6 +442,27 @@ mod tests {
         assert!(
             text.contains("storage error while loading cluster"),
             "the page must name what failed, via the shared helper; got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_cluster_detail_template_empty_state_keeps_the_header_and_marks_the_gap() {
+        let html = ClusterDetailTemplate {
+            nav: "clusters",
+            id: "cluster:abc".into(),
+            cohesion: "too few members to judge".into(),
+            members: vec![],
+            member_count: 0,
+        }
+        .render()
+        .unwrap();
+        assert!(
+            html.contains("<tr><th>ID</th><th>Content</th></tr>"),
+            "the header row must survive a memberless cluster; got: {html}"
+        );
+        assert!(
+            html.contains("<td colspan=\"2\" class=\"empty\">No members in this cluster.</td>"),
+            "the shared empty-state row must stand in for the missing rows; got: {html}"
         );
     }
 }

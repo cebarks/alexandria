@@ -14,7 +14,9 @@
 <h2>Summary</h2>
 {% if let Some(summary) = summary %}<pre class="content-block">{{ summary }}</pre>{% else %}<p>Not finalized — no summary recorded. The "Last activity" value above is when the most recent memory was attached, not when the session ended.</p>{% endif %}
 <h2>Memories</h2>
-{% if memories.is_empty() %}<p>No memories.</p>{% else %}<table>{# ONE physical line per row, as in memories.html: newlines inside a <td> render as visible whitespace. #}
+<table>{# ONE physical line per row, as in memories.html: newlines inside a <td> render as visible whitespace. #}
 <tr><th>ID</th><th>Content</th><th>Created</th></tr>
+{% if memories.is_empty() %}<tr><td colspan="3" class="empty">No memories in this session.</td></tr>{% endif %}
 {% for m in memories %}<tr><td><a class="link" href="/debug/memories/{{ m.id|urlencode }}">{{ m.id }}</a></td><td>{{ m.preview }}</td><td>{{ m.created }}</td></tr>
-{% endfor %}</table>{% endif %}{% endblock %}
+{% endfor %}</table>
+{% endblock %}

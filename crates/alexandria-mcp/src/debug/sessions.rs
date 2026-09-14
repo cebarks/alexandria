@@ -859,4 +859,39 @@ mod tests {
             "the page must name what failed, via the shared helper; got: {text}"
         );
     }
+
+    #[test]
+    fn test_sessions_templates_share_one_empty_state_shape() {
+        let mut list = sessions_template();
+        list.rows.clear();
+        let list_html = list.render().unwrap();
+        assert!(
+            list_html.contains("<th>External ID</th>"),
+            "the header row must survive an empty result; got: {list_html}"
+        );
+        assert!(
+            list_html.contains(
+                "<td colspan=\"7\" class=\"empty\">No sessions match the current filters.</td>"
+            ),
+            "the shared empty-state row must stand in for the missing rows; got: {list_html}"
+        );
+
+        // `detail_template(None)` already carries an empty `memories` vec, which is exactly the
+        // shape this convention replaced: it used to render a bare `<p>No memories.</p>` and drop
+        // the table, losing the column context.
+        let detail_html = detail_template(None).render().unwrap();
+        assert!(
+            detail_html.contains("<tr><th>ID</th><th>Content</th><th>Created</th></tr>"),
+            "the detail table's header must render even with no memories; got: {detail_html}"
+        );
+        assert!(
+            detail_html
+                .contains("<td colspan=\"3\" class=\"empty\">No memories in this session.</td>"),
+            "the detail page must use the same empty-state row as every other table; got: {detail_html}"
+        );
+        assert!(
+            !detail_html.contains("<p>No memories.</p>"),
+            "the retired bare-paragraph empty shape must not come back; got: {detail_html}"
+        );
+    }
 }

@@ -1737,4 +1737,25 @@ mod tests {
             "the page must name what failed, via the shared helper; got: {text}"
         );
     }
+
+    #[test]
+    fn test_memories_template_empty_state_keeps_the_header_and_marks_the_gap() {
+        let mut tpl = memories_template(links("created", "desc"));
+        tpl.rows.clear();
+        let html = tpl.render().unwrap();
+        assert!(
+            html.contains("<th"),
+            "the header row must survive an empty result so column context is not lost; got: {html}"
+        );
+        assert!(
+            html.contains(
+                "<td colspan=\"5\" class=\"empty\">No memories match the current filters.</td>"
+            ),
+            "the shared empty-state row must stand in for the missing rows; got: {html}"
+        );
+        assert!(
+            !html.contains("<p>No memories"),
+            "the retired bare-paragraph empty shape must not come back; got: {html}"
+        );
+    }
 }

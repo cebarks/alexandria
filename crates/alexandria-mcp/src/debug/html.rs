@@ -5,6 +5,19 @@
 //! structural rather than a per-call-site habit — there is deliberately no escape helper
 //! here to reach for. Values interpolated into a URL rather than into HTML text need the
 //! right *context* escape (`|urlencode`), which templates apply explicitly.
+//!
+//! # Presentation contracts
+//!
+//! Four renderings are shared across every debug page and must not be re-invented per handler
+//! or per template; each drifted at least once before being hoisted here:
+//!
+//! 1. **Absent value** — [`ABSENT`], never an empty cell and never a per-page glyph.
+//! 2. **Timestamp** — [`format_dt`] / [`DT_FORMAT`], minute resolution, explicit `UTC`.
+//! 3. **Empty table** — the header row still renders, followed by a single
+//!    `<tr><td colspan="N" class="empty">…</td></tr>`; the count/summary line still renders too.
+//!    A bare `<p>No rows.</p>` in place of the table is the old, retired shape: it drops the
+//!    column context an operator needs to read the emptiness.
+//! 4. **Storage failure on a detail page** — [`unavailable`], one status for one fault class.
 
 use askama::Template;
 use axum::http::StatusCode;
