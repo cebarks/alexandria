@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -55,19 +57,23 @@ struct SessionsTemplate {
     summary: String,
 }
 
-/// `?limit=` / `?offset=`. Public because `list` is, matching `maintenance::Pagination`.
-#[derive(serde::Deserialize)]
-pub struct Params {
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
-}
-
+/// `?limit=` / `?offset=`, read from a free-form map rather than a typed struct so that junk
+/// falls through to the page defaults instead of failing the request with a 400 — the same
+/// tolerance `memories::list` gives its own pagination and `graph::api_graph` gives `?hops`.
+/// A hand-typed `?limit=abc` is a typo, not a malformed request, and this page is a diagnostic
+/// surface that a failing request would leave the operator staring at.
 pub async fn list(
     State(server): State<AlexandriaServer>,
-    Query(params): Query<Params>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
-    let offset = params.offset.unwrap_or(0);
+    let limit: usize = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_LIMIT);
+    let offset: usize = params
+        .get("offset")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let repo = alexandria_storage::repos::SessionRepo::new(server.db.inner());
     let sessions = match repo.list(limit, offset).await {
@@ -393,6 +399,44 @@ mod tests {
                 "raw payload reached the response: {raw}"
             );
         }
+    }
+
+    /// `?limit=abc` and `?limit=` must render the default page, not a 400. `fetch_body` asserts
+    /// 200, so this fails at the request rather than on a missing substring.
+    #[tokio::test]
+    async fn test_sessions_list_tolerates_junk_pagination_params() {
+        let server = super::super::test_support::test_server().await;
+        let session_repo = alexandria_storage::repos::SessionRepo::new(server.db.inner());
+        for id in ["sess-1", "sess-2", "sess-3"] {
+            session_repo.create(id, None, None).await.unwrap();
+        }
+
+        let app = crate::debug::router(server);
+        let junk = fetch_body(app.clone(), "/debug/sessions?limit=abc&offset=%20").await;
+        let blank = fetch_body(app.clone(), "/debug/sessions?limit=&offset=").await;
+        let plain = fetch_body(app, "/debug/sessions").await;
+
+        // DEFAULT_LIMIT (50) is above the three seeded sessions, so all three rows appear on
+        // every variant — the junk values must behave as "no opinion", not as zero.
+        for text in [&junk, &blank, &plain] {
+            for id in ["sess-1", "sess-2", "sess-3"] {
+                assert!(
+                    text.contains(&format!(r##"href="/debug/sessions/{id}">"##)),
+                    "unparseable or empty limit/offset must fall back to the default page size; \
+                     missing {id} in one of the rendered pages"
+                );
+            }
+        }
+        assert_eq!(
+            junk.matches("<tr>").count(),
+            plain.matches("<tr>").count(),
+            "a junk limit must render exactly the default page"
+        );
+        assert_eq!(
+            blank.matches("<tr>").count(),
+            plain.matches("<tr>").count(),
+            "a blank limit must render exactly the default page"
+        );
     }
 
     #[tokio::test]

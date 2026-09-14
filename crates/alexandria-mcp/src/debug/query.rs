@@ -33,7 +33,14 @@ pub struct QueryForm {
     pub mode: String,
     pub query: String,
     /// Retrieve-only: `RecallParams` has no limit field.
-    pub limit: Option<usize>,
+    ///
+    /// A raw string, normalized in [`run`] like the other optional fields, rather than an
+    /// `Option<usize>`: the shipped `<input type="number" name="limit">` posts `limit=` when the
+    /// operator clears the box, and `serde_urlencoded` cannot parse an empty string into a number.
+    /// A typed field would make axum's `Form` extractor reject the whole submission with a 422 —
+    /// and htmx 2 does not swap a 4xx body into `#query-results`, so the page would look like Run
+    /// did nothing at all. Blank means "no opinion", not "malformed request".
+    pub limit: Option<String>,
     /// Retrieve-only, and the *external* session id — the same value `store_memory(session_id)`
     /// takes, because that is what `SessionRepo::get_memories` keys on. An `<input type="text">`
     /// left blank posts the key with an empty value, so this is `Some("")` rather than `None`
@@ -362,10 +369,19 @@ pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryF
             // field, which is exactly the confusion this page exists to remove. So: blank means
             // unscoped.
             let session_id = form.session_id.filter(|id| !id.trim().is_empty());
+            // Same shape as the two above: an empty box and an unparseable box both mean "the
+            // operator expressed no preference", so they normalize to `None` and `do_retrieve_memories`
+            // applies its own default (`params.limit.unwrap_or(10)`). Erroring here would be a 4xx
+            // that htmx cannot render — a silent dead end on the page whose whole job is to explain
+            // why a query returned what it returned.
+            let limit = form
+                .limit
+                .as_deref()
+                .and_then(|raw| raw.trim().parse::<usize>().ok());
             // Spreading activation writes heat, so a retrieve run is the one debug route that
             // mutates. The template says so out loud; the checkbox routes around it for an
             // operator who wants an answer that a previous test query did not bias.
-            retrieve_fragment(&server, form.query, form.limit, session_id, dry_run).await
+            retrieve_fragment(&server, form.query, limit, session_id, dry_run).await
         }
         // recall mode intentionally ignores all three of the form's retrieve-only fields:
         //   - `limit`: `RecallParams` has no limit field at all;
@@ -619,6 +635,54 @@ mod tests {
             sorted_lines(&whitespace),
             sorted_lines(&omitted),
             "a whitespace-only session_id must produce exactly the unscoped results"
+        );
+    }
+
+    /// A cleared `<input type="number" name="limit">` posts `limit=`, which the typed `Option<usize>`
+    /// this field used to be could not deserialize — axum's `Form` extractor answered 422 and htmx
+    /// swapped nothing, so Run looked dead. Blank and junk must both read as "no opinion" and get
+    /// the tool's own default (`limit.unwrap_or(10)`), which is what the omitted-limit and the
+    /// explicit `limit=3` controls below pin down.
+    #[tokio::test]
+    async fn test_query_tester_blank_or_junk_limit_falls_back_to_default() {
+        let server = super::super::test_support::test_server().await;
+        // More facts than the default limit, so "default" is a countable outcome rather than an
+        // unfalsifiable one: 12 stored, 10 shown. StubEmbedding scores every pair 1.0, so the
+        // floor drops none of them and the row count is purely the limit.
+        for i in 0..12 {
+            server
+                .do_store_memory(crate::tools::StoreMemoryParams {
+                    content: format!("pinned memory number {i}"),
+                    tags: None,
+                    session_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        let app = crate::debug::router(server);
+
+        let blank = run_form(app.clone(), "mode=retrieve&query=pinned+memory&limit=").await;
+        let junk = run_form(app.clone(), "mode=retrieve&query=pinned+memory&limit=abc").await;
+        let omitted = run_form(app.clone(), "mode=retrieve&query=pinned+memory").await;
+        let explicit = run_form(app.clone(), "mode=retrieve&query=pinned+memory&limit=3").await;
+
+        for fragment in [&blank, &junk, &omitted] {
+            assert_eq!(
+                row_count(fragment),
+                10,
+                "a blank or unparseable limit must yield the server default of 10 rows; got: {fragment}"
+            );
+            assert!(
+                fragment.contains("Ranked window: the top 10."),
+                "the window note must report the default window; got: {fragment}"
+            );
+        }
+        // Positive control: the fixture can produce a different count, so the 10 above is the
+        // default limit at work and not a cap on what these tests can ever show.
+        assert_eq!(
+            row_count(&explicit),
+            3,
+            "an explicit limit must still be honoured; got: {explicit}"
         );
     }
 
