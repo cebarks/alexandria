@@ -3,6 +3,10 @@
   "version": "2.1.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "tsx --test tests/",
+    "typecheck": "tsc --noEmit"
+  },
   "dependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
     "smol-toml": "^1.8.0"
@@ -10,6 +14,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "latest",
     "@types/node": "^20.0.0",
+    "tsx": "^4.23.13",
     "typescript": "^5.9.0"
   },
   "pi": {
