@@ -9,7 +9,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `RELATE` needs pre-parsed `RecordId` via `.bind()` — inline `type::record()` in RELATE fails
 - `type::record()` replaces `type::thing()` (removed in 3.x)
 - Query result structs need `#[derive(SurrealValue)]` from `surrealdb::types`
-- `RecordId` formatting: use `record_id_to_string()` helper (in `server.rs`), not `.to_string()`
+- `RecordId` formatting: use `record_id_to_string()` helper (in `alexandria-storage`), not `.to_string()`
 - Connection: `surrealdb::engine::any::connect("mem://")` with `kv-mem` feature; `surrealkv://path` with `kv-surrealkv`
 
 ## rmcp (MCP SDK) Patterns
@@ -31,12 +31,19 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 
 - `AlexandriaServer` uses a bare `#[tool_router]` + explicit `#[tool_handler(instructions = "...")]` block — NOT `#[tool_router(server_handler)]` — specifically so `get_info()` carries usage `instructions`. If you add a new tool, add it to the `#[tool_router]` impl block same as the others; the separate `#[tool_handler]` block stays where it is at the bottom of `server.rs` and doesn't need touching unless the overall usage guidance changes.
 - Tool descriptions and param field descriptions (`#[tool(description = ...)]`, `#[schemars(description = ...)]`) are written directively ("call this proactively when...") rather than just describing mechanics — this materially affects how often client LLMs choose to call the tool unprompted. Keep new tools consistent with that style.
-- `record_id_to_string()` is the canonical way to format SurrealDB `RecordId` for use in queries and JSON responses. It's in `alexandria-mcp/src/server.rs` and is `pub`.
+- `record_id_to_string()` is the canonical way to format SurrealDB `RecordId` for use in queries and JSON responses. It lives in `alexandria-storage/src/lib.rs` and is `pub` there; `alexandria-mcp/src/server.rs` re-exports it.
+- There are **12 MCP tools**: `store_memory`, `retrieve_memories`, `recall`, `update_memory`, `import_document`, `delete_memory`, `get_session`, `finalize_session`, `set_reminder`, `check_reminders`, `list_reminders`, `cancel_reminder`. Adding one means a params struct in `alexandria-mcp/src/tools/`, a `#[tool]` method, a `do_*` impl, and a row in the README tool table.
 - Cluster `member_count` is queried live (not cached) — `load_cluster_infos()` calls `get_members()` per cluster.
 - `update_memory` with content change: creates a soft-deleted snapshot of old content, then links via `derived_from` edge. The old version is hidden from search but preserved for lineage.
 - `import_document` creates a `raw` table record for the full document, then `extracted_from` edges from each chunk to it.
 - Spreading activation fires on the top N results of `retrieve_memories` (configurable via `activation.top_n`, default 3) — it's a side effect, not part of the ranking.
 - Cluster maintenance runs as a background `tokio::spawn` in HTTP mode only (not stdio), at an interval configurable via `cluster.maintenance_interval_secs` (default 300s / 5 minutes).
+- Reminders are evaluated purely at query time — there is NO background timer. Due-ness is `status = 'pending' AND next_due_at <= now()` (`ReminderRepo::list_due`), so delivery is lazy, works identically in stdio and HTTP mode, and downtime costs nothing but a later delivery.
+- `check_reminders` is the only consumer: it claims each delivered row with a conditional UPDATE (`status = 'pending' AND next_due_at = <seen>`, `ReminderRepo::record_delivery`), so a lost race skips the row rather than double-delivering; delivery is best-effort-once (a won claim whose response is lost drops that fire). Recurring rows advance to the first fire after now, coalescing skipped occurrences into `missed_occurrences`.
+- The `due_reminders` piggyback on `retrieve_memories`/`recall` is read-only and untargeted: up to 5 due reminders (oldest-due first) regardless of project targeting, each entry carrying its `target` — entries for another project are informational until `check_reminders` delivers/escalates them; targeting, escalation, and coalescing live there alone.
+- Naive datetimes in `set_reminder` are interpreted in `[reminders].timezone` (empty = system-local via iana-time-zone at startup, UTC if detection fails); explicit ISO-8601 offsets always win, and nonexistent (spring-forward) or ambiguous (fall-back) local times are rejected at set time.
+- Every UTC datetime in reminder tool responses renders via `rfc3339_utc` (`server.rs`): Z-suffixed, seconds precision — `to_rfc3339()` would emit `+00:00`. `next_due_at_local` is the deliberate exception: the same instant spelled in the configured timezone for human confirmation.
+- The `schedule_kind` discriminator strings (`once`/`pattern`/`cron`) are constants in `alexandria_storage::models::schedule_kind`, mirrored by the v006 schema `ASSERT`; writers and the engine's `spec_from_reminder` match on the constants so the sides can't drift.
 - Schema migrations are forward-only, numbered (`v001`, `v002`, ...), tracked in `system_config` table.
 - Embedding model is locked on first boot — changing `config.toml` model without wiping data will refuse to start.
 

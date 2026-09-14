@@ -7,7 +7,7 @@ Alexandria loads server config with this precedence:
    - `ALEXANDRIA_CONFIG` env var (explicit path override)
    - `$XDG_CONFIG_HOME/alexandria/config.toml` (default: `~/.config/alexandria/config.toml` on Linux, `~/Library/Application Support/alexandria/config.toml` on macOS)
    - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
-3. **Individual env vars** — `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`
+3. **Individual env vars** — `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
 
 ## Full Example
 
@@ -43,6 +43,10 @@ maintenance_interval_secs = 300    # Cluster maintenance check interval in secon
 
 [retrieve]
 min_similarity = 0.30              # Server-side hard floor on cosine similarity for retrieve_memories (default: 0.30)
+
+[reminders]
+timezone = "Europe/Stockholm"      # IANA name for naive datetimes + pattern/cron evaluation; "" = system-local (default: "")
+escalation_hours = 48              # Project-targeted reminders escalate to global delivery after being overdue this many hours; 0 = escalate as soon as overdue (default: 48)
 ```
 
 ## Section Details
@@ -112,16 +116,27 @@ Controls server-side filtering of `retrieve_memories` results.
 | ----- | ------ | --------- | ------------- |
 | `min_similarity` | f32 | `0.30` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A conservative defense-in-depth cutoff that removes pure noise even if a client sets a lax threshold. Note this is model-dependent: for `all-MiniLM-L6-v2`, genuine matches score ~0.6+, weak-but-plausible matches ~0.3–0.5, and unrelated text stays below ~0.15. Keep this well below the auto-recall client threshold so deliberate agent lookups still surface marginal results. |
 
+### `[reminders]`
+
+Controls how reminder schedules are interpreted and how project-targeted reminders are guaranteed to arrive. These keys affect the reminder tools only.
+
+| Key | Type | Default | Description |
+| ----- | ------ | --------- | ------------- |
+| `timezone` | string | `""` (system-local) | IANA timezone name (e.g. `"Europe/Stockholm"`) used to interpret naive datetimes passed to `set_reminder` and to evaluate recurring `pattern`/`cron` schedules (wall-clock semantics — a daily 09:00 stays 09:00 local across DST). Empty = the system-local timezone detected at startup, falling back to UTC if detection fails; an invalid IANA name is a startup error. Explicit ISO-8601 offsets in `due_at` are always honored regardless. |
+| `escalation_hours` | u64 | `48` | How long a project-targeted reminder may stay overdue before `check_reminders` delivers it regardless of the caller's project (labeled `escalated: true`), so a project that stops being visited can never silently swallow its reminders. `0` escalates as soon as a reminder is overdue. An unparseable value in the env override is a startup error. |
+
 ## Environment Variable Overrides
 
 These env vars override individual config values after the TOML file is loaded:
 
 | Variable | Overrides |
-|---|---|
+| --- | --- |
 | `ALEXANDRIA_CONFIG` | Path to an alternate config TOML file |
 | `ALEXANDRIA_DATA_DIR` | `database.data_dir` |
 | `ALEXANDRIA_EMBEDDING_MODEL` | `embedding.model` |
 | `ALEXANDRIA_EMBEDDING_DEVICE` | `embedding.device` |
+| `ALEXANDRIA_REMINDERS_TIMEZONE` | `reminders.timezone` |
+| `ALEXANDRIA_REMINDERS_ESCALATION_HOURS` | `reminders.escalation_hours` |
 
 Other config keys can only be set via the TOML file.
 

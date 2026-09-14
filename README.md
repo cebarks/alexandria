@@ -11,6 +11,7 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 - **Hierarchical clustering** — Automatic cluster assignment on store, background split/merge maintenance
 - **Progressive recall** — Two-phase retrieval: broad cluster matching first, then scope-narrowing within a cluster
 - **Document import** — Chunk by heading, paragraph, or fixed size with batch tracking and `extracted_from` lineage
+- **Reminders** — One-shot and recurring follow-ups delivered on the next interaction, with project targeting and overdue escalation
 - **Persistent storage** — SurrealKV on disk, survives restarts
 - **Schema migrations** — Versioned `.surql` files with forward-only migration runner
 
@@ -48,16 +49,34 @@ First run downloads the embedding model from HuggingFace Hub (~80MB).
 | `update_memory` | Update content/tags/confidence; content changes re-embed and create lineage |
 | `import_document` | Import and chunk documents with `extracted_from` edge tracking |
 | `delete_memory` | Soft-delete a memory by ID |
+| `get_session` | Retrieve a session's metadata and every memory stored during it |
+| `finalize_session` | Close a session with a summary and tags |
+| `set_reminder` | Schedule a one-shot (`due_at`) or recurring (named pattern / cron) reminder; response previews the next fire times |
+| `check_reminders` | Deliver due reminders and mark them consumed (global, project-matching, or escalated) |
+| `list_reminders` | List scheduled reminders by status and target project |
+| `cancel_reminder` | Soft-cancel a reminder by ID |
+
+### Reminders
+
+Reminders are scheduled messages — "remind me", "check the deploy at 3pm" — delivered to both the
+agent context and the user on the next interaction after they come due. There is no background
+timer: due-ness is evaluated at query time, so delivery is lazy, transport-agnostic, and survives
+server downtime. `set_reminder` validates schedules at set time and echoes the parsed next fire
+times for confirmation; `check_reminders` delivers and consumes them. Reminders target the global
+context or a specific project, and a project-targeted reminder that is overdue by at least
+`[reminders].escalation_hours` escalates to global delivery — nothing is silently lost. Overdue
+items are also surfaced read-only in the `due_reminders` array of `retrieve_memories` and `recall`
+responses.
 
 ### Getting agents to actually use memory
 
 A memory server is only useful if agents reach for it unprompted. Alexandria nudges this at
 three levels:
 
-1. **MCP `instructions`** — the server advertises usage guidance (when to read vs. write memory)
-   in its `initialize` response via `ServerInfo.instructions`. Any MCP-compliant client can surface
-   this to the model. Tool descriptions are also written directively ("call this proactively
-   whenever...") rather than just describing mechanics.
+1. **MCP `instructions`** — the server advertises usage guidance (when to read vs. write memory
+   and how reminders get delivered) in its `initialize` response via `ServerInfo.instructions`.
+   Any MCP-compliant client can surface this to the model. Tool descriptions are also written
+   directively ("call this proactively whenever...") rather than just describing mechanics.
 2. **Client-side skill** — for pi users, [`contrib/pi/skills/alexandria-memory/`](contrib/pi/skills/alexandria-memory/)
    documents concrete trigger conditions and tool choice guidance, mirroring how other high-usage
    MCP tools ship skills alongside themselves.
@@ -140,6 +159,8 @@ Or via stdio (for single-session use):
 Config loads with precedence: defaults → `$XDG_CONFIG_HOME/alexandria/config.toml` → `ALEXANDRIA_CONFIG` env → individual env vars. Data defaults to `$XDG_DATA_HOME/alexandria/data`.
 
 Legacy `~/.alexandria/` paths are used as fallback if the XDG paths don't exist yet.
+
+Reminder delivery is configured by the `[reminders]` section: `timezone` (IANA name, empty = system-local) governs naive datetime input and pattern/cron evaluation, and `escalation_hours` controls overdue escalation to global delivery.
 
 The Pi auto-recall/store extension has its own config at `$XDG_CONFIG_HOME/alexandria/client.toml`.
 

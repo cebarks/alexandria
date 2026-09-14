@@ -428,6 +428,64 @@ mod tests {
         assert!(normalize_cron("99 99 99 99 99").is_err());
     }
 
+    /// The `cron` crate numbers days of week 1=Sunday..7=Saturday and rejects
+    /// `0` — unlike standard/Vixie cron's 0-7 with 0=Sunday. Nothing else here
+    /// pins that, and the wrong reading is silent rather than an error: `1-5`
+    /// fires Sunday–Thursday, never Friday. Both steering surfaces
+    /// (`set_reminder`'s `cron` param description and the memory skill) tell
+    /// callers to write day names because of this, so the numbering is load-
+    /// bearing behavior, not a detail of a third-party crate.
+    #[test]
+    fn cron_numeric_weekdays_are_sunday_first_and_reject_zero() {
+        use chrono::Datelike;
+        let fires = |expr: &str| -> Vec<Weekday> {
+            upcoming(
+                &ScheduleSpec::Cron {
+                    expr: expr.to_string(),
+                },
+                utc(2026, 9, 7, 0, 0), // a Monday
+                Tz::UTC,
+                7,
+            )
+            .unwrap()
+            .iter()
+            .map(|d| d.weekday())
+            .collect()
+        };
+
+        assert_eq!(fires("0 0 9 * * 1"), vec![Weekday::Sun; 7]);
+        assert_eq!(fires("0 0 9 * * 7"), vec![Weekday::Sat; 7]);
+        assert!(normalize_cron("0 0 9 * * 0").is_err());
+
+        // The trap a standard-cron reader falls into: Sunday–Thursday.
+        assert_eq!(
+            fires("0 0 9 * * 1-5"),
+            vec![
+                Weekday::Mon,
+                Weekday::Tue,
+                Weekday::Wed,
+                Weekday::Thu,
+                Weekday::Sun,
+                Weekday::Mon,
+                Weekday::Tue,
+            ]
+        );
+
+        // Day names are unambiguous — the form `pattern_to_cron` emits.
+        assert_eq!(
+            fires("0 0 9 * * MON-FRI"),
+            vec![
+                Weekday::Mon,
+                Weekday::Tue,
+                Weekday::Wed,
+                Weekday::Thu,
+                Weekday::Fri,
+                Weekday::Mon,
+                Weekday::Tue,
+            ]
+        );
+    }
+
     #[test]
     fn pattern_to_cron_all_freqs() {
         let t = NaiveTime::from_hms_opt(9, 0, 0).unwrap();

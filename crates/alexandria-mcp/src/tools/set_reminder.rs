@@ -31,7 +31,7 @@ pub struct SetReminderParams {
     )]
     pub pattern: Option<ReminderPatternParams>,
     #[schemars(
-        description = "Recurring cron escape hatch: standard 5-field cron (min hour dom mon dow), evaluated in the server timezone. Exactly one of due_at/pattern/cron must be given. Prefer pattern unless you need cron-only expressiveness."
+        description = "Recurring cron escape hatch: 5, 6 or 7 fields, evaluated in the server timezone (a 5-field 'min hour dom mon dow' expression gets seconds prepended). Days of week are NOT standard cron: numeric dow runs 1=Sunday..7=Saturday and 0 is rejected, so write day names — '0 9 * * MON-FRI' is weekdays at 09:00, while '0 9 * * 1-5' is Sunday–Thursday. Exactly one of due_at/pattern/cron must be given. Prefer pattern unless you need cron-only expressiveness."
     )]
     pub cron: Option<String>,
     #[schemars(
