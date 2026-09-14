@@ -3,9 +3,13 @@
 {% block body %}<h1>Query Tester</h1>
 {# Everything below is a contract with `run` in query.rs, not just presentation:
    `hx-post` must keep pointing at /debug/query/run, `hx-target` must keep pointing at the
-   #query-results div at the bottom of this block, and the three `name` attributes are the
+   #query-results div at the bottom of this block, and the four `name` attributes are the
    keys `QueryForm` deserializes. Changing any of them silently breaks the swap, because the
    results fragment (`query_results.html`) is not a page and has no link back to this form.
+   Both retrieve-only fields are labelled as such because `recall` has nowhere to put them:
+   `RecallParams` takes a `scope_handle`, which is not a session id. Neither is hidden when
+   mode=recall is selected, and nothing here is pre-filled from an earlier submission — `run`
+   answers with a fragment only, so this form is never re-rendered.
    The trim marker on this comment's closing delimiter drops the newline after it, because
    legacy had exactly one newline between `</h1>` and `<form>` and a blank line there renders as
    extra vertical space. -#}
@@ -18,6 +22,7 @@
 </label>
 <input type="text" name="query" placeholder="query text" required>
 <label>Limit (retrieve only): <input type="number" name="limit" value="10" min="1"></label>
+<label>Session ID (retrieve only): <input type="text" name="session_id" placeholder="external session id, as passed to store_memory(session_id)"></label>
 <button type="submit">Run</button>
 </form>
 <div id="query-results"></div>{% endblock %}
