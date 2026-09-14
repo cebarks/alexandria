@@ -78,6 +78,48 @@ impl SortDir {
     }
 }
 
+/// The page size [`FactListQuery::default`] applies.
+///
+/// Named rather than inlined because it is the storage-side twin of the debug UI's `?limit=`
+/// fallback (`debug/memories.rs`), and the two must not drift: a caller that omits `limit` should
+/// get the same window the operator sees in the browser.
+pub const DEFAULT_FACT_LIST_LIMIT: usize = 50;
+
+/// Everything [`MemoryRepo::list`] takes, as one value.
+///
+/// This exists so `list` needs no clippy arity allow. The seven knobs
+/// were already one cohesive thing — a filter set plus a page — and `..Default::default()` lets
+/// each caller name only the axes it actually varies instead of padding out seven positional
+/// arguments, which is both shorter at the call site and immune to a transposed `limit`/`offset`.
+#[derive(Debug, Clone)]
+pub struct FactListQuery<'a> {
+    /// Case-insensitive substring of `content`.
+    pub search: Option<&'a str>,
+    /// Keep only facts carrying this tag.
+    pub tag: Option<&'a str>,
+    pub include_deleted: bool,
+    pub sort: FactSort,
+    pub dir: SortDir,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+impl Default for FactListQuery<'_> {
+    /// The view this query hardcoded before column sorting existed: live facts only, newest
+    /// first, from the top of the result set.
+    fn default() -> Self {
+        Self {
+            search: None,
+            tag: None,
+            include_deleted: false,
+            sort: FactSort::CreatedAt,
+            dir: SortDir::Desc,
+            limit: DEFAULT_FACT_LIST_LIMIT,
+            offset: 0,
+        }
+    }
+}
+
 pub struct MemoryRepo<'a> {
     db: &'a Surreal<Any>,
 }
@@ -216,20 +258,19 @@ impl<'a> MemoryRepo<'a> {
     /// `test_list_sorts_null_created_at_without_dropping_the_row`.
     ///
     /// Behaviour-preserving defaults for the debug UI's current view: `FactSort::CreatedAt` with
-    /// `SortDir::Desc` is what this query hardcoded before column sorting existed.
-    // Eight arguments, so clippy's threshold trips. Both filter sets and the page are already
-    // cohesive; bundling them into a params struct would move the arity rather than reduce it, and
-    // the debug handler reads better passing all six knobs by name.
-    #[allow(clippy::too_many_arguments)]
+    /// `SortDir::Desc` is what this query hardcoded before column sorting existed — see
+    /// [`FactListQuery::default`].
     pub async fn list(
         &self,
-        search: Option<&str>,
-        tag: Option<&str>,
-        include_deleted: bool,
-        sort: FactSort,
-        dir: SortDir,
-        limit: usize,
-        offset: usize,
+        FactListQuery {
+            search,
+            tag,
+            include_deleted,
+            sort,
+            dir,
+            limit,
+            offset,
+        }: FactListQuery<'_>,
     ) -> Result<Vec<Fact>> {
         let query = Self::list_query(search, tag, include_deleted, sort, dir);
 
@@ -429,29 +470,32 @@ mod tests {
 
         // Default: excludes deleted
         let all = repo
-            .list(None, None, false, FactSort::CreatedAt, SortDir::Desc, 10, 0)
+            .list(FactListQuery {
+                limit: 10,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(all.len(), 2);
 
         // include_deleted = true picks up all 3
         let with_deleted = repo
-            .list(None, None, true, FactSort::CreatedAt, SortDir::Desc, 10, 0)
+            .list(FactListQuery {
+                include_deleted: true,
+                limit: 10,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(with_deleted.len(), 3);
 
         // search filters by content substring
         let searched = repo
-            .list(
-                Some("alpha"),
-                None,
-                false,
-                FactSort::CreatedAt,
-                SortDir::Desc,
-                10,
-                0,
-            )
+            .list(FactListQuery {
+                search: Some("alpha"),
+                limit: 10,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(searched.len(), 1);
@@ -459,15 +503,11 @@ mod tests {
 
         // tag filters
         let tagged = repo
-            .list(
-                None,
-                Some("tag2"),
-                false,
-                FactSort::CreatedAt,
-                SortDir::Desc,
-                10,
-                0,
-            )
+            .list(FactListQuery {
+                tag: Some("tag2"),
+                limit: 10,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(tagged.len(), 1);
@@ -479,11 +519,18 @@ mod tests {
 
         // limit/offset paginate
         let page1 = repo
-            .list(None, None, false, FactSort::CreatedAt, SortDir::Desc, 1, 0)
+            .list(FactListQuery {
+                limit: 1,
+                ..Default::default()
+            })
             .await
             .unwrap();
         let page2 = repo
-            .list(None, None, false, FactSort::CreatedAt, SortDir::Desc, 1, 1)
+            .list(FactListQuery {
+                limit: 1,
+                offset: 1,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(page1.len(), 1);
@@ -654,21 +701,31 @@ mod tests {
     }
 
     async fn sorted_contents(repo: &MemoryRepo<'_>, sort: FactSort, dir: SortDir) -> Vec<String> {
-        repo.list(None, None, false, sort, dir, 100, 0)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|f| f.content)
-            .collect()
+        repo.list(FactListQuery {
+            sort,
+            dir,
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.content)
+        .collect()
     }
 
     async fn sorted_ids(repo: &MemoryRepo<'_>, sort: FactSort, dir: SortDir) -> Vec<String> {
-        repo.list(None, None, false, sort, dir, 100, 0)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|f| record_id_to_string(f.id.as_ref().expect("a listed fact has an id")))
-            .collect()
+        repo.list(FactListQuery {
+            sort,
+            dir,
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| record_id_to_string(f.id.as_ref().expect("a listed fact has an id")))
+        .collect()
     }
 
     /// Every key orders correctly in both directions, against an expectation written down here
@@ -777,15 +834,10 @@ mod tests {
         let legacy: Vec<Fact> = response.take(0).unwrap();
 
         let current = repo
-            .list(
-                None,
-                None,
-                false,
-                FactSort::CreatedAt,
-                SortDir::Desc,
-                100,
-                0,
-            )
+            .list(FactListQuery {
+                limit: 100,
+                ..Default::default()
+            })
             .await
             .unwrap();
 
@@ -840,15 +892,12 @@ mod tests {
         let mut offset = 0;
         loop {
             let page = repo
-                .list(
-                    None,
-                    None,
-                    false,
-                    FactSort::Confidence,
-                    SortDir::Desc,
-                    PAGE,
+                .list(FactListQuery {
+                    sort: FactSort::Confidence,
+                    limit: PAGE,
                     offset,
-                )
+                    ..Default::default()
+                })
                 .await
                 .unwrap();
             if page.is_empty() {
@@ -1015,15 +1064,12 @@ mod tests {
         println!("LIST QUERY sort=TagCount dir=Desc search+tag: {sql}");
 
         let rows = repo
-            .list(
-                Some("alp"),
-                Some("keep"),
-                false,
-                FactSort::TagCount,
-                SortDir::Desc,
-                50,
-                0,
-            )
+            .list(FactListQuery {
+                search: Some("alp"),
+                tag: Some("keep"),
+                sort: FactSort::TagCount,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(

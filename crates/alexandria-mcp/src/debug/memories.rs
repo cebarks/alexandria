@@ -8,7 +8,7 @@ use axum::response::Response;
 use super::html::{error_page, page};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
-use alexandria_storage::repos::{FactSort, SortDir};
+use alexandria_storage::repos::{DEFAULT_FACT_LIST_LIMIT, FactListQuery, FactSort, SortDir};
 
 /// What the page sorts by when `?sort=` / `?dir=` are absent, empty or unrecognised — i.e. the
 /// ordering the memories table had before column sorting existed, so every existing bookmark,
@@ -229,7 +229,7 @@ pub async fn list(
     let limit: usize = params
         .get("limit")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(50);
+        .unwrap_or(DEFAULT_FACT_LIST_LIMIT);
     let offset: usize = params
         .get("offset")
         .and_then(|v| v.parse().ok())
@@ -243,7 +243,15 @@ pub async fn list(
 
     let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
     let rows = match repo
-        .list(search, tag, include_deleted, sort, dir, limit, offset)
+        .list(FactListQuery {
+            search,
+            tag,
+            include_deleted,
+            sort,
+            dir,
+            limit,
+            offset,
+        })
         .await
     {
         Ok(r) => r,
@@ -1022,8 +1030,8 @@ mod tests {
     // ---- column sorting: the handler's `?sort=`/`?dir=`, the encoder, the headers ----
 
     use super::{
-        FactSort, MemoriesTemplate, MemoryRow, SortDir, SortLinks, dir_key, encode_query_value,
-        parse_dir, parse_sort, sort_key, sort_link,
+        FactListQuery, FactSort, MemoriesTemplate, MemoryRow, SortDir, SortLinks, dir_key,
+        encode_query_value, parse_dir, parse_sort, sort_key, sort_link,
     };
     use askama::Template;
 
@@ -1251,7 +1259,10 @@ mod tests {
         // there, with their content and confidence unchanged.
         let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
         let left = repo
-            .list(None, None, true, FactSort::CreatedAt, SortDir::Desc, 50, 0)
+            .list(FactListQuery {
+                include_deleted: true,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(
