@@ -1360,8 +1360,8 @@ mod tests {
         )
         .await;
         assert!(
-            first.contains("of 3 memories") || first.contains("of 2 memories"),
-            "the search itself must match the two payload rows; got: {first}"
+            first.contains("of 2 memories"),
+            "the search must match exactly the two payload rows, not all three; got: {first}"
         );
         assert!(
             first.contains("50% #hash plus+ sign"),
