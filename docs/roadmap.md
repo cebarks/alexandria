@@ -114,10 +114,11 @@ finished the loop:
 
 - `justfile` as the single task runner; CI routes through it so local and CI commands can't drift
 - `.githooks/pre-commit` (fmt check + clippy-as-errors), installed via `just install-hooks`
-- Multi-stage `Dockerfile`: musl-targeted release binary (dynamically linked — `crt-static` is
-  cleared because proc-macro and `cc`-based crates misbehave with musl's default static CRT) on an
-  Alpine runtime as a non-root user, with a `/data` volume holding both the SurrealKV data dir and the
-  HuggingFace model cache; configured entirely through `ALEXANDRIA_SERVER_*` env overrides
+- Multi-stage `Containerfile` (renamed from `Dockerfile` 2026-09-15): musl-targeted release binary
+  (dynamically linked — `crt-static` is cleared because proc-macro and `cc`-based crates misbehave
+  with musl's default static CRT) on an Alpine runtime as a non-root user, with a `/data` volume
+  holding both the SurrealKV data dir and the HuggingFace model cache; configured entirely through
+  `ALEXANDRIA_SERVER_*` env overrides
 - Server config keys `server.transport` / `host` / `port` became env-overridable, which is what makes
   the image config-file-free
 

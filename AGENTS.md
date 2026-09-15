@@ -101,11 +101,19 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
   fails identically, and no recipe ever runs. Fix = repin to the commit the tag names now
   (`gh api repos/<owner>/<repo>/git/ref/tags/v2`), not to a branch head.
 - Triage by duration before reading logs: a real `ci.yml` job is ~2–7 min. A run that concludes in
-  10–40s failed in setup, which means infrastructure, not code.
+  10–40s failed in setup, which means infrastructure, not code. Caveat: the `Container` job can also
+  die in <10s *after* a successful setup — read the step name before blaming the runner.
 - The separate `Container` workflow (`.github/workflows/container.yml`) is path-scoped to
-  `Dockerfile`/`Cargo.*`/`crates/**` and legitimately takes far longer than the rest of CI — it does a
-  cold release build of the workspace inside the image with no layer cache. Do not apply the 10–40s
-  duration heuristic to it, and do not expect it to appear on docs-only pushes.
+  `Containerfile`/`Cargo.*`/`crates/**` and legitimately takes far longer than the rest of CI — it
+  does a cold release build of the workspace inside the image with no layer cache. Do not apply the
+  10–40s duration heuristic to it, and do not expect it to appear on docs-only pushes.
+- The container build file is `Containerfile`, and it must be named: `docker build -f Containerfile`.
+  Unlike buildah/podman, Docker only auto-discovers a file literally called `Dockerfile`, so without
+  `-f` the job fails in ~8s with `failed to solve: failed to read dockerfile: open Dockerfile: no
+  such file or directory`. The same asymmetry is why the ignore file stays `.dockerignore` — Docker
+  never reads `.containerignore`, so renaming it would silently widen the build context for Docker
+  users while podman kept working. `paths:` filters are never validated against the tree, so renaming
+  the build file also silently de-scopes the workflow: both names have to be edited together.
 - Do not test whether a pin is reachable with `gh api repos/<owner>/<repo>/commits/<sha>` — it
   returns 422 "No commit found" for pins that Actions resolves fine. Trust the Actions error text, or
   the fact that a job using that pin passed.

@@ -136,7 +136,7 @@ These env vars override individual config values after the TOML file is loaded:
 | `ALEXANDRIA_EMBEDDING_DEVICE` | `embedding.device` |
 
 The `ALEXANDRIA_SERVER_*` variables exist so a container can be configured entirely by environment
-(the bundled [Dockerfile](../Dockerfile) uses them to default to HTTP on `0.0.0.0:3000`) without
+(the bundled [Containerfile](../Containerfile) uses them to default to HTTP on `0.0.0.0:3000`) without
 shipping a config file.
 
 Everything else — `[heat]`, `[activation]`, `[cluster]`, `[retrieve]`, CORS, and SSE keep-alive —

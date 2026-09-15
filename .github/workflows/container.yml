@@ -12,7 +12,7 @@ on:
   push:
     branches: [main]
     paths:
-      - Dockerfile
+      - Containerfile
       - .dockerignore
       - Cargo.toml
       - Cargo.lock
@@ -21,7 +21,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - Dockerfile
+      - Containerfile
       - .dockerignore
       - Cargo.toml
       - Cargo.lock
@@ -46,8 +46,13 @@ jobs:
       # ubuntu-latest ships Docker 28 + buildx 0.36 preinstalled, so this needs no
       # third-party action. The image compiles the workspace in release mode, so
       # this step dominates the job's runtime.
+      #
+      # -f is not optional: unlike buildah/podman, Docker only looks for a file
+      # literally named "Dockerfile" in the context root, so without it the build
+      # dies in under a second with `failed to read dockerfile: open Dockerfile:
+      # no such file or directory`.
       - name: Build image
-        run: docker build -t "$IMAGE" .
+        run: docker build -f Containerfile -t "$IMAGE" .
 
       # Building proves almost nothing on its own. The entrypoint still has to
       # resolve config defaults with no config.toml mounted, open SurrealKV in the

@@ -174,13 +174,13 @@ journalctl --user -u alexandria -f  # tail logs
 
 ### In Docker
 
-The [`Dockerfile`](Dockerfile) at the repo root builds a musl-targeted release binary and ships it on
-a minimal Alpine runtime as a non-root user (`alexandria`, uid 10001). musl is linked
+The [`Containerfile`](Containerfile) at the repo root builds a musl-targeted release binary and
+ships it on a minimal Alpine runtime as a non-root user (`alexandria`, uid 10001). musl is linked
 *dynamically* — the build clears `crt-static` because proc-macro and `cc`-based crates misbehave with
 the musl target's default static CRT. Build and run:
 
 ```bash
-docker build -t alexandria .
+docker build -f Containerfile -t alexandria .
 docker run -d --name alexandria \
   -p 3000:3000 \
   -v alexandria-data:/data \
@@ -342,7 +342,7 @@ the workflow as well. `just verify-assets` runs in the `test` job ahead of `just
 
 [`.github/workflows/container.yml`](.github/workflows/container.yml) additionally builds the Docker
 image and boot-tests it — waits on `/debug`, then performs a real MCP `initialize` handshake against
-`/mcp` — but only when a change touches the `Dockerfile`, `.dockerignore`, the manifests, or
+`/mcp` — but only when a change touches the `Containerfile`, `.dockerignore`, the manifests, or
 `crates/**`. A green `CI` run therefore says nothing about the image, and vice versa.
 
 ## License
