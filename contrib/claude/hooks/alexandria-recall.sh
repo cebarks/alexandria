@@ -14,18 +14,28 @@
 # Env (all optional):
 #   ALEXANDRIA_URL                         default http://127.0.0.1:3000/mcp
 #   ALEXANDRIA_AUTO_RECALL                 "off" disables recall
-#   ALEXANDRIA_AUTO_RECALL_LIMIT           default 5
-#   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY  default 0.35
-#   ALEXANDRIA_AUTO_STORE                  "off" disables the detectors
+#   ALEXANDRIA_AUTO_RECALL_LIMIT           default 10
+#   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY  default 0.45
+#   ALEXANDRIA_AUTO_STORE                  "off" disables the detectors; "on" enables them in headless sessions (see the entrypoint gate below), where the default is off
+#   ALEXANDRIA_MARKER_MAX_AGE_DAYS         default 7; per-session markers idle longer than this are pruned
 #   ALEXANDRIA_HOOK_CHILD                  set by hooks that shell out to `claude -p`; exits at once
 set -uo pipefail
+[ $# -gt 0 ] || input=$(cat)   # before any guard: exiting with stdin unread can SIGPIPE the writer (test.sh pipes jq in)
 [ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
 
 URL="${ALEXANDRIA_URL:-http://127.0.0.1:3000/mcp}"
-LIMIT="${ALEXANDRIA_AUTO_RECALL_LIMIT:-5}"
-# 0.35 measured 2026-09-08 on all-MiniLM-L6-v2: question-vs-matching-statement
-# scores 0.40-0.65, unrelated memories 0.07-0.40. See docs/configuration.md [recall].
-MIN_SIM="${ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY:-0.35}"
+# 10 measured on all-MiniLM-L6-v2 by the bench-retrieval limit x threshold grid, 2026-09-09 on
+# an 880-fact corpus: delivery saturates at 10 because the worst of the 12 known target ranks is
+# 9, so 15 and 20 add non-targets and no hits. The two levers are not independent — read both
+# comments together before changing either.
+LIMIT="${ALEXANDRIA_AUTO_RECALL_LIMIT:-10}"
+# 0.45 from the same grid. At LIMIT=10 it delivers 8 of 12 targets at ~1.0 non-targets per
+# prompt, where the previous 5/0.35 pair delivered the same 8 at ~3.2. 0.40 was dominated on
+# that grid (same 8 hits, ~2.2 noise) and is a trade on the 20-question one (+2 hits, +1.3
+# noise); 0.50 no longer dominates 0.45 the way it did at LIMIT=5 — it
+# drops to 7 hits for 0.5 noise. Widening the limit is what moved 0.45 onto the frontier, so do
+# not lower LIMIT without revisiting this. See docs/minilm-test-data.md "Result limit".
+MIN_SIM="${ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY:-0.45}"
 CURL=(curl -sS --max-time 5 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
 
 # post JSON-RPC body; prints the SSE data payload.
@@ -54,7 +64,6 @@ if [ $# -gt 0 ]; then
   echo "$out"; exit
 fi
 
-input=$(cat)
 prompt=$(jq -r '.prompt // ""' <<<"$input" 2>/dev/null) || exit 0
 [ -n "${prompt// /}" ] || exit 0
 session=$(jq -r '.session_id // ""' <<<"$input")
@@ -99,18 +108,28 @@ detect() { # <prefix> <patterns...> → prints "<prefix>: <statement>" for the f
     # Pi's "use X instead of Y" preference keeps both sides.
     [[ $prefix = "User preference" && $g -eq 2 && -n ${BASH_REMATCH[3]:-} && $p == *instead* ]] &&
       stmt="Use $stmt instead of $(trim "${BASH_REMATCH[3]}")"
-    [ ${#stmt} -ge 5 ] || continue
+    [[ ${#stmt} -ge 5 && $stmt == *[[:space:]]* ]] || continue   # one word ("no, it's completed") is a state report
     echo "$prefix: $stmt"; return
   done
 }
+# Sessions with no human at the prompt (`claude -p`, Agent SDK, `claude mcp serve`, bench, GitHub Action,
+# triggers) and Cowork carry a CLAUDE_CODE_ENTRYPOINT the binary reserves for them: auto-store is off there
+# unless ALEXANDRIA_AUTO_STORE=on, so scripted experiments never land in the real database. Everything else
+# (cli, desktop, vscode, the remote family) stays on.
+store=${ALEXANDRIA_AUTO_STORE:-}; [ -n "$store" ] || case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*|mcp|bench|claude-code-github-action|claude-security|*_trigger|local-agent|claude-coworker*|remote_cowork) store=off;; esac
 detections=()
-if [ "${ALEXANDRIA_AUTO_STORE:-}" != "off" ] && [ -n "$session" ]; then
+if [ "$store" != off ] && [ -n "$session" ]; then
   p=$(trim "$prompt")
   if [ ${#p} -ge 8 ] && [ ${#p} -le 500 ]; then
     c=$(detect "User correction" "${CORRECTION[@]}"); [ -n "$c" ] && detections+=("$c")
     c=$(detect "User preference" "${PREFERENCE[@]}"); [ -n "$c" ] && detections+=("$c")
   fi
 fi
+
+stored="${XDG_STATE_HOME:-$HOME/.local/state}/alexandria/$session.stored"
+# Prune markers idle for over ALEXANDRIA_MARKER_MAX_AGE_DAYS here too, so a machine whose Stop hook
+# never fires does not accumulate them (same expression as alexandria-extract.sh).
+[ -d "${stored%/*}" ] && find "${stored%/*}" -maxdepth 1 \( -name '*.extracted' -o -name '*.stored' \) -mtime "+${ALEXANDRIA_MARKER_MAX_AGE_DAYS:-7}" -delete
 
 # ---- one MCP session for recall + stores
 SID=$(mcp_open) || {
@@ -120,13 +139,12 @@ SID=$(mcp_open) || {
 }
 trap mcp_close EXIT
 
-stored="${XDG_RUNTIME_DIR:-/tmp}/alexandria/$session.stored"
 for d in "${detections[@]}"; do
   norm=$(tr '[:upper:]' '[:lower:]' <<<"$d" | tr -s '[:space:]' ' ')
   mkdir -p "${stored%/*}"; touch "$stored"
   grep -qxF "$norm" "$stored" && continue
   tag=$([[ $d == "User correction"* ]] && echo correction || echo preference)
-  out=$(mcp_tool store_memory "$(jq -cn --arg c "$d" --arg t "$tag" --arg s "$session" '{content:$c,tags:[$t,"auto-detected"],session_id:$s}')") \
+  out=$(mcp_tool store_memory "$(jq -cn --arg c "$d" --arg t "$tag" --arg s "$session" '{content:$c,tags:[$t,"auto-detected"],session_id:$s,agent_id:"claude-code"}')") \
     && echo "$norm" >>"$stored" || echo "alexandria-recall: store failed: $out" >&2
 done
 
