@@ -405,7 +405,7 @@ Decision rule (from the spec): lowest `mean_rank` wins; tie broken by largest `m
 
 Threshold rules:
 - `join_threshold`, `merge_threshold`, `cohesion_floor`: the "same percentile here" value printed for the chosen model, rounded to two decimals.
-- `retrieve.min_similarity`: if `hit_min` > `nonhit_p99`, round `hit_min` down to two decimals and subtract 0.02; otherwise the midpoint of `hit_min` and `nonhit_p99`, rounded to two decimals.
+- `retrieve.min_similarity`: `nonhit_p50` rounded to two decimals. It must be below `hit_min`; if it is not, the model has no usable noise floor, so record that in the measurements file and do not derive a value. (Rewritten 2026-09-08; the earlier hit-anchored rule had no solution when `nonhit_p99 > hit_min`.)
 - Client auto-recall threshold (hooks' `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY`): `nonhit_p90` rounded up to two decimals, but not above `hit_min`; if `hit_min` is lower, use the midpoint of `hit_min` and `nonhit_p90`.
 
 Write `docs/plans/2026-09-08-embedding-model-swap-measurements.md` in exactly this shape (values filled in from `results.txt`):
