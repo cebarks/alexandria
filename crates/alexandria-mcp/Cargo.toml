@@ -15,6 +15,7 @@ alexandria-pipeline = { path = "../alexandria-pipeline" }
 serde = { workspace = true }
 async-trait = "0.1"
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 rmcp = { workspace = true }

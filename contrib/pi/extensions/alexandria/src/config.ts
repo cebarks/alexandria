@@ -11,6 +11,7 @@ interface ClientToml {
 		extract_model?: string;
 		extract_timeout_ms?: number;
 	};
+	reminders?: { enabled?: boolean; project?: string };
 }
 
 /**
@@ -52,12 +53,16 @@ function loadToml(): ClientToml {
 
 const toml = loadToml();
 
+// Trimmed at the boundary: a set-but-blank or whitespace-only override must fall
+// through to the file (and then to the git probe) rather than being sent verbatim,
+// because the server matches the target exactly and an untrimmed value degrades
+// project delivery to escalation-only with no signal.
+const envProject = process.env.ALEXANDRIA_REMINDERS_PROJECT?.trim();
+
 /** Centralized configuration — TOML file with env var overrides. */
 export const CONFIG = {
 	serverUrl:
-		process.env.ALEXANDRIA_URL ??
-		toml.server?.url ??
-		"http://127.0.0.1:3000/mcp",
+		process.env.ALEXANDRIA_URL ?? toml.server?.url ?? "http://127.0.0.1:3000/mcp",
 
 	recallDisabled:
 		process.env.ALEXANDRIA_AUTO_RECALL === "off" ||
@@ -65,9 +70,7 @@ export const CONFIG = {
 			process.env.ALEXANDRIA_AUTO_RECALL === undefined),
 
 	recallLimit: Number(
-		process.env.ALEXANDRIA_AUTO_RECALL_LIMIT ??
-			toml.recall?.limit ??
-			5,
+		process.env.ALEXANDRIA_AUTO_RECALL_LIMIT ?? toml.recall?.limit ?? 5,
 	),
 
 	recallMinSimilarity: Number(
@@ -95,4 +98,14 @@ export const CONFIG = {
 			toml.store?.extract_timeout_ms ??
 			5000,
 	),
+
+	remindersDisabled:
+		process.env.ALEXANDRIA_REMINDERS === "off" ||
+		(toml.reminders?.enabled === false &&
+			process.env.ALEXANDRIA_REMINDERS === undefined),
+
+	// Exact, case-sensitive match against the server-side reminder target, so the
+	// env override exists for contexts where the git toplevel basename is not the
+	// project name (git worktrees, copied checkouts).
+	remindersProject: envProject || toml.reminders?.project?.trim() || undefined,
 } as const;

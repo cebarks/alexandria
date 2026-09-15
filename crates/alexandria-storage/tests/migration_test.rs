@@ -71,3 +71,25 @@ async fn test_memory_edge_table_exists_after_migration() {
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0]["edge_type"].as_str().unwrap(), "relates_to");
 }
+
+// CREATE alone doesn't prove the migration ran — SurrealDB implicitly creates
+// undefined tables as SCHEMALESS; the field assertions below do.
+#[tokio::test]
+async fn test_reminder_table_exists_after_migration() {
+    let db = Database::connect_embedded().await.unwrap();
+    schema::migrate(db.inner()).await.unwrap();
+
+    let result = db
+        .inner()
+        .query("CREATE reminder SET message = 'probe', schedule_kind = 'once', next_due_at = time::now()")
+        .await
+        .unwrap();
+    result.check().unwrap();
+
+    // SCHEMAFULL defaults from v007 must be present on the created row.
+    let mut result = db.inner().query("SELECT * FROM reminder").await.unwrap();
+    let rows: Vec<serde_json::Value> = result.take(0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["status"].as_str().unwrap(), "pending");
+    assert_eq!(rows[0]["delivered_count"].as_i64().unwrap(), 0);
+}

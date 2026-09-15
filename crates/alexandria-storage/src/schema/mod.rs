@@ -19,6 +19,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "drop_session_memory_count",
         include_str!("v006_drop_session_memory_count.surql"),
     ),
+    (7, "reminder", include_str!("v007_reminder.surql")),
 ];
 
 /// Version a fully migrated database reports in `system_config.schema_version`.

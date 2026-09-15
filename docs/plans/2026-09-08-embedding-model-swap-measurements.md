@@ -3,7 +3,7 @@
 Corpus: 143 active facts from the live database. Questions: 12, listed below.
 
 | model | mean_rank | top1 | mean_gap | hit_min | hit_max | nonhit_p50 | nonhit_p90 | nonhit_p99 | ff_p50 | ff_p90 | ff_p99 |
-|---|---|---|---|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | sentence-transformers/all-MiniLM-L6-v2 | 1.42 | 9/12 | +0.148 | 0.338 | 0.667 | 0.077 | 0.212 | 0.373 | 0.130 | 0.298 | 0.562 |
 | sentence-transformers/msmarco-MiniLM-L6-cos-v5 | 12.58 | 6/12 | +0.000 | 0.119 | 0.583 | 0.173 | 0.295 | 0.400 | 0.230 | 0.375 | 0.561 |
 | sentence-transformers/multi-qa-MiniLM-L6-cos-v1 | 2.33 | 8/12 | +0.091 | 0.318 | 0.635 | 0.082 | 0.215 | 0.375 | 0.125 | 0.290 | 0.568 |
@@ -12,7 +12,7 @@ Corpus: 143 active facts from the live database. Questions: 12, listed below.
 ## Chosen
 
 | key | value |
-|---|---|
+| --- | --- |
 | model | sentence-transformers/all-MiniLM-L6-v2 |
 | dimensions | 384 |
 | cluster.join_threshold | 0.75 |

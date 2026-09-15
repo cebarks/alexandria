@@ -1,17 +1,25 @@
+mod cancel_reminder;
+mod check_reminders;
 mod delete;
 mod finalize_session;
 mod get_session;
 mod import;
+mod list_reminders;
 mod recall;
 mod retrieve;
+mod set_reminder;
 mod store;
 mod update;
 
+pub use cancel_reminder::CancelReminderParams;
+pub use check_reminders::CheckRemindersParams;
 pub use delete::DeleteMemoryParams;
 pub use finalize_session::FinalizeSessionParams;
 pub use get_session::GetSessionParams;
 pub use import::ImportDocumentParams;
+pub use list_reminders::ListRemindersParams;
 pub use recall::RecallParams;
 pub use retrieve::RetrieveMemoriesParams;
+pub use set_reminder::{ReminderPatternParams, SetReminderParams};
 pub use store::StoreMemoryParams;
 pub use update::UpdateMemoryParams;
