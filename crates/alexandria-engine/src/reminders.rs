@@ -11,6 +11,15 @@ use std::str::FromStr;
 /// Hard cap on occurrence iteration; guards against pathological expressions.
 const MAX_ITER: usize = 10_000;
 
+/// Default `[reminders].escalation_hours`, defined once here for the same reason
+/// as `search::DEFAULT_MIN_SIMILARITY`: the binary's config default and the MCP
+/// server's fallback default live in different crates, and a literal in each
+/// drifts silently — a test-built or debug server then escalates on a different
+/// clock than production. `config.rs` and `RemindersSettings::default()` both
+/// derive from this, and `test_server_fallback_defaults_match_config_defaults`
+/// asserts the pair.
+pub const DEFAULT_ESCALATION_HOURS: u64 = 48;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freq {
     Daily,
@@ -87,15 +96,71 @@ pub fn parse_time_of_day(s: &str) -> Result<NaiveTime> {
 
 /// Validate a user-supplied cron string (5, 6, or 7 fields) and normalize it to
 /// the cron crate's seconds-first form. 5-field input gets `0 ` prepended.
+///
+/// Every branch collapses outer whitespace, which is what makes this idempotent:
+/// `spec_from_row` feeds the *stored* form back through here to rebuild a row, and
+/// a padded 5-field input would otherwise be stored as a 6-field string that the
+/// reader then trims — so the same row would render two different `schedule`
+/// strings, one at set time and one for the rest of its life.
 pub fn normalize_cron(expr: &str) -> Result<String> {
+    let expr = expr.trim();
     let fields = expr.split_whitespace().count();
     let normalized = match fields {
         5 => format!("0 {expr}"),
-        6 | 7 => expr.trim().to_string(),
+        6 | 7 => expr.to_string(),
+        // The `cron` crate does accept `@daily` and friends, but a stored
+        // shorthand would fail to re-normalize on the read path and render the
+        // row undeliverable, so the rejection is deliberate. Say what to write
+        // instead rather than state a field-count rule the library lacks.
+        1 if expr.starts_with('@') => match shorthand_expansion(expr) {
+            Some(expanded) => bail!(
+                "cron shorthand {expr:?} is not storable; write it out, e.g. '{expr}' -> '{expanded}'"
+            ),
+            None => bail!(
+                "unknown cron shorthand {expr:?}; write the expression out (e.g. '0 9 * * 1-5' for weekdays at 09:00)"
+            ),
+        },
         n => bail!("cron expression must have 5-7 fields, got {n}: {expr:?}"),
     };
     Schedule::from_str(&normalized).with_context(|| format!("invalid cron expression {expr:?}"))?;
     Ok(normalized)
+}
+
+/// The 5-field form to offer for a rejected `@`-shorthand, mirroring what the
+/// `cron` crate expands it to. `@yearly`/`@annually` and `@monthly` genuinely
+/// differ in the crate (`@yearly` is January 1, `@monthly` is the 1st of every
+/// month), so only the one the crate actually defines is mapped here; anything
+/// else gets `None` rather than a confident wrong suggestion.
+fn shorthand_expansion(expr: &str) -> Option<&'static str> {
+    match expr {
+        "@yearly" | "@annually" => Some("0 0 1 1 *"),
+        "@monthly" => Some("0 0 1 * *"),
+        "@weekly" => Some("0 0 * * 0"),
+        "@daily" | "@midnight" => Some("0 0 * * *"),
+        "@hourly" => Some("0 * * * *"),
+        _ => None,
+    }
+}
+
+/// True when a cron expression restricts **both** day-of-month and day-of-week.
+///
+/// `cron` intersects those two sets (Quartz-style) where Vixie cron unions them,
+/// so `0 9 13 * FRI` fires only on Friday the 13th — not "the 13th, and also
+/// every Friday" — and `0 0 9 1,15 * MON` only when a 1st or 15th is a Monday.
+/// Nothing about the expression is invalid and it does keep firing, which is why
+/// this has to be *warned* about rather than rejected: set-time validation cannot
+/// see that the meaning is not the one the caller had in mind.
+///
+/// Takes the normalized seconds-first form (6 or 7 fields), where day-of-month is
+/// field 4 and day-of-week is field 6. A `*` (or the Vixie `?` synonym) on either
+/// side makes the intersection moot, so only genuinely restricted pairs flag.
+pub fn cron_dom_dow_conflict(expr: &str) -> bool {
+    let restricted = |f: &str| !matches!(f, "*" | "?");
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    match fields.as_slice() {
+        [_, _, _, dom, _, dow, ..] => restricted(dom) && restricted(dow),
+        _ => false,
+    }
 }
 
 fn weekday_token(w: Weekday) -> &'static str {
@@ -223,17 +288,51 @@ fn compiled_schedule(spec: &ScheduleSpec) -> Result<Schedule> {
     Ok(Schedule::from_str(&expr)?)
 }
 
+/// Recurring occurrences strictly after `after`, as UTC instants, in order.
+///
+/// Two rules, both load-bearing:
+///
+/// 1. **One occurrence per wall-clock reading.** `cron` iterates local date/time
+///    fields, so on a fall-back day a time inside the repeated hour is produced
+///    twice — `LocalResult::Ambiguous(earlier, later)` — and the iterator yields
+///    `earlier` first and stashes `later`. Those are the *same* local time, and
+///    someone who asked for `daily 02:30` asked to be reminded once that day, so
+///    the earlier instant is the occurrence and the later one is dropped.
+///    Spring-forward gaps need no handling: a nonexistent local time is never a
+///    candidate, so that day simply has no fire and a daily 09:00 stays 09:00
+///    local across the transition.
+/// 2. **Strictly after `after`, measured on the instant.** The bound cannot be
+///    left to `cron`, which applies it to the anchor's *local fields*. Inside a
+///    fold's second pass those fields can sit before the scheduled time while the
+///    instant sits after it, and rule 1 then hands back the already-consumed
+///    earlier instant — a fire at or before `after`. Written back as
+///    `next_due_at` by the delivery path, that leaves the row due again
+///    immediately and re-delivers it on every check for the rest of the fold.
+///
+/// `next_fire`, `upcoming` and `occurrences_between` all walk this one stream, so
+/// the set-time preview, the advance and the coalescing count cannot disagree.
+fn fires_after<'a>(
+    schedule: &'a Schedule,
+    after: DateTime<Utc>,
+    tz: Tz,
+) -> impl Iterator<Item = DateTime<Utc>> + 'a {
+    let mut last_local: Option<NaiveDateTime> = None;
+    schedule
+        .after_owned(after.with_timezone(&tz))
+        .filter_map(move |dt| {
+            let local = dt.naive_local();
+            if last_local == Some(local) {
+                return None;
+            }
+            last_local = Some(local);
+            let instant = dt.with_timezone(&Utc);
+            (instant > after).then_some(instant)
+        })
+}
+
 /// First fire strictly after `after`, in UTC. `None` for past one-shots or
 /// expressions that never fire again. Recurring evaluation happens in `tz`
-/// (wall-clock semantics); the cron crate + chrono-tz handle DST. `cron`
-/// iterates local date/time fields and skips local times that don't exist, so
-/// a daily 09:00 stays 09:00 local across a transition (verified by
-/// `daily_series_across_dst_spring_forward` and
-/// `daily_series_across_dst_fall_back`) — no manual chrono-tz fallback needed.
-/// On a fall-back day a local time inside the repeated hour is yielded twice by
-/// `cron` (both offsets), and `occurrences_between` counts both, so coalescing
-/// absorbs the duplicate rather than dropping a fire (verified by
-/// `dst_fall_back_repeated_hour_yields_both_instants_and_coalesces`).
+/// (wall-clock semantics); see [`fires_after`] for what that means across DST.
 pub fn next_fire(
     spec: &ScheduleSpec,
     after: DateTime<Utc>,
@@ -243,16 +342,12 @@ pub fn next_fire(
         ScheduleSpec::Once { due_at } => Ok((*due_at > after).then_some(*due_at)),
         _ => {
             let schedule = compiled_schedule(spec)?;
-            let after_local = after.with_timezone(&tz);
-            Ok(schedule
-                .after(&after_local)
-                .next()
-                .map(|dt| dt.with_timezone(&Utc)))
+            Ok(fires_after(&schedule, after, tz).next())
         }
     }
 }
 
-/// Next `n` fire times strictly after `from` (preview for set_reminder).
+/// Next `n` fire times strictly after `from` (preview for `set_reminder`).
 /// `Once` yields `[due_at]` if still in the future, else empty.
 pub fn upcoming(
     spec: &ScheduleSpec,
@@ -268,39 +363,53 @@ pub fn upcoming(
         }),
         _ => {
             let schedule = compiled_schedule(spec)?;
-            let from_local = from.with_timezone(&tz);
-            Ok(schedule
-                .after(&from_local)
-                .take(n)
-                .map(|dt| dt.with_timezone(&Utc))
-                .collect())
+            Ok(fires_after(&schedule, from, tz).take(n).collect())
         }
     }
 }
 
+/// What [`occurrences_between`] found: the count, and whether it stopped early.
+///
+/// `saturated` has to travel with the number. A capped count reported as an exact
+/// one is wrong in a way the reader cannot see — the difference between telling a
+/// user "you missed 3 fires" and telling them "10000" forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OccurrenceCount {
+    pub count: u64,
+    pub saturated: bool,
+}
+
 /// Count occurrences strictly after `after_exclusive` and <= `until_inclusive`.
-/// Used for coalescing: how many fires were missed while nobody consumed.
-/// Always 0 for `Once` (its single occurrence *is* the delivery).
-/// Saturates at MAX_ITER to bound pathological expressions.
+/// Used for coalescing: how many fires elapsed while nobody consumed them.
+/// Always `count = 0` for `Once` (its single occurrence *is* the delivery).
+/// Stops after `MAX_ITER` occurrences and flags `saturated`.
 pub fn occurrences_between(
     spec: &ScheduleSpec,
     after_exclusive: DateTime<Utc>,
     until_inclusive: DateTime<Utc>,
     tz: Tz,
-) -> Result<u64> {
+) -> Result<OccurrenceCount> {
     if matches!(spec, ScheduleSpec::Once { .. }) || until_inclusive <= after_exclusive {
-        return Ok(0);
+        return Ok(OccurrenceCount {
+            count: 0,
+            saturated: false,
+        });
     }
     let schedule = compiled_schedule(spec)?;
-    let from_local = after_exclusive.with_timezone(&tz);
-    let mut count = 0u64;
-    for dt in schedule.after(&from_local).take(MAX_ITER) {
-        if dt.with_timezone(&Utc) > until_inclusive {
+    let limit = MAX_ITER as u64;
+    let mut fires = fires_after(&schedule, after_exclusive, tz).peekable();
+    let mut count: u64 = 0;
+    while count < limit {
+        let Some(instant) = fires.next() else { break };
+        if instant > until_inclusive {
             break;
         }
         count += 1;
     }
-    Ok(count)
+    // Saturated only when there was demonstrably more to count: a stream that
+    // ends exactly at the cap gave a complete answer.
+    let saturated = count >= limit && fires.peek().is_some_and(|d| *d <= until_inclusive);
+    Ok(OccurrenceCount { count, saturated })
 }
 
 /// Short human rendering for list/set responses.
@@ -428,6 +537,102 @@ mod tests {
         assert!(normalize_cron("not a cron").is_err());
         assert!(normalize_cron("0 9 * *").is_err()); // 4 fields
         assert!(normalize_cron("99 99 99 99 99").is_err());
+    }
+
+    /// `spec_from_row` re-normalizes the *stored* expression, so normalization has
+    /// to be a fixed point. A padded 5-field input used to be stored with its
+    /// trailing space inside a 6-field string, which the reader then trimmed — so
+    /// the same row rendered `cron '0 0 9 * * 1-5 '` at set time and
+    /// `cron '0 0 9 * * 1-5'` forever after.
+    #[test]
+    fn normalize_cron_is_idempotent_and_whitespace_free() {
+        for raw in [
+            "0 9 * * 1-5",
+            "  0 9 * * 1-5  ",
+            "0 9 * * 1-5 ",
+            "0 0 9 * * 1-5",
+            "0 0 9 * * 1-5   ",
+            "0 0 9 * * 1-5 2030",
+        ] {
+            let once = normalize_cron(raw).unwrap();
+            assert_eq!(once, once.trim(), "{raw:?} kept padding: {once:?}");
+            assert_eq!(
+                normalize_cron(&once).unwrap(),
+                once,
+                "normalizing the stored form a second time changed it ({raw:?})"
+            );
+        }
+    }
+
+    /// The `@`-shorthands parse in this crate but cannot survive a store/read
+    /// round-trip, so they stay rejected — the point of the test is the *message*:
+    /// "must have 5-7 fields, got 1" states a rule the library does not have and
+    /// tells an operator nothing they can act on.
+    #[test]
+    fn normalize_cron_rejects_shorthand_with_an_actionable_fix() {
+        let err = normalize_cron("@daily").unwrap_err().to_string();
+        assert!(err.contains("not storable"), "{err}");
+        assert!(err.contains("'0 0 * * *'"), "{err} must show the expansion");
+        // An unknown `@` token must not be answered with a confident wrong example.
+        let err = normalize_cron("@nonsense").unwrap_err().to_string();
+        assert!(err.contains("unknown cron shorthand"), "{err}");
+        assert!(!err.contains("0 0 * * *"), "{err}");
+    }
+
+    /// `cron` intersects day-of-month with day-of-week where Vixie cron unions
+    /// them, so `0 9 13 * FRI` is "Friday the 13th only". The detector behind the
+    /// set-time warning, on the normalized seconds-first form.
+    #[test]
+    fn cron_dom_dow_conflict_detects_only_restricted_pairs() {
+        use chrono::Datelike;
+        for (expr, expected) in [
+            ("0 0 9 13 * FRI", true),
+            ("0 0 9 1,15 * MON,WED", true),
+            ("0 0 9 * * MON-FRI", false), // dom is `*`: the intersection is just dow
+            ("0 0 9 13 * *", false),      // dow is `*`
+            ("0 0 9 13 * ?", false),      // Vixie's "no specific value" synonym
+            // 7-field: the trailing year does not shift the two indices.
+            ("0 0 9 13 * FRI 2030", true),
+            ("0 0 9 13 * * 2030", false),
+            ("0 9 * * 1-5", false), // un-normalized 5-field: not what is stored
+        ] {
+            assert_eq!(
+                cron_dom_dow_conflict(expr),
+                expected,
+                "dom/dow conflict for {expr:?}"
+            );
+        }
+        // And the semantics themselves, pinned behaviorally rather than by the
+        // detector alone: only 13ths that fall on a Friday fire.
+        let expr = normalize_cron("0 9 13 * FRI").unwrap();
+        let fires = upcoming(
+            &ScheduleSpec::Cron { expr },
+            utc(2026, 1, 1, 0, 0),
+            Tz::UTC,
+            2,
+        )
+        .unwrap();
+        // 2026-02-13 and 2026-03-13 are Fridays; 2026-01-13 is a Tuesday.
+        assert_eq!(fires[0].day(), 13);
+        assert_eq!(fires[0].month(), 2);
+        assert_eq!(fires[1].month(), 3);
+    }
+
+    /// The cap has to announce itself. A per-second expression over three hours
+    /// is 10 800 occurrences against a 10 000 bound, so the count is a floor, not
+    /// an answer — and `do_check_reminders` publishes it to an agent.
+    #[test]
+    fn occurrences_between_reports_saturation_instead_of_a_false_exact() {
+        let expr = normalize_cron("* * * * * *").unwrap(); // every second
+        let spec = ScheduleSpec::Cron { expr };
+        let from = utc(2026, 9, 1, 0, 0);
+        let thru = utc(2026, 9, 1, 3, 0);
+        let counted = occurrences_between(&spec, from, thru, Tz::UTC).unwrap();
+        assert_eq!(counted.count, MAX_ITER as u64);
+        assert!(counted.saturated, "{counted:?}");
+        // A window comfortably inside the cap must not claim saturation.
+        let ok = occurrences_between(&spec, from, utc(2026, 9, 1, 0, 5), Tz::UTC).unwrap();
+        assert_eq!((ok.count, ok.saturated), (300, false));
     }
 
     /// The `cron` crate numbers days of week 1=Sunday..7=Saturday and rejects
@@ -599,6 +804,20 @@ mod tests {
     fn nyc() -> Tz {
         "America/New_York".parse().unwrap()
     }
+    fn stockolm() -> Tz {
+        "Europe/Stockholm".parse().unwrap()
+    }
+
+    /// `daily at HH:MM` — the shape every DST test below needs, and the one whose
+    /// wall time can land inside a gap or a fold.
+    fn daily(h: u32, mi: u32) -> ScheduleSpec {
+        ScheduleSpec::Pattern {
+            freq: Freq::Daily,
+            time: NaiveTime::from_hms_opt(h, mi, 0).unwrap(),
+            weekdays: vec![],
+            day_of_month: 1,
+        }
+    }
     // `y` is i32 because `TimeZone::with_ymd_and_hms` takes the year as i32.
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
@@ -736,9 +955,10 @@ mod tests {
                 &spec,
                 utc(2026, 9, 1, 12, 0),
                 utc(2026, 9, 4, 13, 0),
-                Tz::UTC
+                Tz::UTC,
             )
-            .unwrap(),
+            .unwrap()
+            .count,
             3
         );
         // none in an empty window
@@ -747,9 +967,10 @@ mod tests {
                 &spec,
                 utc(2026, 9, 1, 12, 0),
                 utc(2026, 9, 1, 13, 0),
-                Tz::UTC
+                Tz::UTC,
             )
-            .unwrap(),
+            .unwrap()
+            .count,
             0
         );
     }
@@ -764,9 +985,10 @@ mod tests {
                 &spec,
                 utc(2026, 9, 1, 0, 0),
                 utc(2026, 9, 20, 0, 0),
-                Tz::UTC
+                Tz::UTC,
             )
-            .unwrap(),
+            .unwrap()
+            .count,
             0
         );
     }
@@ -821,41 +1043,99 @@ mod tests {
     }
 
     #[test]
-    fn dst_fall_back_repeated_hour_yields_both_instants_and_coalesces() {
-        // A wall-clock time inside the fold (01:30 exists twice on 2026-11-01)
-        // is yielded twice by `cron` — once per offset — rather than dropped or
-        // collapsed. That is what makes the doc comment on `next_fire` true, and
-        // what `occurrences_between` then absorbs into one missed-occurrence
-        // count instead of two separate deliveries.
-        let spec = ScheduleSpec::Pattern {
-            freq: Freq::Daily,
-            time: NaiveTime::from_hms_opt(1, 30, 0).unwrap(),
-            weekdays: vec![],
-            day_of_month: 1,
-        };
+    fn dst_fall_back_repeated_wall_time_delivers_once() {
+        // A wall time inside a fall-back fold (01:30 exists twice on 2026-11-01
+        // in New York, once per offset) is ONE occurrence, not two: someone who
+        // asked for `daily 01:30` asked to be reminded once that day. The earlier
+        // instant is the fire and the later one is dropped, so the preview, the
+        // coalescing count and the advance all agree on one fire per local day.
+        let spec = daily(1, 30);
         let ups = upcoming(&spec, utc(2026, 10, 31, 12, 0), nyc(), 3).unwrap();
-        assert_eq!(ups.len(), 3);
-        assert!(
-            ups.windows(2).all(|w| w[0] < w[1]),
-            "strictly increasing: {ups:?}"
+        assert_eq!(
+            ups,
+            vec![
+                utc(2026, 11, 1, 5, 30), // Nov 1 01:30 EDT
+                utc(2026, 11, 2, 6, 30), // Nov 2 01:30 EST — no duplicate on Nov 1
+                utc(2026, 11, 3, 6, 30),
+            ],
+            "{ups:?}"
         );
-        // Nov 1 01:30 EDT = 05:30 UTC and Nov 1 01:30 EST = 06:30 UTC — the fold.
-        assert_eq!(ups[0], utc(2026, 11, 1, 5, 30));
-        assert_eq!(ups[1], utc(2026, 11, 1, 6, 30));
-        assert_eq!(ups[2], utc(2026, 11, 2, 6, 30));
-        // A daily schedule whose next fire was already consumed before the fold
-        // counts both fold instants when it comes back overdue, so the
-        // coalesced delivery reports the real number of elapsed occurrences.
         assert_eq!(
             occurrences_between(
                 &spec,
                 utc(2026, 10, 31, 12, 0),
                 utc(2026, 11, 1, 23, 59),
-                nyc()
+                nyc(),
             )
-            .unwrap(),
-            2
+            .unwrap()
+            .count,
+            1,
+            "the fold day contributes one occurrence"
         );
+    }
+
+    #[test]
+    fn dst_fold_second_pass_never_returns_a_past_fire() {
+        // The regression. Europe/Stockholm falls back 2026-10-25 03:00->02:00, so
+        // 02:30 local is 00:30Z (CEST) and 01:30Z (CET). `cron` bounds its search
+        // on the anchor's *local* fields and yields the earlier fold instant
+        // first, so a check anchored in the fold's second pass used to be handed
+        // 00:30Z — up to an hour in the past. Written back as `next_due_at`, that
+        // value equals the one just consumed, so the row stayed due and
+        // re-delivered on every check for the rest of the fold.
+        let stockholm = stockolm();
+        let spec = daily(2, 30);
+        for (anchor_hour, anchor_min) in [(0, 45), (1, 0), (1, 10), (1, 29)] {
+            let after = utc(2026, 10, 25, anchor_hour, anchor_min);
+            let next = next_fire(&spec, after, stockholm)
+                .unwrap()
+                .unwrap_or_else(|| panic!("daily schedule stopped firing after {after}"));
+            assert!(
+                next > after,
+                "next_fire({after}) = {next}, not strictly after"
+            );
+            assert_ne!(
+                next.to_rfc3339(),
+                "2026-10-25T00:30:00+00:00",
+                "re-delivering the fold's first pass"
+            );
+            assert_eq!(next, upcoming(&spec, after, stockholm, 1).unwrap()[0]);
+        }
+        // From inside the second pass the next fire is the *next local day*, not
+        // the other instant of the day already being consumed.
+        assert_eq!(
+            next_fire(&spec, utc(2026, 10, 25, 1, 10), stockholm).unwrap(),
+            Some(utc(2026, 10, 26, 1, 30)),
+        );
+    }
+
+    #[test]
+    fn dst_gap_series_skips_the_nonexistent_fire() {
+        // Europe/Stockholm springs forward 2026-03-29 02:00->03:00, so 02:30 does
+        // not exist that day. The occurrence is skipped (never delivered as a
+        // shifted time) and the count reports the two real fires around it, so a
+        // lost fire is visible as a coalesced miss rather than silently gone.
+        let stockholm = stockolm();
+        let spec = daily(2, 30);
+        let ups = upcoming(&spec, utc(2026, 3, 28, 0, 0), stockholm, 3).unwrap();
+        assert_eq!(
+            ups,
+            vec![
+                utc(2026, 3, 28, 1, 30), // Mar 28 02:30 CET
+                utc(2026, 3, 30, 0, 30), // Mar 29 has no 02:30 — skipped
+                utc(2026, 3, 31, 0, 30),
+            ],
+            "{ups:?}"
+        );
+        let counted = occurrences_between(
+            &spec,
+            utc(2026, 3, 28, 0, 0),
+            utc(2026, 3, 31, 0, 0),
+            stockholm,
+        )
+        .unwrap();
+        assert_eq!(counted.count, 2, "the gap day contributes no occurrence");
+        assert!(!counted.saturated);
     }
 
     #[test]

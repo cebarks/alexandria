@@ -1175,10 +1175,9 @@ impl AlexandriaServer {
 
             // Occurrences strictly after the stored due time and up to now: the
             // occurrence being delivered *is* the stored one, so it is excluded.
-            // The count saturates at the engine's `MAX_ITER` iteration bound
-            // (10 000, `alexandria_engine::reminders::occurrences_between`): a
-            // schedule abandoned long enough to exceed it reports the cap, not a
-            // wrong-but-larger number.
+            // The walk stops at the engine's `MAX_ITER` bound (10 000) and says so
+            // via `saturated`, because a capped count published as an exact one is
+            // wrong in a way no reader can see — see `OccurrenceCount`.
             let missed = if recurring {
                 match sched::occurrences_between(&spec, due_at, now, tz) {
                     Ok(missed) => missed,
@@ -1191,7 +1190,10 @@ impl AlexandriaServer {
                     }
                 }
             } else {
-                0
+                sched::OccurrenceCount {
+                    count: 0,
+                    saturated: false,
+                }
             };
             // None on a recurring spec means it has no future fire left; it is
             // delivered once more and consumed rather than left due forever.
@@ -1241,8 +1243,11 @@ impl AlexandriaServer {
                 },
                 "escalated": escalated,
                 "recurring": recurring,
-                // Saturated count: see the `MAX_ITER` bound noted where it is computed.
-                "missed_occurrences": missed,
+                // `saturated` travels with the count: at the cap the true number
+                // is larger, and "missed 10000 fires" read as fact is worse than
+                // "at least 10000".
+                "missed_occurrences": missed.count,
+                "missed_occurrences_saturated": missed.saturated,
                 "due_at": rfc3339_utc(due_at),
                 "schedule": sched::human_readable(&spec),
                 "note": r.note,
@@ -1251,6 +1256,17 @@ impl AlexandriaServer {
                     "session_id": r.prov_session_id,
                 },
                 "next_due_at": new_next.map(rfc3339_utc),
+                // The schedule is wall-clock in `[reminders].timezone` while
+                // `due_at`/`next_due_at` are UTC instants. Without the zone name
+                // and a local rendering, a client cannot tell the user *when* a
+                // fire was — `set_reminder` and `list_reminders` already give both.
+                "timezone": tz.name().to_string(),
+                "due_at_local": due_at
+                    .with_timezone(&tz)
+                    .format("%Y-%m-%d %H:%M %Z")
+                    .to_string(),
+                "next_due_at_local": new_next
+                    .map(|n| n.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z").to_string()),
             }));
         }
 
