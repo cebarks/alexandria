@@ -111,7 +111,7 @@ impl Default for RemindersSettings {
     fn default() -> Self {
         Self {
             tz: chrono_tz::Tz::UTC,
-            escalation_hours: 48,
+            escalation_hours: DEFAULT_REMINDER_ESCALATION_HOURS,
         }
     }
 }
@@ -281,7 +281,7 @@ impl AlexandriaServer {
     }
 
     #[tool(
-        description = "Schedule a reminder to be delivered on a future interaction — one-shot (due_at) or recurring (pattern/cron). Use this when the user asks to be reminded of something later, when they say 'remind me', 'don't let me forget', or when a follow-up action will be needed at a specific time ('check the deploy at 3pm', 'ping me about this tomorrow morning'). Reminders are delivered to both the agent context and the user on the next interaction after they come due; project-targeted reminders escalate to global delivery if they stay overdue, so they are never silently lost. The response includes the next fire times — confirm them with the user when the schedule was parsed from natural language."
+        description = "Schedule a reminder to be delivered on a future interaction — one-shot (due_at) or recurring (pattern/cron). Use this when the user asks to be reminded of something later, when they say 'remind me', 'don't let me forget', or when a follow-up action will be needed at a specific time ('check the deploy at 3pm', 'ping me about this tomorrow morning'). Delivery happens on the next check_reminders call after the row comes due — the server runs no timer and reaches no one until some client asks. That call injects the reminder into the agent's context; clients that also surface it to the human do so themselves (the pi companion notifies, a client with no UI does not), so never tell the user a notification was sent. Project-targeted reminders escalate to global delivery once they are at least escalation_hours overdue, so they are never silently lost. The response includes the next fire times — confirm them with the user when the schedule was parsed from natural language, and read the response's `warning` field before you end the turn."
     )]
     async fn set_reminder(
         &self,
@@ -291,7 +291,7 @@ impl AlexandriaServer {
     }
 
     #[tool(
-        description = "Check for reminders that have come due and consume them. Client integrations call this automatically at the start of each interaction; you generally don't need to call it manually unless the user asks 'any reminders?'. Delivery is best-effort-once: calling this marks returned reminders as delivered (recurring ones advance to their next occurrence, coalescing any missed fires into a missed_occurrences count)."
+        description = "Check for reminders that have come due and consume them. Client integrations call this automatically at the start of each interaction; you generally don't need to call it manually unless the user asks 'any reminders?'. Delivery is best-effort-once and one-way: what this returns is injected into your context and the row is advanced or retired, so a reminder you fail to act on is gone until its next fire. Recurring rows move to their next occurrence, coalescing elapsed fires into missed_occurrences (missed_occurrences_saturated means that number is a floor, not a count)."
     )]
     async fn check_reminders(
         &self,
@@ -301,7 +301,7 @@ impl AlexandriaServer {
     }
 
     #[tool(
-        description = "List reminders (pending by default; filter by status 'pending'|'delivered'|'cancelled'|'all' and/or target project). Use when the user asks what reminders exist, or to find an ID before cancelling."
+        description = "List reminders (pending by default; filter by status 'pending'|'delivered'|'cancelled'|'all' and/or target project), oldest-due first, 50 to a page via limit/offset — the response carries truncated and next_offset. Use when the user asks what reminders exist, or to find an ID before cancelling; page it rather than asking for the whole history, since delivered and cancelled rows are kept."
     )]
     async fn list_reminders(
         &self,
@@ -327,8 +327,8 @@ When to READ memory (retrieve_memories / recall): at the start of a task in a pr
 When to WRITE memory (store_memory): as soon as you learn a durable fact worth keeping past this conversation — a user preference, an architectural decision and its rationale, a bug's root cause, a non-obvious gotcha, a correction the user gives you. Do this unprompted; don't wait to be told to remember. Write standalone statements that make sense without today's conversation.\n\n\
 Session memory: pass session_id to store_memory or import_document to group memories by session. Use get_session to review all memories from a session. Use finalize_session at the end of a session to attach a summary and tags.\n\n\
 Use update_memory (not store_memory) when correcting something already stored — it preserves lineage. Use import_document for bulk reference material (specs, READMEs, notes). Use delete_memory only when the user wants something actually forgotten.\n\n\
-Reminders: use set_reminder when the user asks to be reminded of something later or a follow-up will be needed at a specific time. Omit target_project for anything the user should see anywhere; set it for repo-bound follow-ups (exact, case-sensitive match). The response carries next_fire_preview and the timezone the schedule was parsed in — confirm those with the user whenever the schedule came from natural language. Due reminders are delivered when a client calls check_reminders at the start of an interaction — the server runs no timer, so nothing fires on its own. check_reminders is the only tool that consumes them (recurring ones advance; missed fires coalesce rather than trickle); call it yourself when the user asks whether anything is due, or when a reminder they expected has not shown up.\n\n\
-Reminder delivery: retrieve_memories and recall responses also carry a due_reminders array: a read-only, untargeted view of what is currently due (a short oldest-due sample, each entry has a target of global or project:<name>) that consumes nothing. An entry targeting another project is informational there; it reaches the user through the next check_reminders, which also delivers project reminders once they are overdue by more than the server's escalation window. Use list_reminders to review what is scheduled and cancel_reminder when a reminder is no longer needed."
+Reminders: use set_reminder when the user asks to be reminded of something later or a follow-up will be needed at a specific time. Omit target_project for anything the user should see anywhere; set it for repo-bound follow-ups (exact, case-sensitive match). The response carries next_fire_preview and the timezone the schedule was parsed in — confirm those with the user whenever the schedule came from natural language. Due reminders are delivered when a client calls check_reminders at the start of an interaction — the server runs no timer, so nothing fires on its own and a client that never calls it never receives one. check_reminders is the only tool that consumes them (recurring ones advance; missed fires coalesce rather than trickle) and it injects them into your context only: telling the user is your job. Call it yourself when the user asks whether anything is due, or when a reminder they expected has not shown up.\n\n\
+Reminder delivery: retrieve_memories and recall responses also carry a due_reminders array: a read-only, untargeted view of what is currently due (a short oldest-due sample, each entry has a target of global or project:<name>) that consumes nothing. An entry targeting another project is informational there; it reaches the user through the next check_reminders, which also delivers project reminders once they are at least the server's escalation window overdue. Use list_reminders to review what is scheduled and cancel_reminder when a reminder is no longer needed."
 )]
 impl ServerHandler for AlexandriaServer {}
 
@@ -899,6 +899,17 @@ impl AlexandriaServer {
             anyhow::bail!("provide exactly one of due_at, pattern, or cron (got {got})");
         }
 
+        // The one field whose entire purpose is to be read. A blank message stores
+        // fine, reports `status: ok` with a `next_fire_preview`, and then delivers
+        // an empty bullet — the client has to invent a placeholder for it, which is
+        // the wrong place to discover that nothing was ever written. The blank
+        // `target_project` check below already refuses on the same logic.
+        if params.message.trim().is_empty() {
+            anyhow::bail!(
+                "message must not be empty — it is the text delivered to the user when the reminder fires"
+            );
+        }
+
         // A blank target is not "no target": `None` is global, while an empty or
         // all-whitespace `target_project` matches no project hint (matching is
         // byte-exact) and can therefore only ever be held and then escalated —
@@ -1028,13 +1039,28 @@ impl AlexandriaServer {
                 sched::human_readable(&spec)
             );
         }
-        let warning = match (&spec, next) {
+        let mut warning = match (&spec, next) {
             (sched::ScheduleSpec::Once { due_at }, None) => Some(format!(
                 "due_at {} is in the past; this reminder will fire on the very next check",
                 rfc3339_utc(*due_at)
             )),
             _ => None,
         };
+        // The other thing set-time validation cannot fix but can name: this crate
+        // intersects day-of-month with day-of-week where Vixie cron unions them, so
+        // an expression written from habit fires on a far narrower set of days than
+        // the caller meant. It validates and it fires, so the only honest place to
+        // say it is here — the caller is still in the conversation to reword it.
+        if let sched::ScheduleSpec::Cron { expr } = &spec
+            && sched::cron_dom_dow_conflict(expr)
+        {
+            warning = Some(match warning {
+                Some(existing) => format!(
+                    "{existing} Also: this expression restricts both day-of-month and day-of-week, which are ANDed (so '0 9 13 * FRI' is Friday the 13th only, not the 13th plus every Friday) — use two reminders for a union."
+                ),
+                None => "this expression restricts both day-of-month and day-of-week, which are ANDed (so '0 9 13 * FRI' is Friday the 13th only, not the 13th plus every Friday) — use two reminders for a union.".to_string(),
+            });
+        }
         // A past one-shot still stores next_due_at = due_at so list_due catches it.
         let next_due_at = match &spec {
             sched::ScheduleSpec::Once { due_at } => Some(*due_at),

@@ -1401,3 +1401,376 @@ async fn piggyback_empty_retrieve_still_lists_due_reminders() {
         serde_json::from_str(&server.do_check_reminders(check(None)).await.unwrap()).unwrap();
     assert_eq!(chk["count"], 1);
 }
+
+// --- fixes from the pre-merge review: contract and race coverage ---
+
+/// The one field whose entire purpose is to be read. Before this it was accepted
+/// blank, reported `status: ok` with a fire preview, and then delivered an empty
+/// bullet — with the client inventing a placeholder to hide it.
+#[tokio::test]
+async fn set_reminder_rejects_a_blank_message() {
+    let server = setup().await;
+    for blank in ["", "   ", "\n\t"] {
+        let err = server
+            .do_set_reminder(once_params(blank, "2030-01-01T15:00:00Z"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("message must not be empty"), "{err}");
+    }
+    assert_no_rows(&server).await;
+}
+
+/// The schema enforces the same thing, because `do_set_reminder` is not the only
+/// possible writer (admin and migration SQL exist) and a stored empty message is
+/// a delivery of nothing. Whitespace counts as empty for the same reason it does
+/// in the tool layer: the row would deliver an invisible bullet.
+#[tokio::test]
+async fn storage_rejects_an_empty_message_directly() {
+    let db = Database::connect_embedded().await.unwrap();
+    schema::bootstrap(db.inner()).await.unwrap();
+    let repo = ReminderRepo::new(db.inner());
+
+    for blank in ["", "   "] {
+        let stored = repo
+            .create(&NewReminder {
+                message: blank.to_string(),
+                target_project: None,
+                prov_project: None,
+                prov_session_id: None,
+                note: None,
+                schedule_kind: schedule_kind::ONCE.to_string(),
+                due_at: Some(Utc::now()),
+                freq: None,
+                time_of_day: None,
+                weekdays: Vec::new(),
+                day_of_month: None,
+                cron_expr: None,
+                next_due_at: Some(Utc::now()),
+            })
+            .await;
+        match stored {
+            Err(e) => assert!(
+                e.to_string().contains("must conform to"),
+                "unexpected rejection for {blank:?}: {e}"
+            ),
+            Ok(id) => panic!("a blank message {blank:?} was stored as {id}"),
+        }
+    }
+}
+
+/// `cron` ANDs day-of-month with day-of-week where Vixie cron ORs them, so
+/// `0 9 13 * FRI` means "Friday the 13th only". The expression is valid and does
+/// fire, so the only place to catch it is the set-time warning the response
+/// already carries for the numeric-dow trap.
+#[tokio::test]
+async fn set_reminder_warns_when_dom_and_dow_conflict() {
+    let server = setup().await;
+    let out: serde_json::Value = serde_json::from_str(
+        &server
+            .do_set_reminder(cron_params("friday the thirteenth", "0 9 13 * FRI"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let warning = out["warning"].as_str().unwrap_or_default();
+    assert!(warning.contains("ANDed"), "{warning}");
+    assert!(
+        warning.contains("two reminders"),
+        "{warning} must offer the fix"
+    );
+
+    // The same warning channel must stay quiet for expressions where the
+    // intersection is meaningless — otherwise it is noise an agent learns to skip.
+    for benign in ["0 9 * * FRI", "0 9 13 * *"] {
+        let out: serde_json::Value = serde_json::from_str(
+            &server
+                .do_set_reminder(cron_params("x", benign))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let warning = out["warning"].as_str().unwrap_or_default();
+        assert!(
+            !warning.contains("ANDed"),
+            "{benign} should not warn: {warning}"
+        );
+    }
+}
+
+/// The guarantee `do_check_reminders` documents is about *concurrent* consumers,
+/// and until now it was only ever tested by re-issuing a stale claim in sequence.
+/// That pins the WHERE clause; it does not exercise the case the guarantee is
+/// written for — two checks that both see the row as due. The pi companion plus an
+/// agent calling the tool manually is exactly that shape on HTTP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_checks_deliver_a_due_row_exactly_once() {
+    let server = setup().await;
+    let id = server
+        .do_set_reminder(once_params(
+            "only one of you should get this",
+            &Utc::now().to_rfc3339(),
+        ))
+        .await
+        .unwrap();
+    let id: serde_json::Value = serde_json::from_str(&id).unwrap();
+    let id = id["id"].as_str().unwrap().to_string();
+
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let server = server.clone();
+        tasks.push(tokio::spawn(async move {
+            server.do_check_reminders(check(None)).await.unwrap()
+        }));
+    }
+    let mut winners = 0;
+    for t in tasks {
+        let out: serde_json::Value = serde_json::from_str(&t.await.unwrap()).unwrap();
+        if out["delivered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["id"] == serde_json::Value::String(id.clone()))
+        {
+            winners += 1;
+        }
+    }
+    assert_eq!(
+        winners, 1,
+        "four concurrent checks delivered the same row {winners} times"
+    );
+
+    let row = ReminderRepo::new(server.db.inner())
+        .get(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.delivered_count, 1,
+        "a duplicate claim must not bump delivered_count"
+    );
+    assert_eq!(row.status, "delivered");
+}
+
+/// The documented contract of the piggyback — "up to 5, oldest-due first" — was
+/// nowhere pinned, and the cap was applied in Rust after reading every due row.
+#[tokio::test]
+async fn piggyback_caps_at_five_oldest_due_first() {
+    let server = setup().await;
+    let repo = ReminderRepo::new(server.db.inner());
+    let base = Utc::now() - chrono::Duration::hours(1);
+    for i in 0..8 {
+        repo.create(&NewReminder {
+            message: format!("due {i}"),
+            target_project: None,
+            prov_project: None,
+            prov_session_id: None,
+            note: None,
+            schedule_kind: schedule_kind::ONCE.to_string(),
+            due_at: Some(base + chrono::Duration::minutes(i)),
+            freq: None,
+            time_of_day: None,
+            weekdays: Vec::new(),
+            day_of_month: None,
+            cron_expr: None,
+            next_due_at: Some(base + chrono::Duration::minutes(i)),
+        })
+        .await
+        .unwrap();
+    }
+
+    let out = server
+        .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+            query: "anything".to_string(),
+            limit: Some(5),
+            session_id: None,
+        })
+        .await
+        .unwrap();
+    let due = out["due_reminders"].as_array().unwrap();
+    assert_eq!(due.len(), 5, "the documented cap is 5, got {due:?}");
+    let msgs: Vec<&str> = due.iter().map(|d| d["message"].as_str().unwrap()).collect();
+    assert_eq!(
+        msgs,
+        vec!["due 0", "due 1", "due 2", "due 3", "due 4"],
+        "oldest-due first"
+    );
+}
+
+/// `list_reminders` is the tool an agent calls to review history, and history is
+/// append-only (delivered and cancelled rows are kept deliberately). Unbounded,
+/// the recommended flow serialises every reminder ever made into one context.
+#[tokio::test]
+async fn list_reminders_pages_and_reports_truncation() {
+    let server = setup().await;
+    let repo = ReminderRepo::new(server.db.inner());
+    let base = Utc::now() + chrono::Duration::hours(1);
+    for i in 0..5 {
+        repo.create(&NewReminder {
+            message: format!("row {i}"),
+            target_project: None,
+            prov_project: None,
+            prov_session_id: None,
+            note: None,
+            schedule_kind: schedule_kind::ONCE.to_string(),
+            due_at: Some(base + chrono::Duration::minutes(i)),
+            freq: None,
+            time_of_day: None,
+            weekdays: Vec::new(),
+            day_of_month: None,
+            cron_expr: None,
+            next_due_at: Some(base + chrono::Duration::minutes(i)),
+        })
+        .await
+        .unwrap();
+    }
+
+    let page1 = list_json(
+        &server,
+        ListRemindersParams {
+            status: None,
+            target_project: None,
+            limit: Some(2),
+            offset: Some(0),
+        },
+    )
+    .await;
+    assert_eq!(page1["count"], 2);
+    assert_eq!(page1["truncated"], true);
+    assert_eq!(page1["next_offset"], 2);
+
+    let last = list_json(
+        &server,
+        ListRemindersParams {
+            status: None,
+            target_project: None,
+            limit: Some(2),
+            offset: Some(4),
+        },
+    )
+    .await;
+    assert_eq!(last["count"], 1);
+    assert_eq!(last["truncated"], false);
+    assert_eq!(last["next_offset"], serde_json::Value::Null);
+
+    // An absurd page size is clamped rather than honoured: `limit` is client input.
+    let huge = list_json(
+        &server,
+        ListRemindersParams {
+            status: None,
+            target_project: None,
+            limit: Some(i64::MAX),
+            offset: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        huge["limit"],
+        alexandria_mcp::server::MAX_LIST_REMINDERS_LIMIT
+    );
+}
+
+/// A capped count published as an exact number is wrong where a user looks: the
+/// delivery payload has to carry that it stopped early.
+#[tokio::test]
+async fn check_reminders_reports_a_saturated_missed_count() {
+    let server = setup().await;
+    let repo = ReminderRepo::new(server.db.inner());
+    // Every second, left overdue for three hours: 10 800 elapsed fires against
+    // the engine's 10 000 bound.
+    let expr = alexandria_engine::reminders::normalize_cron("* * * * * *").unwrap();
+    let overdue = Utc::now() - chrono::Duration::hours(3);
+    let id = repo
+        .create(&NewReminder {
+            message: "abandoned metronome".to_string(),
+            target_project: None,
+            prov_project: None,
+            prov_session_id: None,
+            note: None,
+            schedule_kind: schedule_kind::CRON.to_string(),
+            due_at: None,
+            freq: None,
+            time_of_day: None,
+            weekdays: Vec::new(),
+            day_of_month: None,
+            cron_expr: Some(expr),
+            next_due_at: Some(overdue),
+        })
+        .await
+        .unwrap();
+
+    let out: serde_json::Value =
+        serde_json::from_str(&server.do_check_reminders(check(None)).await.unwrap()).unwrap();
+    let row = out["delivered"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == serde_json::Value::String(id.clone()))
+        .expect("the overdue row is delivered");
+    assert_eq!(row["missed_occurrences"], 10_000);
+    assert_eq!(
+        row["missed_occurrences_saturated"], true,
+        "the count hit the engine's cap and must say so"
+    );
+}
+
+/// The `due_reminders` piggyback is informational, so its contract is "up to 5,
+/// oldest-due first" — and neither half was pinned by any test, while the read
+/// itself was unbounded (every due row deserialized on every prompt to show five).
+/// The sample also has to survive an undeliverable row: NULL `next_due_at` sorts
+/// first, so a single admin-written row of that shape used to occupy a slot and
+/// report `"due_at": null` on every memory lookup forever.
+#[tokio::test]
+async fn piggyback_sample_is_bounded_ordered_and_hides_undeliverable_rows() {
+    let server = setup().await;
+    let repo = ReminderRepo::new(server.db.inner());
+    let past = Utc::now() - chrono::Duration::hours(2);
+
+    // Undeliverable first: NULL due time (oldest-sorted) and a cron row the engine
+    // cannot reconstruct. Both are `list_due` material on purpose.
+    let mut no_due = raw_row("admin row with no due time", None);
+    no_due.due_at = Some(past);
+    repo.create(&no_due).await.unwrap();
+    let mut junk = raw_row("junk cron row", Some(past));
+    junk.schedule_kind = schedule_kind::CRON.to_string();
+    junk.cron_expr = Some("99 99 99 99 99".to_string());
+    repo.create(&junk).await.unwrap();
+
+    for i in 0..7 {
+        let due = past + chrono::Duration::minutes(i);
+        // `raw_row` leaves `due_at` empty on purpose (it is the unreadable-`once`
+        // fixture); a row the sample has to keep needs a readable schedule.
+        let mut row = raw_row(&format!("real {i}"), Some(due));
+        row.due_at = Some(due);
+        repo.create(&row).await.unwrap();
+    }
+
+    let out = server
+        .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+            query: "anything".to_string(),
+            limit: Some(3),
+            session_id: None,
+        })
+        .await
+        .unwrap();
+    let due = out["due_reminders"].as_array().unwrap();
+    assert_eq!(due.len(), 5, "the documented cap is 5: {due:?}");
+    let msgs: Vec<&str> = due
+        .iter()
+        .map(|d| d["message"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        msgs,
+        vec!["real 0", "real 1", "real 2", "real 3", "real 4"],
+        "oldest-due first, and undeliverable rows must not eat slots"
+    );
+    assert!(
+        due.iter().all(|d| d["due_at"].is_string()),
+        "no null due times in the sample: {due:?}"
+    );
+
+    // Read-only: the same rows are still owed to `check_reminders`.
+    let chk: serde_json::Value =
+        serde_json::from_str(&server.do_check_reminders(check(None)).await.unwrap()).unwrap();
+    assert_eq!(chk["count"], 7, "the sample consumed nothing");
+}

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
+use alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS;
 use alexandria_engine::search::DEFAULT_MIN_SIMILARITY;
 use serde::Deserialize;
 
@@ -197,7 +198,7 @@ impl Default for RemindersConfig {
     fn default() -> Self {
         Self {
             timezone: String::new(),
-            escalation_hours: 48,
+            escalation_hours: DEFAULT_ESCALATION_HOURS,
         }
     }
 }
@@ -341,6 +342,14 @@ mod tests {
         assert_eq!(
             ClusterConfig::default().cohesion_floor,
             alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR
+        );
+        // Same drift guard for reminders: the binary's config default and the MCP
+        // server's fallback default are in different crates, and if only one is
+        // changed a test-built or debug server escalates on a different clock than
+        // production — with nothing failing.
+        assert_eq!(
+            RemindersConfig::default().escalation_hours,
+            alexandria_mcp::server::DEFAULT_REMINDER_ESCALATION_HOURS
         );
     }
 
