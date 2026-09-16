@@ -68,6 +68,32 @@ jobs:
       - run: just verify-assets
       - run: just test
 
+  # The pi companion is TypeScript with its own suite, and nothing else in this
+  # workflow would notice if it stopped compiling: `just test` is cargo-only. It is
+  # also the only client that consumes reminders, so a broken type there is a broken
+  # delivery path for every user of the extension.
+  extension:
+    name: Pi companion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: contrib/pi/extensions/alexandria/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+        working-directory: contrib/pi/extensions/alexandria
+      - name: Type-check
+        run: npm run typecheck
+        working-directory: contrib/pi/extensions/alexandria
+      - name: Tests
+        run: npm test
+        working-directory: contrib/pi/extensions/alexandria
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

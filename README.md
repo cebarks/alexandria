@@ -55,7 +55,7 @@ First run downloads the embedding model from HuggingFace Hub (~80MB).
 | `finalize_session` | Close a session with a summary, tags, and `ended_at` |
 | `set_reminder` | Schedule a one-shot (`due_at`) or recurring (named pattern / cron) reminder; response previews the next fire times |
 | `check_reminders` | Deliver due reminders and mark them consumed (global, project-matching, or escalated) |
-| `list_reminders` | List scheduled reminders by status and target project |
+| `list_reminders` | List scheduled reminders by status and target project, oldest-due first, paginated |
 | `cancel_reminder` | Soft-cancel a reminder by ID |
 
 Tool and parameter descriptions are written directively ("call this proactively when…") because
@@ -70,15 +70,25 @@ See [docs/session-memory.md](docs/session-memory.md) for the data model and curr
 
 ### Reminders
 
-Reminders are scheduled messages — "remind me", "check the deploy at 3pm" — delivered to both the
-agent context and the user on the next interaction after they come due. There is no background
-timer: due-ness is evaluated at query time, so delivery is lazy, transport-agnostic, and survives
-server downtime. `set_reminder` validates schedules at set time and echoes the parsed next fire
-times for confirmation; `check_reminders` delivers and consumes them. Reminders target the global
+Reminders are scheduled messages — "remind me", "check the deploy at 3pm" — delivered into the
+agent's context on the next interaction after they come due. There is no background timer: due-ness is
+evaluated at query time, so delivery is lazy, transport-agnostic, and survives server downtime. The
+cost of that design is that nothing reaches anyone until a client asks: the pi companion calls
+`check_reminders` once per prompt and additionally notifies the human, and that client-side step is
+where "and the user" actually lives — a client that never calls the tool receives nothing.
+`set_reminder` validates schedules at set time and echoes the parsed next fire times for confirmation;
+`check_reminders` delivers and consumes them, one-way. Reminders target the global
 context or a specific project, and a project-targeted reminder that is overdue by at least
 `[reminders].escalation_hours` escalates to global delivery — nothing is silently lost. Overdue
-items are also surfaced read-only in the `due_reminders` array of `retrieve_memories` and `recall`
-responses.
+items are also surfaced read-only, capped and oldest-due first, in the `due_reminders` array of
+`retrieve_memories` and `recall` responses.
+
+Recurring schedules are evaluated as wall clock in `[reminders].timezone`, so a daily 09:00 stays 09:00
+local across a DST change: a time the spring-forward gap removed does not fire that day, and a time a
+fall-back fold repeats fires once, on its first pass. The cron escape hatch carries two dialect
+surprises — numeric days of week are 1=Sunday (write day names), and a restricted day-of-month ANDs
+with a restricted day-of-week instead of ORing as Vixie cron does — so `set_reminder` puts a `warning`
+in the response when it recognizes the second one.
 
 ### Getting agents to actually use memory
 

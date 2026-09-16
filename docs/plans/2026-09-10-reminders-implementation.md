@@ -2586,3 +2586,66 @@ git commit -m "test(extension): reminders formatting + config toggle tests; fina
 - **Inclusive escalation boundary**: a project-targeted reminder escalates at `>= escalation_hours` overdue where the design text said "longer than". The inclusive form is what makes `escalation_hours = 0` mean "escalate as soon as overdue" instead of never.
 - **Claude Code client has no automatic delivery** (2026-09-14 merge): `contrib/claude/hooks/alexandria-recall.sh` injects auto-recall only, so a Claude Code user sees the read-only `due_reminders` piggyback on `retrieve_memories`/`recall` but gets no `check_reminders` consumption unless the agent calls the tool itself. Implementing delivery in the hook was left out of scope; the Pi companion extension is the shipped delivery path.
 - **Migration renumbered v006 → v007** (2026-09-14 merge): main claimed version 6 for `drop_session_memory_count` while this branch was open, so the reminder table shipped as `schema/v007_reminder.surql`. `migrate()` only applies `version > current_version`, so leaving it at 6 would have made every database already migrated past main's v6 silently skip the reminder schema. Steps 4/6/12 below still say v006 — that is what was written and executed at the time.
+
+## Post-review amendments (2026-09-16)
+
+An independent four-lane review of the merged branch (`19a20d9..04ea067`) turned up
+one Critical and a set of Important findings. What changed as a result, and what the
+plan above now contradicts:
+
+- **The fold was a delivery bug, not a missing test.** `next_fire` bounded `cron` on
+  the anchor's *local* fields, and inside a fall-back fold `cron` yields the earlier
+  of the two instants for a wall time. A check anchored in the fold's second pass
+  therefore received a fire time at or before `now` — which equals the `next_due_at`
+  the conditional claim guards, so the claim *succeeded*, `delivered_count` bumped,
+  and every subsequent check inside the fold re-delivered the same occurrence. No
+  concurrency was involved, and it contradicted the "consumption can no longer
+  duplicate a delivery" note above. Fixed by `fires_after()` (dedupe on
+  `naive_local()`, then filter the converted instant), which `next_fire`, `upcoming`
+  and `occurrences_between` all share so the preview, the advance and the coalescing
+  count cannot disagree. **Semantics chosen: one wall-clock reading is one
+  occurrence** — a folded time fires once, on its first pass; a gap time does not
+  fire that day. The `dst_fall_back_repeated_hour_yields_both_instants_and_coalesces`
+  test in Step 3 asserted the opposite and was replaced by
+  `dst_fall_back_repeated_wall_time_delivers_once` plus
+  `dst_fold_second_pass_never_returns_a_past_fire`. "Fall-back-DST recurring series
+  test" is no longer a follow-up; the untested path was wrong.
+- **`occurrences_between` returns `OccurrenceCount { count, saturated }`.** The
+  `MAX_ITER` cap used to be invisible in the payload: an abandoned per-second cron
+  row reported `missed_occurrences: 10000` as fact (reachable in ~7 days for
+  `* * * * *`, ~2.8 h for the 6-field form). `missed_occurrences_saturated` is now
+  published and the companion renders `10000+`.
+- **`cron` intersects day-of-month with day-of-week** (Quartz) where Vixie unions
+  them, so `0 9 13 * FRI` is Friday-the-13th-only. Nothing in this plan or the
+  steering surfaces said so. `cron_dom_dow_conflict()` now warns at set time and the
+  caveat is in the param description, both SKILL.md copies and `configuration.md`.
+- **Migrations are now `DEFINE <kind> OVERWRITE` / `REMOVE <kind> IF EXISTS` across
+  v001–v007.** `migrate()` is not atomic within a file (each statement commits in its
+  own transaction, the version is stamped only after all pending migrations succeed),
+  so a crash mid-v007 left a schema that a plain re-DEFINE could not re-apply —
+  "The table 'reminder' already exists" on every subsequent boot. Pinned by
+  `test_replaying_a_completed_migration_is_not_an_error`, and `MIGRATIONS` became
+  `pub` for it.
+- **Two caps that were aspirational are enforced in SQL**: `list_due_sample`
+  (`LIMIT`, plus `next_due_at != NONE` — `IS NOT NULL` is satisfied by `NONE` in this
+  engine and filtered nothing) and `ReminderRepo::list` (`LIMIT`/`START` with an
+  `id` tiebreaker, `truncated`/`next_offset` in the response, `limit`/`offset` on
+  `list_reminders`).
+- **`set_reminder` rejects a blank `message`** and v007 asserts non-empty after trim.
+  The client-side `(reminder with no text)` placeholder stays as defence in depth.
+- **Single-sourced `[reminders]` defaults**: `DEFAULT_ESCALATION_HOURS` lives in the
+  engine and feeds both crates' defaults, guarded by the existing drift test;
+  `main.rs` refuses to start on an escalation window too large to represent as a
+  duration instead of letting the delivery path hold project reminders forever.
+- **The companion's project hint now comes from the session's `ctx.cwd`**, cached per
+  directory rather than once per process, and the merge step moved to
+  `src/injection.ts` so the isolation claim is tested rather than inspected.
+  `resetClient()` closes what it drops, and the whole prompt path carries one
+  `PROMPT_BUDGET_MS` deadline. `just ci` and a CI job now run `npm run typecheck` and
+  `npm test`; the "extension has no test suite" claims in AGENTS.md and
+  `contrib/pi/README.md` were stale the moment the suite landed.
+- **Docs corrected to the code**, not the reverse: the dual-audience promise (pi's
+  `notify` is a no-op without a dialog UI), the inclusive escalation boundary, the
+  design doc's two-state `status`, and `normalize_cron` now collapsing whitespace on
+  every branch so a padded expression cannot render two different `schedule` strings
+  from one row.

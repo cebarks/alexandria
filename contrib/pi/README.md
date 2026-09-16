@@ -128,8 +128,10 @@ response produces a warning at most, never a blocked turn.
 
 ### Limitations worth knowing
 
-- **No unit tests.** The detector and extraction-prompt logic has no test coverage in the repo, even
-  though the original design called for one. Regex changes are currently unguarded.
+- **The detectors are untested.** The extension has a suite (`just ext-test`, and `npm test` in
+  `extensions/alexandria/`) covering the config loader, the reminder payload/rendering path, the
+  merged dispatcher's failure isolation, and the project-hint probe. The heuristic detector regexes and
+  the LLM extraction prompt are still outside it, so those changes remain unguarded.
 - **No session memory integration.** The extension stores and retrieves without a `session_id`, so
   its writes are ungrouped. See [docs/session-memory.md](../../docs/session-memory.md).
 - **Recall ignores `recall`.** It uses `retrieve_memories`, never the two-phase `recall` tool, so

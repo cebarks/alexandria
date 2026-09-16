@@ -54,18 +54,29 @@ this extension is the delivery path: it checks once per prompt, before the agent
   is consumed on its last delivery).
 - **Missed fires coalesce.** If a daily reminder was due three times while nothing checked, the next
   check delivers it once and labels it `(missed 3 earlier occurrence(s))` instead of sending three
-  copies.
+  copies. The engine stops counting at 10 000 occurrences, and when it has, the label reads
+  `(missed 10000+ earlier occurrence(s), count capped)` rather than presenting a floor as a fact.
+- **Recurring means wall clock.** Schedules run in the server's `[reminders].timezone`, so a daily
+  09:00 stays 09:00 local across a DST change: a time the spring-forward gap removed does not fire that
+  day, and a time a fall-back fold repeats fires once, on its first pass. Delivery rows carry
+  `due_at_local` and `timezone` beside the UTC instant, and the injected block shows each row's `id` so
+  the agent can `cancel_reminder` without a round trip. More than 10 rows in one check are summarized
+  with a pointer to `list_reminders` — they were still consumed, which is why the pointer is there.
 - **Project targeting.** Each check sends a project hint: `ALEXANDRIA_REMINDERS_PROJECT` if set,
-  otherwise the basename of `git rev-parse --show-toplevel`, otherwise nothing. Reminders targeted at
-  that project are delivered; global ones are delivered anywhere. The match is exact and
+  otherwise the basename of `git rev-parse --show-toplevel` run **in the session's directory**
+  (`ctx.cwd`, not the process working directory — a resumed session can live in another project than
+  the one pi was launched from), otherwise nothing. Results are cached per directory. Reminders
+  targeted at that project are delivered; global ones are delivered anywhere. The match is exact and
   case-sensitive against the `target_project` passed to `set_reminder`.
-- **Escalation.** A project-targeted reminder that has been overdue longer than the server's
-  `[reminders] escalation_hours` (default 48) is delivered regardless of the hint, labeled
+- **Escalation.** A project-targeted reminder at least the server's `[reminders] escalation_hours`
+  (default 48) overdue is delivered regardless of the hint, labeled
   `[OVERDUE — escalated from project targeting]`. So a project you stop visiting cannot silently keep
   its reminders unsurfaced.
-- **Two audiences.** Each delivery is both injected into context (the agent-visible half) and shown
-  as `⏰ N Alexandria reminder(s) due` (the human-visible half), so a delivery can't be swallowed
-  without the user noticing.
+- **Two audiences, unequally.** Every delivery is injected into context (the agent-visible half) and
+  *announced* as `⏰ N Alexandria reminder(s) due`. The announcement is the weaker half:
+  `ctx.ui.notify` is a no-op wherever pi has no dialog UI — `pi -p`, print mode, a headless run — so
+  what it guarantees is that the human's own agent saw it, not that the human did. The rows are
+  consumed either way.
 
 Set `ALEXANDRIA_REMINDERS_PROJECT` when the checkout directory is not the project name — most often
 in a **git worktree**, where the toplevel basename is the worktree directory (`feature/reminders`)
@@ -73,9 +84,18 @@ rather than the repository (`alexandria`). Without the override, reminders targe
 project name arrive late and escalated rather than in their own project.
 
 Everything here is fail-open: an unreachable server, a missing `git`, or a malformed response
-produces a warning notification at most, never a blocked turn. A reminder check that gives up at the
-client (5 s) may already have consumed its rows server-side, so that one fire is lost; a malformed
-or error-shaped response consumes nothing, warns once, and is retried on the next prompt.
+produces a warning at most, never a blocked turn — and a notification that itself throws (pi's `ctx.ui`
+goes stale across a session switch) cannot discard an injection, because the message is decided before
+anything touches the UI. A reminder check that gives up at the client may already have consumed its
+rows server-side, so that one fire is lost; a malformed or error-shaped response consumes nothing, is
+reported, and is retried on the next prompt.
+
+The budget is **10 s for the whole prompt path**, not 5 s per call. Each call is bounded at 5 s, but
+they stack — a 2 s git probe, a 5 s handshake, a 5 s call, and one reconnect retry — and pi waits for
+this handler before the turn starts, so the number a user feels is the sum. `PROMPT_BUDGET_MS` aborts
+the lot and closes the dropped connection (a nulled-but-never-closed client leaked one session per
+timed-out prompt). Repeated failures warn once per prompt; that is deliberate, since a permanently
+broken delivery path should stay visible rather than latch itself quiet.
 
 Stale Streamable HTTP sessions — usually an Alexandria restart — are detected and retried once on a
 fresh connection, in every feature.

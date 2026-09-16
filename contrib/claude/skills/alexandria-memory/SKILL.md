@@ -89,22 +89,30 @@ Schedule kinds — give exactly one:
   wall-clock `HH:MM`; weekly needs `weekdays`, monthly needs `day_of_month` 1-31 (short months skip
   the 31st rather than sliding to the 1st).
 - cron: `cron: "0 0 1,15 * *"` — the escape hatch for what patterns can't express (this one:
-  midnight on the 1st and 15th). Prefer patterns; use cron only when patterns fall short. Cron
-  dialect caveats: 5, 6 or 7 fields are accepted (a 5-field expression gets seconds prepended), and
-  numeric days of week are **1=Sunday through 7=Saturday** — not the usual 0-6 — so `1-5` means
-  Sunday to Thursday and `0` is rejected outright. Always write days as names (`MON-FRI`, `SAT`),
-  never as numbers.
+  midnight on the 1st and 15th). Prefer patterns; use cron only when patterns fall short. Three
+  dialect caveats, all silent when you get them wrong: 5, 6 or 7 fields are accepted (a 5-field
+  expression gets seconds prepended; `@daily` is rejected, write it out); numeric days of week are
+  **1=Sunday through 7=Saturday** — not the usual 0-6 — so `1-5` means Sunday to Thursday and `0` is
+  rejected outright, so always write days as names (`MON-FRI`, `SAT`); and day-of-month and
+  day-of-week are **ANDed**, not ORed as in Vixie cron, when both are restricted — `0 9 13 * FRI` is
+  Friday-the-13th-only, so "the 13th *or* every Friday" is two reminders.
+
+Recurring times are wall clock in that timezone, so across a DST transition a daily 09:00 stays 09:00
+local: a time the spring-forward gap removed does not fire that day, and a time a fall-back fold
+repeats fires **once**, on its first pass. One wall-clock reading is one occurrence.
 
 Schedules are parsed and validated at set time — a bad cron or impossible time errors back at you, it
-is never stored to fail later. The response echoes the parsed `schedule`, `next_fire_preview`, and the
+is never stored to fail later, and a response may carry a `warning` naming a schedule that is valid but
+not what you meant (a restricted day-of-month with a restricted day-of-week, a `due_at` already past). The response echoes the parsed `schedule`, `next_fire_preview`, and the
 `timezone` it was evaluated in: **confirm those against what the user asked for before you end the
 turn** — a mis-parsed "every Friday" is cheapest to fix while they're still there. Optional `note` and
 provenance fields ride along at delivery for context.
 
 Targeting: reminders are **global** by default (delivered in any context). Use `target_project` for
 repo-bound follow-ups; delivery matches the project name exactly and case-sensitively. A targeted
-reminder in a project that stops being visited is not lost — after the server's escalation window
-(`[reminders].escalation_hours`) it delivers everywhere.
+reminder in a project that stops being visited is not lost — once it is at least the server's
+escalation window overdue (`[reminders].escalation_hours`) it delivers everywhere, flagged
+`escalated: true`.
 
 Delivery happens only when something calls **`mcp__alexandria__check_reminders`**, and the Claude Code
 hooks here do not call it — they only auto-recall. So under Claude Code you are that something: call

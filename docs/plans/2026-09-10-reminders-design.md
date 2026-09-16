@@ -51,8 +51,9 @@ reminder {
                day_of_month?: int },// for monthly; skips short months (cron-style)
     cron:    { expr: string }       // escape hatch, parsed + validated at set-time
   },
-  next_due_at: datetime,            // UTC, advanced statelessly at delivery
-  status: pending | cancelled,      // soft-cancel; no separate 'delivered' state
+  next_due_at: option<datetime>,    // UTC, advanced statelessly at delivery; a NULL row
+                                      // is excluded from the read-only due sample
+  status: pending | delivered | cancelled,  // v007 as shipped — see the note below
   created_at, cancelled_at?, last_delivered_at?, delivered_count
 }
 ```
@@ -245,9 +246,33 @@ Migration is a directory rename + README note (`cp -r` install, no package manag
 
 **Extension**:
 
-- Config alias resolution (`ALEXANDRIA_AUTO_RECALL=off` → recall disabled)
-- Per-feature failure isolation (one feature throws → others still deliver)
-- Fail-open on unreachable server (turn proceeds, notify at most)
+- Config alias resolution (`ALEXANDRIA_AUTO_RECALL=off` → recall disabled) — shipped, plus env/TOML
+  precedence per field and the set-but-blank case.
+- Per-feature failure isolation (one feature throws → others still deliver) — shipped as
+  `tests/injection.test.ts`, which is why the merge step lives in `src/injection.ts` rather than inline
+  in the handler: as a closure over imported functions it could not be reached from a test at all.
+- Fail-open on unreachable server (turn proceeds, notify at most) — shipped, and extended to the
+  notification itself (pi's `ctx.ui` throws once a session is replaced, which used to discard both
+  blocks *after* the rows had been consumed).
+
+### Deviations recorded during implementation
+
+- **`delivered` exists.** The line above said `pending | cancelled, // no separate 'delivered'
+  state`. Without a terminal state distinct from a user cancel, a consumed one-shot would either stay
+  `pending` and re-deliver forever or be conflated with `cancelled_at`, destroying the retirement
+  semantics the cancel tests pin. v007 asserts `['pending','delivered','cancelled']`.
+- **One wall-clock reading is one occurrence.** A time inside a fall-back fold fires once, on its first
+  pass, and a time removed by a spring-forward gap does not fire that day. `cron` bounds its own
+  strict-after search on the anchor's local fields and yields the earlier fold instant first, so the
+  engine filters on the converted instant as well — otherwise a check inside the fold's second pass is
+  handed a fire time that is already in the past, which the conditional claim then accepts and
+  re-delivers on every prompt.
+- **Cron dialect is Quartz-ish, not Vixie.** Numeric days of week run 1=Sunday..7=Saturday (`0`
+  rejected), and a restricted day-of-month ANDs with a restricted day-of-week. `set_reminder` warns at
+  set time when it sees the second case; the first is documented in the param description and both
+  skills.
+- **`next_fire_preview`, `upcoming`, and the delivery advance share one walk** of the schedule, so the
+  times echoed at set time cannot promise a fire the advance will never produce.
 
 ## Open Questions
 
