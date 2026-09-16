@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "tsx --test tests/",
+    "test": "tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
