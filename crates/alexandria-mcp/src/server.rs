@@ -68,6 +68,38 @@ fn error_message(e: &anyhow::Error) -> String {
         .join(" ")
 }
 
+/// `[reminders]` defaults the MCP layer falls back to when no config was
+/// injected. Named once and shared with the binary's `Default for
+/// RemindersConfig` so the two cannot drift the way `min_similarity` once did
+/// (see AGENTS.md); `tz` is deliberately UTC rather than system-local because
+/// this crate has no `iana-time-zone` dependency — `main.rs` resolves the
+/// operator's zone and injects it for both transports, and the fallback here is
+/// the *test/debug* default, which must be deterministic.
+pub const DEFAULT_REMINDER_ESCALATION_HOURS: u64 =
+    alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS;
+
+/// Rows `list_reminders` returns when the caller asks for no specific page size.
+/// Bounded because the history is append-only (delivered and cancelled rows are
+/// kept deliberately), and every row that comes back is context the caller pays
+/// for.
+pub const DEFAULT_LIST_REMINDERS_LIMIT: i64 = 50;
+
+/// Upper bound on a `list_reminders` page, so a caller cannot ask for the whole
+/// history by passing an enormous `limit`.
+pub const MAX_LIST_REMINDERS_LIMIT: i64 = 500;
+
+/// Rows the read-only `due_reminders` piggyback shows per retrieve/recall
+/// response. One constant because four response shapes carry the field.
+pub const DUE_REMINDERS_CAP: i64 = 5;
+
+/// Extra rows read beyond the cap, so that undeliverable rows cannot starve the
+/// sample. Whether a row is renderable is only knowable in Rust (the schedule has
+/// to be reconstructed), while the `LIMIT` has to be in SQL to bound the read — so
+/// the two disagree by construction, and a corrupt row would otherwise spend one of
+/// five informational slots for as long as an operator leaves it pending. The slack
+/// is a bounded read of `cap + slack`, not a full scan.
+const DUE_SAMPLE_SLACK: i64 = 10;
+
 /// Reminder delivery settings resolved from server config at startup.
 #[derive(Debug, Clone)]
 pub struct RemindersSettings {
@@ -628,7 +660,7 @@ impl AlexandriaServer {
         if facts.is_empty() {
             return Ok(serde_json::json!({
                 "results": [],
-                "due_reminders": self.due_reminders_summary(5).await,
+                "due_reminders": self.due_reminders_summary(DUE_REMINDERS_CAP as usize).await,
             }));
         }
 
@@ -686,7 +718,7 @@ impl AlexandriaServer {
 
         Ok(serde_json::json!({
             "results": results,
-            "due_reminders": self.due_reminders_summary(5).await,
+            "due_reminders": self.due_reminders_summary(DUE_REMINDERS_CAP as usize).await,
         }))
     }
 
@@ -717,7 +749,7 @@ impl AlexandriaServer {
             Ok(serde_json::json!({
                 "mode": "focused",
                 "memories": memories,
-                "due_reminders": self.due_reminders_summary(5).await,
+                "due_reminders": self.due_reminders_summary(DUE_REMINDERS_CAP as usize).await,
             })
             .to_string())
         } else {
@@ -752,7 +784,7 @@ impl AlexandriaServer {
             Ok(serde_json::json!({
                 "mode": "broad",
                 "clusters": cluster_results,
-                "due_reminders": self.due_reminders_summary(5).await,
+                "due_reminders": self.due_reminders_summary(DUE_REMINDERS_CAP as usize).await,
             })
             .to_string())
         }
@@ -1329,7 +1361,14 @@ impl AlexandriaServer {
         };
         let tz = self.reminders.tz;
         let repo = ReminderRepo::new(self.db.inner());
-        let rows = repo.list(status, params.target_project.as_deref()).await?;
+        let limit = params
+            .limit
+            .unwrap_or(DEFAULT_LIST_REMINDERS_LIMIT)
+            .clamp(1, MAX_LIST_REMINDERS_LIMIT);
+        let offset = params.offset.unwrap_or(0).max(0);
+        let (rows, truncated) = repo
+            .list(status, params.target_project.as_deref(), limit, offset)
+            .await?;
 
         let reminders: Vec<serde_json::Value> = rows
             .iter()
@@ -1377,6 +1416,13 @@ impl AlexandriaServer {
 
         Ok(serde_json::json!({
             "count": reminders.len(),
+            // Paginated because this history only grows: delivered and cancelled
+            // rows are kept on purpose, so an unbounded "show me everything" slowly
+            // turns into the whole reminder history in an agent context.
+            "limit": limit,
+            "offset": offset,
+            "truncated": truncated,
+            "next_offset": if truncated { Some(offset + limit) } else { None },
             // The zone every `next_due_at_local` above is rendered in: without it
             // a reader cannot tell whether the local times are theirs.
             "timezone": tz.name().to_string(),
@@ -1434,27 +1480,46 @@ impl AlexandriaServer {
         use alexandria_storage::repos::ReminderRepo;
 
         let repo = ReminderRepo::new(self.db.inner());
-        match repo.list_due(Utc::now()).await {
+        // The bound is pushed into the query, so an unrelated memory lookup never
+        // deserializes the whole overdue set to show a slice of it.
+        match repo
+            .list_due_sample(Utc::now(), cap as i64 + DUE_SAMPLE_SLACK)
+            .await
+        {
             Ok(rows) => rows
                 .into_iter()
-                .take(cap)
-                .map(|r| {
-                    serde_json::json!({
+                .filter_map(|r| {
+                    // A row whose schedule cannot be reconstructed is undeliverable
+                    // and would render as `due_at: null` noise; an operator still
+                    // sees it in `list_reminders` (which reports it as invalid) and
+                    // can `cancel_reminder` it. Until then it costs one of these
+                    // slots, which is the cheaper failure than reading every
+                    // pending row on every prompt to find out.
+                    let spec = match alexandria_engine::reminders::spec_from_reminder(&r) {
+                        Ok(spec) => spec,
+                        Err(e) => {
+                            tracing::debug!(
+                                "due_reminders: skipping unreadable row: {}",
+                                error_message(&e)
+                            );
+                            return None;
+                        }
+                    };
+                    let _ = spec;
+                    Some(serde_json::json!({
                         "id": r.id.as_ref().map(record_id_to_string).unwrap_or_default(),
                         "message": r.message,
                         "target": match &r.target_project {
                             Some(p) => format!("project:{p}"),
                             None => "global".to_string(),
                         },
-                        // A NULL `next_due_at` renders as JSON null: the only
-                        // writer cannot produce one (Task 9 refuses a schedule
-                        // with no future fire), but `list_due`'s `next_due_at <=
-                        // $now` does select such a row, so an admin/migration
-                        // path can. It is reported rather than hidden — like the
-                        // corrupt rows in `do_list_reminders`.
                         "due_at": r.next_due_at.map(rfc3339_utc),
-                    })
+                    }))
                 })
+                // After the filter, not before: capping the raw rows first would put
+                // the corrupt-row problem right back, since the row dropped by the
+                // filter was already counted against `cap`.
+                .take(cap)
                 .collect(),
             Err(e) => {
                 tracing::warn!("due_reminders piggyback failed: {}", error_message(&e));
@@ -2475,6 +2540,8 @@ mod get_info_tests {
                 .list_reminders(Parameters(ListRemindersParams {
                     status: None,
                     target_project: None,
+                    limit: None,
+                    offset: None,
                 }))
                 .await,
         );

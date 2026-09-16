@@ -91,6 +91,11 @@ impl<'a> ReminderRepo<'a> {
     }
 
     /// All pending reminders with next_due_at <= now, oldest first.
+    ///
+    /// Deliberately unbounded: this is the delivery query, and a row this returns
+    /// but does not render would be consumed invisibly. Callers that only want a
+    /// sample (the read-only `due_reminders` piggyback) use
+    /// [`Self::list_due_sample`] so the bound is paid for in the database.
     pub async fn list_due(&self, now: DateTime<Utc>) -> Result<Vec<Reminder>> {
         let mut response = self
             .db
@@ -105,12 +110,53 @@ impl<'a> ReminderRepo<'a> {
         Ok(reminders)
     }
 
+    /// At most `limit` pending reminders due at or before `now`, oldest first.
+    ///
+    /// The `LIMIT` is in the query, not applied afterwards: the informational
+    /// piggyback runs on every memory lookup, so fetching the whole overdue set to
+    /// show a few of it deserializes every message and note on each one. Callers
+    /// that must also drop rows they cannot interpret pass a `limit` with slack —
+    /// see `DUE_SAMPLE_SLACK` in the MCP layer.
+    ///
+    /// `next_due_at != NONE` is also load-bearing for ordering, not just tidiness:
+    /// NONE sorts below every datetime and `next_due_at <= $now` *selects* such a
+    /// row (verified against the embedded 3.2 engine), so an admin- or
+    /// migration-written row with no due time would otherwise sit at the head of
+    /// the sample and displace real reminders, permanently.
+    ///
+    /// The spelling is a SurrealDB 3.2 trap, not a style choice: `IS NOT NULL` (and
+    /// `!= NULL`) are both satisfied by a `NONE` field, so they filter nothing here.
+    /// Only `!= NONE` — or `NOT (= NONE)` — distinguishes an absent field.
+    pub async fn list_due_sample(&self, now: DateTime<Utc>, cap: i64) -> Result<Vec<Reminder>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM reminder \
+                 WHERE status = 'pending' AND next_due_at <= $now AND next_due_at != NONE \
+                 ORDER BY next_due_at ASC \
+                 LIMIT $cap",
+            )
+            .bind(("now", now))
+            .bind(("cap", cap))
+            .await?;
+        let reminders: Vec<Reminder> = response.take(0)?;
+        Ok(reminders)
+    }
+
     /// Status/project filters; both optional. Ordered by next_due_at.
+    ///
+    /// `limit` bounds the page and `offset` skips one; the returned flag says
+    /// whether more rows exist beyond it. One extra row is read to answer that
+    /// without a second `count()` query — the history this pages over is
+    /// append-only (`delivered` and `cancelled` rows are kept forever), so the
+    /// caller cannot infer it from the page it got.
     pub async fn list(
         &self,
         status: Option<&str>,
         target_project: Option<&str>,
-    ) -> Result<Vec<Reminder>> {
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Reminder>, bool)> {
         let mut conditions = Vec::new();
         if status.is_some() {
             conditions.push("status = $status".to_string());
@@ -125,7 +171,12 @@ impl<'a> ReminderRepo<'a> {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        let query = format!("SELECT * FROM reminder {where_clause} ORDER BY next_due_at ASC");
+        // `id` breaks ties: `next_due_at` is not unique (two reminders set for the
+        // same minute share it), and without a stable secondary key `LIMIT`/`START`
+        // can repeat or skip a row between pages.
+        let query = format!(
+            "SELECT * FROM reminder {where_clause} ORDER BY next_due_at ASC, id ASC LIMIT $limit START $offset"
+        );
 
         let mut q = self.db.query(&query);
         if let Some(s) = status {
@@ -134,10 +185,16 @@ impl<'a> ReminderRepo<'a> {
         if let Some(p) = target_project {
             q = q.bind(("target_project", p.to_string()));
         }
+        // Read one past the page: that row's existence is the `truncated` answer.
+        q = q.bind(("limit", limit + 1)).bind(("offset", offset.max(0)));
 
         let mut response = q.await?;
-        let reminders: Vec<Reminder> = response.take(0)?;
-        Ok(reminders)
+        let mut reminders: Vec<Reminder> = response.take(0)?;
+        let truncated = reminders.len() as i64 > limit;
+        if truncated {
+            reminders.pop();
+        }
+        Ok((reminders, truncated))
     }
 
     /// Claim a delivery — a conditional write, not an update.
@@ -493,15 +550,80 @@ mod tests {
             .unwrap();
         repo.create(&probe("b", Utc::now(), None)).await.unwrap();
 
-        assert_eq!(repo.list(Some("pending"), None).await.unwrap().len(), 2);
+        let (all, truncated) = repo.list(None, None, 100, 0).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(
+            !truncated,
+            "a page larger than the row count must not claim more"
+        );
         assert_eq!(
-            repo.list(Some("pending"), Some("alexandria"))
+            repo.list(Some("pending"), None, 100, 0)
                 .await
                 .unwrap()
+                .0
+                .len(),
+            2
+        );
+        assert_eq!(
+            repo.list(Some("pending"), Some("alexandria"), 100, 0)
+                .await
+                .unwrap()
+                .0
                 .len(),
             1
         );
-        assert_eq!(repo.list(Some("cancelled"), None).await.unwrap().len(), 0);
-        assert_eq!(repo.list(None, None).await.unwrap().len(), 2);
+        assert_eq!(
+            repo.list(Some("cancelled"), None, 100, 0)
+                .await
+                .unwrap()
+                .0
+                .len(),
+            0
+        );
+        // The page bound is enforced in SQL, and `truncated` is the signal that a
+        // second page exists — the caller cannot infer it from a full page.
+        let (first_page, truncated) = repo.list(None, None, 1, 0).await.unwrap();
+        assert_eq!(first_page.len(), 1);
+        assert!(truncated);
+        let (second_page, truncated) = repo.list(None, None, 1, 1).await.unwrap();
+        assert_eq!(second_page.len(), 1);
+        assert!(!truncated);
+        assert_ne!(
+            first_page[0].message, second_page[0].message,
+            "offset must skip, not repeat"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_with_limit_and_offset() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = ReminderRepo::new(db.inner());
+        let base = Utc::now();
+        for (i, minute) in [10, 20, 30].into_iter().enumerate() {
+            repo.create(&probe(
+                &format!("page {i}"),
+                base + Duration::minutes(minute),
+                None,
+            ))
+            .await
+            .unwrap();
+        }
+
+        let (first, truncated) = repo.list(None, None, 2, 0).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(truncated, "a third row exists beyond the page");
+        let (second, truncated) = repo.list(None, None, 2, 2).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(!truncated, "the last page must not claim more");
+        assert_ne!(
+            first[0].message, second[0].message,
+            "START must skip, not repeat"
+        );
+        assert_eq!(
+            repo.list(None, None, 100, 0).await.unwrap().0.len(),
+            3,
+            "a page wider than the set returns everything"
+        );
     }
 }

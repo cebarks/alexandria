@@ -93,3 +93,74 @@ async fn test_reminder_table_exists_after_migration() {
     assert_eq!(rows[0]["status"].as_str().unwrap(), "pending");
     assert_eq!(rows[0]["delivered_count"].as_i64().unwrap(), 0);
 }
+
+/// The failure mode this pins: `migrate()` applies a file statement-by-statement
+/// (each top-level statement commits in its own transaction) and stamps
+/// `system_config.schema_version` only once *all* pending migrations succeed. A
+/// crash or timeout part-way through the head migration therefore leaves
+/// definitions in place with an old stamp, and the next boot re-runs that file
+/// from the top. Plain `DEFINE`/`REMOVE` made that retry fatal —
+/// "The table 'reminder' already exists" — so the server refused to start until
+/// an operator manually removed the partial definitions, contradicting
+/// `migrate()`'s "Safe to call on every startup". Every definition statement is
+/// `OVERWRITE` (and removals `IF EXISTS`) so a retry finishes instead of jamming.
+#[tokio::test]
+async fn test_migrations_retry_after_a_lost_version_stamp() {
+    let db = Database::connect_embedded().await.unwrap();
+    schema::migrate(db.inner()).await.unwrap();
+
+    // Rewind the stamp while every definition from v001..v007 is still present:
+    // exactly what the next boot sees after a mid-migration failure.
+    db.inner()
+        .query("UPDATE system_config SET value = '5' WHERE key = 'schema_version'")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    schema::migrate(db.inner()).await.unwrap();
+
+    let mut result = db
+        .inner()
+        .query("SELECT * FROM system_config WHERE key = 'schema_version'")
+        .await
+        .unwrap();
+    let rows: Vec<serde_json::Value> = result.take(0).unwrap();
+    assert_eq!(
+        rows[0]["value"].as_str().unwrap(),
+        schema::LATEST_VERSION.to_string(),
+        "the retry must re-stamp the head, not just stop erroring"
+    );
+
+    // And the schema still behaves: the head migration's defaults survived the
+    // second application of its own statements.
+    let mut result = db
+        .inner()
+        .query("SELECT * FROM reminder LIMIT 1")
+        .await
+        .unwrap();
+    assert!(
+        result
+            .take::<Vec<serde_json::Value>>(0)
+            .is_ok_and(|v| v.is_empty()),
+        "reminder must remain selectable after the retry"
+    );
+}
+
+/// The stricter form of the same contract: re-applying the *earliest* migration
+/// over a fully built schema must not error either, so a stamp lost at any
+/// version self-heals rather than bricking at v001.
+#[tokio::test]
+async fn test_replaying_a_completed_migration_is_not_an_error() {
+    let db = Database::connect_embedded().await.unwrap();
+    schema::migrate(db.inner()).await.unwrap();
+
+    for (version, name, sql) in schema::MIGRATIONS {
+        let response = db.inner().query(*sql).await.unwrap_or_else(|e| {
+            panic!("re-running v{version:03} ({name}) failed at query time: {e}")
+        });
+        response
+            .check()
+            .unwrap_or_else(|e| panic!("re-running v{version:03} ({name}) reported an error: {e}"));
+    }
+}

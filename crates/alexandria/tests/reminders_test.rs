@@ -61,9 +61,10 @@ async fn setup_with_escalation(tz: chrono_tz::Tz, escalation_hours: u64) -> Alex
 /// delivery, and `list_due` can never pick up one written with NULL next_due_at.
 async fn assert_no_rows(server: &AlexandriaServer) {
     let rows = ReminderRepo::new(server.db.inner())
-        .list(None, None)
+        .list(None, None, 100, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(
         rows.is_empty(),
         "rejected schedule still wrote {} row(s): {:?}",
@@ -912,6 +913,8 @@ fn list_filter(status: Option<&str>, target_project: Option<&str>) -> ListRemind
     ListRemindersParams {
         status: status.map(str::to_string),
         target_project: target_project.map(str::to_string),
+        limit: None,
+        offset: None,
     }
 }
 
