@@ -220,6 +220,17 @@ async fn set_reminder_rows_round_trip_through_spec_from_reminder() {
             Some(15),
         ),
         ("cron", cron_params("round trip cron", "0 9 * * *"), None),
+        // A padded 5-field expression is the shape that used to break the
+        // writer/reader equality: `normalize_cron` prepended seconds without
+        // collapsing the padding, so the row stored a 6-field string *with a
+        // trailing space* that the reader then trimmed — one row, two different
+        // `schedule` renderings, and `cron '...'` is exactly the string an agent is
+        // told to confirm against.
+        (
+            "cron",
+            cron_params("round trip padded cron", "  0 9 * * 1-5  "),
+            None,
+        ),
     ];
 
     for (expected_kind, params, expected_dom) in cases {
