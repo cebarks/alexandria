@@ -51,11 +51,13 @@ import {
 } from "./mcp-client.js";
 import { retrieveMemories, formatMemoriesBlock } from "./recall.js";
 import { getProjectHint, checkReminders, formatDueBlock } from "./reminders.js";
+import { buildInjection, type FeatureOutcome } from "./injection.js";
 import { SessionDedupBuffer } from "./detectors/types.js";
 import { detectCorrection } from "./detectors/correction.js";
 import { detectPreference } from "./detectors/preference.js";
 import { trackToolStore } from "./detectors/tool-tracker.js";
 import { ErrorTracker } from "./detectors/error-tracker.js";
+import { PROMPT_BUDGET_MS } from "./mcp-client.js";
 import { runExtraction } from "./extraction.js";
 
 /** Short, readable form of a rejection for a user-facing warning. */
@@ -95,24 +97,60 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 	if (!CONFIG.recallDisabled || !CONFIG.remindersDisabled) {
 		pi.on("before_agent_start", async (event, ctx) => {
 			const query = event.prompt?.trim();
+			// Resolved before any await, and every use guarded: `ctx.ui` is a lazy
+			// getter that throws once the runner is invalidated (a session switch or
+			// reload during the up-to-12 s this handler waits), and an uncaught throw
+			// here would reject the handler — dropping both injections *after*
+			// check_reminders had already consumed its rows.
+			const ui = ctx.ui;
+			const notify = (message: string, level: "info" | "warning") => {
+				try {
+					ui.notify(message, level);
+				} catch {
+					/* the human half is best-effort; the agent half already succeeded */
+				}
+			};
 
-			const recallTask: Promise<string | null> =
+			// One deadline for the whole prompt path, not one per attempt. Each call
+			// is already bounded (5 s) but they stack — git probe, handshake, call, and
+			// a reconnect retry — and pi waits for this handler before the turn starts,
+			// so the number a user actually experiences is the sum. Aborting also stops
+			// spending a socket on a prompt that is no longer wanted.
+			const budget = new AbortController();
+			const timer = setTimeout(
+				() => budget.abort(new Error(`Alexandria prompt budget (${PROMPT_BUDGET_MS} ms) exceeded`)),
+				PROMPT_BUDGET_MS,
+			);
+			ctx.signal?.addEventListener("abort", () => budget.abort(ctx.signal?.reason), {
+				once: true,
+			});
+
+			// Settled, not awaited: one feature failing must never suppress the
+			// other's injection or its notification.
+			const recallTask: Promise<FeatureOutcome> =
 				!CONFIG.recallDisabled && query
 					? (async () => {
-							const memories = await retrieveMemories(query);
-							return memories.length > 0 ? formatMemoriesBlock(memories) : null;
+							const { items, error } = await retrieveMemories(
+								query,
+								undefined,
+								budget.signal,
+							);
+							return {
+								block: items.length > 0 ? formatMemoriesBlock(items) : null,
+								error,
+							};
 						})()
-					: Promise.resolve(null);
+					: Promise.resolve({ block: null });
 
-			const remindersTask: Promise<{
-				block: string | null;
-				count: number;
-				error?: string;
-			}> = CONFIG.remindersDisabled
+			const remindersTask: Promise<FeatureOutcome> = CONFIG.remindersDisabled
 				? Promise.resolve({ block: null, count: 0 })
 				: (async () => {
-						const project = await getProjectHint();
-						const { items, error } = await checkReminders(project);
+						const project = await getProjectHint(ctx.cwd);
+						const { items, error } = await checkReminders(
+							project,
+							undefined,
+							budget.signal,
+						);
 						return {
 							block: items.length > 0 ? formatDueBlock(items) : null,
 							count: items.length,
@@ -120,70 +158,29 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 						};
 					})();
 
-			// Per-feature failure isolation: one failing never suppresses the other
 			const [recallRes, remindersRes] = await Promise.allSettled([
 				recallTask,
 				remindersTask,
 			]);
+			clearTimeout(timer);
 
-			const blocks: string[] = [];
-			if (recallRes.status === "fulfilled" && recallRes.value) {
-				blocks.push(recallRes.value);
-			}
-			if (remindersRes.status === "fulfilled" && remindersRes.value.block) {
-				blocks.push(remindersRes.value.block);
-				// The injected block is the agent-visible half; this is the
-				// human-visible one, so a delivery is not silently eaten.
-				ctx.ui.notify(
-					`⏰ ${remindersRes.value.count} Alexandria reminder(s) due`,
-					"info",
-				);
-			}
-
-			// A rejection means this call did not reach a usable server response
-			// (unreachable, timed out, or bad config) — callToolWithRetry already
-			// handled the stale-session reconnect. Both features share one client,
-			// so either rejection drops it; a cached rejection would otherwise be
-			// replayed on every later prompt, and delivery would never resume.
-			let failure: string | null = null;
-			if (recallRes.status === "rejected") {
-				// A shared cause (one client, one outage) is said once; distinct causes
-				// are both reported, or the single diagnostic names the wrong subsystem.
-				const rc = reasonText(recallRes.reason);
-				failure =
-					remindersRes.status === "rejected"
-						? remindersRes.reason !== undefined &&
-							rc === reasonText(remindersRes.reason)
-							? `Alexandria unreachable (${rc}); continuing without recall or reminders.`
-							: `Alexandria recall failed (${rc}) and the reminder check failed (${reasonText(remindersRes.reason)}); continuing without either.`
-						: `Alexandria auto-recall failed (${rc}); continuing without it.`;
-			} else if (remindersRes.status === "rejected") {
-				failure = `Alexandria reminders check failed (${reasonText(remindersRes.reason)}); continuing without it.`;
-			}
-			if (failure !== null) {
+			// Per-feature failure isolation, the merged message, and the wording
+			// for each failure mode all live in `buildInjection` — extracted so the
+			// cross-product of settled outcomes is testable without a server, which
+			// is the claim this dispatcher exists to make.
+			const injection = buildInjection(recallRes, remindersRes);
+			if (injection.resetClient) {
+				// A rejection means this call did not reach a usable server response
+				// (unreachable, timed out, or bad config) — `callToolWithRetry` already
+				// handled the stale-session reconnect. Both features share one client,
+				// so either rejection drops it; a cached rejection would otherwise be
+				// replayed on every later prompt, and delivery would never resume.
 				resetClient();
-				ctx.ui.notify(failure, "warning");
 			}
-
-			// A server-reported failure or an unparseable payload is not a transport
-			// failure: the reply came back, it just carried nothing usable. Warn once
-			// so a permanently broken delivery path is visible, but keep the client —
-			// and retry next prompt, since an error response consumes no rows.
-			if (remindersRes.status === "fulfilled" && remindersRes.value.error) {
-				ctx.ui.notify(
-					`Alexandria reminders check failed (${remindersRes.value.error}); nothing was consumed, retrying next prompt.`,
-					"warning",
-				);
-			}
-
-			if (blocks.length === 0) return;
-			return {
-				message: {
-					customType: "alexandria",
-					content: blocks.join("\n\n"),
-					display: true,
-				},
-			};
+			for (const n of injection.notifications) notify(n.text, n.level);
+			// Returned last on purpose: nothing a notification does can now discard an
+			// injection the server has already consumed.
+			return injection.message ? { message: injection.message } : undefined;
 		});
 	}
 

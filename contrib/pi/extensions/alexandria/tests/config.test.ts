@@ -207,3 +207,75 @@ test("an unparseable client.toml falls back to defaults instead of throwing", as
 	assert.equal(config.recallLimit, 5);
 	assert.equal(config.remindersProject, undefined);
 });
+
+test("a set-but-blank toggle does not re-enable what client.toml disabled", async () => {
+	// `ALEXANDRIA_REMINDERS=` in a direnv or .env is not a user saying "off", and
+	// gating the file branch on `process.env.X === undefined` let a blank value win
+	// the precedence race by being *present* — silently putting the consuming
+	// per-prompt check_reminders call back on with no signal.
+	for (const [key, field] of [
+		["ALEXANDRIA_AUTO_RECALL", "recallDisabled"],
+		["ALEXANDRIA_AUTO_STORE", "storeDisabled"],
+		["ALEXANDRIA_REMINDERS", "remindersDisabled"],
+	] as const) {
+		for (const blank of ["", "   "]) {
+			const config = await configWith({
+				ALEXANDRIA_CLIENT_CONFIG: fullToml,
+				[key]: blank,
+			});
+			assert.equal(
+				config[field as "recallDisabled" | "storeDisabled" | "remindersDisabled"],
+				true,
+				`${key}=${JSON.stringify(blank)} overrode the file's enabled=false`,
+			);
+		}
+	}
+});
+
+test("an explicit env value still overrides the file in both directions", async () => {
+	// The blank cases above must not have quietly broken the real contract.
+	const off = await configWith({
+		ALEXANDRIA_CLIENT_CONFIG: absentToml,
+		ALEXANDRIA_REMINDERS: "off",
+	});
+	assert.equal(off.remindersDisabled, true);
+	const padded = await configWith({
+		ALEXANDRIA_CLIENT_CONFIG: fullToml,
+		ALEXANDRIA_REMINDERS: "  off  ",
+	});
+	assert.equal(padded.remindersDisabled, true, "a padded ' off ' means off");
+});
+
+test("a blank or unparseable numeric override falls back instead of becoming 0 or NaN", async () => {
+	// `Number("")` is 0 and `Number("ten")` is NaN: a blank limit silenced recall
+	// entirely, and `similarity >= NaN` is false for every row, so recall looked
+	// like an empty database rather than a broken config.
+	for (const key of [
+		"ALEXANDRIA_AUTO_RECALL_LIMIT",
+		"ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY",
+		"ALEXANDRIA_EXTRACT_TIMEOUT_MS",
+	]) {
+		for (const junk of ["", "  ", "ten", "1e999"]) {
+			const config = await configWith({
+				ALEXANDRIA_CLIENT_CONFIG: absentToml,
+				[key]: junk,
+			});
+			const value =
+				key === "ALEXANDRIA_AUTO_RECALL_LIMIT"
+					? config.recallLimit
+					: key === "ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY"
+						? config.recallMinSimilarity
+						: config.extractTimeoutMs;
+			assert.ok(Number.isFinite(value), `${key}=${JSON.stringify(junk)} -> ${value}`);
+			assert.ok(value > 0, `${key}=${JSON.stringify(junk)} -> ${value}`);
+		}
+	}
+	// A real number still wins over the file, and the file still wins over defaults.
+	const numeric = await configWith({
+		ALEXANDRIA_CLIENT_CONFIG: fullToml,
+		ALEXANDRIA_AUTO_RECALL_LIMIT: "3",
+	});
+	assert.equal(numeric.recallLimit, 3);
+	const fromFile = await configWith({ ALEXANDRIA_CLIENT_CONFIG: fullToml });
+	assert.equal(fromFile.recallLimit, 7);
+});

@@ -32,6 +32,17 @@ const HANDSHAKE_TIMEOUT_MS = 5000;
  */
 export const PROMPT_CALL_TIMEOUT_MS = 5000;
 
+/**
+ * Ceiling on the whole per-prompt path, as one abort deadline.
+ *
+ * The per-call budget above is exactly that — per call — and the prompt path
+ * stacks several: a git probe (2 s), a handshake (5 s) and a call (5 s), with one
+ * reconnect retry on top. Pi waits for `before_agent_start` before the turn
+ * starts, so the wait a user actually experiences is the sum, not the 5 s a single
+ * constant suggests. This is the number to quote in the docs.
+ */
+export const PROMPT_BUDGET_MS = 10_000;
+
 async function connect(): Promise<Client> {
 	let url: URL;
 	try {
@@ -64,8 +75,24 @@ export async function getClient(): Promise<Client> {
 	return clientPromise;
 }
 
+/**
+ * Drop the cached client so the next call reconnects.
+ *
+ * The client being dropped is also closed: nulling the promise alone leaks a live
+ * client and its Streamable HTTP session on every timeout, and the prompt path
+ * resets once per failed prompt — so a server that hangs for an afternoon would
+ * accumulate one orphaned session per prompt.
+ */
 export function resetClient(): void {
+	const dropped = clientPromise;
 	clientPromise = null;
+	if (dropped) {
+		void dropped
+			.then((client) => client.close())
+			.catch(() => {
+				/* best-effort: the connection is already being abandoned */
+			});
+	}
 }
 
 export async function closeClient(): Promise<void> {
@@ -80,6 +107,16 @@ export async function closeClient(): Promise<void> {
 	}
 }
 
+/** The transport the prompt-path modules speak through, as a type so they can take
+ *  it as a parameter: reaching `callToolWithRetry` from a test means module mocking,
+ *  which hangs under tsx — and the payload contract is exactly what needs covering. */
+export type CallTool = (
+	name: string,
+	args: Record<string, unknown>,
+	timeoutMs?: number,
+	signal?: AbortSignal,
+) => Promise<{ content?: unknown; isError?: boolean }>;
+
 /** Check if an error is a stale Streamable HTTP session (server restart, expiry, etc.) */
 function isStaleSessionError(err: unknown): boolean {
 	if (!(err instanceof Error)) return false;
@@ -93,14 +130,20 @@ function isStaleSessionError(err: unknown): boolean {
  * establishes a fresh connection, and retries exactly once.
  *
  * `timeoutMs` bounds the wait for this call; see {@linkcode PROMPT_CALL_TIMEOUT_MS}
- * for why the prompt path passes one.
+ * for why the prompt path passes one. `signal` cancels the in-flight request: a
+ * prompt the user has abandoned (or that has hit the dispatcher's overall budget)
+ * should stop spending a socket rather than run to its own timeout.
  */
 export async function callToolWithRetry(
 	name: string,
 	args: Record<string, unknown>,
 	timeoutMs?: number,
+	signal?: AbortSignal,
 ): Promise<Awaited<ReturnType<Client["callTool"]>>> {
-	const options = timeoutMs === undefined ? {} : { timeout: timeoutMs };
+	const options = {
+		...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
+		...(signal === undefined ? {} : { signal }),
+	};
 	try {
 		const client = await getClient();
 		return await client.callTool({ name, arguments: args }, options);

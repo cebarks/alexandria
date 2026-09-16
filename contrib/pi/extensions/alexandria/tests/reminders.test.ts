@@ -75,8 +75,8 @@ test("the block is a header plus one bullet per reminder, in input order", () =>
 	assert.match(rendered[0], HEADER);
 	assert.match(rendered[0], /act on it or tell the user/);
 	assert.deepEqual(rendered.slice(1), [
-		"- renew the TLS cert [target project:infra] [OVERDUE — escalated from project targeting] (missed 2 earlier occurrence(s)) (due 2026-09-12T09:00:00Z)",
-		"- post the standup note (every Friday at 09:00) (⟲ recurring — next fire 2026-09-18T14:00:00Z) note: #standup channel [set in infra, session 01JABC]",
+		"- renew the TLS cert [id reminder:1] [target project:infra] [OVERDUE — escalated from project targeting] (missed 2 earlier occurrence(s)) (due 2026-09-12T09:00:00Z UTC)",
+		"- post the standup note [id reminder:2] (every Friday at 09:00) (⟲ recurring — next fire 2026-09-18T14:00:00Z UTC) note: #standup channel [set in infra, session 01JABC]",
 	]);
 });
 
@@ -89,7 +89,7 @@ test("a reminder with nothing else set renders only its text", () => {
 	// "undefined" into the context the model is asked to read.
 	assert.equal(
 		bullet({ id: "reminder:3", message: "ping the on-call" }),
-		"- ping the on-call",
+		"- ping the on-call [id reminder:3]",
 	);
 });
 
@@ -100,14 +100,14 @@ test("project targets are named, global targets are not", () => {
 			message: "rotate keys",
 			target: "project:infra",
 		}),
-		"- rotate keys [target project:infra]",
+		"- rotate keys [id reminder:4] [target project:infra]",
 	);
 	// "global" was the sender's routing decision, not information for the agent:
 	// printing it would invite the model to reason about a project that none of
 	// these rows are aimed at.
 	assert.equal(
 		bullet({ id: "reminder:5", message: "file taxes", target: "global" }),
-		"- file taxes",
+		"- file taxes [id reminder:5]",
 	);
 });
 
@@ -145,7 +145,7 @@ test("a recurring row says either its next fire or that this one is final", () =
 			recurring: true,
 			next_due_at: "2026-09-19T09:00:00Z",
 		}),
-		"- standup (⟲ recurring — next fire 2026-09-19T09:00:00Z)",
+		"- standup [id reminder:10] (⟲ recurring — next fire 2026-09-19T09:00:00Z UTC)",
 	);
 	// A null next_due_at means the schedule is finished (a one-shot, or no fire
 	// left), and the agent must not promise the user another one.
@@ -156,11 +156,11 @@ test("a recurring row says either its next fire or that this one is final", () =
 			recurring: true,
 			next_due_at: null,
 		}),
-		"- standup (⟲ recurring — final fire, nothing scheduled after this)",
+		"- standup [id reminder:11] (⟲ recurring — final fire, nothing scheduled after this)",
 	);
 	assert.equal(
 		bullet({ id: "reminder:12", message: "standup", recurring: true }),
-		"- standup (⟲ recurring — final fire, nothing scheduled after this)",
+		"- standup [id reminder:12] (⟲ recurring — final fire, nothing scheduled after this)",
 		"an absent next_due_at reads as final, not as a blank timestamp",
 	);
 	assert.doesNotMatch(
@@ -182,23 +182,23 @@ test("due instant and human-readable schedule both render, instant first", () =>
 			due_at: "2026-09-12T09:00:00Z",
 			schedule: "every weekday at 17:30",
 		}),
-		"- deploy (due 2026-09-12T09:00:00Z) (every weekday at 17:30)",
+		"- deploy [id reminder:14] (due 2026-09-12T09:00:00Z UTC) (every weekday at 17:30)",
 	);
 });
 
 test("an empty, blank or absent message renders a placeholder", () => {
 	assert.equal(
 		bullet({ id: "reminder:15", message: "" }),
-		"- (reminder with no text)",
+		"- (reminder with no text) [id reminder:15]",
 	);
 	assert.equal(
 		bullet({ id: "reminder:16", message: " \n  " }),
-		"- (reminder with no text)",
+		"- (reminder with no text) [id reminder:16]",
 	);
 	// Rows arrive out of JSON, so a missing key is a real possibility.
 	assert.equal(
 		bullet({ id: "reminder:17" } as unknown as DueReminder),
-		"- (reminder with no text)",
+		"- (reminder with no text) [id reminder:17]",
 	);
 });
 
@@ -209,15 +209,15 @@ test("provenance says where the reminder was set", () => {
 			message: "a",
 			provenance: { project: "api", session_id: "s1" },
 		}),
-		"- a [set in api, session s1]",
+		"- a [id reminder:18] [set in api, session s1]",
 	);
 	assert.equal(
 		bullet({ id: "reminder:19", message: "a", provenance: { project: "api" } }),
-		"- a [set in api]",
+		"- a [id reminder:19] [set in api]",
 	);
 	assert.equal(
 		bullet({ id: "reminder:20", message: "a", provenance: { session_id: "s1" } }),
-		"- a [set in unknown project, session s1]",
+		"- a [id reminder:20] [set in unknown project, session s1]",
 	);
 	// Nothing known about the origin is nothing to say.
 	assert.doesNotMatch(
@@ -241,7 +241,7 @@ test("newlines anywhere in a reminder collapse into its single line", () => {
 			note: "first\nsecond",
 			provenance: { project: "origin\nrepo", session_id: "abc\ndef" },
 		}),
-		"- renew the cert [target project:two lines] (due 2026-09-12T09:00:00Z) (every Friday) (⟲ recurring — next fire 2026-09-13T09:00:00Z) note: first second [set in origin repo, session abc def]",
+		"- renew the cert [id reminder:22] [target project:two lines] (due 2026-09-12T09:00:00Z UTC) (every Friday) (⟲ recurring — next fire 2026-09-13T09:00:00Z UTC) note: first second [set in origin repo, session abc def]",
 	);
 });
 
@@ -281,25 +281,47 @@ test("getProjectHint fails open to no hint outside a git repository", async (t) 
 	assert.equal(await inDir(nonRepoDir, () => getProjectHint()), undefined);
 });
 
-test("a settled probe is reused until __resetProjectHint() forces another", async (t) => {
+test("a settled probe is cached per directory, not per process", async (t) => {
 	if (repoRoot === undefined || (await gitToplevel(nonRepoDir))) {
 		t.skip("needs git, and a temp directory outside any repository");
 		return;
 	}
 	__resetProjectHint();
-	// First the deterministic miss, which is cached; then a cwd that *is* inside a
-	// repository, which must still report the cached answer; then the test hook,
-	// which must make the extension measure again.
-	assert.equal(await inDir(nonRepoDir, () => getProjectHint()), undefined);
+	// The miss is cached — for *that* directory. With one process-wide slot it used
+	// to answer for every later directory, so a single prompt started outside a repo
+	// pinned the session to no hint for the life of the process, and one process can
+	// serve several projects across /resume.
+	assert.equal(await getProjectHint(nonRepoDir), undefined);
 	assert.equal(
-		await inDir(join(repoRoot, "contrib"), () => getProjectHint()),
-		undefined,
-		"the settled outcome survives the cwd change — one git call per session",
+		await getProjectHint(join(repoRoot, "contrib")),
+		basename(repoRoot),
+		"a directory inside a repository must still find its own hint",
 	);
+	// Repeats are served from the cache: that is what saves the git call.
+	assert.equal(await getProjectHint(nonRepoDir), undefined);
 	__resetProjectHint();
 	assert.equal(
-		await inDir(join(repoRoot, "contrib"), () => getProjectHint()),
+		await getProjectHint(join(repoRoot, "contrib")),
 		basename(repoRoot),
 		"after a reset the probe runs again",
+	);
+});
+
+test("the session directory decides the hint, not the process cwd", async (t) => {
+	if (repoRoot === undefined) {
+		t.skip("git is unavailable, so the probe cannot be exercised");
+		return;
+	}
+	__resetProjectHint();
+	// A resumed session can live in a different project than the one pi was launched
+	// from, and the server matches the target byte-exactly. Answering from
+	// process.cwd() delivers the launching project's reminders to this session and
+	// holds this session's own project reminders until they arrive escalated.
+	const inRepo = join(repoRoot, "contrib");
+	assert.equal(await getProjectHint(inRepo), basename(repoRoot));
+	assert.equal(
+		await inDir(extensionRoot, () => getProjectHint(inRepo)),
+		basename(repoRoot),
+		"an explicit session directory wins over the process cwd",
 	);
 });
