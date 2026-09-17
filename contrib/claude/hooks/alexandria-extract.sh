@@ -62,7 +62,7 @@ stored=$("$MCP" get_session "$(jq -cn --arg s "$session" '{session_id:$s}')" 2>/
   | jq -r '.memories[]?.content | "- " + .')
 [ -n "$stored" ] || stored="(nothing stored yet this session)"
 
-# Prompt text is verbatim from contrib/pi/extensions/alexandria-auto-recall/src/extraction.ts.
+# Prompt text is verbatim from contrib/pi/extensions/alexandria/src/extraction.ts.
 prompt="You are a memory extraction system. Given a conversation between a user and an AI coding assistant, extract durable facts worth remembering across sessions.
 
 Extract:

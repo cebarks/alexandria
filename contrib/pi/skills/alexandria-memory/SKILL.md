@@ -1,12 +1,13 @@
 ---
 name: alexandria-memory
-description: Use the Alexandria agent-memory MCP tools (alexandria_store_memory, alexandria_retrieve_memories, alexandria_recall, alexandria_update_memory, alexandria_import_document, alexandria_delete_memory, alexandria_get_session, alexandria_finalize_session) to persist and recall durable facts, decisions, and preferences across sessions. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
+description: Use the Alexandria agent-memory MCP tools (alexandria_store_memory, alexandria_retrieve_memories, alexandria_recall, alexandria_update_memory, alexandria_import_document, alexandria_delete_memory, alexandria_get_session, alexandria_finalize_session) and its reminder tools (alexandria_set_reminder, alexandria_check_reminders, alexandria_list_reminders, alexandria_cancel_reminder) to persist and recall durable facts, decisions, and preferences across sessions, and to schedule and manage future follow-ups. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before") or asks for a future nudge ("remind me", "don't let me forget", "check this tomorrow"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
 ---
 
 # Alexandria Memory
 
 Alexandria is a persistent, cross-session agent memory server (semantic search + heat-based
-recency + graph clustering) reachable via MCP tools when the `alexandria` server is connected.
+recency + graph clustering + scheduled reminders) reachable via MCP tools when the `alexandria`
+server is connected.
 Its whole value only materializes if it's actually used — an agent that never calls it behaves
 exactly like one with no memory at all. Default to using it; don't wait for an explicit
 "remember this" / "check your memory" instruction.
@@ -16,7 +17,8 @@ exactly like one with no memory at all. Default to using it; don't wait for an e
 - Starting a task in a project/domain you've plausibly touched before (early in the session,
   before diving into research you might have already done).
 - The user references past context: "last time", "we decided", "like before", "you said",
-  "remind me".
+  "remind me what we decided".
+- The user asks for a future nudge ("remind me at 3", "don't let me forget to X") — see Reminders.
 - Before re-deriving an architectural decision, re-debugging something, or re-asking a
   preference question the user may have already answered in a prior session.
 - Before proposing an approach that has tradeoffs — check whether a prior decision/rationale
@@ -76,6 +78,74 @@ not closure — an unfinalized session still has `ended_at` set, and `summary: n
 that it was never closed. Sessions are not searchable by content and there is no way to enumerate
 them: `get_session` only works for an id you already know, so record the id you chose somewhere
 durable if you expect to revisit it. See `docs/session-memory.md` in the Alexandria repo for details.
+
+## Reminders
+
+Alexandria also schedules standalone messages ("remind me to X") that are delivered — to the agent
+context and the user together — on the first interaction after they come due. There is no background
+timer and no mid-session wake-up: a reminder waits for the next interaction, in every transport.
+
+When to set (do this unprompted, like writes):
+
+- The user explicitly asks to be reminded ("remind me at 3", "don't let me forget to renew the cert").
+- A time-bound follow-up this conversation can't finish ("check the deploy at 3pm", "ask me tomorrow
+  whether the migration landed").
+- Resolve relative phrasing ("in 20 minutes", "tomorrow morning") to an explicit datetime against the
+  current time before calling — the server never sees your conversation.
+
+Tool choice:
+
+- **`alexandria_set_reminder`** — schedule a one-shot or recurring message; exactly one of the three
+  kinds below. Write `message` so it still makes sense in a session with none of today's context.
+- **`alexandria_list_reminders`** — what is scheduled and when it fires; filter by `status`
+  (`pending` default, `delivered`, `cancelled`, `all`) and `target_project`. This is where you find an
+  id to cancel.
+- **`alexandria_cancel_reminder`** — soft-cancel by id when the user says it's no longer needed, or
+  after a delivery for a recurring reminder the user now wants stopped.
+
+Schedule kinds — give exactly one:
+
+- one-shot: `due_at: "2026-09-12T09:00:00"` — ISO-8601; an explicit UTC offset is honored, a naive
+  time is read in the server's reminders timezone.
+- pattern: `pattern: {freq: "weekly", time: "09:00", weekdays: ["fri"]}` — daily/weekly/monthly at a
+  wall-clock `HH:MM`; weekly needs `weekdays`, monthly needs `day_of_month` 1-31 (short months skip
+  the 31st rather than sliding to the 1st).
+- cron: `cron: "0 0 1,15 * *"` — the escape hatch for what patterns can't express (this one:
+  midnight on the 1st and 15th). Prefer patterns; use cron only when patterns fall short. Three
+  dialect caveats, all silent when you get them wrong: 5, 6 or 7 fields are accepted (a 5-field
+  expression gets seconds prepended; `@daily` is rejected, write it out); numeric days of week are
+  **1=Sunday through 7=Saturday** — not the usual 0-6 — so `1-5` means Sunday to Thursday and `0` is
+  rejected outright, so always write days as names (`MON-FRI`, `SAT`); and day-of-month and
+  day-of-week are **ANDed**, not ORed as in Vixie cron, when both are restricted — `0 9 13 * FRI` is
+  Friday-the-13th-only, so "the 13th *or* every Friday" is two reminders.
+
+Recurring times are wall clock in that timezone, so across a DST transition a daily 09:00 stays 09:00
+local: a time the spring-forward gap removed does not fire that day, and a time a fall-back fold
+repeats fires **once**, on its first pass. One wall-clock reading is one occurrence.
+
+Schedules are parsed and validated at set time — a bad cron or impossible time errors back at you, it
+is never stored to fail later, and a response may carry a `warning` naming a schedule that is valid but
+not what you meant (a restricted day-of-month with a restricted day-of-week, a `due_at` already past). The response echoes the parsed `schedule`, `next_fire_preview`, and the
+`timezone` it was evaluated in: **confirm those against what the user asked for before you end the
+turn** — a mis-parsed "every Friday" is cheapest to fix while they're still there. Optional `note` and
+provenance fields ride along at delivery for context.
+
+Targeting: reminders are **global** by default (delivered in any context). Use `target_project` for
+repo-bound follow-ups; delivery matches the project name exactly and case-sensitively. A targeted
+reminder in a project that stops being visited is not lost — once it is at least the server's
+escalation window overdue (`[reminders].escalation_hours`) it delivers everywhere, flagged
+`escalated: true`.
+
+Delivery happens only when something calls **`alexandria_check_reminders`** — some client
+integrations do it automatically at the start of each turn; if yours doesn't (check what your client
+actually does), you are that something. That call is the *only* thing that consumes reminders
+(recurring ones advance; missed fires coalesce rather than trickle). So don't call it reflexively;
+call it when the user asks "anything due?", or when a reminder they expected hasn't shown up, passing
+the current project so project-targeted reminders match. The `due_reminders` array on
+`alexandria_retrieve_memories` / `alexandria_recall` responses is a read-only safety net (a small
+oldest-due sample) that is *untargeted*: entries appear there with their `target` whatever project
+they belong to, so another project's entry is informational — it reaches the user through the next
+`alexandria_check_reminders` instead.
 
 ## Guidelines
 

@@ -25,7 +25,7 @@ Facts this plan relies on (verified 2026-09-08):
   (tested). It will fire hooks itself, so every hook needs a recursion guard.
 - `get_session` returns every memory stored with a given `session_id`; it is the
   "already stored this session" list for extraction dedup.
-- The Pi extension (`contrib/pi/extensions/alexandria-auto-recall`) is the reference
+- The Pi extension (`contrib/pi/extensions/alexandria`, formerly `alexandria-auto-recall`) is the reference
   for detector regexes and the extraction prompt. Pi code is not modified.
 
 ---
@@ -178,7 +178,7 @@ Do not start until Track A is in use, so a real corpus exists to measure against
 
 Throwaway example in `alexandria-pipeline` like this morning's, extended to
 `BAAI/bge-small-en-v1.5` and `intfloat/e5-small-v2`. Both are BERT-family and 384-dim,
-so `CandleProvider` should load them; e5 requires `query: ` / `passage: ` prefixes,
+so `CandleProvider` should load them; e5 requires `query:` / `passage:` prefixes,
 which means the provider needs an asymmetric embed API to test it at all. Output: the
 same match/noise table for all three models on the synthetic pairs plus whatever real
 memories exist by then. Deliverable is a recommendation, not code.

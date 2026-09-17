@@ -17,9 +17,21 @@ fmt-fix:
 lint:
     RUSTFLAGS="-Dwarnings" cargo clippy --all-targets --all-features
 
-# Run all tests
+# Run all Rust tests
 test:
     cargo test --all-features
+
+# Type-check and test the pi companion (node:test over tsx, hermetic)
+ext-test:
+    cd contrib/pi/extensions/alexandria && npm run typecheck && npm test
+
+# Install the pi companion's dev dependencies (`node_modules/` is gitignored, so a
+# fresh checkout has nothing to type-check or test against until this runs)
+ext-install:
+    cd contrib/pi/extensions/alexandria && npm ci
+
+# All tests, Rust and client-side
+test-all: test ext-test
 
 # Fast type-check
 check:
@@ -62,7 +74,7 @@ verify-assets:
     done
 
 # Full CI suite locally — run before pushing
-ci: fmt lint test deny verify-assets
+ci: fmt lint test ext-test deny verify-assets
 
 # Install git hooks (pre-commit: fmt + clippy)
 install-hooks:

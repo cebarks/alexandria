@@ -7,7 +7,7 @@ Alexandria loads server config with this precedence:
    - `ALEXANDRIA_CONFIG` env var (explicit path override)
    - `$XDG_CONFIG_HOME/alexandria/config.toml` (default: `~/.config/alexandria/config.toml` on Linux, `~/Library/Application Support/alexandria/config.toml` on macOS)
    - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
-3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`
+3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
 
 ## Full Example
 
@@ -43,6 +43,10 @@ maintenance_interval_secs = 300    # Cluster maintenance check interval in secon
 
 [retrieve]
 min_similarity = 0.10              # Server-side hard floor on cosine similarity for retrieve_memories (default: 0.10)
+
+[reminders]
+timezone = "Europe/Stockholm"      # IANA name for naive datetimes + pattern/cron evaluation; "" = system-local (default: "")
+escalation_hours = 48              # Project-targeted reminders escalate to global delivery after being overdue this many hours; 0 = escalate as soon as overdue (default: 48)
 ```
 
 ## Section Details
@@ -121,6 +125,15 @@ bands above are the same numbers the debug Query Tester renders; both come from 
 `configuration_md_quotes_every_score_band` fails the build if this page stops quoting them, so
 re-measure by editing the const and this table together.
 
+### `[reminders]`
+
+Controls how reminder schedules are interpreted and how project-targeted reminders are guaranteed to arrive. These keys affect the reminder tools only.
+
+| Key | Type | Default | Description |
+| ----- | ------ | --------- | ------------- |
+| `timezone` | string | `""` (system-local) | IANA timezone name (e.g. `"Europe/Stockholm"`) used to interpret naive datetimes passed to `set_reminder` and to evaluate recurring `pattern`/`cron` schedules (wall-clock semantics — a daily 09:00 stays 09:00 local across DST). Empty = the system-local timezone detected at startup, falling back to UTC if detection fails; an invalid IANA name is a startup error. Explicit ISO-8601 offsets in `due_at` are always honored regardless. Across a transition: a wall time removed by the spring-forward gap has no fire that day, and a time duplicated by a fall-back fold fires **once**, on the first pass — one wall-clock reading is one occurrence. Naive one-shot inputs that land in either zone are rejected at set time with a message naming the fix. |
+| `escalation_hours` | u64 | `48` | How long a project-targeted reminder may stay overdue before `check_reminders` delivers it regardless of the caller's project (labeled `escalated: true`), so a project that stops being visited can never silently swallow its reminders. The boundary is inclusive: a reminder escalates once it is *at least* this many hours overdue, which is what makes `0` escalate every overdue project reminder. An unparseable value in the env override is a startup error, and so is a value too large to represent as a duration — the delivery path would otherwise hold project reminders forever, on every check. One default, `alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS`, shared with the MCP server's fallback. |
+
 ## Environment Variable Overrides
 
 These env vars override individual config values after the TOML file is loaded:
@@ -134,6 +147,8 @@ These env vars override individual config values after the TOML file is loaded:
 | `ALEXANDRIA_DATA_DIR` | `database.data_dir` |
 | `ALEXANDRIA_EMBEDDING_MODEL` | `embedding.model` |
 | `ALEXANDRIA_EMBEDDING_DEVICE` | `embedding.device` |
+| `ALEXANDRIA_REMINDERS_TIMEZONE` | `reminders.timezone` |
+| `ALEXANDRIA_REMINDERS_ESCALATION_HOURS` | `reminders.escalation_hours` — a non-numeric value fails startup with an error naming the variable |
 
 The `ALEXANDRIA_SERVER_*` variables exist so a container can be configured entirely by environment
 (the bundled [Containerfile](../Containerfile) uses them to default to HTTP on `0.0.0.0:3000`) without
@@ -146,9 +161,9 @@ can only be set via the TOML file.
 
 ## Client Configuration
 
-The Pi auto-recall/auto-store extension loads its own config from `$XDG_CONFIG_HOME/alexandria/client.toml`.
-It is a separate file with separate keys — the server never reads it and the extension never reads
-`config.toml`.
+The Pi companion extension (recall / store / reminders) loads its own config from
+`$XDG_CONFIG_HOME/alexandria/client.toml`. It is a separate file with separate keys — the server
+never reads it and the extension never reads `config.toml`.
 
 Precedence: defaults → `client.toml` → `ALEXANDRIA_CLIENT_CONFIG` env var (path to alt TOML) → individual `ALEXANDRIA_*` env vars.
 
@@ -167,6 +182,10 @@ min_similarity = 0.58
 enabled = true
 extract_model = "vertex/claude-haiku-4-5"
 extract_timeout_ms = 5000
+
+[reminders]
+enabled = true
+project = "alexandria"
 ```
 
 ### `[server]`
@@ -190,6 +209,17 @@ extract_timeout_ms = 5000
 | `enabled` | bool | `true` | `ALEXANDRIA_AUTO_STORE=off` | Enable heuristic store detectors and LLM extraction. |
 | `extract_model` | string | `"vertex/claude-haiku-4-5"` | `ALEXANDRIA_EXTRACT_MODEL` | Model for session-end LLM extraction. Falls back to session model if unavailable. |
 | `extract_timeout_ms` | number | `5000` | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | Timeout for the extraction LLM call in milliseconds. |
+
+### `[reminders]`
+
+Client-side delivery keys. The server-side `[reminders]` section above configures how
+schedules are interpreted; this section only says whether the extension asks for due reminders, and
+what project hint it sends with the question.
+
+| Key | Type | Default | Env Override | Description |
+| ----- | ------ | --------- | ------------- | ------------- |
+| `enabled` | bool | `true` | `ALEXANDRIA_REMINDERS=off` | Call `check_reminders` on every prompt and inject whatever is due. The server runs no timer, so turning this off means reminders reach the user only if the agent calls `check_reminders` itself. |
+| `project` | string | (git repo dir name) | `ALEXANDRIA_REMINDERS_PROJECT` | Project hint sent with each check, matched exactly (case-sensitive) against the `target_project` set by `set_reminder`. Defaults to the basename of `git rev-parse --show-toplevel`; set it when the checkout directory is not the project name, as with a git worktree. Unset and outside a repo, only global and escalated reminders are delivered. |
 
 ---
 

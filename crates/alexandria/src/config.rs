@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
+use alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS;
 use alexandria_engine::search::DEFAULT_MIN_SIMILARITY;
 use serde::Deserialize;
 
@@ -21,6 +22,7 @@ pub struct Config {
     pub activation: ActivationConfig,
     pub cluster: ClusterConfig,
     pub retrieve: RetrieveConfig,
+    pub reminders: RemindersConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +113,19 @@ pub struct ClusterConfig {
     pub maintenance_interval_secs: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RemindersConfig {
+    /// IANA timezone for naive datetime input and pattern/cron evaluation.
+    /// Empty string = system-local (resolved via iana-time-zone at startup).
+    /// Default: empty (system-local).
+    pub timezone: String,
+    /// Project-targeted reminders escalate to global delivery after being
+    /// overdue this many hours. 0 = escalate as soon as overdue.
+    /// Default: 48 (2 days).
+    pub escalation_hours: u64,
+}
+
 // --- Defaults ---
 
 fn default_data_dir() -> PathBuf {
@@ -175,6 +190,15 @@ impl Default for ClusterConfig {
             merge_threshold: 0.9,
             cohesion_floor: DEFAULT_COHESION_FLOOR,
             maintenance_interval_secs: 300,
+        }
+    }
+}
+
+impl Default for RemindersConfig {
+    fn default() -> Self {
+        Self {
+            timezone: String::new(),
+            escalation_hours: DEFAULT_ESCALATION_HOURS,
         }
     }
 }
@@ -260,6 +284,14 @@ impl Config {
         if let Some(device) = env("ALEXANDRIA_EMBEDDING_DEVICE") {
             config.embedding.device = device;
         }
+        if let Some(tz) = env("ALEXANDRIA_REMINDERS_TIMEZONE") {
+            config.reminders.timezone = tz;
+        }
+        if let Some(h) = env("ALEXANDRIA_REMINDERS_ESCALATION_HOURS") {
+            config.reminders.escalation_hours = h.parse().map_err(|e| {
+                anyhow::anyhow!("invalid ALEXANDRIA_REMINDERS_ESCALATION_HOURS `{h}`: {e}")
+            })?;
+        }
 
         Ok(config)
     }
@@ -310,6 +342,14 @@ mod tests {
         assert_eq!(
             ClusterConfig::default().cohesion_floor,
             alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR
+        );
+        // Same drift guard for reminders: the binary's config default and the MCP
+        // server's fallback default are in different crates, and if only one is
+        // changed a test-built or debug server escalates on a different clock than
+        // production — with nothing failing.
+        assert_eq!(
+            RemindersConfig::default().escalation_hours,
+            alexandria_mcp::server::DEFAULT_REMINDER_ESCALATION_HOURS
         );
     }
 
@@ -464,6 +504,51 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("ALEXANDRIA_SERVER_PORT")
+        );
+    }
+
+    #[test]
+    fn test_reminders_defaults() {
+        let config = Config::default();
+        assert_eq!(config.reminders.timezone, ""); // empty = system-local, resolved at startup
+        assert_eq!(config.reminders.escalation_hours, 48);
+    }
+
+    #[test]
+    fn test_reminders_from_toml() {
+        let toml = r#"
+            [reminders]
+            timezone = "Europe/Stockholm"
+            escalation_hours = 24
+        "#;
+        let config = Config::from_toml(toml).unwrap();
+        assert_eq!(config.reminders.timezone, "Europe/Stockholm");
+        assert_eq!(config.reminders.escalation_hours, 24);
+    }
+
+    #[test]
+    fn test_reminders_env_overrides() {
+        let env = env(&[
+            ("ALEXANDRIA_REMINDERS_TIMEZONE", "America/New_York"),
+            ("ALEXANDRIA_REMINDERS_ESCALATION_HOURS", "12"),
+        ]);
+
+        let config = Config::load_from(&env).unwrap();
+        assert_eq!(config.reminders.timezone, "America/New_York");
+        assert_eq!(config.reminders.escalation_hours, 12);
+    }
+
+    #[test]
+    fn test_reminders_env_invalid_hours() {
+        let env = env(&[("ALEXANDRIA_REMINDERS_ESCALATION_HOURS", "soon")]);
+        let result = Config::load_from(&env);
+        // Name the variable that failed, not just "load errored": an unqualified
+        // `is_err()` here would also pass on an unrelated config-file failure.
+        let err = result.expect_err("a non-numeric escalation window must not load");
+        assert!(
+            err.to_string()
+                .contains("ALEXANDRIA_REMINDERS_ESCALATION_HOURS"),
+            "the error must name the offending variable: {err:#}"
         );
     }
 }

@@ -12,6 +12,7 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 - **Progressive recall** — Two-phase retrieval: broad cluster matching first, then scope-narrowing within a cluster
 - **Session memory** — Group memories by conversation, search within a session, and close it out with a summary
 - **Document import** — Chunk by heading, paragraph, or fixed size with batch tracking and `extracted_from` lineage
+- **Reminders** — One-shot and recurring follow-ups delivered on the next interaction, with project targeting and overdue escalation
 - **Persistent storage** — SurrealKV on disk, survives restarts
 - **Debug web UI** — Browser for memories, clusters, sessions, graph neighborhoods, cluster maintenance history, and a live query tester. Read-only apart from one disclosed heat write (see [Debug Web UI](#debug-web-ui))
 - **Schema migrations** — Versioned `.surql` files with forward-only migration runner
@@ -52,6 +53,10 @@ First run downloads the embedding model from HuggingFace Hub (~80MB).
 | `delete_memory` | Soft-delete a memory by ID |
 | `get_session` | Return a session's metadata plus every memory stored during it |
 | `finalize_session` | Close a session with a summary, tags, and `ended_at` |
+| `set_reminder` | Schedule a one-shot (`due_at`) or recurring (named pattern / cron) reminder; response previews the next fire times |
+| `check_reminders` | Deliver due reminders and mark them consumed (global, project-matching, or escalated) |
+| `list_reminders` | List scheduled reminders by status and target project, oldest-due first, paginated |
+| `cancel_reminder` | Soft-cancel a reminder by ID |
 
 Tool and parameter descriptions are written directively ("call this proactively when…") because
 that measurably changes how often client LLMs reach for them unprompted.
@@ -63,27 +68,50 @@ is created on first use. `retrieve_memories` with `session_id` restricts ranking
 memories, `get_session` reads the whole session back, and `finalize_session` records its summary.
 See [docs/session-memory.md](docs/session-memory.md) for the data model and current limitations.
 
+### Reminders
+
+Reminders are scheduled messages — "remind me", "check the deploy at 3pm" — delivered into the
+agent's context on the next interaction after they come due. There is no background timer: due-ness is
+evaluated at query time, so delivery is lazy, transport-agnostic, and survives server downtime. The
+cost of that design is that nothing reaches anyone until a client asks: the pi companion calls
+`check_reminders` once per prompt and additionally notifies the human, and that client-side step is
+where "and the user" actually lives — a client that never calls the tool receives nothing.
+`set_reminder` validates schedules at set time and echoes the parsed next fire times for confirmation;
+`check_reminders` delivers and consumes them, one-way. Reminders target the global
+context or a specific project, and a project-targeted reminder that is overdue by at least
+`[reminders].escalation_hours` escalates to global delivery — nothing is silently lost. Overdue
+items are also surfaced read-only, capped and oldest-due first, in the `due_reminders` array of
+`retrieve_memories` and `recall` responses.
+
+Recurring schedules are evaluated as wall clock in `[reminders].timezone`, so a daily 09:00 stays 09:00
+local across a DST change: a time the spring-forward gap removed does not fire that day, and a time a
+fall-back fold repeats fires once, on its first pass. The cron escape hatch carries two dialect
+surprises — numeric days of week are 1=Sunday (write day names), and a restricted day-of-month ANDs
+with a restricted day-of-week instead of ORing as Vixie cron does — so `set_reminder` puts a `warning`
+in the response when it recognizes the second one.
+
 ### Getting agents to actually use memory
 
 A memory server is only useful if agents reach for it unprompted. Alexandria nudges this at
 three levels:
 
-1. **MCP `instructions`** — the server advertises usage guidance (when to read vs. write memory)
-   in its `initialize` response via `ServerInfo.instructions`. Any MCP-compliant client can surface
-   this to the model. Tool descriptions are also written directively ("call this proactively
-   whenever...") rather than just describing mechanics.
+1. **MCP `instructions`** — the server advertises usage guidance (when to read vs. write memory
+   and how reminders get delivered) in its `initialize` response via `ServerInfo.instructions`.
+   Any MCP-compliant client can surface this to the model. Tool descriptions are also written
+   directively ("call this proactively whenever...") rather than just describing mechanics.
 2. **Client-side skill** — [`contrib/pi/skills/alexandria-memory/`](contrib/pi/skills/alexandria-memory/)
    (Pi) and [`contrib/claude/skills/alexandria-memory/`](contrib/claude/skills/alexandria-memory/)
    (Claude Code) document concrete trigger conditions and tool choice guidance, mirroring how other high-usage
    MCP tools ship skills alongside themselves.
-3. **Optional pi extension** — [`contrib/pi/extensions/alexandria-auto-recall/`](contrib/pi/extensions/alexandria-auto-recall/)
+3. **Optional companion extension** — [`contrib/pi/extensions/alexandria/`](contrib/pi/extensions/alexandria/)
    runs in both directions. On `before_agent_start` it calls `retrieve_memories` for every prompt and
-   injects hits above a similarity threshold, so the agent never has to decide to check memory. On the
+   injects hits above a similarity threshold, and calls `check_reminders` to deliver whatever is due,
+   so the agent never has to decide to check memory or wait for a timer the server doesn't run. On the
    write side it adds heuristic detectors (corrections, stated preferences, error→resolution pairs)
    that store without being asked, plus an LLM extraction pass at `session_shutdown` for durable facts
    both the agent and the heuristics missed. This trades latency and potential noise for guaranteed
-   recall and much denser capture. The Claude Code equivalent is the set of `UserPromptSubmit`,
-   `PreToolUse`, and `Stop` hooks at
+   recall and much denser capture; recall, store, and reminders each toggle independently. The Claude
+   Code equivalent is the set of `UserPromptSubmit`, `PreToolUse`, and `Stop` hooks at
    [`contrib/claude/hooks/`](contrib/claude/hooks/).
 
 Items 2 and 3 are client-side integrations, not part of the MCP server itself — see
@@ -275,7 +303,9 @@ Config loads with precedence: defaults → `$XDG_CONFIG_HOME/alexandria/config.t
 
 Legacy `~/.alexandria/` paths are used as fallback if the XDG paths don't exist yet.
 
-The Pi auto-recall/auto-store extension has its own config at `$XDG_CONFIG_HOME/alexandria/client.toml`.
+Reminder delivery is configured by the `[reminders]` section: `timezone` (IANA name, empty = system-local) governs naive datetime input and pattern/cron evaluation, and `escalation_hours` controls overdue escalation to global delivery.
+
+The Pi companion extension (recall / store / reminders) has its own config at `$XDG_CONFIG_HOME/alexandria/client.toml`.
 
 See [docs/configuration.md](docs/configuration.md) for all options, client config reference, and migration instructions.
 

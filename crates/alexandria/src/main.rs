@@ -9,6 +9,17 @@ use alexandria_storage::{Database, schema, system_config};
 use config::Config;
 use rmcp::ServiceExt;
 
+/// Hours that still fit in the duration `do_check_reminders` builds (`i64::MAX`
+/// seconds). Past it the window is unrepresentable, and the delivery path holds
+/// project reminders instead of escalating them.
+const MAX_REPRESENTABLE_ESCALATION_HOURS: u64 = (i64::MAX / 3600) as u64;
+
+/// Below the representable bound, still so far out that "escalates after this" is
+/// indistinguishable from "never": the `set_reminder` promise that a project
+/// reminder is never silently lost stops being meaningful. Warned rather than
+/// rejected — someone may genuinely want a decade-long hold.
+const MAX_PRACTICAL_ESCALATION_HOURS: u64 = 24 * 365 * 10;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -66,6 +77,37 @@ async fn main() -> anyhow::Result<()> {
         propagation_factor: config.activation.propagation_factor,
         max_hops: config.activation.max_hops,
     };
+
+    // Resolve reminders timezone: config value, else system-local, else UTC
+    let tz_name = if config.reminders.timezone.is_empty() {
+        iana_time_zone::get_timezone().unwrap_or_else(|e| {
+            tracing::warn!("Could not detect system timezone ({e}); using UTC for reminders");
+            "UTC".to_string()
+        })
+    } else {
+        config.reminders.timezone.clone()
+    };
+    let tz: chrono_tz::Tz = tz_name.parse().map_err(|e| {
+        anyhow::anyhow!("invalid [reminders].timezone `{tz_name}` (expected IANA name like 'Europe/Stockholm'): {e}")
+    })?;
+    // `do_check_reminders` turns this window into a duration, and beyond
+    // `i64::MAX` seconds it cannot: the delivery path then *holds* project
+    // reminders forever, on every check, with only a warning line to show for it.
+    // Refuse to start instead — the same posture as `[reminders].timezone` and the
+    // embedding-model lock, which both fail fast rather than degrading quietly.
+    let escalation_hours = config.reminders.escalation_hours;
+    if escalation_hours > MAX_REPRESENTABLE_ESCALATION_HOURS {
+        anyhow::bail!(
+            "[reminders].escalation_hours = {escalation_hours} exceeds the largest representable              duration ({MAX_REPRESENTABLE_ESCALATION_HOURS}h); project reminders could never escalate"
+        );
+    }
+    if escalation_hours > MAX_PRACTICAL_ESCALATION_HOURS {
+        tracing::warn!(
+            "[reminders].escalation_hours = {escalation_hours} is over              {MAX_PRACTICAL_ESCALATION_HOURS}h (~10 years): project reminders will effectively              never escalate — is that intended?"
+        );
+    }
+    tracing::info!("Reminders timezone: {tz}, escalation: {escalation_hours}h");
+
     let server = AlexandriaServer::new(
         Arc::new(db),
         Arc::new(embedding),
@@ -75,7 +117,11 @@ async fn main() -> anyhow::Result<()> {
     .with_activation_config(activation_config)
     .with_activation_top_n(config.activation.top_n)
     .with_retrieve_min_similarity(config.retrieve.min_similarity)
-    .with_cohesion_floor(config.cluster.cohesion_floor);
+    .with_cohesion_floor(config.cluster.cohesion_floor)
+    .with_reminders_config(alexandria_mcp::server::RemindersSettings {
+        tz,
+        escalation_hours: config.reminders.escalation_hours,
+    });
 
     // 5. Serve based on transport config
     match config.server.transport.as_str() {

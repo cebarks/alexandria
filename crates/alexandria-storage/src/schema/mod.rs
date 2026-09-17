@@ -4,7 +4,13 @@ use surrealdb::engine::any::Any;
 use surrealdb::types::SurrealValue;
 
 /// All migrations in version order. Each is (version, name, SQL).
-const MIGRATIONS: &[(u32, &str, &str)] = &[
+///
+/// `pub` for the retry-safety test, which re-applies every file over a finished
+/// schema: a migration that is not re-runnable is a startup failure waiting for
+/// the crash that leaves `system_config.schema_version` behind. Adding a
+/// migration means its statements must use `DEFINE <kind> OVERWRITE` /
+/// `REMOVE <kind> IF EXISTS` for that test to stay green.
+pub const MIGRATIONS: &[(u32, &str, &str)] = &[
     (1, "initial", include_str!("v001_initial.surql")),
     (2, "memory_edge", include_str!("v002_memory_edge.surql")),
     (3, "system_config", include_str!("v003_system_config.surql")),
@@ -19,6 +25,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "drop_session_memory_count",
         include_str!("v006_drop_session_memory_count.surql"),
     ),
+    (7, "reminder", include_str!("v007_reminder.surql")),
 ];
 
 /// Version a fully migrated database reports in `system_config.schema_version`.

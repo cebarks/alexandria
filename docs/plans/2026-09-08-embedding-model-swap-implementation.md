@@ -27,11 +27,13 @@
 ### Task 1: Pooling mode from the model repo
 
 **Files:**
+
 - Modify: `crates/alexandria-pipeline/src/embedding/candle.rs`
 - Test (unit, in the same file): pooling-config parse
 - Test (slow, downloads model): `crates/alexandria-pipeline/tests/embedding_test.rs`
 
 **Interfaces:**
+
 - Consumes: nothing new.
 - Produces: `CandleProvider` loads any BERT sentence-transformers model that uses CLS or mean pooling. Internal `fn cls_pooling_from_json(s: &str) -> bool` (private, unit-tested). `CandleProvider` gains a private field `cls_pooling: bool`.
 
@@ -186,11 +188,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 2: Measurement bench (throwaway) and model decision
 
 **Files:**
+
 - Create: `crates/alexandria-pipeline/examples/model_bench.rs` (deleted in Task 7)
 - Create: `/tmp/alexandria-bench/questions.json` (not committed)
 - Create: `docs/plans/2026-09-08-embedding-model-swap-measurements.md` (committed; Task 6 reads it)
 
 **Interfaces:**
+
 - Consumes: Task 1 (`CandleProvider` handles bge). `MemoryRepo::list(search, tag, include_deleted, limit, offset) -> Vec<Fact>`, `alexandria_engine::search::cosine_similarity(&[f32], &[f32]) -> f32`, `alexandria_storage::record_id_to_string`.
 - Produces: the measurements file with a fixed table (format below) naming the chosen model and the four threshold values, plus the recommended client-side auto-recall threshold.
 
@@ -376,6 +380,7 @@ cargo run -p alexandria-pipeline --release --example model_bench -- /tmp/alexand
 (That only prints the fact count; to see contents open `http://127.0.0.1:3000/debug/memories?limit=200` in a browser or `curl -s 'http://127.0.0.1:3000/debug/memories?limit=200' | sed 's/<[^>]*>/ /g' | grep -v '^\s*$'`.)
 
 Write `/tmp/alexandria-bench/questions.json` with 10 to 12 entries. Rules for a useful set:
+
 - Phrase each as a question a coding agent would actually ask at task start ("which database does this project use", "how are hooks installed", "what did we decide about X").
 - Cover different topics across the corpus (not ten questions about one memory).
 - At least four questions must share little or no vocabulary with the target memory's wording (these are the cases MiniLM fails on).
@@ -404,6 +409,7 @@ Expected: four `===` sections (or a `SKIPPED` line for a model whose repo lacks 
 Decision rule (from the spec): lowest `mean_rank` wins; tie broken by largest `mean_gap`. If no candidate beats MiniLM on both, the chosen model is `sentence-transformers/all-MiniLM-L6-v2` and Task 6 only edits docs.
 
 Threshold rules:
+
 - `join_threshold`, `merge_threshold`, `cohesion_floor`: the "same percentile here" value printed for the chosen model, rounded to two decimals.
 - `retrieve.min_similarity`: if `hit_min` > `nonhit_p99`, round `hit_min` down to two decimals and subtract 0.02; otherwise the midpoint of `hit_min` and `nonhit_p99`, rounded to two decimals.
 - Client auto-recall threshold (hooks' `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY`): `nonhit_p90` rounded up to two decimals, but not above `hit_min`; if `hit_min` is lower, use the midpoint of `hit_min` and `nonhit_p90`.
@@ -456,9 +462,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 3: Storage: list every fact for re-embedding
 
 **Files:**
+
 - Modify: `crates/alexandria-storage/src/repos/memory_repo.rs`
 
 **Interfaces:**
+
 - Consumes: nothing new.
 - Produces: `MemoryRepo::all_ids_and_content(&self) -> Result<Vec<(String, String)>>` returning `(fact id as "fact:xxx", content)` for every fact including soft-deleted ones, ordered by `created_at`. Embedding writes reuse the existing `MemoryRepo::update_fact(id, None, None, None, Some(&emb))`; no new setter (the spec's `set_embedding` is already covered by `update_fact`).
 
@@ -547,11 +555,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 4: `alexandria_mcp::migrate::reembed`
 
 **Files:**
+
 - Create: `crates/alexandria-mcp/src/migrate.rs`
 - Modify: `crates/alexandria-mcp/src/lib.rs`
 - Create: `crates/alexandria-mcp/tests/reembed_test.rs`
 
 **Interfaces:**
+
 - Consumes: Task 3 `MemoryRepo::all_ids_and_content`, `MemoryRepo::update_fact`; existing `ClusterRepo::list_with_counts() -> Vec<(Cluster, usize)>`, `ClusterRepo::get_members(id) -> Vec<Fact>`, `ClusterRepo::update_centroid(id, &[f32])`; `alexandria_storage::system_config::{get_config, set_config}`; `EmbeddingProvider`.
 - Produces:
 
@@ -788,10 +798,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 5: `alexandria migrate-embeddings` subcommand and error text
 
 **Files:**
+
 - Modify: `crates/alexandria/src/main.rs` (top of `main`, plus a new fn)
 - Modify: `crates/alexandria-storage/src/system_config.rs` (mismatch message)
 
 **Interfaces:**
+
 - Consumes: Task 4 `alexandria_mcp::migrate::{reembed, ReembedOutcome}`.
 - Produces: `alexandria migrate-embeddings` exits 0 with a message on skip or completion, non-zero on error. Any other argument is an error.
 
@@ -894,12 +906,14 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 6: New defaults, thresholds, and docs
 
 **Files:**
+
 - Modify: `crates/alexandria/src/config.rs` (`EmbeddingConfig`, `RetrieveConfig`, `ClusterConfig` defaults; `min_similarity` doc comment; `test_defaults`)
 - Modify: `docs/configuration.md`, `docs/roadmap.md`, `README.md`
 - Modify: `contrib/claude/hooks/alexandria-recall.sh`, `contrib/claude/README.md`
 - Modify: `TODO-misc.md`
 
 **Interfaces:**
+
 - Consumes: the `## Chosen` table in `docs/plans/2026-09-08-embedding-model-swap-measurements.md`. Every value below written as `<chosen ...>` is copied from that table verbatim.
 - Produces: shipped defaults match the chosen model.
 
@@ -984,10 +998,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 7: Migrate the live database, remove the bench
 
 **Files:**
+
 - Delete: `crates/alexandria-pipeline/examples/model_bench.rs`
 - Modify (outside repo): `~/.config/alexandria/config.toml`
 
 **Interfaces:**
+
 - Consumes: Task 5 subcommand, Task 6 chosen model.
 - Produces: the live install runs on the chosen model.
 
