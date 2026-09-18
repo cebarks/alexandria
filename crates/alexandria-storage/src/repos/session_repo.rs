@@ -95,8 +95,15 @@ impl<'a> SessionRepo<'a> {
         agent_id: Option<&str>,
         model: Option<&str>,
     ) -> Result<String> {
-        let Some(session) = self.find_by_external_id(external_id).await? else {
-            return self.create(external_id, agent_id, model).await;
+        // TODO(debt): non-atomic select-then-create-then-fill — see cebarks/alexandria#24.
+        let session = match self.find_by_external_id(external_id).await? {
+            Some(session) => session,
+            None => match self.create(external_id, agent_id, model).await {
+                Ok(id) => return Ok(id),
+                // A concurrent first store won the unique index on external_id; its row
+                // is there now. Anything else is a real error and the re-find misses too.
+                Err(e) => self.find_by_external_id(external_id).await?.ok_or(e)?,
+            },
         };
         let id = session
             .id
@@ -110,8 +117,8 @@ impl<'a> SessionRepo<'a> {
                 .db
                 .query(
                     "UPDATE `session` SET \
-                     agent_id = $agent_id ?? agent_id, \
-                     model = $model ?? model \
+                     agent_id = agent_id ?? $agent_id, \
+                     model = model ?? $model \
                      WHERE external_id = $external_id",
                 )
                 .bind(("external_id", external_id.to_string()));
@@ -457,6 +464,30 @@ mod tests {
             .unwrap();
         let rows: Vec<Session> = response.take(0).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_or_create_concurrent_first_store_yields_one_session() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = SessionRepo::new(db.inner());
+
+        // Both calls miss the SELECT; the loser of the CREATE hits the unique index on
+        // external_id and must fall back to the winner's row instead of erroring.
+        let (a, b) = tokio::join!(
+            repo.find_or_create("sess-race", Some("pi"), None),
+            repo.find_or_create("sess-race", None, Some("sonnet")),
+        );
+        assert_eq!(a.unwrap(), b.unwrap());
+
+        assert_eq!(repo.list(10, 0).await.unwrap().len(), 1);
+        let session = repo
+            .find_by_external_id("sess-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.agent_id.as_deref(), Some("pi"));
+        assert_eq!(session.model.as_deref(), Some("sonnet"));
     }
 
     #[tokio::test]
