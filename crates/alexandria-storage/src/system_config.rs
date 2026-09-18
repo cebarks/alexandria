@@ -55,7 +55,8 @@ pub async fn check_embedding_model(
             let facts = MemoryRepo::new(db).count(None, None, true).await?;
             if facts > 0 {
                 tracing::warn!(
-                    "{facts} fact(s) exist but no embedding lock; assuming they were embedded                      with {model}. If not, run `alexandria migrate-embeddings` after fixing config."
+                    "{facts} fact(s) exist but no embedding lock; assuming they were embedded \
+                     with {model}. If not, run `alexandria migrate-embeddings` after fixing config."
                 );
             }
             set_config(db, "embedding_model", model).await?;
