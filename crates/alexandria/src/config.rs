@@ -68,8 +68,10 @@ pub struct DatabaseConfig {
 pub struct EmbeddingConfig {
     pub model: String,
     pub device: String,
-    /// Facts per `embed()` call during `alexandria migrate-embeddings`. Bounds peak
-    /// memory for large corpora; the server itself embeds one text at a time. Default 32.
+    /// Facts per `embed()` call during `alexandria migrate-embeddings`, which is also
+    /// how often it writes and logs progress. It does not bound memory: the Candle
+    /// provider runs one forward pass per text whatever the call size. 1..=4096,
+    /// default 32; the server itself embeds one text at a time.
     pub batch_size: usize,
 }
 
@@ -308,8 +310,8 @@ impl Config {
             })?;
         }
         anyhow::ensure!(
-            config.embedding.batch_size > 0,
-            "embedding.batch_size must be at least 1"
+            (1..=4096).contains(&config.embedding.batch_size),
+            "embedding.batch_size must be between 1 and 4096"
         );
 
         Ok(config)
@@ -521,6 +523,15 @@ mod tests {
     fn test_embedding_env_zero_batch_size() {
         let env = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "0")]);
         let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("batch_size"), "{err}");
+    }
+
+    #[test]
+    fn test_embedding_env_batch_size_upper_bound() {
+        let ok = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "4096")]);
+        assert_eq!(Config::load_from(&ok).unwrap().embedding.batch_size, 4096);
+        let over = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "4097")]);
+        let err = Config::load_from(&over).unwrap_err();
         assert!(err.to_string().contains("batch_size"), "{err}");
     }
 
