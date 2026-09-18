@@ -346,7 +346,7 @@ engine and storage together. See [AGENTS.md](AGENTS.md) for the full set.
 
 ```bash
 just          # list recipes
-just test     # cargo test --all-features — 223 tests
+just test     # cargo test --workspace --all-features
 just lint     # clippy, warnings as errors (matches CI)
 just fmt-fix  # rustfmt
 just ci       # fmt + lint + test + cargo-deny + verify-assets, the full pre-push check
