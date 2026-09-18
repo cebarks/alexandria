@@ -22,6 +22,7 @@ candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 tokenizers = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
