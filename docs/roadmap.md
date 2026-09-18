@@ -180,7 +180,7 @@ milestone:
   with live memory counts, filterable by `agent_id`, `tag`, `finalized`. `/debug/sessions` (v0.2.7)
   lists them in the browser. `recall` still walks clusters rather than sessions.
 - ~~**`session.agent_id` / `session.model` are dead columns.**~~ Done: optional `agent_id` / `model`
-  on `store_memory` and `import_document`, recorded on the session when first seen.
+  on `store_memory` and `import_document`, the first non-null value wins whenever it arrives.
 - **No tests for the pi extension.** The detector regexes and extraction prompt have no coverage, so
   a pattern edit is unguarded.
 - **Extension does not use sessions.** Auto-store writes are ungrouped.
