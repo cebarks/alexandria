@@ -18,7 +18,8 @@ pub enum ReembedOutcome {
     },
 }
 
-/// `batch_size` is facts per `embed()` call; it bounds peak memory for large corpora.
+/// `batch_size` is facts per `embed()` call and the progress-log granularity. It does not
+/// bound memory: the corpus is preloaded and Candle embeds one text per forward pass.
 /// Must be at least 1; `Config::load` rejects 0 before this is reached.
 pub async fn reembed(
     db: &Database,
