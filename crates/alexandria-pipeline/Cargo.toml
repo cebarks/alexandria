@@ -21,7 +21,7 @@ candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 tokenizers = { workspace = true }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "system-proxy"] }
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 
 [dev-dependencies]
