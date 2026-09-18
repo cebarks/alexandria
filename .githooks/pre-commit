@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if ! command -v just >/dev/null; then
+    echo "❌ 'just' is not installed; the pre-commit checks run through it. See https://just.systems"
+    exit 1
+fi
+
 echo "🔍 Running pre-commit checks..."
 
 # 1. Formatting check
