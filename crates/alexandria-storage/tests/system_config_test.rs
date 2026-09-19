@@ -72,28 +72,51 @@ async fn test_different_dimensions_fails() {
     assert!(err.contains("dimensions mismatch"));
 }
 
+/// Pre-lock corpus: facts exist, no lock. Boot stamps the lock so the migrate-embeddings
+/// recovery path ("start the server once") keeps working, but it stamps the limit those facts
+/// were embedded at, not the configured one. Stamping the configured 256 would make every later
+/// boot pass and make `migrate-embeddings` a no-op over a corpus that is really at 128.
 #[tokio::test]
-async fn test_facts_without_lock_still_stamps() {
+async fn test_facts_without_lock_stamps_the_pre_lock_limit() {
     use alexandria_storage::repos::MemoryRepo;
 
     let db = Database::connect_embedded().await.unwrap();
     schema::migrate(db.inner()).await.unwrap();
-
-    // Pre-lock corpus: facts exist, no lock. Boot must still stamp (warns) so the
-    // migrate-embeddings recovery path ("start the server once") keeps working.
     MemoryRepo::new(db.inner())
         .create_fact("pre-lock fact", 1.0, &[0.1_f32; 384], &[])
         .await
         .unwrap();
 
+    let err = system_config::check_embedding_model(db.inner(), "test-model", 384, 256)
+        .await
+        .expect_err("a 128-token corpus must not boot at 256")
+        .to_string();
+    assert!(err.contains("migrate-embeddings"), "{err}");
+
+    let get = async |key| system_config::get_config(db.inner(), key).await.unwrap();
+    assert_eq!(get("embedding_model").await.unwrap(), "test-model");
+    assert_eq!(get("embedding_max_tokens").await.unwrap(), "128");
+
+    // At the default limit the same corpus boots.
+    system_config::check_embedding_model(db.inner(), "test-model", 384, 128)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_lower_token_limit_points_at_config_not_at_the_migration() {
+    let db = Database::connect_embedded().await.unwrap();
+    schema::migrate(db.inner()).await.unwrap();
     system_config::check_embedding_model(db.inner(), "test-model", 384, 256)
         .await
         .unwrap();
 
-    let model = system_config::get_config(db.inner(), "embedding_model")
+    let err = system_config::check_embedding_model(db.inner(), "test-model", 384, 128)
         .await
-        .unwrap();
-    assert_eq!(model.unwrap(), "test-model");
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not lower"), "{err}");
+    assert!(err.contains("embedding.max_tokens = 256"), "{err}");
 }
 
 #[tokio::test]
