@@ -44,13 +44,9 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   detectable automatically. Treat rank as a lower bound on delivery, and read the results above
   the target before acting on a headroom WARN.
 - [-] **The recall defaults are literals in three places.** `contrib/claude/hooks/alexandria-recall.sh`
-  and `contrib/pi/extensions/alexandria-auto-recall/src/config.ts` are authoritative; `crates/alexandria/src/bench.rs`
+  and `contrib/pi/extensions/alexandria/src/config.ts` are authoritative; `crates/alexandria/src/bench.rs`
   restates them as `RECALL_LIMIT` / `RECALL_THRESHOLD` for the headroom check. Nothing ties them
   together. When changing one, grep the tree for the old value.
-- [-] **`config.ts` recall defaults differ from upstream and merge without a conflict.**
-  `contrib/pi/extensions/alexandria-auto-recall/src/config.ts` ships `0.45` / `10` against
-  upstream's `0.58` / `5`. A one-sided edit only conflicts if upstream touches the same lines, so a
-  sync can revert both silently. Grep the file for both values after every upstream sync.
 
 ## Build / toolchain
 

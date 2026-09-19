@@ -105,6 +105,12 @@ measured under this truncation. They may move once long facts embed on their ful
 
 **Severity:** Medium. Needs a decision. **Effort:** small either way.
 
+**Status (2026-09-19): open, no code change.** Recording an access on each `retrieve_memories`
+top-N result was written and withdrawn after review (#16): it is an unindexed read-modify-write on
+the response path with no transaction, so concurrent retrieves lose updates, and what it counts is
+the cosine ranker's own picks before any client threshold, not use. If a utility signal is wanted,
+collect it client-side on delivery. The wire-or-delete decision below stands as written.
+
 **Where.**
 
 - `projected_heat` and `on_access` (`crates/alexandria-engine/src/heat/decay.rs`) have no callers
@@ -138,6 +144,12 @@ Recommendation: delete unless the measured gain from wiring is real. Half-alive 
 ### A3. No near-duplicate check at store time
 
 **Severity:** Medium. **Effort:** small.
+
+**Status (2026-09-19): open, needs its own design.** Exact-content dedup in `store_memory` was
+written and withdrawn after review (#16): the early return dropped the caller's `tags` and session
+link, `update_memory` and `import_document` did not share the check, and check-then-create is not
+atomic. A design has to cover all three write paths and the response schema, and still has to
+measure a bar before proposing one.
 
 **Where.** The `store_memory` tool description promises "dedup happens via clustering". Clustering
 groups facts; it never rejects or merges one.
