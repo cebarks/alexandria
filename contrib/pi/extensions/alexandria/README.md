@@ -123,8 +123,8 @@ url = "http://127.0.0.1:3000/mcp"
 
 [recall]
 enabled = true
-limit = 5
-min_similarity = 0.58   # measured too high for all-MiniLM-L6-v2 — set 0.35
+limit = 10
+min_similarity = 0.45   # only valid at limit = 10; see docs/configuration.md [recall]
 
 [store]
 enabled = true
@@ -142,8 +142,8 @@ project = "alexandria"
 | --- | --- | --- |
 | `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | Alexandria server MCP endpoint |
 | `ALEXANDRIA_AUTO_RECALL` | (enabled) | Set to `off` to disable auto-recall |
-| `ALEXANDRIA_AUTO_RECALL_LIMIT` | `5` | Max memories to retrieve |
-| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.58` | Minimum cosine similarity, inclusive (model-dependent; sits above the server-side `[retrieve] min_similarity` floor). Measured too high for `all-MiniLM-L6-v2`: recommended `0.35`, see `[recall]` in [`docs/configuration.md`](../../../../docs/configuration.md) |
+| `ALEXANDRIA_AUTO_RECALL_LIMIT` | `10` | Max memories to retrieve. A recall lever, not just a cap; paired with `MIN_SIMILARITY` |
+| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.45` | Minimum cosine similarity, inclusive (model-dependent; sits above the server-side `[retrieve] min_similarity` floor). A judgement call for `all-MiniLM-L6-v2`, only valid at `LIMIT=10`: see `[recall]` in [`docs/configuration.md`](../../../../docs/configuration.md) |
 | `ALEXANDRIA_AUTO_STORE` | (enabled) | Set to `off` to disable all store behavior — detectors and extraction alike |
 | `ALEXANDRIA_EXTRACT_MODEL` | `vertex/claude-haiku-4-5` | Model for the LLM extraction pass |
 | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | `5000` | Extraction timeout in milliseconds |

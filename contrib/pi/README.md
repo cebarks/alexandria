@@ -88,9 +88,8 @@ The directory used to be `extensions/alexandria-auto-recall/`. If the old copy i
 Config file: `$XDG_CONFIG_HOME/alexandria/client.toml`, same precedence as the server
 (defaults → file → `ALEXANDRIA_CLIENT_CONFIG` → individual env vars). See
 [docs/configuration.md](../../docs/configuration.md) for the full reference. Every key is optional;
-the defaults work against a locally running server. Note: the extension default
-`min_similarity = 0.58` is measured too high for `all-MiniLM-L6-v2` — set `0.35`
-(see `[recall]` in docs/configuration.md).
+the defaults work against a locally running server. `limit` and `min_similarity` are a pair read
+off one grid for `all-MiniLM-L6-v2`; change them together (see `[recall]` in docs/configuration.md).
 
 ```toml
 [server]
@@ -98,8 +97,8 @@ url = "http://127.0.0.1:3000/mcp"
 
 [recall]
 enabled = true
-limit = 5
-min_similarity = 0.58
+limit = 10
+min_similarity = 0.45
 
 [store]
 enabled = true
