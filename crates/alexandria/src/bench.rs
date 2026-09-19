@@ -1,6 +1,6 @@
 //! `alexandria bench-retrieval`: measure how well the configured embedding model
-//! separates a correct answer from the rest of the corpus, and derive the
-//! `retrieve.min_similarity` floor from that model's own output rather than by hand.
+//! separates a correct answer from the rest of the corpus, and print the numbers the
+//! `retrieve.min_similarity` floor and the client recall defaults are judged against.
 //!
 //! SurrealKV is single-writer: run it with the server stopped, or against a copy of
 //! the data dir via `ALEXANDRIA_DATA_DIR`. It is not read-only: like server boot it checks
@@ -117,21 +117,21 @@ const QUESTIONS: [(&str, &str); 20] = [
 /// metric definitions to be comparable at all.
 const BASELINE_SIZE: usize = 143;
 
-/// Client-side auto-recall cutoffs to sweep. `0.45` is the measured default both clients
-/// ship; `0.35` was the default until the limit was measured and `0.58` before that, both
-/// kept in the sweep so the comparisons that retired them stay reproducible. The rest
-/// bracket the three.
+/// Client-side auto-recall cutoffs to sweep. `0.45` is the documented default, a judgement
+/// call read off this sweep; `0.35` was the default until the limit was swept and `0.58`
+/// before that, both kept in the sweep so the comparisons that retired them stay
+/// reproducible. The rest bracket the three.
 const THRESHOLDS: [f32; 6] = [0.30, 0.35, 0.40, 0.45, 0.50, 0.58];
 
 /// How many results the auto-recall hook asks the server for
 /// (`ALEXANDRIA_AUTO_RECALL_LIMIT`, default 10 — `contrib/claude/hooks/alexandria-recall.sh`).
 /// A target ranked below this never reaches the client, whatever the threshold. Was 5 until
-/// 2026-09-09, when the grid below measured it; the threshold tables recorded in
+/// 2026-09-09, when the grid below swept it; the threshold tables recorded in
 /// `docs/minilm-test-data.md` before that date are the `limit = 5` row and will not reproduce
 /// from the single-limit table any more — compare them against the grid's `5` row instead.
 const RECALL_LIMIT: usize = 10;
 
-/// The client-side threshold shipped alongside `RECALL_LIMIT` (`ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY`,
+/// The client-side threshold documented alongside `RECALL_LIMIT` (`ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY`,
 /// default 0.45). A target scoring below it is dropped whatever its rank, so the limit can only
 /// ever hide a target that scores at or above this — the headroom check counts those alone.
 const RECALL_THRESHOLD: f32 = 0.45;
