@@ -36,13 +36,15 @@ LIMIT="${ALEXANDRIA_AUTO_RECALL_LIMIT:-10}"
 # drops to 7 hits for 0.5 noise. Widening the limit is what moved 0.45 onto the frontier, so do
 # not lower LIMIT without revisiting this. See docs/minilm-test-data.md "Result limit".
 MIN_SIM="${ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY:-0.45}"
-CURL=(curl -sS --max-time 5 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
+# 5 s per request inside one 8 s budget for the whole hook: this hook blocks the user's prompt, and a wedged
+# (not refused) server would otherwise cost a full timeout on each of up to six requests.
+hcurl() { local left=$((8 - SECONDS)); curl -sS --max-time "$((left > 5 ? 5 : left < 1 ? 1 : left))" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' "$@"; }
 
 # post JSON-RPC body; prints the SSE data payload.
-post() { "${CURL[@]}" -H "Mcp-Session-Id: $SID" -d "$1" "$URL" | sed -n 's/^data: *//p'; }
+post() { hcurl -H "Mcp-Session-Id: $SID" -d "$1" "$URL" | sed -n 's/^data: *//p'; }
 
 mcp_open() { # prints the session id, or an error message with non-zero status
-  SID=$("${CURL[@]}" -o /dev/null -w '%header{mcp-session-id}' -d \
+  SID=$(hcurl -o /dev/null -w '%header{mcp-session-id}' -d \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"alexandria-recall-hook","version":"1.0"}}}' \
     "$URL" 2>/dev/null) || { echo "cannot reach $URL"; return 1; }
   [ -n "$SID" ] || { echo "no Mcp-Session-Id from $URL"; return 1; }
@@ -54,7 +56,7 @@ mcp_tool() { # <tool> <args-json> → tool text result
   res=$(post "$(jq -cn --arg t "$1" --argjson a "$2" '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:$t,arguments:$a}}')")
   jq -er '.result.content[] | select(.type=="text") | .text' <<<"$res" 2>/dev/null || { echo "bad response: $res"; return 1; }
 }
-mcp_close() { "${CURL[@]}" -X DELETE -H "Mcp-Session-Id: $SID" "$URL" >/dev/null 2>&1; }
+mcp_close() { hcurl -X DELETE -H "Mcp-Session-Id: $SID" "$URL" >/dev/null 2>&1; }
 
 if [ $# -gt 0 ]; then
   SID=$(mcp_open) || { echo "alexandria-recall: $SID" >&2; exit 1; }
@@ -126,10 +128,13 @@ if [ "$store" != off ] && [ -n "$session" ]; then
   fi
 fi
 
-stored="${XDG_STATE_HOME:-$HOME/.local/state}/alexandria/$session.stored"
-# Prune markers idle for over ALEXANDRIA_MARKER_MAX_AGE_DAYS here too, so a machine whose Stop hook
-# never fires does not accumulate them (same expression as alexandria-extract.sh).
-[ -d "${stored%/*}" ] && find "${stored%/*}" -maxdepth 1 \( -name '*.extracted' -o -name '*.stored' \) -mtime "+${ALEXANDRIA_MARKER_MAX_AGE_DAYS:-7}" -delete
+state="${XDG_STATE_HOME:-$HOME/.local/state}/alexandria"; stored="$state/$session.stored"
+# Same state-dir block as alexandria-extract.sh: 0700, old-location markers removed by the run that creates
+# it, and markers idle for over ALEXANDRIA_MARKER_MAX_AGE_DAYS pruned here too (never this session's own),
+# so a machine whose Stop hook never fires does not accumulate them.
+[ -d "$state" ] || { mkdir -p "$state"; rm -f "${XDG_RUNTIME_DIR:-/tmp}"/alexandria/*.extracted "${XDG_RUNTIME_DIR:-/tmp}"/alexandria/*.stored; }
+chmod 700 "$state"
+find "$state" -maxdepth 1 \( -name '*.extracted' -o -name '*.stored' \) ! -name "$session.*" -mtime "+${ALEXANDRIA_MARKER_MAX_AGE_DAYS:-7}" -delete
 
 # ---- one MCP session for recall + stores
 SID=$(mcp_open) || {
@@ -141,7 +146,7 @@ trap mcp_close EXIT
 
 for d in "${detections[@]}"; do
   norm=$(tr '[:upper:]' '[:lower:]' <<<"$d" | tr -s '[:space:]' ' ')
-  mkdir -p "${stored%/*}"; touch "$stored"
+  touch "$stored"
   grep -qxF "$norm" "$stored" && continue
   tag=$([[ $d == "User correction"* ]] && echo correction || echo preference)
   out=$(mcp_tool store_memory "$(jq -cn --arg c "$d" --arg t "$tag" --arg s "$session" '{content:$c,tags:[$t,"auto-detected"],session_id:$s,agent_id:"claude-code"}')") \

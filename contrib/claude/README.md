@@ -28,14 +28,12 @@ extraction) the `claude` CLI.
   Pi detectors, and stores unambiguous hits as `User correction: ...` / `User preference: ...` with
   tags `correction`/`preference` + `auto-detected` and the session id. Deduped per session via
   `$XDG_STATE_HOME/alexandria/<session_id>.stored`. The Pi error-resolution tracker is not ported;
-  failed tool results are fed to the extraction pass instead (below).
+  failed tool results can be fed to the extraction pass instead (opt-in, below). Every request shares
+  one 8 s budget, so a wedged server delays the prompt by that much at most.
 
 `alexandria-extract.sh` is a `Stop` hook. After each assistant turn it serializes the transcript lines
-added since its last run (user text, assistant text, and the first 300 characters of each failed
-tool result as `[Tool error]: <tool name> <its command or file path, else the first 120 chars of its input> -- <error>`, so a silent
-fix-and-retry still shows the model the root cause and which call produced it;
-successful tool output, `<tool_use_error>` harness refusals, thinking, and injected system lines are
-dropped), and once at least `ALEXANDRIA_EXTRACT_MIN_CHARS` of new text exists it
+added since its last run (user text and assistant text; tool output, thinking, and injected system
+lines are dropped), and once at least `ALEXANDRIA_EXTRACT_MIN_CHARS` of new text exists it
 asks `claude -p --model haiku` for standalone durable facts using the Pi extraction prompt, with the
 session's already-stored memories and the auto-recall hits the transcript carries for this chunk's
 prompts listed for dedup (so a gotcha already stored by an earlier session is not stored again, as long
@@ -47,6 +45,19 @@ timeout. The child `claude` runs with
 `ALEXANDRIA_HOOK_CHILD=1`, which makes every hook here exit immediately (no recursion). Measured
 2026-09-08 on a ~40-line transcript: about 15 s wall time, haiku correctly returned no memories for a
 purely tactical session.
+
+**Tool errors are opt-in.** With `ALEXANDRIA_EXTRACT_TOOL_ERRORS=on` the first 300 characters of each
+failed tool result join that text as `[Tool error]: <tool name> <executable or file path> -- <error>`,
+so a silent fix-and-retry still shows the model the root cause and which call produced it
+(`<tool_use_error>` harness refusals stay out). It is off by default because this is the one place
+tool output leaves the machine: the text goes to the `claude -p` call, can be stored as a memory, and a
+stored memory is re-injected into later prompts. Before inclusion the hook redacts `Bearer <token>`,
+`key=value`/`key: value` pairs whose key contains `token`, `secret`, `password`, `passwd`, `api_key` or
+`auth`, `scheme://user:pass@` credentials and PEM blocks, and keeps only the executable name of the
+failing command (no `VAR=value` prefix, no arguments). The prompt tells the model the lines are
+untrusted program output. The pattern list is best-effort, not a secret scanner: leave this off on a
+machine whose failures print secrets in other shapes. Nothing collapses error variants either — the
+text differs per run, so each variant the model finds worth keeping becomes its own memory.
 
 `alexandria-session.sh` is a `PreToolUse` hook matched on `mcp__alexandria__store_memory` and
 `mcp__alexandria__import_document`. When the agent calls either without a `session_id` or
@@ -109,7 +120,10 @@ The script's own 80 s budget bounds a wedged `claude -p`. No `"async": true` is 
 goes to `$XDG_STATE_HOME/alexandria/extract.log` (default `~/.local/state/alexandria/`), rotated to
 `extract.log.1` once it passes 1 MiB; marker files in the same directory idle for over
 `ALEXANDRIA_MARKER_MAX_AGE_DAYS` days (default 7) are pruned at the same time, and by the recall hook on
-every prompt.
+every prompt; the running session's own markers are never pruned, so a resumed session is not
+re-extracted. The directory is `0700`. Markers from before the move (`$XDG_RUNTIME_DIR/alexandria/` or
+`/tmp/alexandria/`) are deleted by whichever hook first creates the new directory; a session spanning
+that upgrade is re-extracted once.
 
 **Config (env vars, all optional):**
 
@@ -120,6 +134,7 @@ every prompt.
 | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.45` | Minimum similarity to inject a hit (measured at `LIMIT=10` and only valid there — see [docs/minilm-test-data.md](../../docs/minilm-test-data.md) and `[recall]` in [docs/configuration.md](../../docs/configuration.md)) |
 | `ALEXANDRIA_AUTO_RECALL` | (unset) | Set to `off` to disable recall |
 | `ALEXANDRIA_AUTO_STORE` | (unset) | Set to `off` to disable the detectors and extraction. Sessions with no human at the prompt (`claude -p`, Agent SDK, `claude mcp serve`, bench, GitHub Action, triggers, Cowork; see `CLAUDE_CODE_ENTRYPOINT` below) default to off so scripted experiments never land in the real database; set `on` to enable there |
+| `ALEXANDRIA_EXTRACT_TOOL_ERRORS` | (unset) | Set to `on` to feed redacted failed tool results to extraction (see "Tool errors are opt-in") |
 | `ALEXANDRIA_EXTRACT_MODEL` | `haiku` | Model passed to `claude -p --model` for extraction |
 | `ALEXANDRIA_EXTRACT_MIN_CHARS` | `1500` | New transcript text required before an extraction call |
 | `ALEXANDRIA_EXTRACT_FLUSH_WAIT` | `1` | Seconds to wait before reading the transcript; Stop fires ~50 ms before the last assistant message is flushed (tests set `0`) |
@@ -127,6 +142,9 @@ every prompt.
 | `ALEXANDRIA_MARKER_MAX_AGE_DAYS` | `7` | Per-session marker files idle longer than this are pruned by either hook |
 | `ALEXANDRIA_HOOK_CHILD` | (unset) | Set by the extract hook on its `claude -p` child; every hook exits immediately when set |
 | `ALEXANDRIA_DETACHED` | (unset) | Set by the extract hook on its detached copy; set it yourself to run the hook inline (tests do) |
+
+**Upgrading:** auto-store used to run in every session. If memories stopped arriving from `claude -p`
+scripts or Agent SDK runs, that is this default; set `ALEXANDRIA_AUTO_STORE=on` there.
 
 `CLAUDE_CODE_ENTRYPOINT` is an internal Claude Code variable, not in the documented settings list. The
 gate turns auto-store off for `sdk-*` (`sdk-cli` for `claude -p`, `sdk-ts` and `sdk-py` for the Agent SDKs),
