@@ -16,7 +16,6 @@ const CORRECTION_PATTERNS: RegExp[] = [
 	/\bactually[,.]?\s+(.+)/i,
 	/\bi\s+meant\s+(.+)/i,
 	/\bnot\s+.{2,30}[,;]\s*(?:use|it'?s)\s+(.+)/i,
-	/\bdon'?t\s+use\s+.{2,30}[,;]\s*use\s+(.+)/i,
 	/\bwrong\s*[—–-]\s*(.+)/i,
 	/\bincorrect\s*[—–-]\s*(.+)/i,
 ];
@@ -46,7 +45,7 @@ export function detectCorrection(
 
 			return {
 				content,
-				tags: ["correction", "auto-detected"],
+				tags: ["correction", "auto-detected", "source:regex"],
 			};
 		}
 	}
