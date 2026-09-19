@@ -70,7 +70,18 @@ async fn main() -> anyhow::Result<()> {
     let embedding = CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
     let dims = embedding.dimensions();
     system_config::check_embedding_model(db.inner(), &config.embedding.model, dims).await?;
-    schema::ensure_vector_index(db.inner(), dims).await?;
+    // A failed define must not stop boot: the brute-force KNN form returns the same rows, and
+    // the backfill aborts on any row of another dimension — which is exactly the state a
+    // reverted, half-finished `migrate-embeddings` leaves behind.
+    let vector_index = match schema::ensure_vector_index(db.inner(), dims).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                "Could not define the HNSW index; retrieval falls back to a full scan: {e:#}"
+            );
+            false
+        }
+    };
     tracing::info!("Embedding model loaded ({dims} dimensions)");
 
     // 4. Create MCP server
@@ -119,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
     .with_activation_top_n(config.activation.top_n)
     .with_retrieve_min_similarity(config.retrieve.min_similarity)
     .with_cohesion_floor(config.cluster.cohesion_floor)
+    .with_vector_index(vector_index)
     .with_reminders_config(alexandria_mcp::server::RemindersSettings {
         tz,
         escalation_hours: config.reminders.escalation_hours,
