@@ -1,15 +1,17 @@
-//! Re-embed every fact and cluster centroid with a new model, then move the lock.
-//! Not transactional: a failure mid-way leaves the lock on the old model. While
-//! config still names the new model the server refuses to boot; rerun the migration
-//! to finish, or revert config to go back to the old model.
+//! Re-embed every fact and cluster centroid with a new model or token limit, then move
+//! the lock.
+//! Not transactional: a failure mid-way leaves the lock on the old model and limit. While
+//! config still names the new ones the server refuses to boot; rerun the migration to
+//! finish. Reverting config (`embedding.model`, `embedding.max_tokens`) goes back only if no
+//! fact has been rewritten yet. The limit only goes up: a corpus embedded at 256 tokens is
+//! not re-embedded at 128. The HNSW index is
+//! dropped first (it rejects vectors of another dimension); the next server boot
+//! redefines it.
 
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{Database, record_id_to_string, system_config};
 use anyhow::ensure;
-
-/// Facts per `embed()` call. Bounds peak memory for large corpora.
-const BATCH: usize = 32;
 
 #[derive(Debug)]
 pub enum ReembedOutcome {
@@ -21,9 +23,20 @@ pub enum ReembedOutcome {
     },
 }
 
+/// `batch_size` is facts per `embed()` call and the progress-log granularity. It does not
+/// bound memory: the corpus is preloaded and Candle embeds one text per forward pass.
+/// Must be at least 1; `Config::load` rejects 0 before this is reached.
+///
+/// `max_tokens` is the limit `provider` truncates at, which becomes the new lock. `force`
+/// re-embeds even when the lock already matches: the escape for a corpus whose lock is right
+/// but whose vectors are not (a binary rolled back after migrating writes old-limit vectors
+/// under the new lock, and nothing can detect that afterwards).
 pub async fn reembed(
     db: &Database,
     provider: &dyn EmbeddingProvider,
+    batch_size: usize,
+    max_tokens: usize,
+    force: bool,
 ) -> anyhow::Result<ReembedOutcome> {
     let new_model = provider.model_id();
     let memories = MemoryRepo::new(db.inner());
@@ -42,17 +55,33 @@ pub async fn reembed(
                 "no embedding lock found (fresh database); just start the server".into(),
             ));
         }
-        Some(stored) if stored == new_model => {
-            return Ok(ReembedOutcome::Skipped(format!("already on {new_model}")));
+        Some(stored) => {
+            let stored_tokens = system_config::stored_max_tokens(db.inner()).await?;
+            // Same model only: a different model re-embeds everything in its own space, and
+            // its position table may be smaller than the old limit.
+            ensure!(
+                stored != new_model || max_tokens >= stored_tokens,
+                "the corpus is embedded at {stored_tokens} tokens and embedding.max_tokens is \
+                 {max_tokens}; the limit is not lowered. Set embedding.max_tokens = {stored_tokens}"
+            );
+            if stored == new_model && stored_tokens == max_tokens && !force {
+                return Ok(ReembedOutcome::Skipped(format!(
+                    "already on {new_model} at {max_tokens} tokens (pass --force to re-embed anyway)"
+                )));
+            }
+            tracing::info!(
+                "Re-embedding {stored} ({stored_tokens} tokens) -> {new_model} ({max_tokens} tokens)"
+            );
         }
-        Some(stored) => tracing::info!("Re-embedding {stored} -> {new_model}"),
     }
+
+    alexandria_storage::schema::drop_vector_index(db.inner()).await?;
 
     // 1. Facts, deleted ones included.
     let rows = memories.all_ids_and_content().await?;
     let total = rows.len();
     let mut done = 0;
-    for batch in rows.chunks(BATCH) {
+    for batch in rows.chunks(batch_size) {
         let texts: Vec<&str> = batch.iter().map(|(_, c)| c.as_str()).collect();
         let vecs = provider.embed(&texts).await?;
         ensure!(
@@ -108,6 +137,7 @@ pub async fn reembed(
     // 3. Lock last.
     system_config::set_config(db.inner(), "embedding_model", new_model).await?;
     system_config::set_config(db.inner(), "embedding_dimensions", &dims.to_string()).await?;
+    system_config::set_config(db.inner(), "embedding_max_tokens", &max_tokens.to_string()).await?;
 
     Ok(ReembedOutcome::Done {
         facts: total,
