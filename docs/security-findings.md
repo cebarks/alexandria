@@ -3,8 +3,14 @@
 Audit of 2026-09-10 against commit `858dd82`. Scope: the HTTP transport and debug UI (`crates/alexandria/src/main.rs`,
 `crates/alexandria-mcp`), the storage query layer, the embedding pipeline, and the two client
 integrations under `contrib/` (pi extension, Claude Code hooks). Method: full read of those files,
-cross-checked against the vendored `rmcp 3.2.0` source for transport defaults, plus live measurements
+cross-checked against the vendored `rmcp 3.3.0` source for transport defaults, plus live measurements
 against the running server where a claim depended on data.
+
+**Reading this after the audit date.** The findings are kept as written on 2026-09-10. Each one
+carries a **Status** line saying whether it still holds on the tree this file ships in, re-checked
+2026-09-19 after the rebase onto upstream `e251a5e`. Code is cited by symbol, not by line number, so
+a reference survives the next edit. Where the cited code is gone, the Status line names what
+replaced it.
 
 The audit was prompted by reading *Classification of Malignant Prompt Embeddings with Convex Hulls*
 (Kelvin Sanchez, Johns Hopkins Whiting School of Engineering, December 2025). The paper is summarised
@@ -42,14 +48,15 @@ change.
 Alexandria is not just a database. Both client integrations inject retrieved memory content into the
 agent's context on **every prompt**:
 
-- pi extension: `contrib/pi/extensions/alexandria-auto-recall/src/recall.ts:43-52` formats each hit
+- pi extension: `formatMemoriesBlock` in `contrib/pi/extensions/alexandria/src/recall.ts` formats each hit
   as `- (similarity, id) [tags] <content>` and returns it as a custom message before the agent starts.
-- Claude Code hook: `contrib/claude/hooks/alexandria-recall.sh:157-165` emits the same block as
+- Claude Code hook: `contrib/claude/hooks/alexandria-recall.sh` emits the same block as
   `additionalContext` on `UserPromptSubmit`.
 
 The only guard is one sentence, "verify relevance before relying on them". Content is not delimited
 per memory beyond a leading `- `, and newlines inside a memory are not stripped, so a stored memory
-can forge additional bullets or append instructions to the block.
+can forge additional bullets or append instructions to the block. (Status: the pi extension now
+flattens each memory to one line with `oneLine`; the Claude hook still prints content as stored.)
 
 That makes the memory store a **persistence layer for prompt injection**: text that reaches a fact
 record is replayed into every future prompt whose embedding lands near it. The writers that can put
@@ -57,15 +64,16 @@ text there:
 
 | Writer | What it stores | Trust of the source text | Where |
 |---|---|---|---|
-| `store_memory` from an agent | Whatever the agent decides | Agent-mediated | `crates/alexandria-mcp/src/server.rs:204` |
+| `store_memory` from an agent | Whatever the agent decides | Agent-mediated | `do_store_memory` in `crates/alexandria-mcp/src/server.rs` |
 | Heuristic detectors | Regex captures from the user's prompt | User text | `contrib/pi/.../detectors/{correction,preference}.ts`, `alexandria-recall.sh` |
 | Error-resolution tracker | First 200 chars of a failed tool result plus the next success | **Tool output** | `contrib/pi/.../detectors/error-tracker.ts` |
-| LLM extraction (pi) | Model-chosen facts from user and assistant text | Assistant text can echo tool output | `contrib/pi/.../extraction-parse.ts` |
-| LLM extraction (Claude) | Model-chosen facts from user text, assistant text, and **failed tool results** | Tool output | `contrib/claude/hooks/alexandria-extract.sh:67-81` |
-| `import_document` | Third-party text verbatim, confidence 1.0, initial heat 2.0 | Whatever the document is | `server.rs:318-418` (confidence at `:383`, heat at `:387`) |
+| LLM extraction (pi) | Model-chosen facts from user and assistant text | Assistant text can echo tool output | `contrib/pi/.../extraction.ts` |
+| LLM extraction (Claude) | Model-chosen facts from user text and assistant text. `tool_result` blocks are filtered out; failed tool results become an opt-in input in #17 | Assistant text can echo tool output | `contrib/claude/hooks/alexandria-extract.sh` |
+| `import_document` | Third-party text verbatim, confidence 1.0, initial heat 2.0 | Whatever the document is | `do_import_document` |
 | Any network client | Anything | None | Docker image on `0.0.0.0` |
 
-Two of those paths (tool output through extraction, `import_document` of a fetched README or web
+Two of those paths (tool output through the error-resolution tracker or echoed into extraction,
+`import_document` of a fetched README or web
 page) let an attacker who controls a document the agent reads plant a memory without ever touching
 the server directly. Note also that imported text is stored with *higher* confidence and initial heat
 than a user's own statements, which inverts the trust order.
@@ -116,15 +124,20 @@ provenance and rendering rather than classification, and that is finding S2.
 
 **Where.**
 
-- `crates/alexandria/src/config.rs:47-48`: `allowed_origins` and `allowed_hosts` both default to `["*"]`.
-- `crates/alexandria/src/main.rs:142` and `:147`: a `"*"` entry calls `disable_allowed_hosts()` /
+- `ServerConfig::default` in `crates/alexandria/src/config.rs`: `allowed_origins` and `allowed_hosts` both default to `["*"]`.
+- `serve_http` in `crates/alexandria/src/main.rs`: a `"*"` entry calls `disable_allowed_hosts()` /
   `disable_allowed_origins()` on the rmcp config.
-- rmcp `3.2.0`, `src/transport/streamable_http_server/tower.rs:172`: the library's own default is
-  `allowed_hosts = ["localhost", "127.0.0.1", "::1"]`. `host_is_allowed` (`:762`) returns true only
+- rmcp `3.3.0`, `StreamableHttpServerConfig::default` in
+  `src/transport/streamable_http_server/tower.rs`: the library's own default is
+  `allowed_hosts = ["localhost", "127.0.0.1", "::1"]`. `host_is_allowed` returns true only
   when the list is empty or matches, so Alexandria ships with a weaker default than the library it
   wraps.
-- The `/debug` router is merged alongside the rmcp service (`crates/alexandria/src/main.rs:304-306`) and is not
-  covered by rmcp's Host or Origin checks at all.
+- The `/debug` router is merged alongside the rmcp service (`serve_http`) and is not covered by rmcp's Host or Origin checks at all.
+
+**Status (2026-09-19): partly fixed upstream.** `crates/alexandria-mcp/src/debug/guard.rs` now applies
+the configured `allowed_hosts` to `/debug` (fix 3). It is opt-in: the default is still `["*"]`, which
+skips the check on both `/mcp` and `/debug`, and there is still no `ALEXANDRIA_SERVER_ALLOWED_HOSTS`.
+Fixes 1 and 2 are open.
 
 **Attack.** The operator opens any web page while the server runs on loopback. The page's origin is
 rebound via DNS to `127.0.0.1`; the browser now treats `http://attacker:3000/mcp` as same-origin and
@@ -149,13 +162,17 @@ specification requires for locally bound servers; it is off.
 
 **Where.**
 
-- `crates/alexandria-mcp/src/server.rs:221-226`: every `store_memory` creates a `provenance` row
+- `do_store_memory`: every `store_memory` creates a `provenance` row
   with `kind = 'user'` and nothing else. The row is never related to the fact (the `has_provenance`
   relation from `v001_initial.surql` is never created anywhere in the tree) and never read. The
   `agent_id` and `model` params are recorded on the session, not the fact.
-- `import_document` (`server.rs:383,387`) stores chunks with confidence `1.0` and heat `2.0`;
+- `do_import_document` stores chunks with confidence `1.0` and heat `2.0`;
   `store_memory` uses `0.5` and `1.0`.
-- Recall rendering: `recall.ts:43-52`, `alexandria-recall.sh:157-165` (see the threat model).
+- Recall rendering: `formatMemoriesBlock` in `recall.ts`, and `alexandria-recall.sh` (see the threat
+  model).
+
+**Status (2026-09-19): open.** Facts still carry no source. Of fix 2, only the newline stripping has
+landed, and only in the pi extension.
 
 **Impact.** A reader of the recall block cannot tell a user's stated preference from a paragraph of
 a fetched web page or from a sentence a cheap extraction model pulled out of tool output. The
@@ -190,8 +207,13 @@ What not to do: an embedding-space classifier (see the paper above).
 
 **Severity:** Low. **Effort:** small.
 
-**Where.** `crates/alexandria-mcp/src/debug/html.rs:18` (`htmx.org@1.9.12` from unpkg) and
-`crates/alexandria-mcp/src/debug/graph.rs:78` (`vis-network@9.1.6` from unpkg). Neither tag has an
+**Status (2026-09-19): fixed upstream.** Both scripts are vendored under
+`crates/alexandria-mcp/assets/` with a `SHA256SUMS`, served by `debug/assets.rs`, and tests in
+`debug/html.rs` and `debug/graph.rs` assert that no CDN reference remains. The rest of this finding
+describes the audited commit.
+
+**Where.** `crates/alexandria-mcp/src/debug/html.rs` (`htmx.org@1.9.12` from unpkg) and
+`crates/alexandria-mcp/src/debug/graph.rs` (`vis-network@9.1.6` from unpkg). Neither tag had an
 `integrity` attribute.
 
 **Impact.** Anyone who can serve a modified file at those URLs (CDN compromise, on-path attacker on a
@@ -206,9 +228,13 @@ API. The versions are pinned, which limits accidental drift but not substitution
 
 **Severity:** Low. **Effort:** trivial.
 
-**Where.** `crates/alexandria-mcp/src/debug/query.rs:34-45`: `POST /debug/query/run` accepts
+**Status (2026-09-19): fixed upstream.** `debug/guard.rs` rejects any non-GET request whose
+`Sec-Fetch-Site` is `cross-site` or `cross-origin`, unconditionally, and the form gained a `dry_run`
+box that skips activation. The rest of this finding describes the audited commit.
+
+**Where.** `run` in `crates/alexandria-mcp/src/debug/query.rs`: `POST /debug/query/run` accepts
 `application/x-www-form-urlencoded` and calls `do_retrieve_memories`, which triggers spreading
-activation and writes heat (`server.rs:457-464`).
+activation and writes heat (`retrieve_core`).
 
 **Impact.** A form POST with that content type is a CORS "simple request", so any web page can submit
 it to a loopback server without a preflight and without S1's rebinding trick. Effect is limited to
@@ -222,16 +248,18 @@ form posts are blocked with one `if`.
 
 **Severity:** Low. **Effort:** trivial.
 
+**Status (2026-09-19): first item fixed, the other two open.** `retrieve_core` clamps `limit` to
+`1..=MAX_RETRIEVE_LIMIT` (100) before it reaches the KNN operator.
+
 **Where.**
 
-- `retrieve_memories.limit` (`server.rs:424`) flows unchanged into the KNN operator
-  `embedding <|{k},COSINE|>` at `crates/alexandria-storage/src/repos/memory_repo.rs:83`. Nothing
-  bounds `k`.
-- `import_document` embeds every chunk sequentially and inline on the runtime (`server.rs:376-378`,
+- `retrieve_memories.limit` (`retrieve_core`) flows unchanged into the KNN operator
+  `embedding <|{k},COSINE|>` in `MemoryRepo::nearest`. Nothing bounds `k`.
+- `import_document` embeds every chunk sequentially and inline on the runtime (`do_import_document`,
   see the performance report). rmcp caps request bodies at 4 MiB
-  (`tower.rs:55`, `DEFAULT_MAX_REQUEST_BODY_BYTES`), which bounds the input but still allows
+  (`DEFAULT_MAX_REQUEST_BODY_BYTES` in `tower.rs`), which bounds the input but still allows
   thousands of chunks per call.
-- Debug list `limit` (`debug/memories.rs:46-49`) is likewise unbounded, though that page is read-only.
+- Debug list `limit` (`list` in `debug/memories.rs`) is likewise unbounded, though that page is read-only.
 
 **Fix.** Clamp `limit` to a ceiling (100 is far above any measured useful value; the clients ask for
 10). Cap chunk count per import, or move chunk embedding off the runtime thread so a large import
@@ -245,6 +273,8 @@ degrades gracefully instead of stalling other requests.
 `tokenizer.json`, and `model.safetensors` over HTTPS (rustls) and writes them into the cache with no
 checksum. The Hub API exposes a SHA-256 per LFS file.
 
+**Status (2026-09-19): open.**
+
 **Impact.** Low. TLS covers the transport, safetensors parsing is not an arbitrary-code format, and
 the download happens once. A compromised upstream repository would still be accepted, which is true
 of every consumer of that model.
@@ -257,8 +287,9 @@ digest in config for the locked model. Not urgent.
 - Every user-supplied value reaches SurrealDB through `.bind()`. The only `format!` interpolations
   into query text are the numeric `k` (S5), fixed clause fragments chosen by `Option::is_some`, and
   constant table names. Record IDs for `RELATE` go through `RecordId::parse_simple`.
-- All DB-sourced strings in the debug UI pass through `esc()` (`debug/html.rs:1-8`, with a test),
-  including record IDs in `href` attributes.
+- All DB-sourced strings in the debug UI pass through `esc()` (`debug/html.rs`, with a test),
+  including record IDs in `href` attributes. (Status: `esc()` is gone. The pages are askama templates
+  now, which escape `{{ }}` at compile time, so the conclusion holds by a different mechanism.)
 - The container runs as uid 10001, not root. CI actions are pinned by full SHA with
   `persist-credentials: false`; `cargo deny` runs in CI with one documented advisory ignore.
 - Nothing logs memory content at `info` or above.
