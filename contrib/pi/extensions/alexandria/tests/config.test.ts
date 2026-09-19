@@ -104,8 +104,8 @@ test("no env and no file: every feature is on, and the defaults hold", async () 
 	assert.equal(config.recallDisabled, false);
 	assert.equal(config.storeDisabled, false);
 	assert.equal(config.remindersDisabled, false);
-	assert.equal(config.recallLimit, 5);
-	assert.equal(config.recallMinSimilarity, 0.58);
+	assert.equal(config.recallLimit, 10);
+	assert.equal(config.recallMinSimilarity, 0.45);
 	assert.equal(config.extractModel, "vertex/claude-haiku-4-5");
 	assert.equal(config.extractTimeoutMs, 5000);
 	assert.equal(config.remindersProject, undefined);
@@ -204,7 +204,7 @@ test("an unparseable client.toml falls back to defaults instead of throwing", as
 	const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: brokenToml });
 	assert.equal(config.remindersDisabled, false);
 	assert.equal(config.recallDisabled, false);
-	assert.equal(config.recallLimit, 5);
+	assert.equal(config.recallLimit, 10);
 	assert.equal(config.remindersProject, undefined);
 });
 
