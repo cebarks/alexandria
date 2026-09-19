@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use tokenizers::{Tokenizer, TruncationParams};
+use tokenizers::{PostProcessor, Tokenizer, TruncationParams};
 
 use super::hub;
 use super::provider::EmbeddingProvider;
@@ -19,11 +19,13 @@ fn cls_pooling_from_json(s: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Longest input, in wordpiece tokens including `[CLS]`/`[SEP]`, that one embedding sees.
-/// The cached `tokenizer.json` ships 128; sentence-transformers serves this model at 256 and
-/// the live corpus p99 is 284 (docs/performance-and-ability-findings.md, A1). Locked in
-/// `system_config` beside the model id, so changing it forces a re-embed.
-pub const MAX_TOKENS: usize = 256;
+/// Default for `embedding.max_tokens`: the longest input, in wordpiece tokens including
+/// `[CLS]`/`[SEP]`, that one embedding sees. 128 is what the cached `tokenizer.json` ships, so it
+/// is what every corpus from before the key existed was embedded at. sentence-transformers serves
+/// this model at 256 and the live corpus p99 is 284 (docs/performance-and-ability-findings.md,
+/// A1), so 256 is the tested opt-in. The value in use is locked in `system_config` beside the
+/// model id, so raising it forces a re-embed.
+pub const DEFAULT_MAX_TOKENS: usize = 128;
 
 pub struct CandleProvider {
     model: BertModel,
@@ -32,10 +34,11 @@ pub struct CandleProvider {
     model_id: String,
     dimensions: usize,
     cls_pooling: bool,
+    max_tokens: usize,
 }
 
 impl CandleProvider {
-    pub async fn new(model_id: &str, device_str: &str) -> Result<Self> {
+    pub async fn new(model_id: &str, device_str: &str, max_tokens: usize) -> Result<Self> {
         // Cache first, network only on a miss (see hub.rs).
         let required = async |file: &str| {
             hub::fetch(model_id, file)
@@ -69,6 +72,7 @@ impl CandleProvider {
                 &tokenizer_path,
                 &weights_path,
                 &device_str_owned,
+                max_tokens,
             )
         })
         .await??;
@@ -82,7 +86,29 @@ impl CandleProvider {
             model_id: model_id.to_string(),
             dimensions,
             cls_pooling,
+            max_tokens,
         })
+    }
+
+    /// The truncation limit this provider embeds at. The boot lock records this, not the config
+    /// value, so the lock cannot disagree with the vectors.
+    pub fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
+    /// Token count of `encoding` before truncation. Each overflow piece is post-processed
+    /// like the kept one, so it carries its own `[CLS]`/`[SEP]`; count those once.
+    fn full_len(&self, encoding: &tokenizers::Encoding) -> usize {
+        let added = self
+            .tokenizer
+            .get_post_processor()
+            .map_or(0, |p| p.added_tokens(false));
+        let overflow: usize = encoding
+            .get_overflowing()
+            .iter()
+            .map(|o| o.len().saturating_sub(added))
+            .sum();
+        encoding.len() + overflow
     }
 
     /// Test hook: override the pooling mode read from `1_Pooling/config.json`.
@@ -97,6 +123,7 @@ impl CandleProvider {
         tokenizer_path: &Path,
         weights_path: &Path,
         device_str: &str,
+        max_tokens: usize,
     ) -> Result<(BertModel, Tokenizer, Device, usize)> {
         let device = match device_str {
             "cpu" => Device::Cpu,
@@ -106,12 +133,17 @@ impl CandleProvider {
         let config_str = std::fs::read_to_string(config_path)?;
         let config: BertConfig = serde_json::from_str(&config_str)?;
         let dimensions = config.hidden_size;
+        anyhow::ensure!(
+            max_tokens <= config.max_position_embeddings,
+            "embedding.max_tokens = {max_tokens} exceeds this model's position table ({})",
+            config.max_position_embeddings
+        );
 
         let mut tokenizer =
             Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
         tokenizer
             .with_truncation(Some(TruncationParams {
-                max_length: MAX_TOKENS,
+                max_length: max_tokens,
                 ..Default::default()
             }))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -144,7 +176,9 @@ impl CandleProvider {
             if !encoding.get_overflowing().is_empty() {
                 tracing::warn!(
                     chars = text.chars().count(),
-                    "text exceeds {MAX_TOKENS} tokens; only its first {MAX_TOKENS} are embedded"
+                    tokens = self.full_len(&encoding),
+                    "text exceeds {0} tokens; only its first {0} are embedded",
+                    self.max_tokens
                 );
             }
 
@@ -213,6 +247,13 @@ impl EmbeddingProvider for CandleProvider {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    // ponytail: a second tokenization of text `embed` already tokenized, well under a
+    // millisecond. Return it from `embed` instead if the store path ever shows up in a profile.
+    fn overflow(&self, text: &str) -> Option<usize> {
+        let encoding = self.tokenizer.encode(text, true).ok()?;
+        (!encoding.get_overflowing().is_empty()).then(|| self.full_len(&encoding))
     }
 }
 

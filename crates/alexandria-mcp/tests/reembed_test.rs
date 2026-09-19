@@ -1,7 +1,10 @@
 use alexandria_mcp::migrate::{ReembedOutcome, reembed};
-use alexandria_pipeline::embedding::{EmbeddingProvider, MAX_TOKENS};
+use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{Database, system_config};
+
+/// The limit the fake provider is said to truncate at; above the 128 a lock without the key means.
+const MAX_TOKENS: usize = 256;
 
 /// Fake model "b": 3-dim unit vectors chosen per text so a mean centroid is
 /// distinguishable from any single member.
@@ -68,7 +71,7 @@ async fn seed() -> (Database, String, String, String, String) {
 async fn reembed_rewrites_facts_centroids_and_lock() {
     let (db, live1, live2, gone, cid) = seed().await;
 
-    let outcome = reembed(&db, &ModelB, 2).await.unwrap();
+    let outcome = reembed(&db, &ModelB, 2, MAX_TOKENS, false).await.unwrap();
     match outcome {
         ReembedOutcome::Done { facts, clusters } => {
             assert_eq!(facts, 3, "deleted facts are re-embedded too");
@@ -132,7 +135,7 @@ async fn reembed_runs_when_only_token_lock_differs() {
         .await
         .unwrap();
 
-    let outcome = reembed(&db, &ModelB, 2).await.unwrap();
+    let outcome = reembed(&db, &ModelB, 2, MAX_TOKENS, false).await.unwrap();
     assert!(matches!(outcome, ReembedOutcome::Done { facts: 3, .. }));
 
     let fact = MemoryRepo::new(db.inner())
@@ -159,7 +162,7 @@ async fn reembed_drops_vector_index_before_changing_dimension() {
         .await
         .unwrap();
 
-    let outcome = reembed(&db, &ModelB, 2).await.unwrap();
+    let outcome = reembed(&db, &ModelB, 2, MAX_TOKENS, false).await.unwrap();
     assert!(matches!(outcome, ReembedOutcome::Done { facts: 3, .. }));
 
     let fact = MemoryRepo::new(db.inner())
@@ -180,7 +183,7 @@ async fn reembed_is_noop_when_lock_matches() {
         .await
         .unwrap();
 
-    let outcome = reembed(&db, &ModelB, 2).await.unwrap();
+    let outcome = reembed(&db, &ModelB, 2, MAX_TOKENS, false).await.unwrap();
     assert!(matches!(outcome, ReembedOutcome::Skipped(_)));
 
     let fact = MemoryRepo::new(db.inner())
@@ -198,7 +201,7 @@ async fn reembed_is_noop_on_fresh_database() {
         .await
         .unwrap();
 
-    let outcome = reembed(&db, &ModelB, 2).await.unwrap();
+    let outcome = reembed(&db, &ModelB, 2, MAX_TOKENS, false).await.unwrap();
     assert!(matches!(outcome, ReembedOutcome::Skipped(_)));
     assert!(
         system_config::get_config(db.inner(), "embedding_model")
@@ -220,7 +223,9 @@ async fn reembed_refuses_unlocked_database_with_facts() {
         .await
         .unwrap();
 
-    let err = reembed(&db, &ModelB, 2).await.unwrap_err();
+    let err = reembed(&db, &ModelB, 2, MAX_TOKENS, false)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("1 fact"), "{err}");
 
     let fact = memories.get_fact(&id).await.unwrap().unwrap();
@@ -239,7 +244,7 @@ async fn reembed_drops_empty_clusters() {
     let clusters = ClusterRepo::new(db.inner());
     let empty = clusters.create(None, &[0.1, 0.9]).await.unwrap();
 
-    reembed(&db, &ModelB, 2).await.unwrap();
+    reembed(&db, &ModelB, 2, MAX_TOKENS, false).await.unwrap();
 
     let ids: Vec<String> = clusters
         .list()
@@ -261,7 +266,7 @@ async fn reembed_moves_lock_over_empty_corpus() {
         .await
         .unwrap();
 
-    let outcome = reembed(&db, &ModelB, 2).await.unwrap();
+    let outcome = reembed(&db, &ModelB, 2, MAX_TOKENS, false).await.unwrap();
     assert!(matches!(
         outcome,
         ReembedOutcome::Done {
@@ -276,4 +281,83 @@ async fn reembed_moves_lock_over_empty_corpus() {
             .as_deref(),
         Some("b")
     );
+}
+
+/// `--force`: the lock matches, so nothing would run, but the vectors are rewritten anyway.
+#[tokio::test]
+async fn reembed_force_runs_when_lock_matches() {
+    let (db, live1, _, _, _) = seed().await;
+    system_config::set_config(db.inner(), "embedding_model", "b")
+        .await
+        .unwrap();
+    system_config::set_config(db.inner(), "embedding_max_tokens", &MAX_TOKENS.to_string())
+        .await
+        .unwrap();
+
+    let outcome = reembed(&db, &ModelB, 2, MAX_TOKENS, true).await.unwrap();
+    assert!(matches!(outcome, ReembedOutcome::Done { facts: 3, .. }));
+    let fact = MemoryRepo::new(db.inner())
+        .get_fact(&live1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fact.embedding, embed_b("one"));
+}
+
+/// The limit only goes up, force or not, and a refusal touches nothing.
+#[tokio::test]
+async fn reembed_refuses_to_lower_the_token_limit() {
+    let (db, live1, _, _, _) = seed().await;
+    system_config::set_config(db.inner(), "embedding_model", "b")
+        .await
+        .unwrap();
+    system_config::set_config(db.inner(), "embedding_max_tokens", "256")
+        .await
+        .unwrap();
+
+    let err = reembed(&db, &ModelB, 2, 128, true).await.unwrap_err();
+    assert!(err.to_string().contains("not lowered"), "{err}");
+    let fact = MemoryRepo::new(db.inner())
+        .get_fact(&live1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fact.embedding, vec![0.6, 0.8], "untouched");
+}
+
+/// Model "b" that fails on its second batch.
+struct FailsMidway(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for FailsMidway {
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(call == 0, "provider died");
+        Ok(texts.iter().map(|t| embed_b(t)).collect())
+    }
+    fn dimensions(&self) -> usize {
+        3
+    }
+    fn model_id(&self) -> &str {
+        "b"
+    }
+}
+
+/// The lock is written last. An interrupted run must leave it on the old model and limit so
+/// boot keeps refusing and a rerun finishes the job; a lock moved early would bless a corpus
+/// that is half one vector space and half another.
+#[tokio::test]
+async fn reembed_interrupted_leaves_the_old_lock() {
+    let (db, _, _, _, _) = seed().await;
+    let provider = FailsMidway(std::sync::atomic::AtomicUsize::new(0));
+
+    let err = reembed(&db, &provider, 2, MAX_TOKENS, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("provider died"), "{err}");
+
+    let get = async |key| system_config::get_config(db.inner(), key).await.unwrap();
+    assert_eq!(get("embedding_model").await.as_deref(), Some("a"));
+    assert_eq!(get("embedding_dimensions").await.as_deref(), Some("2"));
+    assert_eq!(get("embedding_max_tokens").await, None);
 }

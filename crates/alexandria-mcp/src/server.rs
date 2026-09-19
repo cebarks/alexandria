@@ -219,14 +219,29 @@ impl AlexandriaServer {
     }
 
     #[tool(
-        description = "Persist a durable fact, decision, preference, or correction so future sessions/agents can recall it. Call this proactively whenever you learn something worth remembering — a user preference, an architectural decision and its rationale, a resolved bug's root cause, a gotcha you just discovered — not only when explicitly told to 'remember this'. Cheap and idempotent-ish (dedup happens via clustering); prefer storing over losing context. Write content as a standalone statement that makes sense without the current conversation."
+        description = "Persist a durable fact, decision, preference, or correction so future sessions/agents can recall it. Call this proactively whenever you learn something worth remembering — a user preference, an architectural decision and its rationale, a resolved bug's root cause, a gotcha you just discovered — not only when explicitly told to 'remember this'. Cheap and idempotent-ish (dedup happens via clustering); prefer storing over losing context. Write content as a standalone statement that makes sense without the current conversation. If the response carries `truncated: true`, the content was longer than the embedding sees and only its head is searchable: split it into shorter memories."
     )]
     async fn store_memory(
         &self,
         Parameters(params): Parameters<StoreMemoryParams>,
     ) -> CallToolResult {
+        // Asked before the store because the id does not exist until after it, and the id is
+        // what makes the warning actionable.
+        let overflow = self.embedding.overflow(&params.content);
         match self.do_store_memory(params).await {
-            Ok(id) => CallToolResult::structured(serde_json::json!({ "status": "ok", "id": id })),
+            Ok(id) => {
+                let mut body = serde_json::json!({ "status": "ok", "id": id });
+                if let Some(tokens) = overflow {
+                    tracing::warn!(
+                        fact_id = %id,
+                        tokens,
+                        "stored memory exceeds the embedding token limit; only its head is searchable"
+                    );
+                    body["truncated"] = true.into();
+                    body["tokens"] = tokens.into();
+                }
+                CallToolResult::structured(body)
+            }
             Err(e) => CallToolResult::structured_error(serde_json::json!({
                 "status": "error",
                 "message": e.to_string()
@@ -517,7 +532,10 @@ impl AlexandriaServer {
                         .into_iter()
                         .map(|c| c.content)
                         .collect(),
-                    // 800 chars stays under the 256-token embedding limit even for code-dense text.
+                    // 800 chars is about 180-200 tokens of Latin prose, inside a 256-token limit
+                    // but over the default 128. Not a bound either way: CJK tokenizes near one
+                    // token per character. A chunk past `embedding.max_tokens` embeds on its head
+                    // and logs the overflow.
                     "fixed_size" => chunk_by_fixed_size(&params.content, 800, 100)
                         .into_iter()
                         .map(|c| c.content)
@@ -2623,6 +2641,53 @@ mod get_info_tests {
             *structured,
             "{label}: text block and structuredContent diverged"
         );
+    }
+
+    /// Stub whose limit is ten characters, standing in for a tokenizer.
+    struct TinyLimit;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for TinyLimit {
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            StubEmbedding.embed(texts).await
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+        fn overflow(&self, text: &str) -> Option<usize> {
+            (text.len() > 10).then_some(text.len())
+        }
+    }
+
+    /// The store response is the only machine-readable truncation signal the storing agent gets.
+    #[tokio::test]
+    async fn store_memory_flags_truncated_content() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(TinyLimit), 0.75, 86400.0);
+        let store = async |content: &str| {
+            let result = server
+                .store_memory(Parameters(StoreMemoryParams {
+                    content: content.to_string(),
+                    tags: None,
+                    session_id: None,
+                    agent_id: None,
+                    model: None,
+                }))
+                .await;
+            result.structured_content.expect("structuredContent set")
+        };
+
+        let long = store("well past ten characters").await;
+        assert_eq!(long["status"], "ok");
+        assert_eq!(long["truncated"], true);
+        assert_eq!(long["tokens"], 24);
+        assert!(store("short").await.get("truncated").is_none());
     }
 
     #[tokio::test]
