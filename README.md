@@ -41,6 +41,24 @@ alexandria
 
 First run downloads the embedding model from HuggingFace Hub (~80MB).
 
+## Command Line
+
+`alexandria` with no arguments starts the server. The two subcommands are maintenance tools
+that run once and exit.
+
+| Command | What it does |
+| --- | --- |
+| `alexandria` | Start the server on the configured transport. |
+| `alexandria migrate-embeddings` | Re-embed the whole corpus with the model in `config.toml`. Needed after a deliberate model change — see [docs/configuration.md](docs/configuration.md). |
+| `alexandria bench-retrieval` | Measure how well the configured model separates a correct answer from the rest of the corpus, and print the score distributions and the limit × threshold grid that the `retrieve.min_similarity` floor and the client recall defaults are judged against — see [docs/minilm-test-data.md](docs/minilm-test-data.md). |
+| `alexandria --help` | Print the same list. |
+
+Both subcommands open the data dir directly and SurrealKV is single-writer, so the server has
+to be stopped first. `bench-retrieval` can instead run against a copy of the data dir via
+`ALEXANDRIA_DATA_DIR`, which keeps the server down only for a `cp`. It is not read-only: like
+server boot it checks the embedding-model lock (refusing on a mismatch) and defines the HNSW
+index if it is missing.
+
 ## MCP Tools
 
 | Tool | Description |
@@ -52,6 +70,7 @@ First run downloads the embedding model from HuggingFace Hub (~80MB).
 | `import_document` | Import and chunk documents with `extracted_from` edge tracking |
 | `delete_memory` | Soft-delete a memory by ID |
 | `get_session` | Return a session's metadata plus every memory stored during it |
+| `list_sessions` | List sessions newest-first with live memory counts; filter by `agent_id`, `tag`, or `finalized` |
 | `finalize_session` | Close a session with a summary, tags, and `ended_at` |
 | `set_reminder` | Schedule a one-shot (`due_at`) or recurring (named pattern / cron) reminder; response previews the next fire times |
 | `check_reminders` | Deliver due reminders and mark them consumed (global, project-matching, or escalated) |
@@ -65,7 +84,8 @@ that measurably changes how often client LLMs reach for them unprompted.
 
 Passing `session_id` to `store_memory` groups memories under a caller-chosen handle, and the session
 is created on first use. `retrieve_memories` with `session_id` restricts ranking to that session's
-memories, `get_session` reads the whole session back, and `finalize_session` records its summary.
+memories, `get_session` reads the whole session back, `list_sessions` finds a session whose id you
+don't have, and `finalize_session` records its summary.
 See [docs/session-memory.md](docs/session-memory.md) for the data model and current limitations.
 
 ### Reminders
@@ -188,10 +208,25 @@ After=network.target
 ExecStart=%h/.cargo/bin/alexandria
 Restart=on-failure
 RestartSec=5
-Environment=RUST_LOG=info
+Environment=RUST_LOG=info,rmcp=warn
 
 [Install]
 WantedBy=default.target
+```
+
+`rmcp=warn` drops the per-request transport chatter (~6 lines per call at `info`) while keeping Alexandria's own logs.
+
+journald has no per-unit size cap, so bound the journal globally if you want to limit history:
+
+```ini
+# /etc/systemd/journald.conf.d/alexandria.conf
+[Journal]
+SystemMaxUse=200M
+MaxRetentionSec=1month
+```
+
+```bash
+sudo systemctl restart systemd-journald
 ```
 
 ```bash
@@ -315,6 +350,7 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | --- | --- |
 | [docs/configuration.md](docs/configuration.md) | Every server and client config key, env overrides, XDG migration |
 | [docs/session-memory.md](docs/session-memory.md) | Session data model, lifecycle, tool semantics, current limitations |
+| [docs/minilm-test-data.md](docs/minilm-test-data.md) | Retrieval measurements for the embedding model: how to rerun `bench-retrieval`, metric definitions, the floor rule and the client threshold sweep |
 | [docs/roadmap.md](docs/roadmap.md) | Shipped milestones, known gaps, planned work |
 | [contrib/pi/README.md](contrib/pi/README.md) | pi skill vs. extension: what each does, install, failure behavior |
 | [AGENTS.md](AGENTS.md) | Working notes for humans and agents on this codebase — SurrealDB 3.2 gotchas, crate boundaries, task runner |
@@ -346,7 +382,7 @@ engine and storage together. See [AGENTS.md](AGENTS.md) for the full set.
 
 ```bash
 just          # list recipes
-just test     # cargo test --all-features — 223 tests
+just test     # cargo test --workspace --all-features
 just lint     # clippy, warnings as errors (matches CI)
 just fmt-fix  # rustfmt
 just ci       # fmt + lint + test + cargo-deny + verify-assets, the full pre-push check
