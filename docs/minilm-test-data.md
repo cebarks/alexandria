@@ -6,6 +6,12 @@ and live in `docs/plans/2026-09-08-embedding-model-swap-measurements.md`.
 
 Produced by `alexandria bench-retrieval` (`crates/alexandria/src/bench.rs`).
 
+**What this file can and cannot support.** The tables below are real measurements of a
+20-question set. The client defaults read off them — `limit = 10`, `min_similarity = 0.45` —
+are judgement calls, not measurements: every question was written against a fact already in
+this corpus, as a near-paraphrase of it, and there is no question without a stored target. See
+[Limitations](#limitations) before quoting a number from here as a reason for a default.
+
 ## Running it
 
 SurrealKV is single-writer, so the bench cannot share the data dir with a running server.
@@ -29,15 +35,21 @@ the corpus was actually embedded with. Only the questions are embedded at run ti
 
 Every metric ranks the corpus by exact cosine in process. The server answers from the HNSW
 index, which is approximate, so after the live row the bench asks the index for the same
-top-`RECALL_LIMIT` per question through `MemoryRepo::nearest` and prints where the two
-disagree. It defines the index on the snapshot first if the copy lacks it (the only write the
-bench makes); without that the query falls back to a brute-force scan and the overlap would
-be trivially perfect.
+top-`RECALL_LIMIT` per question through `MemoryRepo::nearest_indexed` and prints where the two
+disagree. The bench is therefore not read-only: like server boot it checks the embedding-model
+lock (refusing on a mismatch, and stamping a lock on a database that has none) and then defines
+the index if the copy lacks it. Without the index there is nothing for the overlap to measure.
 
 ## Results (2026-09-09)
 
 Corpus `created_at` spans 2026-09-08 12:30:01 UTC .. 2026-09-10 00:44:21 UTC. The baseline
 subset runs through 2026-09-08 16:26:33 UTC.
+
+> **Non-regenerable history.** Every row in this section, the two threshold tables and both
+> 880-fact grids were printed by the 12-question code, up to and including the commit
+> "fix(bench): count recall-limit headroom over targets that clear the threshold". The
+> committed bench scores 20 questions and cannot print an `x/12` row; the corpora they ran on
+> were not kept either. They are a record of what was seen, not something a re-run reproduces.
 
 | corpus | facts | mean_rank | top1 | mean_gap | hit_min | hit_max | nonhit_p50 | nonhit_p90 | nonhit_p99 | ff_p50 | ff_p90 | ff_p99 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -66,10 +78,11 @@ Per-question rank:
 
 ### Baseline check
 
-The baseline row reproduces the 2026-09-08 candle pass on every column — recorded 1.42,
-9/12, +0.148, 0.338, 0.667, 0.077, 0.212, 0.373, 0.130, 0.298, 0.562 — and every
-per-question rank. The metric definitions therefore agree with the recorded tables, and the
-live row can be compared against them.
+The baseline row reproduces the 2026-09-08 candle pass to within 0.01 — recorded 1.42,
+9/12, +0.148, 0.338, 0.667, 0.077, 0.212, 0.373, 0.130, 0.298, 0.562. Three columns drifted
+in the third decimal (`nonhit_p50` 0.077 -> 0.078, `nonhit_p99` 0.373 -> 0.372, `ff_p99`
+0.562 -> 0.560); the rest, and every per-question rank, match. The metric definitions
+therefore agree with the recorded tables, and the live row can be compared against them.
 
 ### Reading the live row
 
@@ -80,9 +93,9 @@ the same cosine values. What moved is how many facts sit above them — `mean_ra
 
 The noise tail moved the other way: `nonhit_p99` 0.373 to 0.341, `ff_p99` 0.562 to 0.507.
 The 590 facts added since are on average *less* similar to these questions than the original
-corpus, which tightens the distribution while still crowding the target on rank. A floor
-derived from the non-hit distribution therefore gets slightly looser as the corpus grows, at
-the same time as ranking gets harder. **The floor is not a proxy for retrieval quality.**
+corpus, which tightens the distribution while still crowding the target on rank. The floor
+rule's output moved a hundredth lower in this pass while ranking got harder — and later passes
+moved it back up (see [Floor](#floor)). **The floor is not a proxy for retrieval quality.**
 
 The third row is the same measurement re-run later the same day to collect the threshold
 sweep below, by which point the corpus had grown 743 -> 807. Everything moved in the
@@ -96,9 +109,9 @@ The fifth row (927 facts, 2026-09-10, taken with the server stopped) is the firs
 `bench-retrieval` started printing its own recall-limit headroom. Same shape as before —
 `hit_min`/`hit_max` unchanged, `mean_rank` 3.25 -> 3.42 — but the worst target rank is now 10
 (q12, 6 -> 7 -> 9 -> 10 across the live passes), which is exactly `RECALL_LIMIT`. That is not
-the headroom that matters: q12's target scores 0.379, under the shipped `T = 0.45`, so the
+the headroom that matters: q12's target scores 0.379, under the chosen `T = 0.45`, so the
 client drops it at any limit. Among the eight targets that clear 0.45 the worst rank is q1 at 8,
-so the shipped pair has two positions of headroom — which is what `bench-retrieval`'s headroom
+so the chosen pair has two positions of headroom — which is what `bench-retrieval`'s headroom
 line reports, after its first version counted every target and warned on q12. The `limit = 10`
 grid row at 927 matches the 880 grid on every hit count; only `noise_per_q` moved, by at most
 0.2. Rows 10, 15 and 20 are identical at `T = 0.45`, so nothing above the threshold sits past
@@ -115,8 +128,18 @@ valid only if it sits below `hit_min` — gives:
 | live | 0.07 | pass (`hit_min` 0.338) |
 
 The configured default is `0.10` and is left unchanged: both values sit far below the weakest
-true hit, so the difference is immaterial. Note that the rule's output is a property of the
-model *and the corpus*, not of the model alone — it drifts down as the corpus grows.
+true hit, so the difference is immaterial. The rule's output is a property of the model *and
+the corpus*, and it does not move in one direction. `nonhit_p50` across the recorded passes:
+
+```
+0.078 @143  ->  0.074 @743/807  ->  0.075 @880/927  ->  0.079 @957/965
+```
+
+Non-monotone, ending above where it started, and the last step is confounded with the 12 -> 20
+question change. The estimator is the weak part: a median over question x non-target pairs is
+a corpus-composition statistic, and being a p50 it admits half the noise pairs by construction
+(`nonhit_p90` is 0.197, `nonhit_p99` 0.340). `0.10` sits above every value the rule has
+produced, so in practice it is a constant kept by hand, not one the rule derived.
 
 ### Client threshold
 
@@ -127,7 +150,7 @@ candidate threshold, how many of the 12 targets survive, how many of those the l
 have delivered anyway, and how many non-targets ride along.
 
 > **These two tables hold `limit` at 5**, the value shipped when they were measured. The
-> default is now `10` and the shipped threshold is `0.45`, decided in [Result
+> documented default is now `10` with a threshold of `0.45`, chosen in [Result
 > limit](#result-limit) below — the reasoning in this subsection is the argument as it stood
 > at `limit = 5`, kept because it is what the grid had to overturn. Do not read a
 > recommendation out of it; the bolded `0.35` rows mark the then-default, not the current one.
@@ -172,7 +195,7 @@ non-targets, or 7 hits at 0.33. Nine times the injection for two more hits out o
 `0.35` was taken, because `noise_per_q` is an upper bound in a way `hits_delivered` is not —
 see the limits below — and because a memory that never surfaces is the failure auto-recall
 exists to prevent, while an extra adjacent memory costs a few hundred prompt tokens. That
-choice was superseded once the limit was measured: it is a bad exchange rate, and the grid
+choice was superseded once the limit was swept: it is a bad exchange rate, and the grid
 below finds a better one rather than picking a side of it. Note what it forced — with the
 limit fixed at 5, `0.40` and `0.45` both delivered 7, the same as `0.50` at more noise, so the
 whole middle of the range was dominated and the decision really was `0.35`-or-`0.50`.
@@ -180,7 +203,7 @@ whole middle of the range was dominated and the decision really was `0.35`-or-`0
 **`0.30` shows the threshold is not always the binding constraint.** Even admitting every
 target by score, the live row delivers 10/12: two targets rank 8th and 7th, outside
 `limit=5`, so no threshold reaches them. For those questions the lever is
-`ALEXANDRIA_AUTO_RECALL_LIMIT` — measured in the next section.
+`ALEXANDRIA_AUTO_RECALL_LIMIT` — swept in the next section.
 
 Limits on how far to read this table:
 
@@ -199,8 +222,12 @@ The threshold tables above are one row of a grid: they hold `limit` at 5 — the
 and vary `T`. Both levers gate the same delivery, so neither is readable alone. This pass (880
 facts, a superset of the 807 above — the threshold numbers here are the same measurement at a
 larger corpus, not a revision of it) sweeps both. Cells are `hits_delivered` out of 12, with
-`noise_per_q` in parentheses. **`limit = 10, T = 0.45` is the pair now shipped**, set in both
-clients on 2026-09-09 off this table.
+`noise_per_q` in parentheses. **`limit = 10, T = 0.45` is the pair chosen off this table** —
+a judgement call on a small hand-authored question set, see [Limitations](#limitations). The client changes that
+ship it are pending in the Claude-hooks and pi-extension PRs (#17, #18); until they land the pi
+extension still defaults to `5` / `0.58`. Cells are transcribed at one decimal, as the
+formatter printed them then; it prints two since "feat(bench): print noise_per_q to two
+decimals in the grid".
 
 Live corpus, 880 facts:
 
@@ -209,7 +236,7 @@ Live corpus, 880 facts:
 | 3 | 8 (2.3) | 8 (2.1) | 7 (1.2) | 7 (0.7) | 7 (0.4) | 4 (0.2) |
 | 5 (was) | 8 (4.2) | 8 (3.2) | 7 (1.7) | 7 (0.8) | 7 (0.5) | 4 (0.2) |
 | 8 | 11 (5.8) | 10 (4.2) | 8 (2.0) | 8 (1.0) | 7 (0.5) | 4 (0.2) |
-| **10** (shipped) | 12 (6.7) | 11 (4.7) | 8 (2.2) | **8 (1.0)** | 7 (0.5) | 4 (0.2) |
+| **10** (chosen) | 12 (6.7) | 11 (4.7) | 8 (2.2) | **8 (1.0)** | 7 (0.5) | 4 (0.2) |
 | 15 | 12 (8.9) | 11 (5.8) | 8 (2.6) | 8 (1.0) | 7 (0.5) | 4 (0.2) |
 | 20 | 12 (10.5) | 11 (6.6) | 8 (2.7) | 8 (1.0) | 7 (0.5) | 4 (0.2) |
 
@@ -220,7 +247,7 @@ Baseline corpus, 143 facts:
 | 3 | 11 (1.6) | 10 (0.9) | 7 (0.7) | 7 (0.3) | 7 (0.0) | 4 (0.0) |
 | 5 (was) | 12 (2.3) | 11 (1.4) | 8 (0.8) | 8 (0.3) | 7 (0.0) | 4 (0.0) |
 | 8 | 12 (2.8) | 11 (1.8) | 8 (0.9) | 8 (0.3) | 7 (0.0) | 4 (0.0) |
-| **10** (shipped) | 12 (3.2) | 11 (2.0) | 8 (0.9) | **8 (0.3)** | 7 (0.0) | 4 (0.0) |
+| **10** (chosen) | 12 (3.2) | 11 (2.0) | 8 (0.9) | **8 (0.3)** | 7 (0.0) | 4 (0.0) |
 | 15 | 12 (3.6) | 11 (2.0) | 8 (0.9) | 8 (0.3) | 7 (0.0) | 4 (0.0) |
 | 20 | 12 (3.6) | 11 (2.0) | 8 (0.9) | 8 (0.3) | 7 (0.0) | 4 (0.0) |
 
@@ -259,7 +286,7 @@ Limits on how far to read the grid, beyond the three that apply to the threshold
   to 3 and fires on an already-limit-truncated list, so at `limit=3` the two couple and below it
   spreading activation silently narrows. Every row at 3 or above leaves activation untouched.
 - Nothing here says what happens between 10 and 15, or whether 10 still saturates at 2000 facts.
-  The grid is six points chosen to bracket the shipped value, not a curve.
+  The grid is six points picked to bracket the chosen value, not a curve.
 
 ### Recent targets (2026-09-10, 20 questions)
 
@@ -299,7 +326,7 @@ and the worst is 4, against a worst of 11 among the originals. That is the expec
 not evidence the model improved: a fact stored yesterday has had one day to accumulate
 neighbours, where the originals have had two days and a 6x corpus. `hit_max` rose from 0.667
 to 0.828, so the strongest hit in the set is now one of the new targets. Six of the eight
-clear the shipped `T = 0.45` and all six are delivered at `limit = 10`; the other two score
+clear the chosen `T = 0.45` and all six are delivered at `limit = 10`; the other two score
 between 0.40 and 0.45 (they appear in the 0.40 row's `hits_kept` and not the 0.45 row's).
 
 **q12 has crossed the limit.** Its target now ranks 11, past `RECALL_LIMIT = 10`, but it
@@ -331,7 +358,8 @@ as the 880-fact one. Re-run 2026-09-10 on 965 facts (eight added since the 957 p
 rank and every column reproduces except `nonhit_p99` 0.340 -> 0.339 and `ff_p90` 0.286 ->
 0.287). The baseline grid is identical to the 143-fact one recorded under [Result
 limit](#result-limit) and is not repeated. Cells are `hits_delivered` out of 20 with
-`noise_per_q` in parentheses.
+`noise_per_q` in parentheses, transcribed at one decimal from a formatter that now prints two
+(`5.45` is recorded here as `5.5`, `1.65` as `1.6`) — non-regenerable to that precision.
 
 Live corpus, 965 facts:
 
@@ -340,11 +368,11 @@ Live corpus, 965 facts:
 | 3 | 15 (2.2) | 15 (2.0) | 14 (1.5) | 13 (1.1) | 13 (0.6) | 9 (0.1) |
 | 5 | 16 (4.1) | 16 (3.4) | 15 (2.2) | 13 (1.4) | 13 (0.7) | 9 (0.1) |
 | 8 | 19 (6.0) | 18 (4.8) | 16 (2.8) | 14 (1.6) | 13 (0.7) | 9 (0.1) |
-| **10** (shipped) | 19 (7.2) | 18 (5.5) | 16 (3.0) | **14 (1.6)** | 13 (0.7) | 9 (0.1) |
+| **10** (chosen) | 19 (7.2) | 18 (5.5) | 16 (3.0) | **14 (1.6)** | 13 (0.7) | 9 (0.1) |
 | 15 | 20 (9.8) | 19 (6.5) | 16 (3.2) | 14 (1.6) | 13 (0.7) | 9 (0.1) |
 | 20 | 20 (11.7) | 19 (7.2) | 16 (3.2) | 14 (1.6) | 13 (0.7) | 9 (0.1) |
 
-**The shipped pair stays, by the rule that picked it.** The pair moves only when another cell
+**The chosen pair stays, by the rule that picked it.** The pair moves only when another cell
 strictly dominates it — at least as many hits at no more noise — on both corpora. No cell does.
 `limit=8, T=0.45` ties it exactly: the 14 targets that clear 0.45 all rank 8 or better, so the
 two cells deliver the same set. `limit=3, T=0.40` delivers 14 at 1.5 against 1.65, but it is a
@@ -362,7 +390,7 @@ this cell, not the 12-question claim.
 
 **Saturation still holds at 10 for what the threshold admits.** Every column is flat from
 `limit=8` to `10`; only `T=0.30` and `0.35` pick up a hit at 15, and it is q12 (rank 11,
-0.38), which the shipped threshold drops anyway. The headroom line is unchanged: worst rank 8
+0.38), which the chosen threshold drops anyway. The headroom line is unchanged: worst rank 8
 (q1) among the 14 targets at or above 0.45, two positions left.
 
 ### HNSW overlap (1008 facts)
@@ -391,8 +419,9 @@ to either would show.
 - **ff_pN** — percentiles over every fact-to-fact pair.
 - **hits_kept** — targets scoring at or above the client threshold, ignoring rank.
 - **hits_delivered** — targets that clear the threshold *and* rank within the row's `limit`, so
-  a client would actually be shown them. The threshold tables hold this at `RECALL_LIMIT` (5,
-  the auto-recall hook's default `limit`); the grid varies it. The honest recall number;
+  a client would actually be shown them. The threshold tables hold this at `RECALL_LIMIT` (10;
+  the two 807- and 143-fact tables predate that and were printed when it was 5); the grid
+  varies it. The honest recall number;
   `hits_kept` alone only restates whether the threshold sits below a target's score, and is
   therefore the ceiling every `limit` column converges on.
 - **noise_per_q** — mean non-targets per question that survive both the limit and the
@@ -403,7 +432,7 @@ to either would show.
   exact top-k differs from the index's are listed under the line with the dropped ids.
 
 Percentiles use linear interpolation, matching `numpy.percentile`'s default. The 2026-09-08
-second pass ran through numpy; nearest-rank here would shift the derived floor by a hundredth
+second pass ran through numpy; nearest-rank here would shift the floor rule's output by a hundredth
 and silently break comparability with the recorded tables.
 
 ## Test data
@@ -436,6 +465,17 @@ they are absent from the baseline corpus and print as `absent` on that row.
 
 ## Limitations
 
+- **The questions were authored against the corpus.** All 20 were written by reading a stored
+  fact and paraphrasing it into a question. Real prompts are not paraphrases of stored facts,
+  so they score lower than these do, and a `0.45` client threshold drops more of them than
+  the `14/20` here implies. The score distribution the sweep reads is a product of that
+  authoring, and it is the one the client defaults rest on.
+- **There are no negative controls.** Every question has a stored target, so the bench cannot
+  measure auto-recall's most common failure: injecting memories into a prompt nothing was
+  stored for. `noise_per_q` counts non-targets for questions that always have a target, which
+  is a different quantity. A subset of questions with no target is the follow-up that would
+  let `limit` and `min_similarity` be called measured again; until then they are plausible
+  values kept by judgement.
 - **The recent targets are one day old.** Questions 13–20 check that a memory stored after
   the baseline window can be found, but all eight targets date from a single day, and their
   ranks will inflate the way the originals' did as the corpus grows around them. Read them as
@@ -443,7 +483,7 @@ they are absent from the baseline corpus and print as `absent` on that row.
 - **The baseline is reconstructed by size, not identity.** `BASELINE_SIZE = 143` takes the
   143 oldest *active* facts, which is not the same set that was active on 2026-09-08: any of
   those deleted since drops out and the window reaches forward to replace it. Drift is
-  currently negligible — the row reproduces exactly — but it grows with every deletion and
+  currently small — the row reproduces within 0.01 — but it grows with every deletion and
   the tool cannot detect it.
 - **A timestamp cutoff cannot be substituted for the size-based baseline.** No active fact
   predates 2026-09-08 12:30 UTC. The `08:08` in the measurements doc is local time (UTC-4)
