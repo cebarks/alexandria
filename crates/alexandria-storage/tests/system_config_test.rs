@@ -71,3 +71,27 @@ async fn test_different_dimensions_fails() {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("dimensions mismatch"));
 }
+
+#[tokio::test]
+async fn test_facts_without_lock_still_stamps() {
+    use alexandria_storage::repos::MemoryRepo;
+
+    let db = Database::connect_embedded().await.unwrap();
+    schema::migrate(db.inner()).await.unwrap();
+
+    // Pre-lock corpus: facts exist, no lock. Boot must still stamp (warns) so the
+    // migrate-embeddings recovery path ("start the server once") keeps working.
+    MemoryRepo::new(db.inner())
+        .create_fact("pre-lock fact", 1.0, &[0.1_f32; 384], &[])
+        .await
+        .unwrap();
+
+    system_config::check_embedding_model(db.inner(), "test-model", 384)
+        .await
+        .unwrap();
+
+    let model = system_config::get_config(db.inner(), "embedding_model")
+        .await
+        .unwrap();
+    assert_eq!(model.unwrap(), "test-model");
+}
