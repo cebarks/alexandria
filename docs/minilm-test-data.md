@@ -415,8 +415,8 @@ to either would show.
 ### 256-token re-embed (1139 facts)
 
 Finding A1 in `docs/performance-and-ability-findings.md`: the tokenizer shipped a 128-token
-truncation, so every fact longer than that was embedded on its opening. On 2026-09-10 the limit
-went to 256 and the whole corpus was re-embedded (`alexandria migrate-embeddings`, 1834 facts
+truncation, so every fact longer than that was embedded on its opening. On 2026-09-10 this
+install's limit went to 256 (`embedding.max_tokens`; the default stays 128) and the whole corpus was re-embedded (`alexandria migrate-embeddings`, 1834 facts
 including deleted ones, 998 centroids, 68 s). Two snapshots of the same 1139-fact corpus, taken
 minutes apart with the server stopped, one before and one after the re-embed. Both rows are
 `limit = 10`.
@@ -433,8 +433,9 @@ that used to sit above it now embeds on its full text and scores lower against t
 The noise and fact-fact percentiles rose by one to three thousandths, which is the long facts
 becoming slightly more similar to everything once their tails count. The threshold sweep and
 the limit grid reproduce the 965-fact grid cell for cell at `T >= 0.40`; at `0.30`/`0.35`
-`noise_per_q` moves by 0.05. The shipped pair stays. HNSW overlap is still 200/200, target
-delivered 19/19. The floor rule still gives 0.08.
+`noise_per_q` moves by 0.05. The chosen pair stays. The floor rule still gives 0.08. (The HNSW
+overlap line printed 200/200 and 19/19 on this run too, but at that date it compared the exact
+scan with itself; see "HNSW overlap through the index".)
 
 **What this pass cannot show.** The benefit of the change is that the 100-odd facts past 128
 tokens are now searchable by their second half. No frozen question targets one of them, so
