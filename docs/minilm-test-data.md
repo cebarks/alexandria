@@ -448,6 +448,59 @@ per-question rank reproduces, and the before-snapshot run reproduced all of them
 the metric definitions are unchanged; the fact-fact columns of the baseline are simply
 measured on new vectors from here on.
 
+### Duplicate bar (1161 facts)
+
+Finding A3 in `docs/performance-and-ability-findings.md` proposed rejecting a `store_memory`
+whose nearest live fact scores above a high cosine bar, and said to measure the bar first. On
+2026-09-10 every pair of live facts was compared on a copy of the 256-token corpus (1161 facts,
+soft-deleted excluded). Nearest-neighbour cosine per fact, and pairs by band:
+
+| band | facts whose nearest neighbour is here | pairs | byte-identical pairs |
+|---|---|---|---|
+| 0.95 to 1.00 | 19 | 137 | 94 |
+| 0.90 to 0.95 | 6 | 36 | 0 |
+| 0.85 to 0.90 | 28 | 19 | 0 |
+| 0.35 to 0.85 | 1108 | | |
+
+Within the top band, all 94 identical pairs score 1.0, 42 pairs sit in 0.97 to 0.99 and one in
+0.95 to 0.97; none of those 43 is identical.
+
+**One junk family is 172 of the 173 pairs at or above 0.90.** The Claude hook's correction
+detector stored "User correction: completed" 14 times across sessions (91 pairs at 1.0) plus the
+variants "been completed" (0.974 against it), "completed first" (0.947) and "completed)" (0.942).
+Its per-session marker only stops repeats within a session.
+
+**No bar separates restatements from adjacent facts.** The single non-junk pair above 0.95
+(0.967) is a bug description and its fix instruction; collapsing it loses the fix. The readable
+true restatements score 0.949 (a config note reworded), 0.891, 0.884 and 0.878, and share those
+bands with distinct facts such as an attempt-versus-result pair at 0.903.
+
+**Decision.** No cosine bar is usable. At 0.98 the check catches exactly the byte-identical set,
+so a bar adds nothing over comparing trimmed content, and anything lower starts collapsing
+distinct facts. An exact-content check in `store_memory` was written on that basis and withdrawn
+in review (#16): dedup has to cover `update_memory` and `import_document` too and say what happens
+to the caller's tags and session link, which is a design of its own. Rerun this measurement
+before proposing a semantic bar: the throwaway probe was a `cargo` example that opened a copy of
+the data dir, loaded `SELECT * FROM fact WHERE deleted = false`, ran `cosine_similarity` over all
+pairs, and printed the histogram plus every pair at or above 0.85 with both contents, which is
+what makes the false positives readable.
+
+**Re-run 2026-09-19 (1879 facts).** Same probe, corpus 60% larger:
+
+| band | pairs | byte-identical | junk family | other |
+|---|---|---|---|---|
+| 0.95 to 1.00 | 136 | 94 | 136 | 0 |
+| 0.90 to 0.95 | 38 | 0 | 34 | 4 |
+| 0.85 to 0.90 | 30 | 0 | 4 | 26 |
+
+The byte-identical set is the same 94 junk pairs: 718 new facts added no identical pair, so an
+exact-content check would have caught nothing since the first run. Nothing outside the junk family
+scores above 0.95 any more. Below that the mixing is worse than the first run showed, because it
+now includes corrections: restatements sit at 0.949, 0.895, 0.893, 0.891, 0.883 and 0.878, and
+among them are the attempt-versus-result pair (0.903), a superseded decision next to the one that
+replaced it (0.892), and two "root cause found" facts next to the earlier fact they contradict
+(0.874, 0.872). A bar low enough to merge the restatements merges a fact with its own correction.
+
 ### Lexical search (A4, 1173 facts)
 
 Finding A4 in `docs/performance-and-ability-findings.md` proposed a BM25 full-text index on
@@ -476,7 +529,9 @@ and it is a delivered hit at cosine 0.556.
 
 **Every target fusion rescues is under the client threshold.** q4 (7 to 3–5), q10 (2 to 1–2),
 q15 (2 to 1) and q20 (4 to 3) move up, but their target cosines are 0.369, 0.368, 0.410 and
-0.429, all under `T = 0.45`, so the client drops them whatever the server's order.
+0.429, all under the chosen `T = 0.45`, so a client on that pair drops them whatever the server's
+order. At the Claude hook's shipped `limit = 5`, `T = 0.35` three of the four are already delivered
+on cosine alone; fusion's one real rescue is q4, and it costs q9.
 
 **MiniLM already handles identifiers.** Seven throwaway probes were written around a unique
 token in a real fact: a rustc error code (`E0423`), env var names (`ALEXANDRIA_EXTRACT_FLUSH_WAIT`,
@@ -496,6 +551,19 @@ before revisiting: the probe was a `bench-lexical` subcommand on the binary that
 through `MemoryRepo::list`, defined the two objects above on the copy, and printed cosine, BM25 and
 fused rank per question beside the target's cosine. Untried: `AND` matching and a phrase boost;
 neither helps a target that shares no token with its question. 27 questions is a small sample.
+
+**Re-run 2026-09-19 (1879 facts).** Same probe and questions:
+
+| set | cosine mean_rank | fused, BM25 weight 1.0 | 0.5 | 0.25 |
+|---|---|---|---|---|
+| 20 frozen questions | 3.95 | 7.10 | 5.05 | 4.50 |
+| 7 identifier probes | 1.57 | 1.14 | 1.14 | 1.29 |
+
+`top1` is 12/20 on cosine and 11, 11 and 12 fused. The same four targets are absent from the BM25
+top 50, and q9 falls from 1 to 16 at weight 1.0 and to 10 at 0.25. Cosine alone drifted from 3.35
+to 3.95 as the corpus grew (q20 from 4 to 11, q11 from 13 to 16); fusion recovers q20 only to 7–10,
+still under the threshold. The identifier probes rank exactly as before on cosine. The decision
+stands.
 
 ### HNSW overlap through the index (1844 facts)
 
