@@ -37,6 +37,14 @@ pub const LATEST_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 /// On an existing database, reads the current version and runs only newer migrations.
 pub async fn migrate(db: &Surreal<Any>) -> Result<()> {
     let current_version = get_current_version(db).await;
+    // A newer binary may have written things this one cannot read (a lock key, a field), and
+    // this one would write over them without knowing. Old binaries cannot be fixed; this stops
+    // every binary from here on.
+    anyhow::ensure!(
+        current_version <= LATEST_VERSION,
+        "database schema is v{current_version} but this binary only knows v{LATEST_VERSION}; \
+         it was last opened by a newer alexandria. Upgrade the binary; rolling back is unsafe."
+    );
 
     let pending: Vec<_> = MIGRATIONS
         .iter()
@@ -126,6 +134,20 @@ struct SystemConfigRow {
 mod tests {
     use super::*;
     use crate::models::Session;
+
+    /// A database a newer binary migrated must not be opened by an older one.
+    #[tokio::test]
+    async fn migrate_refuses_a_schema_newer_than_this_binary() {
+        let db = crate::connection::Database::connect_embedded()
+            .await
+            .unwrap();
+        let db = db.inner();
+        migrate(db).await.unwrap();
+        set_version(db, LATEST_VERSION + 1).await.unwrap();
+
+        let err = migrate(db).await.unwrap_err().to_string();
+        assert!(err.contains("newer alexandria"), "{err}");
+    }
 
     /// Rows written before v006 carry a memory_count value; the migration must
     /// clear it and the field-less Session struct must still read them back.
