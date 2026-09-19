@@ -181,9 +181,10 @@ milestone:
   lists them in the browser. `recall` still walks clusters rather than sessions.
 - ~~**`session.agent_id` / `session.model` are dead columns.**~~ Done: optional `agent_id` / `model`
   on `store_memory` and `import_document`, the first non-null value wins whenever it arrives.
-- **No tests for the pi extension.** The detector regexes and extraction prompt have no coverage, so
-  a pattern edit is unguarded.
-- **Extension does not use sessions.** Auto-store writes are ungrouped.
+- ~~**No tests for the pi extension.**~~ Done: the detectors, serializer and response parser are
+  covered under `just ext-test`. The extraction prompt text is still unguarded.
+- ~~**Extension does not use sessions.**~~ Done: auto-store writes carry pi's session id,
+  `agent_id = "pi"` and the model. Finalize-at-shutdown is still open.
 - ~~**The debug graph's BFS is unbounded.**~~ Done 2026-09-14 — `EdgeRepo::get_neighbors_capped` visits
   at most `max_nodes` records and reports whether that bound is what stopped it; the debug graph
   calls it with `GRAPH_VISIT_CAP` (4 × `GRAPH_NODE_CAP` = 800) and its notice distinguishes "the

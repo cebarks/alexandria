@@ -86,9 +86,9 @@ These are real gaps in the shipped implementation, not usage advice:
   UI's other route: `/debug/sessions` (list, in the total order above) and
   `/debug/sessions/:external_id` (detail: summary, tags, the session's memories), HTTP mode only — or
   query the `session` table directly.
-- **The pi extension does not populate sessions.** `contrib/pi/` stores and retrieves memories
-  without a `session_id`, so auto-store/auto-recall traffic is ungrouped. Session tools are for
-  agents that decide to use them explicitly.
+- **The pi extension groups but does not finalize.** `contrib/pi/` sends pi's session id,
+  `agent_id = "pi"` and the model with every auto-store, so those writes are grouped; it never calls
+  `finalize_session`, so its sessions have no summary.
 
 ## SurrealDB 3.2 gotchas in this code path
 
