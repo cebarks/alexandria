@@ -393,7 +393,12 @@ this cell, not the 12-question claim.
 0.38), which the chosen threshold drops anyway. The headroom line is unchanged: worst rank 8
 (q1) among the 14 targets at or above 0.45, two positions left.
 
-### HNSW overlap (1008 facts)
+### HNSW overlap (1008 facts) — vacuous, kept as history
+
+> This pass did not measure the index. The bench then queried through `MemoryRepo::nearest`,
+> whose `<|k,COSINE|>` form is a brute-force KNN whether or not an index exists, so the line
+> compares the exact scan with itself and would print 200/200 for any index parameters. The
+> [1844-fact pass](#hnsw-overlap-through-the-index-1844-facts) below is the first real one.
 
 First pass after the overlap check landed. Live corpus, 1008 facts, `limit = 10`:
 
@@ -406,6 +411,24 @@ the recorded metrics describe what the server serves. `19/19` because q12's targ
 on the exact scan and so is not in the set the index could have delivered; it is not an index
 miss. The index is defined with SurrealDB's default `EFC`/`M`, and this line is where a change
 to either would show.
+
+### HNSW overlap through the index (1844 facts)
+
+Re-run 2026-09-18 on a copy of the live data dir, after the bench switched to
+`MemoryRepo::nearest_indexed` (`<|k,150|>`, the form `test_nearest_indexed_plan_uses_the_hnsw_index`
+pins to a `KnnScan` on `fact_embedding_hnsw`). Live corpus, 1844 facts, `limit = 10`:
+
+```
+hnsw top-10 vs exact scan: 200/200 ids agree over 20 questions, target delivered 17/17
+```
+
+The index returns the exact top 10 for every question at `ef = 150` and SurrealDB's default
+`EFC`/`M`. The bench asks for exactly `RECALL_LIMIT` rows; the server asks for ten more than
+`limit` and re-ranks, so production has more slack than this line credits it with. `17/17`
+because three targets (q11 at 13, q12 at 18, q20 at 11) now rank past 10 on the exact scan and are not
+in the set the index could have delivered — that is rank inflation at 1844 facts, not an index
+miss, and it is the same effect the grids above track. Twenty questions on one corpus is a
+smoke test of the index, not a recall curve for it.
 
 ## Metric definitions
 
