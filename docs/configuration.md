@@ -7,7 +7,7 @@ Alexandria loads server config with this precedence:
    - `ALEXANDRIA_CONFIG` env var (explicit path override)
    - `$XDG_CONFIG_HOME/alexandria/config.toml` (default: `~/.config/alexandria/config.toml` on Linux, `~/Library/Application Support/alexandria/config.toml` on macOS)
    - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
-3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_EMBEDDING_BATCH_SIZE`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
+3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_EMBEDDING_BATCH_SIZE`, `ALEXANDRIA_EMBEDDING_MAX_TOKENS`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
 
 ## Full Example
 
@@ -78,10 +78,15 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 | `model` | string | `"sentence-transformers/all-MiniLM-L6-v2"` | HuggingFace model ID. Must be a BERT-family model compatible with candle. Pooling mode (CLS or mean) is read from the model repo's `1_Pooling/config.json`; models without it use mean pooling. |
 | `device` | string | `"cpu"` | Compute device. Only `"cpu"` is currently supported. |
 | `batch_size` | usize | `32` | Facts per `embed()` call during `alexandria migrate-embeddings`. Sets how often the migration writes and logs progress; it does not bound memory or change speed with the Candle provider, which runs one forward pass per text. Must be between 1 and 4096, checked at config load. The server itself embeds one text at a time. |
+| `max_tokens` | usize | `128` | Longest text one embedding sees, in wordpiece tokens including `[CLS]`/`[SEP]`. A longer memory is still stored whole, but only its first `max_tokens` tokens are searchable; the server logs a warning with the fact id and token count, and `store_memory` returns `truncated: true`. **128** is the standard: it is what the model's `tokenizer.json` ships, so every database created before this key existed is at 128 and boots unchanged. **256** is tested (it is what sentence-transformers serves this model at, and it covered the p99 of the corpus it was measured on; see [docs/minilm-test-data.md](minilm-test-data.md), "256-token re-embed"). Anything above 256 is experimental: the model was trained at 128 and nothing here has measured it. Must be between 3 and 512, checked at config load, and no larger than the model's position table, checked when the model loads. Padding is off at every value, so a text costs its own length, not the limit. |
 
 **Switching models on an existing database:** stop the server, set the new `model`, run `alexandria migrate-embeddings` (re-embeds every memory and cluster centroid, then updates the lock), and start the server again. Thresholds (`[cluster]`, `[retrieve] min_similarity`, and the client's `[recall] min_similarity`) are tuned to the default model; retune them if you switch. `alexandria bench-retrieval` derives the latter two from the new model's own output — see [docs/minilm-test-data.md](minilm-test-data.md). The migration is not transactional: if it fails partway, rerun it. Do not revert `model` in config afterwards, the database may hold a mix of old and new vectors.
 
-**Model locking:** On first boot, the model name, dimension count, and token limit (256 wordpiece tokens per text; longer texts embed on their first 256 and log a warning) are stored in the database. Changing the model in config without wiping the database will cause a startup error with instructions to either revert the model or run `alexandria migrate-embeddings`. A database locked before the token limit was recorded was embedded at 128 tokens; the server refuses to boot on it until `alexandria migrate-embeddings` re-embeds everything at 256.
+**Raising the token limit on an existing database:** stop the server, set `max_tokens`, run `alexandria migrate-embeddings`, start the server. It re-embeds everything, as a model switch does, and moves the lock last. The limit only goes up: `migrate-embeddings` refuses a `max_tokens` below what the corpus is locked at, and the server refuses to boot on one, so the way back from 256 is to keep `max_tokens = 256`. `alexandria migrate-embeddings --force` re-embeds even when the lock already matches config, for a corpus whose lock is right and whose vectors may not be.
+
+**Model locking:** On first boot, the model name, dimension count, and token limit are stored in the database. Changing the model or the limit in config without migrating causes a startup error that says which way to go. A database locked before the token limit was recorded, or one that has memories and no lock at all, was embedded at 128 tokens and is treated as locked at 128: it boots at the default and refuses a higher `max_tokens` until `alexandria migrate-embeddings` has run.
+
+**Rolling back the binary is unsafe after a migration, and undetectable.** A release from before `max_tokens` existed does not read the token lock. Run against a database migrated to 256, it writes 128-token, padded vectors into a corpus labelled 256, and nothing can tell afterwards. From this release on, a binary refuses to open a database whose schema version is newer than its own, which stops the general case; it cannot stop binaries that predate the check. If it has happened, `alexandria migrate-embeddings --force` repairs it.
 
 **First run:** The model weights (~80MB for all-MiniLM-L6-v2) are downloaded from HuggingFace Hub and cached in `~/.cache/huggingface/`.
 
@@ -150,6 +155,7 @@ These env vars override individual config values after the TOML file is loaded:
 | `ALEXANDRIA_EMBEDDING_MODEL` | `embedding.model` |
 | `ALEXANDRIA_EMBEDDING_DEVICE` | `embedding.device` |
 | `ALEXANDRIA_EMBEDDING_BATCH_SIZE` | `embedding.batch_size` |
+| `ALEXANDRIA_EMBEDDING_MAX_TOKENS` | `embedding.max_tokens` |
 | `ALEXANDRIA_REMINDERS_TIMEZONE` | `reminders.timezone` |
 | `ALEXANDRIA_REMINDERS_ESCALATION_HOURS` | `reminders.escalation_hours` — a non-numeric value fails startup with an error naming the variable |
 
