@@ -50,7 +50,8 @@ This is a recall, store, **and** reminders companion (package version 2.1) — f
    per prompt and whatever is due is injected alongside the recall hits and shown as a notification.
    The server runs no timer, so this per-interaction check is how reminders reach the user at all.
 3. **Heuristic detectors** — pattern matching on prompts and tool results, with no LLM in the loop:
-   correction-shaped language ("no, use X"), forward-looking preference statements ("always do X"),
+   correction-shaped language ("no, use X"), forward-looking preference statements ("always do X",
+   "never do Y" — stored from the trigger word on, so a prohibition keeps its negation),
    and error→success pairs per tool, which become "this error resolves this way" memories. Stores are
    fire-and-forget so they never add latency to the turn.
 4. **Dedup tracking** — every heuristic store, and every agent-initiated `store_memory` /
@@ -88,9 +89,8 @@ The directory used to be `extensions/alexandria-auto-recall/`. If the old copy i
 Config file: `$XDG_CONFIG_HOME/alexandria/client.toml`, same precedence as the server
 (defaults → file → `ALEXANDRIA_CLIENT_CONFIG` → individual env vars). See
 [docs/configuration.md](../../docs/configuration.md) for the full reference. Every key is optional;
-the defaults work against a locally running server. Note: the extension default
-`min_similarity = 0.58` is measured too high for `all-MiniLM-L6-v2` — set `0.35`
-(see `[recall]` in docs/configuration.md).
+the defaults work against a locally running server. `limit` and `min_similarity` are a pair read
+off one grid for `all-MiniLM-L6-v2`; change them together (see `[recall]` in docs/configuration.md).
 
 ```toml
 [server]
@@ -98,8 +98,8 @@ url = "http://127.0.0.1:3000/mcp"
 
 [recall]
 enabled = true
-limit = 5
-min_similarity = 0.58
+limit = 10
+min_similarity = 0.45
 
 [store]
 enabled = true
@@ -128,12 +128,15 @@ response produces a warning at most, never a blocked turn.
 
 ### Limitations worth knowing
 
-- **The detectors are untested.** The extension has a suite (`just ext-test`, and `npm test` in
-  `extensions/alexandria/`) covering the config loader, the reminder payload/rendering path, the
-  merged dispatcher's failure isolation, and the project-hint probe. The heuristic detector regexes and
-  the LLM extraction prompt are still outside it, so those changes remain unguarded.
-- **No session memory integration.** The extension stores and retrieves without a `session_id`, so
-  its writes are ungrouped. See [docs/session-memory.md](../../docs/session-memory.md).
+- **The extraction prompt is untested.** The suite (`just ext-test`, and `npm test` in
+  `extensions/alexandria/`) covers the config loader, the reminder payload/rendering path, the
+  merged dispatcher's failure isolation, the project-hint probe, the detectors, and the transcript
+  serializer and response parser. The prompt text and its truncation are still outside it.
+- **Sessions are grouped, not finalized.** Every store carries pi's session id, `agent_id = "pi"`
+  and the model, but nothing calls `finalize_session`, so a pi session never gets a summary. See
+  [docs/session-memory.md](../../docs/session-memory.md).
+- **Reworded repeats are stored again.** The regex detectors dedup exact repeats within one process
+  only; near-duplicates are deferred to [#27](https://github.com/cebarks/alexandria/issues/27).
 - **Recall ignores `recall`.** It uses `retrieve_memories`, never the two-phase `recall` tool, so
   broad "what do we know about X" exploration is not what auto-recall is tuned for.
 - **Reminders need a client to ask.** Nothing fires on its own: with `ALEXANDRIA_REMINDERS=off` (or

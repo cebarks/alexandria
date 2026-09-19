@@ -16,8 +16,6 @@ const CORRECTION_PATTERNS: RegExp[] = [
 	/\bactually[,.]?\s+(.+)/i,
 	/\bi\s+meant\s+(.+)/i,
 	/\bnot\s+.{2,30}[,;]\s*(?:use|it'?s)\s+(.+)/i,
-	/\bdon'?t\s+use\s+.{2,30}[,;]\s*use\s+(.+)/i,
-	/\buse\s+(.+?)\s+instead\s+of\s+.+/i,
 	/\bwrong\s*[—–-]\s*(.+)/i,
 	/\bincorrect\s*[—–-]\s*(.+)/i,
 ];
@@ -38,7 +36,8 @@ export function detectCorrection(
 		const match = trimmed.match(pattern);
 		if (match?.[1]) {
 			const correctedFact = match[1].replace(/[.!]+$/, "").trim();
-			if (correctedFact.length < 5) continue; // too short to be useful
+			// One word ("no, it's completed") is a state report, not a fact.
+			if (correctedFact.length < 5 || !/\s/.test(correctedFact)) continue;
 
 			const content = `User correction: ${correctedFact}`;
 
@@ -46,7 +45,7 @@ export function detectCorrection(
 
 			return {
 				content,
-				tags: ["correction", "auto-detected"],
+				tags: ["correction", "auto-detected", "source:regex"],
 			};
 		}
 	}

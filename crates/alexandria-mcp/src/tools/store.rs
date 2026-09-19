@@ -10,4 +10,12 @@ pub struct StoreMemoryParams {
         description = "Optional session ID to group this memory into a session context. Auto-creates the session on first use."
     )]
     pub session_id: Option<String>,
+    #[schemars(
+        description = "Optional identifier of the agent or harness storing this (e.g. 'claude-code', 'pi'). Only meaningful with session_id; the first non-null value wins whenever it arrives and is never overwritten."
+    )]
+    pub agent_id: Option<String>,
+    #[schemars(
+        description = "Optional model name of the agent storing this (e.g. 'claude-sonnet-5'). Only meaningful with session_id; the first non-null value wins whenever it arrives and is never overwritten."
+    )]
+    pub model: Option<String>,
 }

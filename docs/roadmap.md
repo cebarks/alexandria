@@ -1,6 +1,6 @@
 # Roadmap
 
-**Current state:** 8 MCP tools, 223 tests, schema `v006`, HTTP + stdio + Docker deployment, one
+**Current state:** 13 MCP tools, schema `v006`, HTTP + stdio + Docker deployment, one
 crate per layer and two client-side pi integrations under `contrib/pi/`.
 
 ## Completed
@@ -176,14 +176,15 @@ milestone:
 
 - ~~**Session-scoped search ignores soft-deletes.**~~ Done 2026-09-08 — `SessionRepo::get_memories()`
   filters `deleted = false`, matching the unscoped path.
-- **No session enumeration.** `get_session` needs an id you already know; there is no `list_sessions`,
-  and `recall` walks clusters rather than sessions. `/debug/sessions` (v0.2.7) lists them in the browser;
-  the MCP surface still cannot.
-- **`session.agent_id` / `session.model` are dead columns.** Present in schema and model, never
-  populated — either wire them to a tool parameter or drop them.
-- **No tests for the pi extension.** The detector regexes and extraction prompt have no coverage, so
-  a pattern edit is unguarded.
-- **Extension does not use sessions.** Auto-store writes are ungrouped.
+- ~~**No session enumeration.**~~ Done 2026-09-09: `list_sessions` (13 tools total) lists newest-first
+  with live memory counts, filterable by `agent_id`, `tag`, `finalized`. `/debug/sessions` (v0.2.7)
+  lists them in the browser. `recall` still walks clusters rather than sessions.
+- ~~**`session.agent_id` / `session.model` are dead columns.**~~ Done: optional `agent_id` / `model`
+  on `store_memory` and `import_document`, the first non-null value wins whenever it arrives.
+- ~~**No tests for the pi extension.**~~ Done: the detectors, serializer and response parser are
+  covered under `just ext-test`. The extraction prompt text is still unguarded.
+- ~~**Extension does not use sessions.**~~ Done: auto-store writes carry pi's session id,
+  `agent_id = "pi"` and the model. Finalize-at-shutdown is still open.
 - ~~**The debug graph's BFS is unbounded.**~~ Done 2026-09-14 — `EdgeRepo::get_neighbors_capped` visits
   at most `max_nodes` records and reports whether that bound is what stopped it; the debug graph
   calls it with `GRAPH_VISIT_CAP` (4 × `GRAPH_NODE_CAP` = 800) and its notice distinguishes "the
@@ -235,7 +236,7 @@ The goal: memories should organize themselves without manual curation.
 
 **Performance**
 
-- SurrealDB vector index for DB-side cosine similarity (matters at >10k memories)
+- ~~SurrealDB vector index for DB-side cosine similarity~~ Done 2026-09-18 (HNSW, defined at boot, queried with `<|k,ef|>`; the 2026-09-09 version defined the index but never queried it)
 - Full-text search index for keyword matching alongside semantic search
 - Cluster heat caching with TTL
 - Bulk heat maintenance sweep for untouched records

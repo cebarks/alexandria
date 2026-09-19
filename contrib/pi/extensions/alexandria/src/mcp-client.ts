@@ -12,6 +12,7 @@ import {
 	StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
 import { CONFIG } from "./config.js";
+import type { SessionArgs } from "./session-args.js";
 
 let clientPromise: Promise<Client> | null = null;
 
@@ -173,9 +174,31 @@ export function extractTextContent(content: unknown): string | undefined {
 	return undefined;
 }
 
+/**
+ * The message of a failed tool result, or undefined when it succeeded. The server reports a
+ * rejected call as a normal result flagged `isError` with a `{"status":"error","message":...}`
+ * text block, not as a thrown error, so a caller that does not look never learns of it. `isError`
+ * alone decides; the body only supplies the wording.
+ */
+export function toolErrorMessage(result: { content?: unknown; isError?: boolean }): string | undefined {
+	if (result.isError !== true) return undefined;
+	const text = extractTextContent(result.content);
+	if (text === undefined) return "tool call failed";
+	try {
+		const message = (JSON.parse(text) as { message?: unknown } | null)?.message;
+		if (typeof message === "string") return message;
+	} catch {
+		/* not JSON: the text is the message */
+	}
+	return text;
+}
+
 export async function storeMemory(
 	content: string,
 	tags: string[],
+	session: SessionArgs,
 ): Promise<void> {
-	await callToolWithRetry("store_memory", { content, tags });
+	const result = await callToolWithRetry("store_memory", { content, tags, ...session });
+	const err = toolErrorMessage(result);
+	if (err) throw new Error(err);
 }
