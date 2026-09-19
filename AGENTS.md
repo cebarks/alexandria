@@ -161,9 +161,11 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
   `alexandria bench-retrieval`, metric definitions, and the frozen question set
 - `docs/roadmap.md` — shipped milestones and planned work
 - `docs/security-findings.md` — 2026-09-10 audit: threat model (memory as a prompt-injection
-  persistence layer), the convex-hull paper verdict, ranked findings S1–S6 with file:line refs
+  persistence layer), the convex-hull paper verdict, ranked findings S1–S6
 - `docs/performance-and-ability-findings.md` — same audit: the 128-token truncation measurement,
   inert heat model, O(N) cluster counting, ranked findings A1–A4 / P1–P5
+- `docs/*-findings.md` cite code by symbol (`do_store_memory`, `MemoryRepo::nearest`), never by
+  `file.rs:NN`. Line numbers go stale on the next commit; a symbol can be grepped.
 - `docs/plans/` — dated design/implementation plans for completed work (historical, not maintained)
 - `contrib/pi/README.md` — how the pi skill and extension differ and install
 - `AGENTS.md` — this file. It was named `CLAUDE.md` until the docs sweep that added session memory

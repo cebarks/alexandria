@@ -7,8 +7,13 @@ request; "ability" findings are about retrieval quality and features the code cl
 deliver.
 
 No latency benchmarks were run. Every performance claim below is structural (query counts, bytes moved,
-tokens processed) and can be checked by reading the cited lines. The one measured item is the token
+tokens processed) and can be checked by reading the cited code. The one measured item is the token
 length of the live corpus, which drives finding A1.
+
+**Reading this after the audit date.** The findings are kept as written on 2026-09-10. A finding that
+has since been acted on carries a **Status** line; one without still holds as written, re-checked
+2026-09-19 after the rebase onto upstream `e251a5e`. Code is cited by symbol, not by line number, so
+a reference survives the next edit.
 
 | ID | Finding | Severity | Effort |
 |---|---|---|---|
@@ -53,9 +58,9 @@ How it was measured, so it can be rerun after a fix:
 
 **Where.**
 
-- `crates/alexandria-pipeline/src/embedding/candle.rs:104` loads `tokenizer.json` with
-  `Tokenizer::from_file` and never changes its truncation or padding settings; `:126` calls
-  `encode(text, true)`, which applies whatever the file specifies.
+- `CandleProvider::load_model` (`crates/alexandria-pipeline/src/embedding/candle.rs`) loads
+  `tokenizer.json` with `Tokenizer::from_file` and never changes its truncation or padding settings;
+  `embed_sync` calls `encode(text, true)`, which applies whatever the file specifies.
 - The cached snapshot's `tokenizer.json` specifies `truncation.max_length = 128` and
   `padding.strategy = Fixed(128)`. The model's `config.json` has `max_position_embeddings = 512`;
   sentence-transformers runs this model at `max_seq_length = 256`.
@@ -63,7 +68,7 @@ How it was measured, so it can be rerun after a fix:
 **Impact.** 100 of 1122 live facts are searchable only by their first 128 tokens. The rest of each
 fact is invisible to `retrieve_memories`, `recall`, cluster assignment, and the duplicate detection
 that A3 would add. `import_document` is hit harder: the `fixed_size` strategy cuts 1000-character
-chunks (`server.rs:340`), about 220 to 250 tokens, so nearly every fixed-size chunk is truncated;
+chunks (`do_import_document`), about 220 to 250 tokens, so nearly every fixed-size chunk is truncated;
 `heading` chunks are unbounded; `whole` mode embeds only the opening of the document.
 
 The client thresholds in `docs/minilm-test-data.md` (`limit = 10`, `min_similarity = 0.45`) were
@@ -80,7 +85,7 @@ measured under this truncation. They may move once long facts embed on their ful
 3. Make the chunkers token-aware or cap them so that `fixed_size` stays under the limit
    (roughly 900 characters for 256 tokens).
 4. **Re-embed.** `alexandria migrate-embeddings` skips when the stored model id equals the configured
-   one (`crates/alexandria-mcp/src/migrate.rs:47-49`), so the fix needs either a `--force` flag or,
+   one (`reembed` in `crates/alexandria-mcp/src/migrate.rs`), so the fix needs either a `--force` flag or,
    better, a second lock value such as `embedding_max_tokens` in `system_config` that
    `check_embedding_model` and `reembed` treat like a model change. The lock approach also stops a
    future truncation edit from silently mixing vector spaces.
@@ -92,15 +97,15 @@ measured under this truncation. They may move once long facts embed on their ful
 
 **Where.**
 
-- `crates/alexandria-engine/src/heat/decay.rs:31` (`projected_heat`) and `:46` (`on_access`) have
-  no callers outside the engine's own tests.
-- `server.rs` never calls `HeatRepo::update` (`crates/alexandria-storage/src/repos/heat_repo.rs:49`).
-  The only writes are the initial row (`server.rs:219`, `:387`) and `add_heat` from spreading
-  activation (`server.rs:696-702`), which warms *neighbours* of a retrieved fact but not the fact.
-- Ranking ignores heat: `do_retrieve_memories` ranks by cosine only (`server.rs:451`);
-  `broad_recall` sorts by similarity (`crates/alexandria-engine/src/recall/algorithm.rs:126`) even
-  though its doc comment at `:57` says "rank by best_member_sim × cluster_heat"; the members it is
-  given have `heat` hardcoded to `1.0` (`server.rs:734`).
+- `projected_heat` and `on_access` (`crates/alexandria-engine/src/heat/decay.rs`) have no callers
+  outside the engine crate.
+- `server.rs` never calls `HeatRepo::update`. The only writes are the initial row
+  (`HeatRepo::create_for_memory` in `do_store_memory` and `do_import_document`) and `add_heat` from
+  spreading activation (`trigger_activation`), which warms *neighbours* of a retrieved fact but not the fact.
+- Ranking ignores heat: `do_retrieve_memories` ranks by cosine only (`retrieve_core`);
+  `broad_recall` sorts by similarity (`crates/alexandria-engine/src/recall/algorithm.rs`) even
+  though its doc comment says "rank by best_member_sim × cluster_heat"; the members it is
+  given have `heat` hardcoded to `1.0` (`load_cluster_with_members`).
 
 **Impact.** `access_count` and `stability` never change. `heat` only ever rises via activation and
 is never read, so the Ebbinghaus model described in the README and roadmap (v0.1, "Ebbinghaus heat
@@ -124,27 +129,29 @@ Recommendation: delete unless the measured gain from wiring is real. Half-alive 
 
 **Severity:** Medium. **Effort:** small.
 
-**Where.** The `store_memory` tool description promises "dedup happens via clustering"
-(`server.rs:86`). Clustering groups facts; it never rejects or merges one. `TODO-misc.md`
-("A restated target scores as a miss") already records that duplicates outrank the original in the
-bench.
+**Where.** The `store_memory` tool description promises "dedup happens via clustering". Clustering
+groups facts; it never rejects or merges one.
 
 **Impact.** Auto-store paths (heuristic detectors, extraction, the Claude hook) restate facts across
 sessions. Each copy takes a result slot, so `limit = 10` delivers fewer distinct facts, and
 `update_memory` cannot find the canonical record to correct.
 
-**Fix.** With the HNSW index now defined at boot, one `MemoryRepo::nearest(embedding, 1)` before
-`create_fact` costs one indexed query. On a hit at or above a high bar, return
+**Fix.** One nearest-neighbour lookup before `create_fact`. It has to be
+`MemoryRepo::nearest_indexed(embedding, 1)` to cost one indexed query; `MemoryRepo::nearest` is a
+full scan whether or not the index exists. On a hit at or above a bar, return
 `{"status": "duplicate", "id": <existing>}` or link the new text to the existing fact with
-`derived_from`. The bar must be high: `TODO-misc.md` notes that MiniLM scores true duplicates and
-adjacent distinct memories in the same 0.63 to 0.76 band, so only near-verbatim restatements (0.95
-and up) are safe to collapse automatically. Measure the threshold on the live corpus before choosing.
+`derived_from`. How MiniLM scores true duplicates against adjacent distinct memories was not
+measured in this audit, so no bar is proposed here: measure it on the live corpus first.
+
+**Correction (2026-09-19).** This finding used to cite `TODO-misc.md` for duplicates outranking the
+original in the bench and for a 0.63 to 0.76 duplicate band, and derived a 0.95 bar from the band.
+`TODO-misc.md` says neither. Both claims and the bar are withdrawn.
 
 ### A4. No lexical search
 
 **Severity:** Medium. **Effort:** medium.
 
-**Where.** `do_retrieve_memories` is KNN only (`server.rs:432-454`). The `docs/roadmap.md` v0.4 list
+**Where.** `do_retrieve_memories` is KNN only (`retrieve_core`). The `docs/roadmap.md` v0.4 list
 already names "Full-text search index for keyword matching alongside semantic search".
 
 **Impact.** A symmetric sentence model is weak on identifiers, flag names, error strings, and config
@@ -164,7 +171,7 @@ pango markup on a text block"). Those are the cases where an exact token match s
 **Severity:** Medium. **Effort:** trivial. Same root cause as A1.
 
 **Where.** `padding.strategy = Fixed(128)` in the loaded `tokenizer.json`; the attention mask keeps
-mean pooling correct (`candle.rs:148-158`), so the result is right, but the compute is not.
+mean pooling correct (`embed_sync`), so the result is right, but the compute is not.
 
 **Impact.** A typical query is 10 to 25 tokens and a typical fact is 73 (p50). BERT attention cost
 grows with sequence length, so single-text embeds do several times the work they need. This sits on
@@ -180,26 +187,24 @@ client timeout.
 
 **Where.**
 
-- `server.rs:707-717` `load_cluster_infos` calls `ClusterRepo::list_with_counts`
-  (`crates/alexandria-storage/src/repos/cluster_repo.rs:266`), which calls `get_members` (`:52`) once
-  per cluster and takes `.len()`. `get_members` selects full `Fact` rows, embeddings included.
+- `load_cluster_infos` calls `ClusterRepo::list_with_counts`, which calls `get_members` once per
+  cluster and takes `.len()`. `get_members` selects full `Fact` rows, embeddings included.
 - Callers: `assign_to_cluster_and_update` on every `store_memory` and on every `import_document`
-  chunk (`server.rs:655`), and `load_all_clusters_with_members` (`server.rs:749-764`) on every broad
-  `recall` (`:520`), which then keeps every embedding in memory to score clusters.
+  chunk, and `load_all_clusters_with_members` on every broad `recall` (`do_recall`), which then
+  keeps every embedding in memory to score clusters.
 
 **Impact.** Each store moves every live embedding out of the database to count them. At 384 floats
 per fact that is about 1.5 KB per fact, roughly 1.7 MB per store on today's corpus, and it grows
 linearly. Broad recall does the same and then does an in-process cosine over the whole corpus,
-bypassing the HNSW index that `retrieve_memories` already uses. `TODO-misc.md` records the
+bypassing the HNSW index that `retrieve_memories` already uses. `AGENTS.md` records the
 per-cluster query but not that the rows carry embeddings.
 
 **Fix.**
 
-1. Counting: one query, the pattern `SessionRepo::list` already uses at
-   `crates/alexandria-storage/src/repos/session_repo.rs:163`:
+1. Counting: one query, the pattern `SessionRepo::list` already uses:
    `SELECT *, count(->contains_memory->fact) AS member_count FROM cluster`. Replace
    `list_with_counts` with it.
-2. Broad recall: take the top-k facts from `MemoryRepo::nearest`, group them by cluster via
+2. Broad recall: take the top-k facts from `MemoryRepo::nearest_indexed`, group them by cluster via
    `cluster_for_fact` or a single graph query, and rank clusters from that. That makes recall O(k)
    instead of O(N) and keeps it on the index. If the full-member design is kept for now, at least
    project only `id, content` in `get_members` when embeddings are not needed.
@@ -210,8 +215,8 @@ per-cluster query but not that the rows carry embeddings.
 
 **Where.**
 
-- `candle.rs:184`: "Run inline for now", because `&self` cannot move into `spawn_blocking`.
-- `candle.rs:120-123`: `embed_sync` loops over texts one at a time, building tensors and running a
+- `CandleProvider::embed`: "Run inline for now", because `&self` cannot move into `spawn_blocking`.
+- `embed_sync` loops over texts one at a time, building tensors and running a
   `(1, L)` forward per text. The `batch_size` config for `migrate-embeddings` bounds memory but does
   not batch inference.
 
@@ -230,10 +235,9 @@ multiple.
 
 **Severity:** Low. **Effort:** trivial.
 
-**Where.** `server.rs:461-462`: the comment says "Fire-and-forget activation, don't block on it" and
-the next line awaits it. `trigger_activation` (`:675`) runs `EdgeRepo::get_neighbors`
-(`crates/alexandria-storage/src/repos/edge_repo.rs:109`), a BFS that issues two queries per visited
-node (`:64`), then one `UPDATE` per target.
+**Where.** `retrieve_core`: the comment says "Fire-and-forget activation, don't block on it" and
+the next line awaits it. `trigger_activation` runs `EdgeRepo::get_neighbors`, a BFS that issues two
+queries per visited node (`get_direct_neighbors`), then one `UPDATE` per target.
 
 **Impact.** At least two queries per top result on every retrieve, more with edges. Cheap today
 because the only edges are `derived_from` and `extracted_from`, so most facts have none. It becomes
@@ -241,13 +245,14 @@ real once relation discovery (roadmap v0.3) creates edges, and it is on the auto
 budget. Note that if A2 is resolved by deletion, this finding goes with it.
 
 **Fix.** `tokio::spawn` the activation with cloned `Arc`s, or skip it entirely when the fact has no
-edges (the early return at `:681` already does that after the first query).
+edges (the early return in `trigger_activation` already does that after the first query).
 
 ### P5. Maintenance re-reads every cluster after every merge
 
 **Severity:** Low. **Effort:** none yet.
 
-**Where.** `crates/alexandria/src/main.rs:228-293`: after each executed merge the loop re-queries all clusters and
+**Where.** The maintenance task spawned in `serve_http` (`crates/alexandria/src/main.rs`): after each
+executed merge the loop re-queries all clusters and
 re-counts members (through `get_members`, so with embeddings, see P2) before scanning for the next
 pair. Merges per tick times clusters times facts.
 
