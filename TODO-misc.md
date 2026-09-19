@@ -16,8 +16,7 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   `test-util` cargo feature would hide it properly; add one if a second such hook appears.
 
 - [-] **`alexandria-mcp` still issues one inline SurrealDB query.** The `provenance` create in
-  `do_store_memory` (`server.rs`) bypasses the storage crate. It is maintained by someone else, so
-  leave it; do not add new ones.
+  `do_store_memory` (`server.rs`) bypasses the storage crate. Do not add new ones.
 - [-] **Cluster `member_count` is one query per cluster.** `load_cluster_infos()` calls
   `get_members()` for each cluster. Batch it when cluster counts grow.
 - [-] **`recall` walks clusters, not sessions.** Sessions are reachable only through the session
@@ -43,10 +42,12 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   rank 1. MiniLM cannot separate duplicates from adjacent memories by score, so this is not
   detectable automatically. Treat rank as a lower bound on delivery, and read the results above
   the target before acting on a headroom WARN.
-- [-] **The recall defaults are literals in three places.** `contrib/claude/hooks/alexandria-recall.sh`
-  and `contrib/pi/extensions/alexandria/src/config.ts` are authoritative; `crates/alexandria/src/bench.rs`
-  restates them as `RECALL_LIMIT` / `RECALL_THRESHOLD` for the headroom check. Nothing ties them
-  together. When changing one, grep the tree for the old value.
+- [-] **The recall defaults are literals in three places, and today they disagree.**
+  `contrib/claude/hooks/alexandria-recall.sh` ships `5` / `0.35`,
+  `contrib/pi/extensions/alexandria/src/config.ts` ships `5` / `0.58`, and
+  `crates/alexandria/src/bench.rs` checks headroom against the measured pair `10` / `0.45` as
+  `RECALL_LIMIT` / `RECALL_THRESHOLD`. The client changes are pending in #17 and #18. Nothing ties
+  the three together; when changing one, grep the tree for the old value.
 
 ## Build / toolchain
 
@@ -54,8 +55,8 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   a snapshot, so every edit to `.githooks/pre-commit` needs a re-run and nothing warns that the
   installed copy is stale. A symlink breaks on Windows checkouts without developer mode; leave the
   copy unless staleness bites.
-- [ ] **`.cargo/config.toml` and `rust-toolchain.toml` were dropped when this branch was integrated
-  into main (2026-09-09).** Decision: linker/CPU flags are per-machine developer preference, not
+- [-] **`.cargo/config.toml` and `rust-toolchain.toml` are deliberately absent (decided
+  2026-09-09).** Decision: linker/CPU flags are per-machine developer preference, not
   repo policy — the file only ever affected local x86-64 Linux gnu builds (CI's ubuntu jobs would
   have broken on the missing `mold`, and the Docker build already overrides `rustflags` via
   `RUSTFLAGS`, so neither `target-cpu` nor mold applied there). Dev boxes wanting it keep
@@ -78,14 +79,11 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   `serializeEntries` only advances `turnNum` on user text, so an image-only user message and the
   assistant's answer to it are both labelled with the prior turn. Label the assistant line by its own
   counter if the extraction prompt ever starts misattributing answers.
-- [-] **Store failures notify once per call.** `notifyStoreFailed` in `index.ts` fires for every
-  rejected `storeMemory`, so a server that rejects everything at shutdown produces one toast per
-  extracted memory. Collapse the shutdown loop to a single count if that gets noisy.
 - [-] **Auto-recall is not session-scoped.** `retrieveMemories` never passes `session_id`, so a
   resumed pi session recalls across everything. Pass `ctx.sessionManager.getSessionId()` if
   same-session recall ever matters more than cross-session recall.
-- [-] **`typecheck-pi` checks against whatever `pi-coding-agent` the lockfile holds.**
-  `package.json` says `latest` but `npm ci` installs the locked `0.84.2`, so the types only move
+- [-] **`just ext-test` type-checks against whatever `@earendil-works/pi-coding-agent` the lockfile
+  holds.** `package.json` says `latest` but `npm ci` installs the locked `0.84.2`, so the types only move
   when someone runs `npm install` or Dependabot bumps the lock. A failing typecheck after a lock
   bump means upstream changed `ExtensionAPI`, not that our code regressed; pin the version if that
   starts happening.
@@ -110,8 +108,8 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   match. Factor a sourced helper out if a third hook needs them or either expression changes.
 - [-] **Cross-session extraction dedup covers only what the prompts recalled.**
   `alexandria-extract.sh` feeds the recall hook's `hook_additional_context` hits into
-  `<already_stored>`; a post-hoc similarity filter does not work on MiniLM (duplicates and distinct
-  neighbours both score 0.63-0.76), so haiku has to judge. Not covered: gotchas that surface only
+  `<already_stored>`; a post-hoc similarity filter does not work on MiniLM (`docs/minilm-test-data.md`,
+  "Duplicate bar"), so haiku has to judge. Not covered: gotchas that surface only
   from tool output, sessions with `ALEXANDRIA_AUTO_RECALL=off`, and hits recalled in an earlier
   chunk of the same session. If duplicates of that shape keep appearing, the next step is one
   `retrieve_memories` per candidate with the top hits fed to a second, smaller haiku call.

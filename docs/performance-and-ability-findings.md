@@ -148,8 +148,10 @@ Recommendation: delete unless the measured gain from wiring is real. Half-alive 
 **Status (2026-09-19): open, needs its own design.** Exact-content dedup in `store_memory` was
 written and withdrawn after review (#16): the early return dropped the caller's `tags` and session
 link, `update_memory` and `import_document` did not share the check, and check-then-create is not
-atomic. A design has to cover all three write paths and the response schema, and still has to
-measure a bar before proposing one.
+atomic. A design has to cover all three write paths and the response schema. The bar was measured
+(`docs/minilm-test-data.md`, "Duplicate bar", 2026-09-10 and again 2026-09-19): no cosine bar
+separates restatements from adjacent facts or from corrections, and 0.98 equals byte equality, so
+a design that wants more than exact matching needs something other than a threshold.
 
 **Where.** The `store_memory` tool description promises "dedup happens via clustering". Clustering
 groups facts; it never rejects or merges one.
