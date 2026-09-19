@@ -28,12 +28,16 @@ contradictions in `retrieve_memories`.
 
 ## Scope
 
+Revises roadmap v0.3 (`docs/roadmap.md`, "v0.3"): the async task queue with priority levels and the
+Consolidate stage are deferred, and the OpenAI embedding provider is out (see Out). What remains of
+Extract -> Relate -> Consolidate here is Relate, plus cluster labels.
+
 In:
 
 - `LlmProvider` trait and `OpenAiCompatible` implementation in `alexandria-pipeline`.
 - Pure candidate-selection, prompt-building, response-parsing, and staleness functions in
   `alexandria-engine`.
-- Migration `v007` and the repo methods listed below.
+- Migration `v008` and the repo methods listed below.
 - `[llm]` config section with env overrides.
 - Enrichment pass in the maintenance task; the task moves from `crates/alexandria/src/main.rs` to
   `src/maintenance.rs`.
@@ -127,7 +131,7 @@ nothing else."
 
 ### `alexandria-storage`
 
-Migration `v007_enrichment.surql`:
+Migration `v008_enrichment.surql` (`v007` is `v007_reminder.surql`):
 
 ```sql
 DEFINE FIELD relations_checked_at   ON fact    TYPE option<datetime>;
@@ -226,7 +230,7 @@ backlog drains. That is intended: edges are the more valuable output and labels 
 `calls_used`. Per-item logging at `debug!`. Failures at `warn!` with the fact or cluster id.
 
 Nothing is written to `maintenance_log`; that table is the split/merge audit trail and its schema
-(`action`, `source`, `targets`, `members_moved`) doesn't fit. Edges carry `created_at`, and labels are
+(`action`, `source_id`, `target_ids`, `members_moved`) doesn't fit. Edges carry `created_at`, and labels are
 inspectable in the cluster list, which is enough audit for now.
 
 ## Error Handling
@@ -258,7 +262,7 @@ Engine (unit, no I/O):
 
 Storage (integration, in-memory DB):
 
-- `v007` applies on a fresh DB and on a DB migrated through `v006`; existing rows read back with
+- `v008` applies on a fresh DB and on a DB migrated through `v007`; existing rows read back with
   `None` in the new fields.
 - `unchecked_facts` excludes stamped and deleted facts, oldest first.
 - `delete_relation_edges` removes the three relation types and keeps `derived_from`.
@@ -286,6 +290,24 @@ Config:
 - `[llm]` parses, env overrides win, unset `base_url` yields `None`. `#[serial]` on env tests.
 
 No test calls a real LLM.
+
+## Deferred work that stops being fine at 10⁵ facts
+
+Each of these is a reasonable shortcut at the current ~2k facts and a design constraint at 100k.
+None is in scope here; they are listed so the milestone is not planned as if they were free.
+
+- **This design's own tick** loads every live fact (`id`, `content`, `embedding`) once per tick that
+  has unchecked facts (Data Flow, step 2). At 10⁵ that is ~150 MB of vectors per tick; candidate
+  selection should go through `MemoryRepo::nearest` instead.
+- **`heat_state` has no index on `memory`.** `HeatRepo`'s reads and updates are
+  `... WHERE memory = $id`, a table scan per lookup, and activation does several per retrieve.
+- **Cluster member counting is O(clusters) queries.** `load_cluster_infos` calls
+  `ClusterRepo::get_members` per cluster on every store, import and broad recall (P2 in
+  `docs/performance-and-ability-findings.md`).
+- **`migrate-embeddings` preloads the corpus.** `MemoryRepo::all_ids_and_content` reads every id and
+  content into memory before re-embedding, inside the command that exists for recovery (#23).
+- **Exact-content dedup, if it returns.** The parked `find_by_content` is a full scan of `fact` per
+  store; it needs an index on a content hash before it ships at that scale.
 
 ## Follow-ups (not this milestone)
 

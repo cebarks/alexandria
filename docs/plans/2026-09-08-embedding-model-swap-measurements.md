@@ -63,8 +63,11 @@ simply contains no pair similar enough to justify 0.90.
 
 Same 143-fact corpus (dumped from the 08:08 data copy) and the same 12 questions, run
 through sentence-transformers on CPU instead of candle so that non-BERT architectures could
-be tried without writing loaders. MiniLM and multi-qa reproduce the candle numbers exactly,
-so the two paths are comparable. bge-small now carries its query instruction prefix; nomic
+be tried without writing loaders. multi-qa reproduces the candle numbers exactly; MiniLM does on
+every retrieval column (`mean_rank`, `top1`, `mean_gap`, `hit_min`, `hit_max`) and to within 0.01
+on the distribution ones, where `nonhit_p50` (0.077 -> 0.078), `ff_p50` (0.130 -> 0.132), `ff_p90`
+(0.298 -> 0.302) and `ff_p99` (0.562 -> 0.571) drifted. The two paths are comparable to that
+precision, which matters because `nonhit_p50` is the column the retrieve-floor rule reads. bge-small now carries its query instruction prefix; nomic
 uses `search_query:` / `search_document:`. Qwen3-Embedding-0.6B (596M params) and
 embeddinggemma-300m (gated) were not run.
 
@@ -99,7 +102,8 @@ technical statements, and small mean-pooled MiniLM appears to be the right shape
 Moved to `docs/minilm-test-data.md`, which is maintained; these plan docs are not. MiniLM
 was rerun alone against the grown corpus with `alexandria bench-retrieval` (`crates/alexandria/src/bench.rs`),
 which also computes the retrieve floor from the model's own output instead of by hand. The
-reconstructed 143-fact baseline reproduces the first-pass row above on every column and
-every per-question rank; at 743 facts `mean_rank` goes 1.42 -> 2.75, `top1` 9/12 -> 7/12 and
+reconstructed 143-fact baseline reproduces the first-pass row above on every per-question rank
+and every retrieval column, and to within 0.01 on the rest (`nonhit_p50` 0.077 -> 0.078,
+`nonhit_p99` 0.373 -> 0.372, `ff_p99` 0.562 -> 0.560); at 743 facts `mean_rank` goes 1.42 -> 2.75, `top1` 9/12 -> 7/12 and
 `mean_gap` +0.148 -> +0.077, with `hit_min`/`hit_max` unchanged. Floor 0.07 live, 0.08 on
 the baseline, against the 0.10 default; no config change.
