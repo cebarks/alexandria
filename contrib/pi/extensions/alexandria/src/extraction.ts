@@ -9,6 +9,11 @@
 
 import { CONFIG } from "./config.js";
 import type { SessionDedupBuffer, DetectedMemory } from "./detectors/types.js";
+import {
+	extractText,
+	parseExtractionResponse,
+	serializeEntries,
+} from "./extraction-parse.js";
 
 const EXTRACTION_PROMPT = `You are a memory extraction system. Given a conversation between a user and an AI coding assistant, extract durable facts worth remembering across sessions.
 
@@ -36,64 +41,6 @@ Respond with JSON only:
 }
 
 If nothing is worth extracting, respond with: {"memories": []}`;
-
-interface ExtractionResult {
-	memories: DetectedMemory[];
-}
-
-/**
- * Serialize session entries into a text representation for the extraction prompt.
- * Strips tool call details, keeps user/assistant text + compaction summaries.
- */
-function serializeEntries(entries: unknown[]): string {
-	const lines: string[] = [];
-	let turnNum = 0;
-
-	for (const entry of entries) {
-		const e = entry as Record<string, unknown>;
-		if (e.type === "message") {
-			const msg = e.message as Record<string, unknown> | undefined;
-			if (!msg) continue;
-
-			const role = msg.role as string;
-			const content = msg.content;
-
-			if (role === "user") {
-				turnNum++;
-				const text = extractText(content);
-				if (text) lines.push(`[Turn ${turnNum} - User]: ${text}`);
-			} else if (role === "assistant") {
-				const text = extractText(content);
-				if (text) lines.push(`[Turn ${turnNum} - Assistant]: ${text}`);
-			}
-		} else if (e.type === "compaction") {
-			const summary =
-				(e as Record<string, unknown>).summary ??
-				(
-					(e as Record<string, unknown>).compaction as
-						| Record<string, unknown>
-						| undefined
-				)?.summary;
-			if (typeof summary === "string") {
-				lines.push(`[Session Summary]: ${summary}`);
-			}
-		}
-	}
-
-	return lines.join("\n\n");
-}
-
-/** Extract plain text from a message content field (string or content blocks). */
-function extractText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (Array.isArray(content)) {
-		return content
-			.filter((b: Record<string, unknown>) => b?.type === "text")
-			.map((b: Record<string, unknown>) => b.text as string)
-			.join("\n");
-	}
-	return "";
-}
 
 /**
  * Build the full extraction prompt with conversation and "already stored" context.
@@ -189,27 +136,7 @@ export async function runExtraction(
 			timeoutPromise,
 		])) as Record<string, unknown>;
 
-		// Extract text from response
-		const responseText = extractText(response.content);
-		if (!responseText) return [];
-
-		// Parse JSON from response — handle markdown code fences
-		const jsonText = responseText
-			.replace(/^```(?:json)?\s*\n?/m, "")
-			.replace(/\n?```\s*$/m, "")
-			.trim();
-		const parsed = JSON.parse(jsonText) as ExtractionResult;
-
-		if (!Array.isArray(parsed.memories)) return [];
-
-		return parsed.memories
-			.filter((m) => typeof m.content === "string" && m.content.length > 0)
-			.map((m) => ({
-				content: m.content,
-				tags: Array.isArray(m.tags)
-					? m.tags.filter((t) => typeof t === "string")
-					: ["extracted"],
-			}));
+		return parseExtractionResponse(extractText(response.content));
 	} catch (err) {
 		if (err instanceof Error && err.message === "extraction_timeout") {
 			ctx.ui.notify("Alexandria extraction timed out; skipping.", "warning");
