@@ -1,6 +1,6 @@
 # Roadmap
 
-**Current state:** 13 MCP tools, schema `v006`, HTTP + stdio + Docker deployment, one
+**Current state:** 13 MCP tools, schema `v007`, HTTP + stdio + Docker deployment, one
 crate per layer and two client-side pi integrations under `contrib/pi/`.
 
 ## Completed
