@@ -40,20 +40,29 @@ hook "no, use jj instead of git"
 hook "always run clippy before pushing"
 hook "no, use jj instead of git"
 hook "no, it's completed"   # one-word capture: dropped
+# Prohibitions keep their negation (the capture starts at the trigger), a bare don't counts only at the
+# start of a clause, and a match with a negation earlier in its sentence is not stored at all.
+hook "Don't ever force push main."
+hook "Never commit Cargo.lock here."
+hook "Don't use tabs, use spaces."
+hook "I don't know why this test fails."
+hook "It's not that I prefer tabs over spaces."
+hook "There's no need to always rebase first."
 got=$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq -c '[.memories[] | select(.tags|index("auto-detected")) | .content] | sort')
 echo "$got"
-[ "$got" = '["User correction: jj instead of git","User preference: Use jj instead of git","User preference: run clippy before pushing"]' ]
+[ "$got" = '["User correction: jj instead of git","User preference: Don'"'"'t ever force push main","User preference: Don'"'"'t use tabs, use spaces","User preference: Never commit Cargo.lock here","User preference: always run clippy before pushing","User preference: use jj instead of git"]' ]
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("source:regex"))] | length')" = 6 ]
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq -r '.session.agent_id')" = claude-code ]   # hook stores stamp the session
 # Auto-store off: nothing new.
 ALEXANDRIA_AUTO_STORE=off hook "never use tabs"
-[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 3 ]
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 6 ]
 # Headless session (CLAUDE_CODE_ENTRYPOINT gate): detectors off by default, on with ALEXANDRIA_AUTO_STORE=on.
 CLAUDE_CODE_ENTRYPOINT=sdk-cli hook "never use spaces"
-[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 3 ]
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 6 ]
 CLAUDE_CODE_ENTRYPOINT=claude-code-github-action hook "never use spaces"
-[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 3 ]
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 6 ]
 CLAUDE_CODE_ENTRYPOINT=sdk-cli ALEXANDRIA_AUTO_STORE=on hook "never use spaces"
-[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 4 ]
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 7 ]
 
 # Session hook: injects session_id and agent_id when missing, silent when both present.
 out=$(jq -cn '{session_id:"sess-test-123",tool_name:"mcp__alexandria__store_memory",tool_input:{content:"x"}}' | ./alexandria-session.sh)

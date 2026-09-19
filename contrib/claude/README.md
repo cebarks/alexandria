@@ -26,7 +26,9 @@ extraction) the `claude` CLI.
 - scans the prompt for correction ("no, use X", "that's wrong, ...", "actually ...") and preference
   ("always ...", "never ...", "from now on ...", "use X instead of Y") phrasing, same patterns as the
   Pi detectors, and stores unambiguous hits as `User correction: ...` / `User preference: ...` with
-  tags `correction`/`preference` + `auto-detected` and the session id. Deduped per session via
+  tags `correction`/`preference` + `auto-detected` + `source:regex` and the session id. A preference is
+  stored from its trigger word on, so a prohibition keeps its negation (`never commit Cargo.lock`), and
+  one with a negation earlier in its clause is not stored at all. Deduped per session via
   `$XDG_STATE_HOME/alexandria/<session_id>.stored`. The Pi error-resolution tracker is not ported;
   failed tool results can be fed to the extraction pass instead (opt-in, below). Every request shares
   one 8 s budget, so a wedged server delays the prompt by that much at most.
