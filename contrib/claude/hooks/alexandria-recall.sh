@@ -72,9 +72,12 @@ session=$(jq -r '.session_id // ""' <<<"$input")
 
 # ---- heuristic detectors (ported from contrib/pi .../detectors/{correction,preference}.ts)
 # Each entry: "<capture group index> <ERE>". \b is spelled (^|[^[:alnum:]_]) and
-# counts as a group, hence the explicit index. ERE has no lazy quantifiers; the
-# greedy (.+) before "instead of"/"better" differs from Pi only on prompts that
-# contain the anchor word twice.
+# counts as a group, hence the explicit index. Every preference pattern captures
+# from its trigger onward ("never commit Cargo.lock", not "commit Cargo.lock"): a
+# capture that starts after the trigger drops the polarity, and an inverted
+# preference is worse than a missing one. Negative triggers come first so "don't
+# always rebase" is stored whole; a bare don't / do not only counts at the start of
+# a clause or after "please" ("I don't know why" is not an instruction).
 W='(^|[^[:alnum:]_])'; S='[[:space:]]'
 CORRECTION=(
   "3 ${W}no[,.]?${S}+(use|it${S}+should${S}+be|it'?s)${S}+(.+)"
@@ -82,34 +85,35 @@ CORRECTION=(
   "2 ${W}actually[,.]?${S}+(.+)"
   "2 ${W}i${S}+meant${S}+(.+)"
   "3 ${W}not${S}+.{2,30}[,;]${S}*(use|it'?s)${S}+(.+)"
-  "2 ${W}don'?t${S}+use${S}+.{2,30}[,;]${S}*use${S}+(.+)"
-  "2 ${W}use${S}+(.+)${S}+instead${S}+of${S}+.+"
   "3 ${W}wrong${S}*(—|–|-)${S}*(.+)"
   "3 ${W}incorrect${S}*(—|–|-)${S}*(.+)"
 )
 PREFERENCE=(
-  "2 ${W}always${S}+(.+)"
-  "2 ${W}never${S}+(.+)"
-  "2 ${W}i${S}+prefer${S}+(.+)"
-  "2 ${W}i${S}+like${S}+(.+)${S}+better"
-  "2 ${W}default${S}+to${S}+(.+)"
-  "2 ${W}don'?t${S}+ever${S}+(.+)"
-  "2 ${W}make${S}+sure${S}+to${S}+(.+)"
+  "3 (^|[.!?;:,]${S}*|${W}please${S}+)((don'?t|do${S}+not)${S}+.+)"
+  "2 ${W}(don'?t${S}+ever${S}+.+)"
+  "2 ${W}(never${S}+.+)"
+  "2 ${W}(always${S}+.+)"
+  "2 ${W}(i${S}+prefer${S}+.+)"
+  "2 ${W}(i${S}+like${S}+.+${S}+better.*)"
+  "2 ${W}(default${S}+to${S}+.+)"
+  "2 ${W}(make${S}+sure${S}+to${S}+.+)"
+  "2 ${W}(use${S}+.+${S}+instead${S}+of${S}+.+)"
   "2 ${W}from${S}+now${S}+on[,.]?${S}+(.+)"
   "2 ${W}going${S}+forward[,.]?${S}+(.+)"
-  "2 ${W}use${S}+(.+)${S}+instead${S}+of${S}+(.+)"
 )
+# A negation earlier in the same clause governs the match ("it's not that I prefer tabs") and no
+# capture can keep it, so such a preference is never stored. A "no," lead-in is its own clause.
+NEGATION="${W}(not|no|never|cannot|without)(\$|[^[:alnum:]_])|n'?t(\$|[^[:alnum:]_])"
 trim() { local s=$1; [[ $s =~ ^[[:space:]]*(.*[^[:space:].!])[[:space:].!]*$ ]] && s=${BASH_REMATCH[1]}; echo "$s"; }
 detect() { # <prefix> <patterns...> → prints "<prefix>: <statement>" for the first match, or nothing
-  local prefix=$1 p g stmt; shift
+  local prefix=$1 p g stmt before; shift
   shopt -s nocasematch
   for p in "$@"; do
     g=${p%% *}; p=${p#* }
     [[ $prompt =~ $p ]] || continue
     stmt=$(trim "${BASH_REMATCH[g]}")
-    # Pi's "use X instead of Y" preference keeps both sides.
-    [[ $prefix = "User preference" && $g -eq 2 && -n ${BASH_REMATCH[3]:-} && $p == *instead* ]] &&
-      stmt="Use $stmt instead of $(trim "${BASH_REMATCH[3]}")"
+    before=${prompt%%"${BASH_REMATCH[g]}"*}; before=${before##*[.!?;:,]}
+    [[ $prefix = "User preference" && $before =~ $NEGATION ]] && continue
     [[ ${#stmt} -ge 5 && $stmt == *[[:space:]]* ]] || continue   # one word ("no, it's completed") is a state report
     echo "$prefix: $stmt"; return
   done
@@ -149,7 +153,7 @@ for d in "${detections[@]}"; do
   touch "$stored"
   grep -qxF "$norm" "$stored" && continue
   tag=$([[ $d == "User correction"* ]] && echo correction || echo preference)
-  out=$(mcp_tool store_memory "$(jq -cn --arg c "$d" --arg t "$tag" --arg s "$session" '{content:$c,tags:[$t,"auto-detected"],session_id:$s,agent_id:"claude-code"}')") \
+  out=$(mcp_tool store_memory "$(jq -cn --arg c "$d" --arg t "$tag" --arg s "$session" '{content:$c,tags:[$t,"auto-detected","source:regex"],session_id:$s,agent_id:"claude-code"}')") \
     && echo "$norm" >>"$stored" || echo "alexandria-recall: store failed: $out" >&2
 done
 
