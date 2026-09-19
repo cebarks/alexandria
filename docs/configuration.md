@@ -7,7 +7,7 @@ Alexandria loads server config with this precedence:
    - `ALEXANDRIA_CONFIG` env var (explicit path override)
    - `$XDG_CONFIG_HOME/alexandria/config.toml` (default: `~/.config/alexandria/config.toml` on Linux, `~/Library/Application Support/alexandria/config.toml` on macOS)
    - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
-3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
+3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_EMBEDDING_BATCH_SIZE`, `ALEXANDRIA_EMBEDDING_MAX_TOKENS`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
 
 ## Full Example
 
@@ -26,6 +26,7 @@ sse_keep_alive_secs = 15      # SSE keep-alive interval in seconds (default: 15)
 [embedding]
 model = "sentence-transformers/all-MiniLM-L6-v2"   # HuggingFace model ID (default shown; omit to use it)
 device = "cpu"                                       # "cpu" only for now (default: "cpu")
+batch_size = 32                                      # Facts per embed() call in migrate-embeddings (default: 32)
 
 [heat]
 spacing_halflife_secs = 86400.0   # Spaced repetition half-life in seconds (default: 86400 = 1 day)
@@ -76,10 +77,16 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 |-----|------|---------|-------------|
 | `model` | string | `"sentence-transformers/all-MiniLM-L6-v2"` | HuggingFace model ID. Must be a BERT-family model compatible with candle. Pooling mode (CLS or mean) is read from the model repo's `1_Pooling/config.json`; models without it use mean pooling. |
 | `device` | string | `"cpu"` | Compute device. Only `"cpu"` is currently supported. |
+| `batch_size` | usize | `32` | Facts per `embed()` call during `alexandria migrate-embeddings`. Sets how often the migration writes and logs progress; it does not bound memory or change speed with the Candle provider, which runs one forward pass per text. Must be between 1 and 4096, checked at config load. The server itself embeds one text at a time. |
+| `max_tokens` | usize | `128` | Longest text one embedding sees, in wordpiece tokens including `[CLS]`/`[SEP]`. A longer memory is still stored whole, but only its first `max_tokens` tokens are searchable; the server logs a warning with the fact id and token count, and `store_memory` returns `truncated: true`. **128** is the standard: it is what the model's `tokenizer.json` ships, so every database created before this key existed is at 128 and boots unchanged. **256** is tested (it is what sentence-transformers serves this model at, and it covered the p99 of the corpus it was measured on; see [docs/minilm-test-data.md](minilm-test-data.md), "256-token re-embed"). Anything above 256 is experimental: the model was trained at 128 and nothing here has measured it. Must be between 3 and 512, checked at config load, and no larger than the model's position table, checked when the model loads. Padding is off at every value, so a text costs its own length, not the limit. |
 
-**Switching models on an existing database:** stop the server, set the new `model`, run `alexandria migrate-embeddings` (re-embeds every memory and cluster centroid, then updates the lock), and start the server again. Thresholds (`[cluster]` and `[retrieve] min_similarity`) are tuned to the default model; retune them if you switch. The migration is not transactional: if it fails partway, rerun it. Do not revert `model` in config afterwards, the database may hold a mix of old and new vectors.
+**Switching models on an existing database:** stop the server, set the new `model`, run `alexandria migrate-embeddings` (re-embeds every memory and cluster centroid, then updates the lock), and start the server again. Thresholds (`[cluster]`, `[retrieve] min_similarity`, and the client's `[recall] min_similarity`) are tuned to the default model; retune them if you switch. `alexandria bench-retrieval` derives the latter two from the new model's own output — see [docs/minilm-test-data.md](minilm-test-data.md). The migration is not transactional: if it fails partway, rerun it. Do not revert `model` in config afterwards, the database may hold a mix of old and new vectors.
 
-**Model locking:** On first boot, the model name and dimension count are stored in the database. Changing the model in config without wiping the database will cause a startup error with instructions to either revert the model or run `alexandria migrate-embeddings`.
+**Raising the token limit on an existing database:** stop the server, set `max_tokens`, run `alexandria migrate-embeddings`, start the server. It re-embeds everything, as a model switch does, and moves the lock last. The limit only goes up: `migrate-embeddings` refuses a `max_tokens` below what the corpus is locked at, and the server refuses to boot on one, so the way back from 256 is to keep `max_tokens = 256`. `alexandria migrate-embeddings --force` re-embeds even when the lock already matches config, for a corpus whose lock is right and whose vectors may not be.
+
+**Model locking:** On first boot, the model name, dimension count, and token limit are stored in the database. Changing the model or the limit in config without migrating causes a startup error that says which way to go. A database locked before the token limit was recorded, or one that has memories and no lock at all, was embedded at 128 tokens and is treated as locked at 128: it boots at the default and refuses a higher `max_tokens` until `alexandria migrate-embeddings` has run.
+
+**Rolling back the binary is unsafe after a migration, and undetectable.** A release from before `max_tokens` existed does not read the token lock. Run against a database migrated to 256, it writes 128-token, padded vectors into a corpus labelled 256, and nothing can tell afterwards. From this release on, a binary refuses to open a database whose schema version is newer than its own, which stops the general case; it cannot stop binaries that predate the check. If it has happened, `alexandria migrate-embeddings --force` repairs it.
 
 **First run:** The model weights (~80MB for all-MiniLM-L6-v2) are downloaded from HuggingFace Hub and cached in `~/.cache/huggingface/`.
 
@@ -116,7 +123,7 @@ Controls server-side filtering of `retrieve_memories` results.
 
 | Key | Type | Default | Description |
 | ----- | ------ | --------- | ------------- |
-| `min_similarity` | f32 | `0.10` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A noise cutoff only. Model-dependent: for `all-MiniLM-L6-v2` (measured 2026-09-08), a keyword or near-paraphrase hit scores 0.55–0.76, a natural-language question against its matching statement 0.40–0.65, and a question sharing no vocabulary with the statement as low as ~0.2. Unrelated memories score 0.07–0.40. The floor stays below the vocabulary-free cases; client thresholds do the real filtering. |
+| `min_similarity` | f32 | `0.10` | Hard floor on cosine similarity below which results are dropped, regardless of the requested `limit`. A noise cutoff only — the client's `[recall] min_similarity` does the real filtering. Model-dependent: for `all-MiniLM-L6-v2` (measured 2026-09-08), a keyword or near-paraphrase hit scores 0.55–0.76, a natural-language question against its matching statement 0.40–0.65, and a question sharing no vocabulary with the statement as low as ~0.2. Unrelated memories score 0.07–0.40. `0.10` is a constant kept by hand. `alexandria bench-retrieval` prints a retrieve-floor rule — the median non-hit score rounded to two decimals, valid only if it sits below the weakest correct hit — but **its output is a property of the model *and* the corpus and does not move in one direction**: `0.08` at 143 facts, `0.07` at 807, back to `0.08` at 957. `0.10` sits above all of them and far below the weakest true hit on `all-MiniLM-L6-v2` (0.338), which is the whole argument for it. The recorded passes, and the re-measurement those bands need for any other model, are in [docs/minilm-test-data.md](minilm-test-data.md). |
 
 The default is defined once at `alexandria_engine::search::DEFAULT_MIN_SIMILARITY`, which both
 `RetrieveConfig::default()` and `AlexandriaServer`'s construction fallback read. The measured score
@@ -147,6 +154,8 @@ These env vars override individual config values after the TOML file is loaded:
 | `ALEXANDRIA_DATA_DIR` | `database.data_dir` |
 | `ALEXANDRIA_EMBEDDING_MODEL` | `embedding.model` |
 | `ALEXANDRIA_EMBEDDING_DEVICE` | `embedding.device` |
+| `ALEXANDRIA_EMBEDDING_BATCH_SIZE` | `embedding.batch_size` |
+| `ALEXANDRIA_EMBEDDING_MAX_TOKENS` | `embedding.max_tokens` |
 | `ALEXANDRIA_REMINDERS_TIMEZONE` | `reminders.timezone` |
 | `ALEXANDRIA_REMINDERS_ESCALATION_HOURS` | `reminders.escalation_hours` — a non-numeric value fails startup with an error naming the variable |
 
@@ -175,8 +184,8 @@ url = "http://127.0.0.1:3000/mcp"
 
 [recall]
 enabled = true
-limit = 5
-min_similarity = 0.58
+limit = 10
+min_similarity = 0.45
 
 [store]
 enabled = true
@@ -199,8 +208,8 @@ project = "alexandria"
 | Key | Type | Default | Env Override | Description |
 | ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_AUTO_RECALL=off` | Enable auto-recall on every prompt. |
-| `limit` | number | `5` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. |
-| `min_similarity` | number | `0.58` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. **Recommended: `0.35`.** The `0.58` Pi default predates measurement and assumed genuine matches score 0.6+; on `all-MiniLM-L6-v2` (measured 2026-09-08, synthetic pairs) question-vs-matching-statement scores 0.40–0.65 and unrelated memories 0.07–0.40, so `0.58` drops most real hits. `0.35` keeps them and admits only topically adjacent memories. The Claude Code hook (`contrib/claude`) already defaults to `0.35`; the Pi default is left at `0.58` pending a change to the extension. |
+| `limit` | number | `10` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. It is not merely a cap — a target ranked below it cannot be surfaced by any threshold, so it is a recall lever in its own right, and the stronger of the two. A judgement call on a small hand-authored question set, not a measurement — the questions were written against facts already in the corpus and none lacks a target (see [docs/minilm-test-data.md](minilm-test-data.md), "Limitations"); the pi extension's own default moves to it in the pi-extension PR and is `5` until then. What the 2026-09-09 limit × threshold grid on an 880-fact corpus showed ("Result limit"): delivery saturates at `10`, because the worst of the 12 benchmark target ranks is 9, so `15` and `20` add non-target memories and no hits. Was `5` until that pass, which hid 3 of the 11 targets that cleared the then-default threshold on score. Lowering it below `3` also silently narrows spreading activation (`activation.top_n`). |
+| `min_similarity` | number | `0.45` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. A judgement call read off the same grid, with the same caveats (the pi extension's own default is `0.58` until the pi-extension PR); the grid counts how many of 12 known targets a threshold actually delivers *through* `limit`. **Read it together with `limit` — the two are not independent.** At `limit = 10`: `0.45` delivers 8/12 at ~1.0 non-targets per prompt, `0.35` delivers 11/12 at ~4.7, `0.50` delivers 7/12 at ~0.5, and the old `0.58` Pi default delivers only 4/12 — it assumed genuine matches score 0.6+ and drops two thirds of real hits. `0.40` was dominated on that 12-question grid (same 8 delivered as `0.45`, roughly double the noise); with the 20-question set it delivers 16/20 at ~3.0 against `0.45`'s 14/20 at ~1.65, a genuine trade that the strict-dominance rule used to pick the pair does not take. `0.45` is chosen as the frontier pick: paired with `limit = 10` it delivers what the previous `5`/`0.35` pair did at a third of the injection. Note that `0.45` is only on the frontier *because* the limit is 10 — at `limit = 5` it was dominated by `0.50`, so do not lower one without revisiting the other. It is not free: the weakest target scores 0.338 and falls below it. |
 
 ### `[store]`
 

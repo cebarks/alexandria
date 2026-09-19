@@ -682,6 +682,8 @@ mod tests {
                     content: format!("pinned memory number {i}"),
                     tags: None,
                     session_id: None,
+                    agent_id: None,
+                    model: None,
                 })
                 .await
                 .unwrap();
@@ -797,6 +799,8 @@ mod tests {
                         content: content.to_string(),
                         tags: None,
                         session_id: None,
+                        agent_id: None,
+                        model: None,
                     })
                     .await
                     .unwrap(),
@@ -889,6 +893,8 @@ mod tests {
                 content: "a recallable fact".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -920,6 +926,8 @@ mod tests {
                         content: content.to_string(),
                         tags: None,
                         session_id: None,
+                        agent_id: None,
+                        model: None,
                     })
                     .await
                     .unwrap(),
@@ -992,6 +1000,8 @@ mod tests {
                 content: "a strong match memory".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -1192,6 +1202,8 @@ mod tests {
                         content: content.to_string(),
                         tags: None,
                         session_id: None,
+                        agent_id: None,
+                        model: None,
                     })
                     .await
                     .unwrap(),
@@ -1282,6 +1294,8 @@ mod tests {
                 content: "a recallable fact".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();

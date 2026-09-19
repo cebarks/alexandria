@@ -68,6 +68,17 @@ pub struct DatabaseConfig {
 pub struct EmbeddingConfig {
     pub model: String,
     pub device: String,
+    /// Facts per `embed()` call during `alexandria migrate-embeddings`, which is also
+    /// how often it writes and logs progress. It does not bound memory: the Candle
+    /// provider runs one forward pass per text whatever the call size. 1..=4096,
+    /// default 32; the server itself embeds one text at a time.
+    pub batch_size: usize,
+    /// Longest text, in wordpiece tokens including `[CLS]`/`[SEP]`, one embedding sees; the
+    /// rest of a longer text is not searchable. 3..=512, default 128 (what the tokenizer
+    /// ships, so what every database from before this key was embedded at). 256 is tested;
+    /// above that is experimental. Locked on first boot: raising it needs
+    /// `alexandria migrate-embeddings`, and it is never lowered.
+    pub max_tokens: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +107,13 @@ pub struct RetrieveConfig {
     /// constant, not this comment, for the current number. It is a noise cutoff only:
     /// with all-MiniLM-L6-v2 a natural-language question against a stored statement
     /// scores ~0.2 and unrelated text ~0.0, so it must stay low.
+    ///
+    /// A constant kept by hand. `alexandria bench-retrieval` prints a
+    /// retrieve-floor rule (median non-hit score rounded to two decimals, valid
+    /// only below the weakest correct hit), but its output depends on the corpus
+    /// and does not move in one direction — 0.08 at 143 facts, 0.07 at 807,
+    /// 0.08 at 957. 0.10 sits above all of them and far below the weakest true
+    /// hit (0.338). See `docs/minilm-test-data.md`.
     pub min_similarity: f32,
 }
 
@@ -153,6 +171,8 @@ impl Default for EmbeddingConfig {
         Self {
             model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             device: "cpu".to_string(),
+            batch_size: 32,
+            max_tokens: alexandria_pipeline::embedding::DEFAULT_MAX_TOKENS,
         }
     }
 }
@@ -284,6 +304,16 @@ impl Config {
         if let Some(device) = env("ALEXANDRIA_EMBEDDING_DEVICE") {
             config.embedding.device = device;
         }
+        if let Some(batch) = env("ALEXANDRIA_EMBEDDING_BATCH_SIZE") {
+            config.embedding.batch_size = batch.parse().map_err(|e| {
+                anyhow::anyhow!("invalid ALEXANDRIA_EMBEDDING_BATCH_SIZE `{batch}`: {e}")
+            })?;
+        }
+        if let Some(tokens) = env("ALEXANDRIA_EMBEDDING_MAX_TOKENS") {
+            config.embedding.max_tokens = tokens.parse().map_err(|e| {
+                anyhow::anyhow!("invalid ALEXANDRIA_EMBEDDING_MAX_TOKENS `{tokens}`: {e}")
+            })?;
+        }
         if let Some(tz) = env("ALEXANDRIA_REMINDERS_TIMEZONE") {
             config.reminders.timezone = tz;
         }
@@ -292,6 +322,16 @@ impl Config {
                 anyhow::anyhow!("invalid ALEXANDRIA_REMINDERS_ESCALATION_HOURS `{h}`: {e}")
             })?;
         }
+        anyhow::ensure!(
+            (1..=4096).contains(&config.embedding.batch_size),
+            "embedding.batch_size must be between 1 and 4096"
+        );
+        // 3 is `[CLS]`, one wordpiece, `[SEP]`. 512 is the BERT position table; the provider
+        // checks the loaded model's own table too.
+        anyhow::ensure!(
+            (3..=512).contains(&config.embedding.max_tokens),
+            "embedding.max_tokens must be between 3 and 512"
+        );
 
         Ok(config)
     }
@@ -391,7 +431,14 @@ mod tests {
         assert_eq!(config.embedding.model, "other-model");
         // Everything else is default
         assert_eq!(config.embedding.device, "cpu");
+        assert_eq!(config.embedding.batch_size, 32);
         assert_eq!(config.cluster.join_threshold, 0.75);
+    }
+
+    #[test]
+    fn test_embedding_batch_size() {
+        let config = Config::from_toml("[embedding]\nbatch_size = 8\n").unwrap();
+        assert_eq!(config.embedding.batch_size, 8);
     }
 
     #[test]
@@ -471,12 +518,69 @@ mod tests {
             ("ALEXANDRIA_DATA_DIR", "/tmp/env-test"),
             ("ALEXANDRIA_EMBEDDING_MODEL", "env-model"),
             ("ALEXANDRIA_EMBEDDING_DEVICE", "env-device"),
+            ("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "8"),
         ]);
 
         let config = Config::load_from(&env).unwrap();
         assert_eq!(config.database.data_dir, PathBuf::from("/tmp/env-test"));
         assert_eq!(config.embedding.model, "env-model");
         assert_eq!(config.embedding.device, "env-device");
+        assert_eq!(config.embedding.batch_size, 8);
+    }
+
+    #[test]
+    fn test_embedding_env_invalid_batch_size() {
+        let env = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "lots")]);
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("ALEXANDRIA_EMBEDDING_BATCH_SIZE"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_embedding_max_tokens_default_env_and_range() {
+        assert_eq!(Config::default().embedding.max_tokens, 128);
+        let config = Config::from_toml("[embedding]\nmax_tokens = 256\n").unwrap();
+        assert_eq!(config.embedding.max_tokens, 256);
+
+        let at =
+            |v: &'static str| Config::load_from(&env(&[("ALEXANDRIA_EMBEDDING_MAX_TOKENS", v)]));
+        assert_eq!(at("512").unwrap().embedding.max_tokens, 512);
+        for bad in ["2", "513"] {
+            let err = at(bad).unwrap_err().to_string();
+            assert!(err.contains("between 3 and 512"), "{bad}: {err}");
+        }
+        let err = at("many").unwrap_err().to_string();
+        assert!(err.contains("ALEXANDRIA_EMBEDDING_MAX_TOKENS"), "{err}");
+    }
+
+    #[test]
+    fn test_embedding_env_zero_batch_size() {
+        let env = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "0")]);
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("batch_size"), "{err}");
+    }
+
+    #[test]
+    fn test_embedding_env_batch_size_upper_bound() {
+        let ok = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "4096")]);
+        assert_eq!(Config::load_from(&ok).unwrap().embedding.batch_size, 4096);
+        let over = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "4097")]);
+        let err = Config::load_from(&over).unwrap_err();
+        assert!(err.to_string().contains("batch_size"), "{err}");
+    }
+
+    #[test]
+    fn test_embedding_toml_zero_batch_size() {
+        let path =
+            std::env::temp_dir().join(format!("alexandria-batch0-{}.toml", std::process::id()));
+        std::fs::write(&path, "[embedding]\nbatch_size = 0\n").unwrap();
+        let vars = [("ALEXANDRIA_CONFIG", path.to_str().unwrap())];
+        let env = env(&vars);
+        let err = Config::load_from(&env).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.to_string().contains("batch_size"), "{err}");
     }
 
     #[test]

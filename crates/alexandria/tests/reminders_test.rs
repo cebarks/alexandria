@@ -1311,6 +1311,8 @@ async fn piggyback_lists_due_reminders_without_consuming() {
             content: "OAuth tokens expire after 7 days".to_string(),
             tags: None,
             session_id: None,
+            agent_id: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -1352,6 +1354,8 @@ async fn piggyback_recall_broad_lists_due_reminders_without_consuming() {
             content: "the search index is built with tantivy".to_string(),
             tags: None,
             session_id: None,
+            agent_id: None,
+            model: None,
         })
         .await
         .unwrap();
