@@ -3,7 +3,7 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue, ToSql};
 
-use crate::models::Fact;
+use crate::models::{Fact, RawRecord};
 use crate::record_id_to_string;
 
 /// A sortable column for [`MemoryRepo::list`].
@@ -85,6 +85,21 @@ impl SortDir {
 /// get the same window the operator sees in the browser.
 pub const DEFAULT_FACT_LIST_LIMIT: usize = 50;
 
+// ponytail: fixed search breadth, the value SurrealDB's own HNSW tests use. Must stay above the
+// largest `k` a caller asks for; make it a config key if recall ever measures short.
+const HNSW_EF: usize = 150;
+
+/// The numeric-ef form is the only one the planner serves from the HNSW index; a distance name
+/// in that slot means brute force.
+fn knn_sql(k: usize, indexed: bool) -> String {
+    let arg = if indexed {
+        HNSW_EF.to_string()
+    } else {
+        "COSINE".to_string()
+    };
+    format!("SELECT * FROM fact WHERE deleted = false AND embedding <|{k},{arg}|> $q")
+}
+
 /// Everything [`MemoryRepo::list`] takes, as one value.
 ///
 /// This exists so `list` needs no clippy arity allow. The seven knobs
@@ -160,6 +175,22 @@ impl<'a> MemoryRepo<'a> {
         Ok(id.to_sql())
     }
 
+    /// Create a `raw` record holding a full source document for `import_document`.
+    pub async fn create_raw(&self, content: &str) -> Result<String> {
+        let mut response = self
+            .db
+            .query("CREATE raw SET content = $content, deleted = false")
+            .bind(("content", content.to_string()))
+            .await?;
+
+        let created: Option<RawRecord> = response.take(0)?;
+        let raw = created.ok_or_else(|| anyhow::anyhow!("Failed to create raw record"))?;
+        let id = raw
+            .id
+            .ok_or_else(|| anyhow::anyhow!("Raw record has no id"))?;
+        Ok(record_id_to_string(&id))
+    }
+
     pub async fn get_fact(&self, id: &str) -> Result<Option<Fact>> {
         let mut response = self
             .db
@@ -168,6 +199,26 @@ impl<'a> MemoryRepo<'a> {
             .await?;
         let fact: Option<Fact> = response.take(0)?;
         Ok(fact)
+    }
+
+    /// The `k` live facts nearest to `query` by cosine similarity, nearest first, by a
+    /// brute-force scan inside the database. `<|k,COSINE|>` never consults the HNSW index,
+    /// defined or not; this is the path for a database without one.
+    pub async fn nearest(&self, query: &[f32], k: usize) -> Result<Vec<Fact>> {
+        self.knn(knn_sql(k, false), query).await
+    }
+
+    /// Same as `nearest`, served from the HNSW index. Only valid once
+    /// `schema::ensure_vector_index` has succeeded: without the index the planner strips
+    /// `<|k,ef|>` to a plain scan.
+    pub async fn nearest_indexed(&self, query: &[f32], k: usize) -> Result<Vec<Fact>> {
+        self.knn(knn_sql(k, true), query).await
+    }
+
+    async fn knn(&self, sql: String, query: &[f32]) -> Result<Vec<Fact>> {
+        let mut response = self.db.query(sql).bind(("q", query.to_vec())).await?;
+        let facts: Vec<Fact> = response.take(0)?;
+        Ok(facts)
     }
 
     pub async fn soft_delete_fact(&self, id: &str) -> Result<()> {
@@ -451,6 +502,27 @@ mod tests {
     use crate::connection::Database;
 
     #[tokio::test]
+    async fn test_create_raw() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let id = repo.create_raw("full document").await.unwrap();
+        assert!(id.starts_with("raw:"), "unexpected id {id}");
+
+        let mut response = db
+            .inner()
+            .query("SELECT * FROM type::record($id)")
+            .bind(("id", id.clone()))
+            .await
+            .unwrap();
+        let raw: Option<RawRecord> = response.take(0).unwrap();
+        let raw = raw.expect("raw record round-trips");
+        assert_eq!(raw.content, "full document");
+        assert!(!raw.deleted);
+    }
+
+    #[tokio::test]
     async fn test_list_and_count_facts() {
         let db = Database::connect_embedded().await.unwrap();
         crate::schema::migrate(db.inner()).await.unwrap();
@@ -536,6 +608,77 @@ mod tests {
         assert_eq!(page1.len(), 1);
         assert_eq!(page2.len(), 1);
         assert_ne!(page1[0].content, page2[0].content);
+    }
+
+    #[tokio::test]
+    async fn test_nearest_orders_by_similarity_and_skips_deleted() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        crate::schema::ensure_vector_index(db.inner(), 2)
+            .await
+            .unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let near = repo
+            .create_fact("near", 0.5, &[1.0, 0.0], &[])
+            .await
+            .unwrap();
+        let mid = repo
+            .create_fact("mid", 0.5, &[0.7, 0.7], &[])
+            .await
+            .unwrap();
+        repo.create_fact("far", 0.5, &[0.0, 1.0], &[])
+            .await
+            .unwrap();
+        let gone = repo
+            .create_fact("gone", 0.5, &[1.0, 0.1], &[])
+            .await
+            .unwrap();
+        repo.soft_delete_fact(&gone).await.unwrap();
+
+        let ids = |facts: Vec<Fact>| -> Vec<String> {
+            facts
+                .iter()
+                .map(|f| record_id_to_string(f.id.as_ref().unwrap()))
+                .collect()
+        };
+        let want = vec![near, mid];
+        assert_eq!(ids(repo.nearest(&[0.9, 0.1], 2).await.unwrap()), want);
+        assert_eq!(
+            ids(repo.nearest_indexed(&[0.9, 0.1], 2).await.unwrap()),
+            want
+        );
+    }
+
+    /// Results cannot tell the two plans apart, so assert the plan: a SurrealDB upgrade that
+    /// stops serving `<|k,ef|>` from the index fails here instead of silently scanning.
+    #[tokio::test]
+    async fn test_nearest_indexed_plan_uses_the_hnsw_index() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        crate::schema::ensure_vector_index(db.inner(), 2)
+            .await
+            .unwrap();
+
+        let plan = |indexed: bool| {
+            let db = db.inner().clone();
+            async move {
+                let mut response = db
+                    .query(format!("EXPLAIN FORMAT JSON {}", knn_sql(2, indexed)))
+                    .bind(("q", vec![0.9f32, 0.1]))
+                    .await
+                    .unwrap();
+                let plan: surrealdb::types::Value = response.take(0).unwrap();
+                plan.to_sql().replace(' ', "")
+            }
+        };
+
+        let indexed = plan(true).await;
+        assert!(indexed.contains("KnnScan"), "{indexed}");
+        assert!(indexed.contains("fact_embedding_hnsw"), "{indexed}");
+        let brute = plan(false).await;
+        assert!(brute.contains("KnnTopK"), "{brute}");
+        assert!(!brute.contains("KnnScan"), "{brute}");
     }
 
     #[tokio::test]

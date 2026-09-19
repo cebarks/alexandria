@@ -45,7 +45,7 @@ use chrono::{DateTime, SecondsFormat, Utc, Weekday};
 
 use crate::tools::{
     CancelReminderParams, CheckRemindersParams, DeleteMemoryParams, FinalizeSessionParams,
-    GetSessionParams, ImportDocumentParams, ListRemindersParams, RecallParams,
+    GetSessionParams, ImportDocumentParams, ListRemindersParams, ListSessionsParams, RecallParams,
     RetrieveMemoriesParams, SetReminderParams, StoreMemoryParams, UpdateMemoryParams,
 };
 
@@ -100,6 +100,14 @@ pub const DUE_REMINDERS_CAP: i64 = 5;
 /// is a bounded read of `cap + slack`, not a full scan.
 const DUE_SAMPLE_SLACK: i64 = 10;
 
+/// Ceiling on `retrieve_memories`' `limit`. With `KNN_SLACK` it keeps `k` under the HNSW
+/// search breadth (`HNSW_EF` in `memory_repo.rs`).
+pub const MAX_RETRIEVE_LIMIT: usize = 100;
+
+/// Extra neighbours requested beyond `limit`, so an approximate index result still holds the
+/// exact top `limit` after the in-process re-rank.
+const KNN_SLACK: usize = 10;
+
 /// Reminder delivery settings resolved from server config at startup.
 #[derive(Debug, Clone)]
 pub struct RemindersSettings {
@@ -124,12 +132,16 @@ pub struct AlexandriaServer {
     pub heat_spacing_halflife: f64,
     pub activation_config: ActivationConfig,
     pub activation_top_n: usize,
-    /// Hard floor on cosine similarity for retrieve_memories results.
+    /// Hard floor on cosine similarity for retrieve_memories results. The
+    /// builder default matches `RetrieveConfig`; production overrides it from config.
     pub retrieve_min_similarity: f32,
     /// Avg member-to-centroid similarity below which a cluster is reported as needing a
     /// split. Carried here so the debug UI shows the same verdict the maintenance task acts on.
     pub cohesion_floor: f32,
     pub reminders: RemindersSettings,
+    /// Whether `schema::ensure_vector_index` succeeded at boot. Off, retrieval stays on the
+    /// brute-force KNN form, which returns the same rows without the index.
+    pub vector_index: bool,
 }
 
 impl AlexandriaServer {
@@ -149,6 +161,7 @@ impl AlexandriaServer {
             retrieve_min_similarity: DEFAULT_MIN_SIMILARITY,
             cohesion_floor: DEFAULT_COHESION_FLOOR,
             reminders: RemindersSettings::default(),
+            vector_index: false,
         }
     }
 
@@ -176,6 +189,11 @@ impl AlexandriaServer {
         self.reminders = settings;
         self
     }
+
+    pub fn with_vector_index(mut self, defined: bool) -> Self {
+        self.vector_index = defined;
+        self
+    }
 }
 
 #[tool_router]
@@ -201,14 +219,29 @@ impl AlexandriaServer {
     }
 
     #[tool(
-        description = "Persist a durable fact, decision, preference, or correction so future sessions/agents can recall it. Call this proactively whenever you learn something worth remembering — a user preference, an architectural decision and its rationale, a resolved bug's root cause, a gotcha you just discovered — not only when explicitly told to 'remember this'. Cheap and idempotent-ish (dedup happens via clustering); prefer storing over losing context. Write content as a standalone statement that makes sense without the current conversation."
+        description = "Persist a durable fact, decision, preference, or correction so future sessions/agents can recall it. Call this proactively whenever you learn something worth remembering — a user preference, an architectural decision and its rationale, a resolved bug's root cause, a gotcha you just discovered — not only when explicitly told to 'remember this'. Cheap and idempotent-ish (dedup happens via clustering); prefer storing over losing context. Write content as a standalone statement that makes sense without the current conversation. If the response carries `truncated: true`, the content was longer than the embedding sees and only its head is searchable: split it into shorter memories."
     )]
     async fn store_memory(
         &self,
         Parameters(params): Parameters<StoreMemoryParams>,
     ) -> CallToolResult {
+        // Asked before the store because the id does not exist until after it, and the id is
+        // what makes the warning actionable.
+        let overflow = self.embedding.overflow(&params.content);
         match self.do_store_memory(params).await {
-            Ok(id) => CallToolResult::structured(serde_json::json!({ "status": "ok", "id": id })),
+            Ok(id) => {
+                let mut body = serde_json::json!({ "status": "ok", "id": id });
+                if let Some(tokens) = overflow {
+                    tracing::warn!(
+                        fact_id = %id,
+                        tokens,
+                        "stored memory exceeds the embedding token limit; only its head is searchable"
+                    );
+                    body["truncated"] = true.into();
+                    body["tokens"] = tokens.into();
+                }
+                CallToolResult::structured(body)
+            }
             Err(e) => CallToolResult::structured_error(serde_json::json!({
                 "status": "error",
                 "message": e.to_string()
@@ -271,6 +304,16 @@ impl AlexandriaServer {
     }
 
     #[tool(
+        description = "List sessions newest-first with their metadata and live memory count. Call this when you need to find a session whose id you don't have — 'the session from yesterday', 'what did the pi agent work on' — then pass its external_id to get_session. Filter by agent_id, tag, or finalized (true = has a summary)."
+    )]
+    async fn list_sessions(
+        &self,
+        Parameters(params): Parameters<ListSessionsParams>,
+    ) -> CallToolResult {
+        tool_json(self.do_list_sessions(params).await)
+    }
+
+    #[tool(
         description = "Finalize a session by setting its summary, tags, and ended_at timestamp. Call this when a session wraps up to capture a summary of what was accomplished."
     )]
     async fn finalize_session(
@@ -325,9 +368,15 @@ impl AlexandriaServer {
     instructions = "Alexandria is a persistent agent memory system — use it proactively, not just when explicitly asked to 'remember' or 'recall' something.\n\n\
 When to READ memory (retrieve_memories / recall): at the start of a task in a project or domain you've likely worked in before; whenever the user references past context ('last time', 'we decided', 'like before'); before re-deriving a decision or re-debugging something that may have been solved already. Use retrieve_memories for a specific lookup, recall for open-ended/broad exploration (call it once broad, then again with the returned scope_handle to narrow).\n\n\
 When to WRITE memory (store_memory): as soon as you learn a durable fact worth keeping past this conversation — a user preference, an architectural decision and its rationale, a bug's root cause, a non-obvious gotcha, a correction the user gives you. Do this unprompted; don't wait to be told to remember. Write standalone statements that make sense without today's conversation.\n\n\
-Session memory: pass session_id to store_memory or import_document to group memories by session. Use get_session to review all memories from a session. Use finalize_session at the end of a session to attach a summary and tags.\n\n\
-Use update_memory (not store_memory) when correcting something already stored — it preserves lineage. Use import_document for bulk reference material (specs, READMEs, notes). Use delete_memory only when the user wants something actually forgotten.\n\n\
-Reminders: use set_reminder when the user asks to be reminded of something later or a follow-up will be needed at a specific time. Omit target_project for anything the user should see anywhere; set it for repo-bound follow-ups (exact, case-sensitive match). The response carries next_fire_preview and the timezone the schedule was parsed in — confirm those with the user whenever the schedule came from natural language. Due reminders are delivered when a client calls check_reminders at the start of an interaction — the server runs no timer, so nothing fires on its own and a client that never calls it never receives one. check_reminders is the only tool that consumes them (recurring ones advance; missed fires coalesce rather than trickle) and it injects them into your context only: telling the user is your job. Call it yourself when the user asks whether anything is due, or when a reminder they expected has not shown up.\n\n\
+Session memory: pass session_id to store_memory or import_document to group memories by session. Use get_session to review all memories from a session, and list_sessions to find a session id you don't have. Use finalize_session at the end of a session to attach a summary and tags.
+
+\
+Use update_memory (not store_memory) when correcting something already stored — it preserves lineage. Use import_document for bulk reference material (specs, READMEs, notes). Use delete_memory only when the user wants something actually forgotten.
+
+\
+Reminders: use set_reminder when the user asks to be reminded of something later or a follow-up will be needed at a specific time. Omit target_project for anything the user should see anywhere; set it for repo-bound follow-ups (exact, case-sensitive match). The response carries next_fire_preview and the timezone the schedule was parsed in — confirm those with the user whenever the schedule came from natural language. Due reminders are delivered when a client calls check_reminders at the start of an interaction — the server runs no timer, so nothing fires on its own and a client that never calls it never receives one. check_reminders is the only tool that consumes them (recurring ones advance; missed fires coalesce rather than trickle) and it injects them into your context only: telling the user is your job. Call it yourself when the user asks whether anything is due, or when a reminder they expected has not shown up.
+
+\
 Reminder delivery: retrieve_memories and recall responses also carry a due_reminders array: a read-only, untargeted view of what is currently due (a short oldest-due sample, each entry has a target of global or project:<name>) that consumes nothing. An entry targeting another project is informational there; it reaches the user through the next check_reminders, which also delivers project reminders once they are at least the server's escalation window overdue. Use list_reminders to review what is scheduled and cancel_reminder when a reminder is no longer needed."
 )]
 impl ServerHandler for AlexandriaServer {}
@@ -378,15 +427,13 @@ impl AlexandriaServer {
         // 6. Session linkage (implicit create on first use)
         if let Some(ref session_id) = params.session_id {
             let session_repo = SessionRepo::new(self.db.inner());
-            if session_repo
-                .find_by_external_id(session_id)
-                .await?
-                .is_none()
-            {
-                session_repo.create(session_id, None, None).await?;
-            }
-            let session = session_repo.find_by_external_id(session_id).await?.unwrap();
-            let session_rid = session.id.map(|r| record_id_to_string(&r)).unwrap();
+            let session_rid = session_repo
+                .find_or_create(
+                    session_id,
+                    params.agent_id.as_deref(),
+                    params.model.as_deref(),
+                )
+                .await?;
             session_repo.add_memory(&session_rid, &fact_id).await?;
             session_repo.touch(session_id).await?;
         }
@@ -485,7 +532,11 @@ impl AlexandriaServer {
                         .into_iter()
                         .map(|c| c.content)
                         .collect(),
-                    "fixed_size" => chunk_by_fixed_size(&params.content, 1000, 100)
+                    // 800 chars is about 180-200 tokens of Latin prose, inside a 256-token limit
+                    // but over the default 128. Not a bound either way: CJK tokenizes near one
+                    // token per character. A chunk past `embedding.max_tokens` embeds on its head
+                    // and logs the overflow.
+                    "fixed_size" => chunk_by_fixed_size(&params.content, 800, 100)
                         .into_iter()
                         .map(|c| c.content)
                         .collect(),
@@ -496,9 +547,8 @@ impl AlexandriaServer {
         };
 
         // Create a raw record for the full document (source for extracted_from edges)
-        let raw_id = self.create_raw_record(&params.content).await?;
-
         let repo = MemoryRepo::new(self.db.inner());
+        let raw_id = repo.create_raw(&params.content).await?;
         let heat_repo = HeatRepo::new(self.db.inner());
         let edge_repo = EdgeRepo::new(self.db.inner());
         let mut created_ids = Vec::new();
@@ -510,17 +560,15 @@ impl AlexandriaServer {
         // Session linkage (implicit create on first use), resolved once for all chunks
         let session_repo = SessionRepo::new(self.db.inner());
         let session_rid = match params.session_id {
-            Some(ref session_id) => {
-                if session_repo
-                    .find_by_external_id(session_id)
-                    .await?
-                    .is_none()
-                {
-                    session_repo.create(session_id, None, None).await?;
-                }
-                let session = session_repo.find_by_external_id(session_id).await?.unwrap();
-                Some(session.id.map(|r| record_id_to_string(&r)).unwrap())
-            }
+            Some(ref session_id) => Some(
+                session_repo
+                    .find_or_create(
+                        session_id,
+                        params.agent_id.as_deref(),
+                        params.model.as_deref(),
+                    )
+                    .await?,
+            ),
             None => None,
         };
 
@@ -637,24 +685,30 @@ impl AlexandriaServer {
         params: RetrieveMemoriesParams,
         options: RetrieveOptions,
     ) -> anyhow::Result<serde_json::Value> {
-        let limit = params.limit.unwrap_or(10);
+        // `limit` is client input and ends up interpolated into the KNN operator, which parses
+        // `k` as a u32: clamp it here rather than fail the whole retrieve on a large value.
+        let limit = params.limit.unwrap_or(10).clamp(1, MAX_RETRIEVE_LIMIT);
 
         // 1. Embed query
         let query_vecs = self.embedding.embed(&[&params.query]).await?;
         let query_emb = &query_vecs[0];
 
-        // 2. Load facts (scoped to session if provided, otherwise all non-deleted)
+        // 2. Load candidates: the session's facts if scoped, otherwise the nearest live facts,
+        // from the HNSW index when boot defined it. The index is approximate, so ask for more
+        // than `limit`; step 3 re-ranks by exact cosine and truncates, which makes the slack
+        // free and keeps a near-miss from displacing a row that was never fetched.
         let facts: Vec<alexandria_storage::models::Fact> =
             if let Some(ref session_id) = params.session_id {
                 let session_repo = SessionRepo::new(self.db.inner());
                 session_repo.get_memories(session_id).await?
             } else {
-                let mut response = self
-                    .db
-                    .inner()
-                    .query("SELECT * FROM fact WHERE deleted = false")
-                    .await?;
-                response.take(0)?
+                let repo = MemoryRepo::new(self.db.inner());
+                let k = limit + KNN_SLACK;
+                if self.vector_index {
+                    repo.nearest_indexed(query_emb, k).await?
+                } else {
+                    repo.nearest(query_emb, k).await?
+                }
             };
 
         if facts.is_empty() {
@@ -788,6 +842,34 @@ impl AlexandriaServer {
             })
             .to_string())
         }
+    }
+
+    pub async fn do_list_sessions(&self, params: ListSessionsParams) -> anyhow::Result<String> {
+        let sessions = SessionRepo::new(self.db.inner())
+            .list_filtered(
+                params.agent_id.as_deref(),
+                params.tag.as_deref(),
+                params.finalized,
+                params.limit.unwrap_or(20),
+                params.offset.unwrap_or(0),
+            )
+            .await?;
+        let list: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "external_id": s.external_id,
+                    "agent_id": s.agent_id,
+                    "model": s.model,
+                    "started_at": s.started_at,
+                    "ended_at": s.ended_at,
+                    "summary": s.summary,
+                    "memory_count": s.memory_count,
+                    "tags": s.tags,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "sessions": list, "count": list.len() }).to_string())
     }
 
     pub async fn do_get_session(&self, params: GetSessionParams) -> anyhow::Result<String> {
@@ -1569,13 +1651,7 @@ impl AlexandriaServer {
                 cluster_repo.add_member(&cid, fact_id).await?;
                 if let Some(old) = clusters.iter().find(|c| c.id == cid) {
                     let new_centroid = update_centroid(&old.centroid, embedding, old.member_count);
-                    self.db
-                        .inner()
-                        .query("UPDATE type::record($id) SET centroid = $centroid")
-                        .bind(("id", cid))
-                        .bind(("centroid", new_centroid))
-                        .await?
-                        .check()?;
+                    cluster_repo.update_centroid(&cid, &new_centroid).await?;
                 }
             }
             alexandria_engine::clusters::ClusterAssignment::NewCluster => {
@@ -1619,44 +1695,16 @@ impl AlexandriaServer {
         Ok(())
     }
 
-    /// Create a raw record for document import.
-    async fn create_raw_record(&self, content: &str) -> anyhow::Result<String> {
-        let mut response = self
-            .db
-            .inner()
-            .query("CREATE raw SET content = $content, deleted = false")
-            .bind(("content", content.to_string()))
-            .await?;
-        let created: Option<alexandria_storage::models::RawRecord> = response.take(0)?;
-        let raw = created.ok_or_else(|| anyhow::anyhow!("Failed to create raw record"))?;
-        let id = raw
-            .id
-            .ok_or_else(|| anyhow::anyhow!("Raw record has no id"))?;
-        Ok(record_id_to_string(&id))
-    }
-
     async fn load_cluster_infos(&self) -> anyhow::Result<Vec<ClusterInfo>> {
-        let mut response = self.db.inner().query("SELECT * FROM cluster").await?;
-        let clusters: Vec<alexandria_storage::models::Cluster> = response.take(0)?;
-
-        let cluster_repo = ClusterRepo::new(self.db.inner());
-        let mut infos = Vec::with_capacity(clusters.len());
-
-        for c in clusters {
-            let id = c.id.map(|r| record_id_to_string(&r)).unwrap_or_default();
-            let member_count = cluster_repo
-                .get_members(&id)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            infos.push(ClusterInfo {
-                id,
+        let clusters = ClusterRepo::new(self.db.inner()).list_with_counts().await?;
+        Ok(clusters
+            .into_iter()
+            .map(|(c, member_count)| ClusterInfo {
+                id: c.id.map(|r| record_id_to_string(&r)).unwrap_or_default(),
                 centroid: c.centroid,
                 member_count,
-            });
-        }
-
-        Ok(infos)
+            })
+            .collect())
     }
 
     async fn load_cluster_with_members(
@@ -1800,14 +1848,14 @@ mod get_info_tests {
         );
     }
 
-    /// The twelve public MCP tools, by name — the exact set `AGENTS.md` and `README.md` document.
+    /// The thirteen public MCP tools, by name — the exact set `AGENTS.md` and `README.md` document.
     ///
     /// Deliberately a closed list rather than a count. `do_retrieve_memories_dry` and
     /// `do_retrieve_memories_unfiltered` are `#[tool]`-less wrappers over `retrieve_core` used only
     /// by the debug Query Tester, and a *count* check would keep passing if someone renamed a real
-    /// tool and registered one of those as the thirteenth: the advertised surface would change while
-    /// the total stayed twelve. Names are what an MCP client actually calls.
-    const PUBLIC_TOOLS: [&str; 12] = [
+    /// tool and registered one of those as the fourteenth: the advertised surface would change while
+    /// the total stayed thirteen. Names are what an MCP client actually calls.
+    const PUBLIC_TOOLS: [&str; 13] = [
         "store_memory",
         "retrieve_memories",
         "recall",
@@ -1815,6 +1863,7 @@ mod get_info_tests {
         "import_document",
         "delete_memory",
         "get_session",
+        "list_sessions",
         "finalize_session",
         "set_reminder",
         "check_reminders",
@@ -1822,7 +1871,7 @@ mod get_info_tests {
         "cancel_reminder",
     ];
 
-    /// Guards the "exactly 12 MCP tools" invariant in `AGENTS.md`/`README.md`.
+    /// Guards the "exactly 13 MCP tools" invariant in `AGENTS.md`/`README.md`.
     ///
     /// Until now that claim was verified by a human counting `#[tool]` attributes, so a future
     /// `#[tool]` on a debug-only wrapper — or a rename — would silently widen or shift the
@@ -1836,7 +1885,7 @@ mod get_info_tests {
     /// and takes only a `&str`, so it is checked here too — a name the router lists but the handler
     /// cannot resolve would be advertised and then rejected at call time.
     #[tokio::test]
-    async fn test_advertised_tool_set_is_exactly_the_twelve_public_tools() {
+    async fn test_advertised_tool_set_is_exactly_the_thirteen_public_tools() {
         let db = Database::connect_embedded().await.unwrap();
         alexandria_storage::schema::migrate(db.inner())
             .await
@@ -1853,12 +1902,12 @@ mod get_info_tests {
         expected.sort();
         assert_eq!(
             advertised, expected,
-            "the advertised MCP tool set must be exactly the twelve documented public tools"
+            "the advertised MCP tool set must be exactly the thirteen documented public tools"
         );
         assert_eq!(
             advertised.len(),
-            12,
-            "asserting the exact set is the point; a duplicate name would hide a thirteenth tool"
+            13,
+            "asserting the exact set is the point; a duplicate name would hide a fourteenth tool"
         );
 
         for name in PUBLIC_TOOLS {
@@ -1923,6 +1972,8 @@ mod get_info_tests {
                 content: "a near match memory".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -1931,6 +1982,8 @@ mod get_info_tests {
                 content: "a far away memory".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -1950,6 +2003,52 @@ mod get_info_tests {
         assert_eq!(results.len(), 1, "floor should drop the orthogonal memory");
         assert!(results[0]["content"].as_str().unwrap().contains("near"));
         assert!(results[0]["similarity"].as_f64().unwrap() >= 0.30);
+    }
+
+    /// Same retrieval through the HNSW index, and `limit` is clamped to
+    /// `1..=MAX_RETRIEVE_LIMIT` instead of reaching the KNN operator as sent.
+    #[tokio::test]
+    async fn retrieve_memories_serves_from_vector_index() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        alexandria_storage::schema::ensure_vector_index(db.inner(), 2)
+            .await
+            .unwrap();
+        let server =
+            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0)
+                .with_vector_index(true);
+        for content in ["near one", "near two", "far away"] {
+            server
+                .do_store_memory(StoreMemoryParams {
+                    content: content.to_string(),
+                    tags: None,
+                    session_id: None,
+                    agent_id: None,
+                    model: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let retrieve = |limit| {
+            server.do_retrieve_memories(RetrieveMemoriesParams {
+                query: "anything".to_string(),
+                limit: Some(limit),
+                session_id: None,
+            })
+        };
+        let results = retrieve(2).await.unwrap();
+        let results = results["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        for r in results {
+            assert!(r["content"].as_str().unwrap().contains("near"));
+        }
+        let results = retrieve(0).await.unwrap();
+        assert_eq!(results["results"].as_array().unwrap().len(), 1);
+        let results = retrieve(usize::MAX).await.unwrap();
+        assert!(results["results"].as_array().unwrap().len() >= 2);
     }
 
     /// Stub producing vectors with exact cosine similarity to the query [1, 0]:
@@ -1998,6 +2097,8 @@ mod get_info_tests {
                 content: "just below the floor".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2006,6 +2107,8 @@ mod get_info_tests {
                 content: "just above the floor".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2051,6 +2154,8 @@ mod get_info_tests {
                 content: "seed alpha".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2059,6 +2164,8 @@ mod get_info_tests {
                 content: "seed beta".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2192,6 +2299,70 @@ mod get_info_tests {
     }
 
     #[tokio::test]
+    async fn list_sessions_filters_and_counts() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+
+        for (sess, agent) in [("sess-l1", "pi"), ("sess-l2", "claude-code")] {
+            server
+                .do_store_memory(StoreMemoryParams {
+                    content: format!("fact in {sess}"),
+                    tags: None,
+                    session_id: Some(sess.to_string()),
+                    agent_id: Some(agent.to_string()),
+                    model: None,
+                })
+                .await
+                .unwrap();
+        }
+        server
+            .do_finalize_session(FinalizeSessionParams {
+                session_id: "sess-l2".to_string(),
+                summary: Some("wrapped".to_string()),
+                tags: None,
+            })
+            .await
+            .unwrap();
+
+        let all: serde_json::Value = serde_json::from_str(
+            &server
+                .do_list_sessions(ListSessionsParams {
+                    agent_id: None,
+                    tag: None,
+                    finalized: None,
+                    limit: None,
+                    offset: None,
+                })
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(all["count"], 2);
+        assert_eq!(all["sessions"][0]["external_id"], "sess-l2");
+        assert_eq!(all["sessions"][0]["memory_count"], 1);
+        assert_eq!(all["sessions"][0]["summary"], "wrapped");
+
+        let open: serde_json::Value = serde_json::from_str(
+            &server
+                .do_list_sessions(ListSessionsParams {
+                    agent_id: Some("pi".to_string()),
+                    tag: None,
+                    finalized: Some(false),
+                    limit: None,
+                    offset: None,
+                })
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(open["count"], 1);
+        assert_eq!(open["sessions"][0]["external_id"], "sess-l1");
+    }
+
+    #[tokio::test]
     async fn get_session_hides_deleted_and_reports_live_count() {
         let db = Database::connect_embedded().await.unwrap();
         alexandria_storage::schema::migrate(db.inner())
@@ -2204,6 +2375,8 @@ mod get_info_tests {
                 content: "kept fact".to_string(),
                 tags: None,
                 session_id: Some("sess-del".to_string()),
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2212,6 +2385,8 @@ mod get_info_tests {
                 content: "deleted fact".to_string(),
                 tags: None,
                 session_id: Some("sess-del".to_string()),
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2257,6 +2432,8 @@ mod get_info_tests {
                 content: "unrelated fact outside the session".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2267,6 +2444,8 @@ mod get_info_tests {
                 chunk_strategy: Some("paragraph".to_string()),
                 tags: None,
                 session_id: Some("sess-import".to_string()),
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2305,6 +2484,8 @@ mod get_info_tests {
                 content: "first session fact".to_string(),
                 tags: None,
                 session_id: Some("sess-abc".to_string()),
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2313,6 +2494,8 @@ mod get_info_tests {
                 content: "second session fact".to_string(),
                 tags: Some(vec!["important".to_string()]),
                 session_id: Some("sess-abc".to_string()),
+                agent_id: Some("claude-code".to_string()),
+                model: Some("claude-sonnet-5".to_string()),
             })
             .await
             .unwrap();
@@ -2323,6 +2506,8 @@ mod get_info_tests {
                 content: "unrelated fact".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2353,6 +2538,9 @@ mod get_info_tests {
         let parsed: serde_json::Value = serde_json::from_str(&session_json).unwrap();
         assert_eq!(parsed["session"]["external_id"], "sess-abc");
         assert_eq!(parsed["session"]["memory_count"], 2);
+        // Acquired from the second store_memory; the session was created without them.
+        assert_eq!(parsed["session"]["agent_id"], "claude-code");
+        assert_eq!(parsed["session"]["model"], "claude-sonnet-5");
         assert!(parsed["session"]["summary"].is_null());
         assert_eq!(parsed["memories"].as_array().unwrap().len(), 2);
 
@@ -2403,6 +2591,8 @@ mod get_info_tests {
                 content: "a near match memory".to_string(),
                 tags: None,
                 session_id: None,
+                agent_id: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -2453,6 +2643,53 @@ mod get_info_tests {
         );
     }
 
+    /// Stub whose limit is ten characters, standing in for a tokenizer.
+    struct TinyLimit;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for TinyLimit {
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            StubEmbedding.embed(texts).await
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+        fn overflow(&self, text: &str) -> Option<usize> {
+            (text.len() > 10).then_some(text.len())
+        }
+    }
+
+    /// The store response is the only machine-readable truncation signal the storing agent gets.
+    #[tokio::test]
+    async fn store_memory_flags_truncated_content() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(Arc::new(db), Arc::new(TinyLimit), 0.75, 86400.0);
+        let store = async |content: &str| {
+            let result = server
+                .store_memory(Parameters(StoreMemoryParams {
+                    content: content.to_string(),
+                    tags: None,
+                    session_id: None,
+                    agent_id: None,
+                    model: None,
+                }))
+                .await;
+            result.structured_content.expect("structuredContent set")
+        };
+
+        let long = store("well past ten characters").await;
+        assert_eq!(long["status"], "ok");
+        assert_eq!(long["truncated"], true);
+        assert_eq!(long["tokens"], 24);
+        assert!(store("short").await.get("truncated").is_none());
+    }
+
     #[tokio::test]
     async fn every_tool_returns_structured_content_matching_text() {
         let db = Database::connect_embedded().await.unwrap();
@@ -2466,6 +2703,8 @@ mod get_info_tests {
                 content: "the project uses SurrealDB".to_string(),
                 tags: Some(vec!["db".to_string()]),
                 session_id: Some("sess-struct".to_string()),
+                agent_id: None,
+                model: None,
             }))
             .await;
         check_structured("store_memory", &stored);
@@ -2503,6 +2742,8 @@ mod get_info_tests {
                     chunk_strategy: Some("paragraph".to_string()),
                     tags: None,
                     session_id: Some("sess-struct".to_string()),
+                    agent_id: None,
+                    model: None,
                 }))
                 .await,
         );
@@ -2511,6 +2752,18 @@ mod get_info_tests {
             &server
                 .get_session(Parameters(GetSessionParams {
                     session_id: "sess-struct".to_string(),
+                }))
+                .await,
+        );
+        check_structured(
+            "list_sessions",
+            &server
+                .list_sessions(Parameters(ListSessionsParams {
+                    agent_id: None,
+                    tag: None,
+                    finalized: None,
+                    limit: None,
+                    offset: None,
                 }))
                 .await,
         );

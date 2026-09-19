@@ -14,4 +14,4 @@ pub use maintenance::MaintenanceLog;
 pub use memory::{Fact, RawRecord};
 pub use provenance::Provenance;
 pub use reminder::{Reminder, schedule_kind};
-pub use session::Session;
+pub use session::{Session, SessionListItem};

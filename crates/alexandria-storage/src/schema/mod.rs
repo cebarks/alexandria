@@ -37,6 +37,14 @@ pub const LATEST_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 /// On an existing database, reads the current version and runs only newer migrations.
 pub async fn migrate(db: &Surreal<Any>) -> Result<()> {
     let current_version = get_current_version(db).await;
+    // A newer binary may have written things this one cannot read (a lock key, a field), and
+    // this one would write over them without knowing. Old binaries cannot be fixed; this stops
+    // every binary from here on.
+    anyhow::ensure!(
+        current_version <= LATEST_VERSION,
+        "database schema is v{current_version} but this binary only knows v{LATEST_VERSION}; \
+         it was last opened by a newer alexandria. Upgrade the binary; rolling back is unsafe."
+    );
 
     let pending: Vec<_> = MIGRATIONS
         .iter()
@@ -58,6 +66,29 @@ pub async fn migrate(db: &Surreal<Any>) -> Result<()> {
     set_version(db, latest).await?;
 
     tracing::info!("Schema migrated to v{latest:03}");
+    Ok(())
+}
+
+/// Define the HNSW index over `fact.embedding` if it is missing. Not a numbered
+/// migration: HNSW needs `DIMENSION` at define time, and the dimension is a
+/// property of the embedding model locked on first boot, so this runs at boot
+/// after the model check with the verified dimension.
+pub async fn ensure_vector_index(db: &Surreal<Any>, dimensions: usize) -> Result<()> {
+    db.query(format!(
+        "DEFINE INDEX IF NOT EXISTS fact_embedding_hnsw ON fact FIELDS embedding \
+         HNSW DIMENSION {dimensions} DISTANCE COSINE"
+    ))
+    .await?
+    .check()?;
+    Ok(())
+}
+
+/// Drop the HNSW index. Re-embedding to a model with a different dimension has
+/// to remove it first, since the index rejects vectors of any other size.
+pub async fn drop_vector_index(db: &Surreal<Any>) -> Result<()> {
+    db.query("REMOVE INDEX IF EXISTS fact_embedding_hnsw ON fact")
+        .await?
+        .check()?;
     Ok(())
 }
 
@@ -104,6 +135,20 @@ mod tests {
     use super::*;
     use crate::models::Session;
 
+    /// A database a newer binary migrated must not be opened by an older one.
+    #[tokio::test]
+    async fn migrate_refuses_a_schema_newer_than_this_binary() {
+        let db = crate::connection::Database::connect_embedded()
+            .await
+            .unwrap();
+        let db = db.inner();
+        migrate(db).await.unwrap();
+        set_version(db, LATEST_VERSION + 1).await.unwrap();
+
+        let err = migrate(db).await.unwrap_err().to_string();
+        assert!(err.contains("newer alexandria"), "{err}");
+    }
+
     /// Rows written before v006 carry a memory_count value; the migration must
     /// clear it and the field-less Session struct must still read them back.
     #[tokio::test]
@@ -140,5 +185,49 @@ mod tests {
             .take(0)
             .unwrap();
         assert!(leftover.is_none() || leftover == Some(serde_json::Value::Null));
+    }
+
+    /// The index is defined at boot (dimensions are per-deployment), so defining
+    /// it twice must be a no-op and the KNN query must go through it.
+    #[tokio::test]
+    async fn vector_index_is_idempotent_and_serves_knn() {
+        let db = crate::connection::Database::connect_embedded()
+            .await
+            .unwrap();
+        let db = db.inner();
+        migrate(db).await.unwrap();
+        let memories = crate::repos::MemoryRepo::new(db);
+        let near = memories
+            .create_fact("near", 0.5, &[1.0, 0.0], &[])
+            .await
+            .unwrap();
+        memories
+            .create_fact("far", 0.5, &[0.0, 1.0], &[])
+            .await
+            .unwrap();
+
+        ensure_vector_index(db, 2).await.unwrap();
+        ensure_vector_index(db, 2).await.unwrap();
+
+        let rows: Vec<crate::models::Fact> = db
+            .query("SELECT * FROM fact WHERE deleted = false AND embedding <|1,COSINE|> $q")
+            .bind(("q", vec![0.9f32, 0.1]))
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            crate::record_id_to_string(rows[0].id.as_ref().unwrap()),
+            near
+        );
+
+        drop_vector_index(db).await.unwrap();
+        drop_vector_index(db).await.unwrap();
+        // A 3-dim vector is only writable once the 2-dim index is gone.
+        memories
+            .create_fact("wider", 0.5, &[0.0, 0.0, 1.0], &[])
+            .await
+            .unwrap();
     }
 }

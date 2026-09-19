@@ -11,7 +11,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `RELATE` needs pre-parsed `RecordId` via `.bind()` — inline `type::record()` in RELATE fails
 - `type::record()` replaces `type::thing()` (removed in 3.x)
 - Query result structs need `#[derive(SurrealValue)]` from `surrealdb::types`
-- `RecordId` formatting: use `record_id_to_string()` helper, not `.to_string()`
+- `RecordId` formatting: use `record_id_to_string()` helper (in `alexandria-storage/src/lib.rs`, re-exported by `alexandria-mcp/src/server.rs`), not `.to_string()`
 - Connection: `surrealdb::engine::any::connect("mem://")` with `kv-mem` feature; `surrealkv://path` with `kv-surrealkv`
 - To count filtered records reached by a graph traversal *inline in a SELECT*, the `WHERE` goes **inside** the traversal target's parentheses: `(->contains_session_memory->(fact WHERE deleted = false)).len()`. The obvious `(->edge->fact WHERE ...).len()` fails with `Unexpected token WHERE expected delimiter )`, and so do the `array::len(...)` and `count(...)` spellings — no N+1 fallback is needed once you find this.
 - An absent `option<T>` field is `NONE`, and **`IS NOT NULL` and `!= NULL` are both satisfied by `NONE`** — they filter nothing; only `field != NONE` (or `NOT (field = NONE)`, or `type::is_none(field) = false`) excludes it. Verified against the pinned 3.2.4 engine: with one `NONE` and one set row, `WHERE next_due_at IS NOT NULL` returned both and `WHERE next_due_at != NONE` returned one. This bites ordering too, because `NONE` sorts below every datetime: such a row wins the head of an `ORDER BY next_due_at ASC LIMIT n` page.
@@ -26,7 +26,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 
 ## Architecture Boundaries
 
-- **storage** owns all DB access — no raw SurrealDB queries outside this crate (the `alexandria-mcp` handlers still issue some inline queries directly; don't add new ones without reason)
+- **storage** owns all DB access — no raw SurrealDB queries outside this crate (the `alexandria-mcp` `provenance` create in `do_store_memory` is the one remaining inline query and is maintained elsewhere; don't add new ones)
 - **engine** is pure algorithms — no DB, no async (except test helpers). Takes data in, returns results.
 - **pipeline** owns embedding — abstracts over providers via `EmbeddingProvider` trait
 - **mcp** wires tools to engine+storage — the only crate that knows about both. Also owns the debug web UI (`alexandria-mcp/src/debug/`), which is Axum handlers over the same repos, plus `crates/alexandria-mcp/templates/` (askama, compiled at build time) and `crates/alexandria-mcp/assets/` (vendored third-party JS, `include_bytes!`). Both are **compile-time contracts**: a missing template or asset file is a build error, not a runtime 404.
@@ -38,13 +38,26 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `AlexandriaServer` uses a bare `#[tool_router]` + explicit `#[tool_handler(instructions = "...")]` block — NOT `#[tool_router(server_handler)]` — specifically so `get_info()` carries usage `instructions`. If you add a new tool, add it to the `#[tool_router]` impl block same as the others; the separate `#[tool_handler]` block stays where it is at the bottom of `server.rs` and doesn't need touching unless the overall usage guidance changes.
 - Tool descriptions and param field descriptions (`#[tool(description = ...)]`, `#[schemars(description = ...)]`) are written directively ("call this proactively when...") rather than just describing mechanics — this materially affects how often client LLMs choose to call the tool unprompted. Keep new tools consistent with that style.
 - `record_id_to_string()` is the canonical way to format SurrealDB `RecordId` for use in queries and JSON responses. It lives in `alexandria-storage/src/lib.rs` and is re-exported from `alexandria-mcp/src/server.rs`.
-- There are **12 MCP tools**: `store_memory`, `retrieve_memories`, `recall`, `update_memory`, `import_document`, `delete_memory`, `get_session`, `finalize_session`, `set_reminder`, `check_reminders`, `list_reminders`, `cancel_reminder`. Adding one means a params struct in `alexandria-mcp/src/tools/`, a `#[tool]` method, a `do_*` impl, and a row in the README tool table. `do_retrieve_memories_dry` and `do_retrieve_memories_unfiltered` are **not** tools — they are non-`#[tool]` wrappers over `retrieve_core(params, options)` used only by the debug Query Tester. Do not count them as tools, advertise them, or add a `dry_run` field to `RetrieveMemoriesParams`: that struct is the public MCP schema every LLM client sees, and a debug-only knob there would be an affordance agents could set.
+- There are **13 MCP tools**: `store_memory`, `retrieve_memories`, `recall`, `update_memory`, `import_document`, `delete_memory`, `get_session`, `list_sessions`, `finalize_session`, `set_reminder`, `check_reminders`, `list_reminders`, `cancel_reminder`. Adding one means a params struct in `alexandria-mcp/src/tools/`, a `#[tool]` method, a `do_*` impl, and a row in the README tool table. `do_retrieve_memories_dry` and `do_retrieve_memories_unfiltered` are **not** tools — they are non-`#[tool]` wrappers over `retrieve_core(params, options)` used only by the debug Query Tester. Do not count them as tools, advertise them, or add a `dry_run` field to `RetrieveMemoriesParams`: that struct is the public MCP schema every LLM client sees, and a debug-only knob there would be an affordance agents could set.
+- The HNSW index on `fact.embedding` is defined at boot by `schema::ensure_vector_index()`, not in a
+  numbered migration, because HNSW needs `DIMENSION` at define time and the dimension comes from the
+  locked embedding model. Only the numeric-ef form reaches it: `MemoryRepo::nearest_indexed()` issues
+  `embedding <|k,150|> $q` (plan `KnnScan`), while `MemoryRepo::nearest()` issues
+  `embedding <|k,COSINE|> $q`, which is a brute-force scan (`KnnTopK`) whether or not the index
+  exists. `bench-retrieval` calls `nearest_indexed` too, after defining the index on its snapshot,
+  so its overlap line measures the index. `<|k,ef|>` without an index strips to a plain scan,
+  so `do_retrieve_memories` picks by
+  `AlexandriaServer::vector_index`, which `main.rs` sets only when the define succeeded — a failed
+  define logs an error and boots on the brute-force path (most tests never define the index and
+  take that path too). `test_nearest_indexed_plan_uses_the_hnsw_index` asserts the plan, because
+  results cannot tell the two apart. `migrate-embeddings` drops the index before re-embedding
+  because it rejects vectors of any other dimension; the next boot redefines it.
 - Cluster `member_count` is queried live (not cached) — `load_cluster_infos()` calls `get_members()` per cluster, so it is one query per cluster. Fine at current scale, the first thing to revisit if cluster counts grow.
 - The dashboard's cluster-health rollup costs **~2 queries per cluster per render** (`get_members` + the stored centroid from `list_with_counts`), and is flagged `TODO(debt)` in code. Same revisit trigger as above.
 - `update_memory` with content change: creates a soft-deleted snapshot of old content, then links via `derived_from` edge. The old version is hidden from search but preserved for lineage.
 - `import_document` creates a `raw` table record for the full document, then `extracted_from` edges from each chunk to it.
 - Spreading activation fires on the top N results of `retrieve_memories` (configurable via `activation.top_n`, default 3) — it's a side effect, not part of the ranking.
-- `retrieve_memories` drops results below `retrieve.min_similarity` server-side, *after* ranking and *after* the `limit` truncation, and *before* activation is triggered — so a result the Query Tester reports as "dropped" was ranked inside the requested window, not suppressed from the whole database. The default is defined once at `alexandria_engine::search::DEFAULT_MIN_SIMILARITY`; read that constant, not this file, for the number. `RetrieveConfig::default()` and `AlexandriaServer::new`'s fallback both derive from it (they used to diverge — 0.10 vs 0.30 — which made a test-built server filter differently from production). The pi extension's client threshold (0.58) sits deliberately above this floor — keep that ordering if you tune either. `cluster.cohesion_floor` follows the same pattern via `alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR`.
+- `retrieve_memories` drops results below `retrieve.min_similarity` server-side, *after* ranking and *after* the `limit` truncation, and *before* activation is triggered — so a result the Query Tester reports as "dropped" was ranked inside the requested window, not suppressed from the whole database. The default is defined once at `alexandria_engine::search::DEFAULT_MIN_SIMILARITY`; read that constant, not this file, for the number. `RetrieveConfig::default()` and `AlexandriaServer::new`'s fallback both derive from it (they used to diverge — 0.10 vs 0.30 — which made a test-built server filter differently from production). It is a noise cutoff only — the client threshold (`[recall] min_similarity`) does the real filtering, paired with the client `limit` — both judgement calls read off `bench-retrieval`'s grid, and neither readable without the other. Do not restate any of those numbers here; `docs/minilm-test-data.md` records the measurements and `docs/configuration.md` the rationale. `cluster.cohesion_floor` follows the same pattern via `alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR`.
 - Cluster maintenance runs as a background `tokio::spawn` in HTTP mode only (not stdio), at an interval configurable via `cluster.maintenance_interval_secs` (default 300s / 5 minutes). It drains **all** eligible merges per tick, not one.
 - Every split/merge is recorded in the `maintenance_log` table (`v004`) and surfaced at `/debug/maintenance`. If cluster behavior looks wrong, that table is the audit trail.
 - Sessions are created implicitly by `store_memory(session_id)` — there is no create tool. `SessionRepo::touch()` bumps `ended_at`, so `ended_at` means last-activity; only a non-null `summary` distinguishes a finalized session. There is no `memory_count` column to bump — migration `v006_drop_session_memory_count.surql` dropped it, because `delete_memory` cannot decrement a stored counter; per-session counts are derived from the `contains_session_memory` traversal with the same `deleted = false` filter `get_memories()` applies (see `SessionRepo::list`). See `docs/session-memory.md`.
@@ -63,7 +76,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - The `schedule_kind` discriminator strings (`once`/`pattern`/`cron`) are constants in `alexandria_storage::models::schedule_kind`, mirrored by the v007 schema `ASSERT`; writers and the engine's `spec_from_reminder` match on the constants so the sides can't drift.
 - Schema migrations are forward-only, numbered (`v001`, `v002`, ...), tracked in `system_config` table. Current head is `v007_reminder.surql`; `schema::LATEST_VERSION` is derived from the `MIGRATIONS` table, so it cannot drift from the list, and it is the single source for that number (migration tests assert against it, never a literal). `/debug` renders applied-vs-compiled-in version and calls out a mismatch.
 - Every definition statement in a migration is `DEFINE <kind> OVERWRITE …` and every removal is `REMOVE <kind> IF EXISTS …` **because `migrate()` is not atomic across a file**: each migration is one multi-statement query, SurrealDB commits each statement in its own transaction, and `system_config` is stamped only after all pending migrations succeed. A crash mid-file leaves definitions applied with the old stamp, so the next boot re-runs that file from the top — with plain `DEFINE` that is a deterministic `The table 'reminder' already exists` and the server never starts again. `migration_test::test_replaying_a_completed_migration_is_not_an_error` re-applies every compiled-in file and is the gate on the rule; `MIGRATIONS` is `pub` for exactly that test. Note the 3.2 grammar puts the qualifier *after* the kind — `DEFINE OVERWRITE FIELD …` is a parse error.
-- Embedding model is locked on first boot — changing `config.toml` model without wiping data will refuse to start.
+- Embedding model is locked on first boot — changing `config.toml` model without wiping data will refuse to start. The truncation limit (`embedding.max_tokens`, default `DEFAULT_MAX_TOKENS` = 128 in `candle.rs`, 256 tested, up to 512) is locked the same way as `embedding_max_tokens`. A lock without that key, or facts with no lock at all, means the corpus was embedded at the tokenizer's shipped 128 (`PRE_LOCK_MAX_TOKENS`), and that is what gets compared or stamped, never the configured value. The limit only goes up: boot refuses a mismatch in either direction, and `alexandria migrate-embeddings` re-embeds upward and refuses downward. The lock check takes `CandleProvider::max_tokens()`, not the config value, so it records what the vectors were made with.
 - The **debug UI is read-only with exactly one sanctioned exception**: the Query Tester's non-dry
   `retrieve` run performs spreading activation, so it writes heat just as a real
   `retrieve_memories` call does. Dry run uses
@@ -93,11 +106,20 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Record ids in an `href` (or any URL) use `|urlencode`; HTML text uses plain `{{ }}`. In `graph.html` the id is interpolated **inside a JavaScript string literal**, where browsers do not decode character references — `|urlencode` is what makes that safe, since its output alphabet is `[A-Za-z0-9_.-~/]` plus `%XX` and so cannot produce a quote, backslash, `<` or newline that would terminate the literal or the `<script>` element.
 - Adding a vendored asset means three edits: `assets.rs` (the closed `match` allowlist), `assets/SHA256SUMS`, and `just vendor-assets`. The allowlist is a `match` over literal filenames with `include_bytes!`, so there is no filesystem read or path parsing at request time — traversal is impossible by construction, and the 404 tests exist to keep it that way. Filenames pin the bytes because they are served `max-age=31536000, immutable`; `just verify-assets` is what makes `SHA256SUMS` machine-enforced rather than decorative.
 
+## Build Gate
+
+Before any `cargo check`, `cargo run`, or `cargo build`, run these in order and fix what they report:
+
+1. `cargo fmt --all -- --check` (or `just fmt`)
+2. `cargo clippy --workspace --all-targets --all-features -- -D warnings` (or just `just lint`)
+
+Both must pass clean first. Do not skip the gate to "just see if it compiles".
+
 ## Testing
 
 - The repo intentionally carries no `rust-toolchain.toml` and no `.cargo/config.toml` — `rust-version = "1.98"` + edition 2024 are the only compiler statement; mold/`target-cpu` live in each dev's `~/.cargo/config.toml` (see TODO-misc "Build / toolchain"). Don't re-add them to the repo.
 - Use the `just` recipes (they match CI): `just test` (Rust only), `just ext-test` (pi companion: `npm run typecheck` + `npm test`, needs `just ext-install` once per checkout since `node_modules/` is gitignored), `just lint`, `just fmt`, `just ci` (fmt + lint + test + ext-test + `cargo deny` + `verify-assets`). `.github/workflows/ci.yml` mirrors it with a separate `Pi companion` job — the workflow does not call `just ci`, so a new gate has to be added in both places. `just verify-assets` checks `assets/SHA256SUMS`; `just vendor-assets` re-downloads the assets and re-verifies. `just install-hooks` wires `.githooks/pre-commit`.
-- Run tests on **stable**, not nightly: `diskann-wide` (SurrealDB transitive dep) fails trait inference on its NEON intrinsics under recent nightlies on aarch64, and the failure looks like it originates in this workspace. Current suite: 361 Rust tests green, plus 50 extension tests via `just ext-test`, plus one `#[ignore]`d 130 s wall-clock delivery test that no gate runs (`cargo test -p alexandria --test reminders_test -- --ignored`) — recount with `cargo test --all-features 2>&1 | rg -o '([0-9]+) passed' | awk '{s+=$1} END {print s}'` rather than trusting the number here.
+- Run tests on **stable**, not nightly: `diskann-wide` (SurrealDB transitive dep) fails trait inference on its NEON intrinsics under recent nightlies on aarch64, and the failure looks like it originates in this workspace. Run the suite with `just test` (Rust) and `just ext-test` (extension); there is also one `#[ignore]`d 130 s wall-clock delivery test that no gate runs (`cargo test -p alexandria --test reminders_test -- --ignored`). Test counts are deliberately not recorded here; they went stale in every doc that carried one.
 - All integration tests use `Database::connect_embedded()` (in-memory SurrealDB) — no disk state between tests.
 - `CandleProvider` tests download the real model on first run (~80MB) — they're slow the first time.
 - Test helpers in `alexandria-storage/src/connection.rs`: `connect_embedded()` for quick in-memory DB.
@@ -144,11 +166,20 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `README.md` — feature/tool overview, quick start, deployment (systemd, Docker), debug UI
 - `docs/configuration.md` — every server and client config key, env overrides, XDG migration
 - `docs/session-memory.md` — session data model, lifecycle, tool semantics, current limitations
+- `docs/minilm-test-data.md` — retrieval measurements for the embedding model, how to rerun
+  `alexandria bench-retrieval`, metric definitions, and the frozen question set
 - `docs/roadmap.md` — shipped milestones and planned work
+- `docs/security-findings.md` — 2026-09-10 audit: threat model (memory as a prompt-injection
+  persistence layer), the convex-hull paper verdict, ranked findings S1–S6
+- `docs/performance-and-ability-findings.md` — same audit: the 128-token truncation measurement,
+  inert heat model, O(N) cluster counting, ranked findings A1–A4 / P1–P5
+- `docs/*-findings.md` cite code by symbol (`do_store_memory`, `MemoryRepo::nearest`), never by
+  `file.rs:NN`. Line numbers go stale on the next commit; a symbol can be grepped.
 - `docs/plans/` — dated design/implementation plans for completed work (historical, not maintained)
 - `contrib/pi/README.md` — how the pi skill and extension differ and install
 - `AGENTS.md` — this file. It was named `CLAUDE.md` until the docs sweep that added session memory
   and the pi extension docs, so older `docs/plans/*` references to `CLAUDE.md` point here.
+  `CLAUDE.md` still exists as a one-line `@AGENTS.md` import so Claude Code auto-loads this file.
 
 ## Config Precedence
 
