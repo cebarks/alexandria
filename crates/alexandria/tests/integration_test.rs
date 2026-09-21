@@ -9,7 +9,7 @@ async fn setup() -> (AlexandriaServer, Arc<Database>) {
     let db = Database::connect_embedded().await.unwrap();
     schema::bootstrap(db.inner()).await.unwrap();
 
-    let embedding = CandleProvider::new("sentence-transformers/all-MiniLM-L6-v2", "cpu")
+    let embedding = CandleProvider::new("sentence-transformers/all-MiniLM-L6-v2", "cpu", 128)
         .await
         .unwrap();
 

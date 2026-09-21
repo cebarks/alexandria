@@ -575,7 +575,12 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     tracing::info!("Loading embedding model: {}", config.embedding.model);
-    let provider = CandleProvider::new(&config.embedding.model, &config.embedding.device).await?;
+    let provider = CandleProvider::new(
+        &config.embedding.model,
+        &config.embedding.device,
+        config.embedding.max_tokens,
+    )
+    .await?;
     let questions: Vec<&str> = QUESTIONS.iter().map(|(q, _)| *q).collect();
     let qvecs = provider.embed(&questions).await?;
 
@@ -598,6 +603,7 @@ pub async fn run() -> anyhow::Result<()> {
         db.inner(),
         &config.embedding.model,
         provider.dimensions(),
+        provider.max_tokens(),
     )
     .await?;
     schema::ensure_vector_index(db.inner(), provider.dimensions()).await?;

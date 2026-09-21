@@ -34,6 +34,18 @@ pub async fn set_config(db: &Surreal<Any>, key: &str, value: &str) -> Result<()>
     Ok(())
 }
 
+/// Token limit a corpus was embedded at when its lock predates `embedding_max_tokens`:
+/// the tokenizer's shipped default, which was applied unchanged until the key existed.
+pub const PRE_LOCK_MAX_TOKENS: usize = 128;
+
+/// Stored `embedding_max_tokens`, or [`PRE_LOCK_MAX_TOKENS`] when the key is absent.
+pub async fn stored_max_tokens(db: &Surreal<Any>) -> Result<usize> {
+    Ok(get_config(db, "embedding_max_tokens")
+        .await?
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(PRE_LOCK_MAX_TOKENS))
+}
+
 /// Check if the configured embedding model matches what's stored in the database.
 /// On first boot, stores the current model info. On subsequent boots, compares.
 ///
@@ -42,55 +54,89 @@ pub async fn check_embedding_model(
     db: &Surreal<Any>,
     model: &str,
     dimensions: usize,
+    max_tokens: usize,
 ) -> Result<()> {
     let stored_model = get_config(db, "embedding_model").await?;
     let stored_dims = get_config(db, "embedding_dimensions").await?;
 
-    match (stored_model, stored_dims) {
-        (None, _) | (_, None) => {
-            // First boot — store the config. A database from before the lock existed
-            // has facts but no lock; we can't verify which model produced them, so
-            // warn rather than refuse (migrate-embeddings tells the user to boot once
-            // to stamp the lock, so refusing here would leave no recovery path).
+    let (stored_m, stored_d) = match (stored_model, stored_dims) {
+        (Some(m), Some(d)) => (m, d),
+        _ => {
+            // First boot: store the config. A database from before the lock existed has facts
+            // but no lock. Which model produced them cannot be verified, so that is assumed
+            // (migrate-embeddings tells the user to boot once to stamp the lock). The token
+            // limit is not assumed: those facts were embedded at the tokenizer's shipped
+            // default, so that is what gets stamped, and the comparison below refuses a
+            // configured limit that differs.
             let facts = MemoryRepo::new(db).count(None, None, true).await?;
-            if facts > 0 {
+            let stamp = if facts > 0 {
                 tracing::warn!(
                     "{facts} fact(s) exist but no embedding lock; assuming they were embedded \
-                     with {model}. If not, run `alexandria migrate-embeddings` after fixing config."
+                     with {model} at {PRE_LOCK_MAX_TOKENS} tokens. If the model is wrong, run \
+                     `alexandria migrate-embeddings` after fixing config."
                 );
-            }
+                PRE_LOCK_MAX_TOKENS
+            } else {
+                max_tokens
+            };
             set_config(db, "embedding_model", model).await?;
             set_config(db, "embedding_dimensions", &dimensions.to_string()).await?;
-            tracing::info!("Stored embedding config: model={model}, dimensions={dimensions}");
-            Ok(())
+            set_config(db, "embedding_max_tokens", &stamp.to_string()).await?;
+            tracing::info!(
+                "Stored embedding config: model={model}, dimensions={dimensions}, max_tokens={stamp}"
+            );
+            (model.to_string(), dimensions.to_string())
         }
-        (Some(stored_m), Some(stored_d)) => {
-            if stored_m != model {
-                anyhow::bail!(
-                    "Embedding model mismatch!\n\
-                     Stored: {stored_m}\n\
-                     Configured: {model}\n\
-                     \n\
-                     The database contains embeddings from a different model.\n\
-                     Mixing models produces garbage search results.\n\
-                     \n\
-                     Options:\n\
-                     1. Change your config back to: {stored_m} (only if no migration has been attempted)\n\
-                     2. Run `alexandria migrate-embeddings` with the server stopped to re-embed everything with {model}\n\
-                     3. Delete the database and start fresh"
-                );
-            }
-            let stored_dim: usize = stored_d.parse().unwrap_or(0);
-            if stored_dim != dimensions {
-                anyhow::bail!(
-                    "Embedding dimensions mismatch!\n\
-                     Stored: {stored_dim}\n\
-                     Current: {dimensions}\n\
-                     This likely means the model changed without updating system_config."
-                );
-            }
-            tracing::debug!("Embedding model check passed: {model} ({dimensions} dims)");
-            Ok(())
-        }
+    };
+
+    if stored_m != model {
+        anyhow::bail!(
+            "Embedding model mismatch!\n\
+             Stored: {stored_m}\n\
+             Configured: {model}\n\
+             \n\
+             The database contains embeddings from a different model.\n\
+             Mixing models produces garbage search results.\n\
+             \n\
+             Options:\n\
+             1. Change your config back to: {stored_m} (only if no migration has been attempted)\n\
+             2. Run `alexandria migrate-embeddings` with the server stopped to re-embed everything with {model}\n\
+             3. Delete the database and start fresh"
+        );
     }
+    let stored_dim: usize = stored_d.parse().unwrap_or(0);
+    if stored_dim != dimensions {
+        anyhow::bail!(
+            "Embedding dimensions mismatch!\n\
+             Stored: {stored_dim}\n\
+             Current: {dimensions}\n\
+             This likely means the model changed without updating system_config."
+        );
+    }
+    let stored_t = stored_max_tokens(db).await?;
+    if max_tokens > stored_t {
+        anyhow::bail!(
+            "Embedding token limit mismatch!\n\
+             Stored: {stored_t}\n\
+             Configured: {max_tokens} (embedding.max_tokens)\n\
+             \n\
+             Facts longer than {stored_t} tokens were embedded on a prefix.\n\
+             Run `alexandria migrate-embeddings` with the server stopped to re-embed everything at \
+             {max_tokens} tokens, or set embedding.max_tokens = {stored_t} to keep the corpus as it is."
+        );
+    }
+    if max_tokens < stored_t {
+        anyhow::bail!(
+            "Embedding token limit mismatch!\n\
+             Stored: {stored_t}\n\
+             Configured: {max_tokens} (embedding.max_tokens)\n\
+             \n\
+             The corpus was embedded at {stored_t} tokens and `migrate-embeddings` does not lower \
+             the limit. Set embedding.max_tokens = {stored_t}."
+        );
+    }
+    tracing::debug!(
+        "Embedding model check passed: {model} ({dimensions} dims, {max_tokens} tokens)"
+    );
+    Ok(())
 }

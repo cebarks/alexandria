@@ -73,6 +73,12 @@ pub struct EmbeddingConfig {
     /// provider runs one forward pass per text whatever the call size. 1..=4096,
     /// default 32; the server itself embeds one text at a time.
     pub batch_size: usize,
+    /// Longest text, in wordpiece tokens including `[CLS]`/`[SEP]`, one embedding sees; the
+    /// rest of a longer text is not searchable. 3..=512, default 128 (what the tokenizer
+    /// ships, so what every database from before this key was embedded at). 256 is tested;
+    /// above that is experimental. Locked on first boot: raising it needs
+    /// `alexandria migrate-embeddings`, and it is never lowered.
+    pub max_tokens: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -166,6 +172,7 @@ impl Default for EmbeddingConfig {
             model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             device: "cpu".to_string(),
             batch_size: 32,
+            max_tokens: alexandria_pipeline::embedding::DEFAULT_MAX_TOKENS,
         }
     }
 }
@@ -302,6 +309,11 @@ impl Config {
                 anyhow::anyhow!("invalid ALEXANDRIA_EMBEDDING_BATCH_SIZE `{batch}`: {e}")
             })?;
         }
+        if let Some(tokens) = env("ALEXANDRIA_EMBEDDING_MAX_TOKENS") {
+            config.embedding.max_tokens = tokens.parse().map_err(|e| {
+                anyhow::anyhow!("invalid ALEXANDRIA_EMBEDDING_MAX_TOKENS `{tokens}`: {e}")
+            })?;
+        }
         if let Some(tz) = env("ALEXANDRIA_REMINDERS_TIMEZONE") {
             config.reminders.timezone = tz;
         }
@@ -313,6 +325,12 @@ impl Config {
         anyhow::ensure!(
             (1..=4096).contains(&config.embedding.batch_size),
             "embedding.batch_size must be between 1 and 4096"
+        );
+        // 3 is `[CLS]`, one wordpiece, `[SEP]`. 512 is the BERT position table; the provider
+        // checks the loaded model's own table too.
+        anyhow::ensure!(
+            (3..=512).contains(&config.embedding.max_tokens),
+            "embedding.max_tokens must be between 3 and 512"
         );
 
         Ok(config)
@@ -518,6 +536,23 @@ mod tests {
             err.to_string().contains("ALEXANDRIA_EMBEDDING_BATCH_SIZE"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_embedding_max_tokens_default_env_and_range() {
+        assert_eq!(Config::default().embedding.max_tokens, 128);
+        let config = Config::from_toml("[embedding]\nmax_tokens = 256\n").unwrap();
+        assert_eq!(config.embedding.max_tokens, 256);
+
+        let at =
+            |v: &'static str| Config::load_from(&env(&[("ALEXANDRIA_EMBEDDING_MAX_TOKENS", v)]));
+        assert_eq!(at("512").unwrap().embedding.max_tokens, 512);
+        for bad in ["2", "513"] {
+            let err = at(bad).unwrap_err().to_string();
+            assert!(err.contains("between 3 and 512"), "{bad}: {err}");
+        }
+        let err = at("many").unwrap_err().to_string();
+        assert!(err.contains("ALEXANDRIA_EMBEDDING_MAX_TOKENS"), "{err}");
     }
 
     #[test]

@@ -33,6 +33,9 @@ port = 3000
 [embedding]
 model = "sentence-transformers/all-MiniLM-L6-v2"
 device = "cpu"
+# Tokens of each memory the search sees. 128 is the standard, 256 is tested, up to 512 is
+# experimental. Locked on first run and only ever raised (alexandria migrate-embeddings).
+max_tokens = 128
 EOF
 
 # Run
@@ -49,7 +52,7 @@ that run once and exit.
 | Command | What it does |
 | --- | --- |
 | `alexandria` | Start the server on the configured transport. |
-| `alexandria migrate-embeddings` | Re-embed the whole corpus with the model in `config.toml`. Needed after a deliberate model change — see [docs/configuration.md](docs/configuration.md). |
+| `alexandria migrate-embeddings [--force]` | Re-embed the whole corpus with the model and `max_tokens` in `config.toml`. Needed after a deliberate model change or after raising `max_tokens`; `--force` re-embeds even when nothing changed — see [docs/configuration.md](docs/configuration.md). |
 | `alexandria bench-retrieval` | Measure how well the configured model separates a correct answer from the rest of the corpus, and print the score distributions and the limit × threshold grid that the `retrieve.min_similarity` floor and the client recall defaults are judged against — see [docs/minilm-test-data.md](docs/minilm-test-data.md). |
 | `alexandria --help` | Print the same list. |
 
@@ -63,7 +66,7 @@ index if it is missing.
 
 | Tool | Description |
 | ------ | ------------- |
-| `store_memory` | Store text with auto-embedding, clustering, and heat initialization; optional `session_id` to group it |
+| `store_memory` | Store text with auto-embedding, clustering, and heat initialization; optional `session_id` to group it. Returns `truncated: true` when the text is longer than `embedding.max_tokens`, meaning only its head is searchable |
 | `retrieve_memories` | Semantic similarity search with spreading activation on top results; optional `session_id` to scope |
 | `recall` | Progressive two-phase recall: broad cluster scan → focused scope narrowing |
 | `update_memory` | Update content/tags/confidence; content changes re-embed and create lineage |
