@@ -31,8 +31,8 @@
  * Config (env vars, all optional):
  *   ALEXANDRIA_URL                          default: http://127.0.0.1:3000/mcp
  *   ALEXANDRIA_AUTO_RECALL                  set to "off" to disable recall
- *   ALEXANDRIA_AUTO_RECALL_LIMIT            default: 5
- *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.58 (too high for MiniLM; 0.35 recommended, see config.ts)
+ *   ALEXANDRIA_AUTO_RECALL_LIMIT            default: 10 (read with MIN_SIMILARITY; see docs/minilm-test-data.md)
+ *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.45 (only valid at LIMIT=10)
  *   ALEXANDRIA_AUTO_STORE                   set to "off" to disable all store behavior
  *   ALEXANDRIA_EXTRACT_MODEL                default: vertex/claude-haiku-4-5
  *   ALEXANDRIA_EXTRACT_TIMEOUT_MS           default: 5000
@@ -59,6 +59,7 @@ import { trackToolStore } from "./detectors/tool-tracker.js";
 import { ErrorTracker } from "./detectors/error-tracker.js";
 import { PROMPT_BUDGET_MS } from "./mcp-client.js";
 import { runExtraction } from "./extraction.js";
+import { sessionArgs } from "./session-args.js";
 
 /** Short, readable form of a rejection for a user-facing warning. */
 function reasonText(reason: unknown): string {
@@ -86,6 +87,16 @@ function extractResultText(result: unknown): string | null {
 	}
 
 	return null;
+}
+
+function notifyStoreFailed(
+	ctx: { ui: { notify(message: string, level: "warning"): void } },
+	err: unknown,
+): void {
+	ctx.ui.notify(
+		`Alexandria store_memory failed (${err instanceof Error ? err.message : String(err)})`,
+		"warning",
+	);
 }
 
 export default function alexandriaExtension(pi: ExtensionAPI) {
@@ -187,7 +198,7 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 	// ── Store: Heuristic detectors ──────────────────────────────────────
 	if (!CONFIG.storeDisabled) {
 		// Correction + preference detection on user prompts
-		pi.on("before_agent_start", async (event) => {
+		pi.on("before_agent_start", async (event, ctx) => {
 			const prompt = event.prompt?.trim();
 			if (!prompt) return;
 
@@ -200,7 +211,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 			for (const detection of detections) {
 				// storeMemory uses callToolWithRetry internally, so stale
 				// sessions are recovered automatically.
-				storeMemory(detection.content, detection.tags).catch(() => {});
+				storeMemory(detection.content, detection.tags, sessionArgs(ctx)).catch((err) =>
+					notifyStoreFailed(ctx, err),
+				);
 			}
 		});
 
@@ -235,10 +248,12 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 		});
 
 		// Flush error resolutions at agent_end
-		pi.on("agent_end", async () => {
+		pi.on("agent_end", async (_event, ctx) => {
 			const resolutions = errorTracker.flush();
 			for (const mem of resolutions) {
-				storeMemory(mem.content, mem.tags).catch(() => {});
+				storeMemory(mem.content, mem.tags, sessionArgs(ctx)).catch((err) =>
+					notifyStoreFailed(ctx, err),
+				);
 			}
 		});
 	}
@@ -253,7 +268,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 					dedupBuffer,
 				);
 				for (const mem of extracted) {
-					await storeMemory(mem.content, [...mem.tags, "extracted"]).catch(() => {});
+					await storeMemory(mem.content, [...mem.tags, "extracted"], sessionArgs(ctx)).catch((err) =>
+						notifyStoreFailed(ctx, err),
+					);
 				}
 			} catch (err) {
 				ctx.ui.notify(

@@ -92,17 +92,23 @@ export const CONFIG = {
 
 	recallLimit: envNum(
 		"ALEXANDRIA_AUTO_RECALL_LIMIT",
-		toml.recall?.limit ?? 5,
+		// 10, matching the Claude Code hook. A judgement call read off the
+		// 2026-09-09 bench-retrieval limit x threshold grid (880 facts, a small
+		// hand-authored question set): delivery saturates at 10 because the worst
+		// known target rank is 9, so 15 and 20 add non-targets and no hits. Paired
+		// with the threshold below; changing one alone leaves the frontier.
+		toml.recall?.limit ?? 10,
 	),
 
 	recallMinSimilarity: envNum(
 		"ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY",
 		toml.recall?.min_similarity ??
-			// TODO: 0.58 was chosen assuming genuine matches score 0.6+. Measured
-			// 2026-09-08 on all-MiniLM-L6-v2: question-vs-statement matches score
-			// 0.40-0.65, so this drops most of them. Recommended: 0.35, matching
-			// the Claude Code hook. See docs/configuration.md [recall].
-			0.58,
+			// 0.45, matching the Claude Code hook. Same grid, same caveats: at
+			// limit 10 it delivers 8 of 12 targets at ~1.0 non-targets per prompt,
+			// where 5/0.35 delivered the same 8 at ~3.2. It is only on the frontier
+			// because the limit is 10; at 5 it was dominated by 0.50.
+			// See docs/minilm-test-data.md "Result limit".
+			0.45,
 	),
 
 	storeDisabled:

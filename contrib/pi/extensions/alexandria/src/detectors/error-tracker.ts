@@ -57,15 +57,15 @@ export class ErrorTracker {
 	 * (not the raw MCP response blob).
 	 */
 	recordSuccess(toolName: string, text: string): void {
+		const successText = text.slice(0, MAX_TEXT_LENGTH).trim();
+		if (!successText) return;
+
 		// Find a matching error for this tool
 		const errorIdx = this.errors.findIndex((e) => e.toolName === toolName);
 		if (errorIdx === -1) return;
 
 		const error = this.errors[errorIdx];
 		this.errors.splice(errorIdx, 1);
-
-		const successText = text.slice(0, MAX_TEXT_LENGTH).trim();
-		if (!successText) return;
 
 		this.resolutions.push({ error, successText });
 	}

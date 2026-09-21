@@ -22,10 +22,16 @@ in-directory reference for behavior and configuration.
 | Auto-recall | `before_agent_start` | Embeds the user's prompt, calls `retrieve_memories`, injects hits with `similarity >= recall.min_similarity` (inclusive) as an `alexandria` context message. The injected block tells the agent to verify relevance and to `update_memory` anything stale. | `ALEXANDRIA_AUTO_RECALL=off` or `[recall] enabled = false` |
 | Reminder delivery | `before_agent_start` | Calls `check_reminders` once per prompt, injects whatever is due into the same message and shows a count notification. | `ALEXANDRIA_REMINDERS=off` or `[reminders] enabled = false` |
 | Correction detector | `before_agent_start` | Regex over the prompt for correction-shaped language ("no, use X"). Fires only on unambiguous matches; ambiguous cases are left to the extraction pass. | `ALEXANDRIA_AUTO_STORE=off` or `[store] enabled = false` |
-| Preference detector | `before_agent_start` | Regex for forward-looking preference/convention statements ("always do X"). | as above |
+| Preference detector | `before_agent_start` | Regex for forward-looking preference/convention statements ("always do X", "never do Y", "don't do Z"). The stored text starts at the trigger word, so a prohibition keeps its negation; a match with a negation earlier in its clause is not stored at all. | as above |
 | Error tracker | `tool_execution_end` → `agent_end` | Pairs a failing tool call with a later success of the same tool and stores the resolution. Errors must contain a recognized signal to be tracked. | as above |
 | Dedup tracker | `tool_result` | Records content from agent-initiated `store_memory` / `update_memory` calls (matched by tool-name suffix, so the MCP prefix doesn't matter) so extraction doesn't re-report them | — |
 | LLM extraction | `session_shutdown` | Serializes the conversation, sends it to `store.extract_model`, stores what's left tagged `extracted`. Skipped when the shutdown reason is `reload`. | `ALEXANDRIA_AUTO_STORE=off` or `[store] enabled = false` |
+
+Every store carries pi's session id, `agent_id = "pi"` and the active model id, so the writes are
+grouped in Alexandria (`get_session`, `list_sessions(agent_id="pi")`). Correction and preference
+stores are tagged `auto-detected` + `source:regex`, error resolutions `auto-detected`, extraction
+output `extracted`, so quality can be cut by source later. A store the server rejects shows as a
+warning.
 
 Heuristic stores are fire-and-forget and never block a turn. Only the extraction pass can add
 latency, and only at session end.
@@ -123,8 +129,8 @@ url = "http://127.0.0.1:3000/mcp"
 
 [recall]
 enabled = true
-limit = 5
-min_similarity = 0.58   # measured too high for all-MiniLM-L6-v2 — set 0.35
+limit = 10
+min_similarity = 0.45   # only valid at limit = 10; see docs/configuration.md [recall]
 
 [store]
 enabled = true
@@ -142,8 +148,8 @@ project = "alexandria"
 | --- | --- | --- |
 | `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | Alexandria server MCP endpoint |
 | `ALEXANDRIA_AUTO_RECALL` | (enabled) | Set to `off` to disable auto-recall |
-| `ALEXANDRIA_AUTO_RECALL_LIMIT` | `5` | Max memories to retrieve |
-| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.58` | Minimum cosine similarity, inclusive (model-dependent; sits above the server-side `[retrieve] min_similarity` floor). Measured too high for `all-MiniLM-L6-v2`: recommended `0.35`, see `[recall]` in [`docs/configuration.md`](../../../../docs/configuration.md) |
+| `ALEXANDRIA_AUTO_RECALL_LIMIT` | `10` | Max memories to retrieve. A recall lever, not just a cap; paired with `MIN_SIMILARITY` |
+| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.45` | Minimum cosine similarity, inclusive (model-dependent; sits above the server-side `[retrieve] min_similarity` floor). A judgement call for `all-MiniLM-L6-v2`, only valid at `LIMIT=10`: see `[recall]` in [`docs/configuration.md`](../../../../docs/configuration.md) |
 | `ALEXANDRIA_AUTO_STORE` | (enabled) | Set to `off` to disable all store behavior — detectors and extraction alike |
 | `ALEXANDRIA_EXTRACT_MODEL` | `vertex/claude-haiku-4-5` | Model for the LLM extraction pass |
 | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | `5000` | Extraction timeout in milliseconds |
@@ -156,9 +162,12 @@ uses; `ALEXANDRIA_REMINDERS` follows the same shape for the reminders feature.
 
 ## Known gaps
 
-- No unit tests for the detectors or the extraction prompt (the config loader and the reminders
-  feature do have them, in `tests/`).
-- Does not pass `session_id`, so its memories are not grouped into Alexandria sessions.
+- No unit tests for the extraction prompt or its truncation (the detectors, the transcript
+  serializer and the response parser do have them, in `tests/`).
+- Sessions are grouped but never finalized: nothing calls `finalize_session` at shutdown yet.
+- Regex stores are not deduplicated across rewordings. The session buffer catches a repeat of the
+  same text in one process, nothing catches "use jj" today and "prefer jj" next week. Deferred to
+  [#27](https://github.com/cebarks/alexandria/issues/27).
 - Uses `retrieve_memories` only; the two-phase `recall` tool is never called.
 - Nothing fires a reminder on its own: with reminders off, delivery depends on the agent happening
   to call `check_reminders`.
