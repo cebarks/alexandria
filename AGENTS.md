@@ -26,7 +26,7 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 
 ## Architecture Boundaries
 
-- **storage** owns all DB access — no raw SurrealDB queries outside this crate (the `alexandria-mcp` handlers still issue some inline queries directly; don't add new ones without reason)
+- **storage** owns all DB access — no raw SurrealDB queries outside this crate (the `alexandria-mcp` `provenance` create in `do_store_memory` is the one remaining inline query and is maintained elsewhere; don't add new ones)
 - **engine** is pure algorithms — no DB, no async (except test helpers). Takes data in, returns results.
 - **pipeline** owns embedding — abstracts over providers via `EmbeddingProvider` trait
 - **mcp** wires tools to engine+storage — the only crate that knows about both. Also owns the debug web UI (`alexandria-mcp/src/debug/`), which is Axum handlers over the same repos, plus `crates/alexandria-mcp/templates/` (askama, compiled at build time) and `crates/alexandria-mcp/assets/` (vendored third-party JS, `include_bytes!`). Both are **compile-time contracts**: a missing template or asset file is a build error, not a runtime 404.
@@ -160,6 +160,12 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `docs/minilm-test-data.md` — retrieval measurements for the embedding model, how to rerun
   `alexandria bench-retrieval`, metric definitions, and the frozen question set
 - `docs/roadmap.md` — shipped milestones and planned work
+- `docs/security-findings.md` — 2026-09-10 audit: threat model (memory as a prompt-injection
+  persistence layer), the convex-hull paper verdict, ranked findings S1–S6
+- `docs/performance-and-ability-findings.md` — same audit: the 128-token truncation measurement,
+  inert heat model, O(N) cluster counting, ranked findings A1–A4 / P1–P5
+- `docs/*-findings.md` cite code by symbol (`do_store_memory`, `MemoryRepo::nearest`), never by
+  `file.rs:NN`. Line numbers go stale on the next commit; a symbol can be grepped.
 - `docs/plans/` — dated design/implementation plans for completed work (historical, not maintained)
 - `contrib/pi/README.md` — how the pi skill and extension differ and install
 - `AGENTS.md` — this file. It was named `CLAUDE.md` until the docs sweep that added session memory
