@@ -26,28 +26,46 @@ extraction) the `claude` CLI.
 - scans the prompt for correction ("no, use X", "that's wrong, ...", "actually ...") and preference
   ("always ...", "never ...", "from now on ...", "use X instead of Y") phrasing, same patterns as the
   Pi detectors, and stores unambiguous hits as `User correction: ...` / `User preference: ...` with
-  tags `correction`/`preference` + `auto-detected` and the session id. Deduped per session via
-  `$XDG_RUNTIME_DIR/alexandria/<session_id>.stored`. The Pi error-resolution tracker is not ported;
-  the extraction pass covers resolved bugs better.
+  tags `correction`/`preference` + `auto-detected` + `source:regex` and the session id. A preference is
+  stored from its trigger word on, so a prohibition keeps its negation (`never commit Cargo.lock`), and
+  one with a negation earlier in its clause is not stored at all. Deduped per session via
+  `$XDG_STATE_HOME/alexandria/<session_id>.stored`. The Pi error-resolution tracker is not ported;
+  failed tool results can be fed to the extraction pass instead (opt-in, below). Every request shares
+  one 8 s budget, so a wedged server delays the prompt by that much at most.
 
 `alexandria-extract.sh` is a `Stop` hook. After each assistant turn it serializes the transcript lines
-added since its last run (user text and assistant text only; tool calls, thinking, and injected
-system lines are dropped), and once at least `ALEXANDRIA_EXTRACT_MIN_CHARS` of new text exists it
+added since its last run (user text and assistant text; tool output, thinking, and injected system
+lines are dropped), and once at least `ALEXANDRIA_EXTRACT_MIN_CHARS` of new text exists it
 asks `claude -p --model haiku` for standalone durable facts using the Pi extraction prompt, with the
-session's already-stored memories listed for dedup. Results are stored with the session id and an
+session's already-stored memories and the auto-recall hits the transcript carries for this chunk's
+prompts listed for dedup (so a gotcha already stored by an earlier session is not stored again, as long
+as some prompt recalled it). Results are stored with the session id and an
 `extracted` tag. Short turns cost nothing; one haiku call covers several turns. A marker file
-`$XDG_RUNTIME_DIR/alexandria/<session_id>.extracted` holds the transcript line count and is written
-before the LLM call, so a failed or slow turn is never retried across turns. Within a turn, an empty
-or failed first attempt gets one retry inside the remaining 80 s budget (haiku is non-deterministic
-on the same prompt), so purely tactical turns cost two calls. The child `claude` runs with
+`$XDG_STATE_HOME/alexandria/<session_id>.extracted` holds the transcript line count and is written
+before the LLM call, so a failed or slow turn is never retried: one haiku call per turn, 80 s
+timeout. The child `claude` runs with
 `ALEXANDRIA_HOOK_CHILD=1`, which makes every hook here exit immediately (no recursion). Measured
 2026-09-08 on a ~40-line transcript: about 15 s wall time, haiku correctly returned no memories for a
 purely tactical session.
 
+**Tool errors are opt-in.** With `ALEXANDRIA_EXTRACT_TOOL_ERRORS=on` the first 300 characters of each
+failed tool result join that text as `[Tool error]: <tool name> <executable or file path> -- <error>`,
+so a silent fix-and-retry still shows the model the root cause and which call produced it
+(`<tool_use_error>` harness refusals stay out). It is off by default because this is the one place
+tool output leaves the machine: the text goes to the `claude -p` call, can be stored as a memory, and a
+stored memory is re-injected into later prompts. Before inclusion the hook redacts `Bearer <token>`,
+`key=value`/`key: value` pairs whose key contains `token`, `secret`, `password`, `passwd`, `api_key` or
+`auth`, `scheme://user:pass@` credentials and PEM blocks, and keeps only the executable name of the
+failing command (no `VAR=value` prefix, no arguments). The prompt tells the model the lines are
+untrusted program output. The pattern list is best-effort, not a secret scanner: leave this off on a
+machine whose failures print secrets in other shapes. Nothing collapses error variants either — the
+text differs per run, so each variant the model finds worth keeping becomes its own memory.
+
 `alexandria-session.sh` is a `PreToolUse` hook matched on `mcp__alexandria__store_memory` and
-`mcp__alexandria__import_document`. When the agent calls either without a `session_id`, it rewrites
-the call to include the Claude Code session id, so memories and imported chunks are grouped per
-session without relying on the model to remember.
+`mcp__alexandria__import_document`. When the agent calls either without a `session_id` or
+`agent_id`, it rewrites the call to include the Claude Code session id and `agent_id: "claude-code"`,
+so memories and imported chunks are grouped per session and attributed without relying on the model
+to remember. The recall and extract hooks stamp the same `agent_id` on the stores they make themselves.
 
 All three fail open. If the server is unreachable or errors, the recall hook returns a `systemMessage`
 ("Alexandria memory unavailable: ...") so you can see it, and the prompt proceeds with nothing
@@ -101,23 +119,49 @@ kills hooks still running when the session ends, so the script re-execs itself w
 does the 15–80 s LLM call, never holds your next turn, and finishes even if you quit right after
 your last turn (verified 2026-09-08: a 10 s stub completed 11 s after the headless session exited).
 The script's own 80 s budget bounds a wedged `claude -p`. No `"async": true` is needed. Its stderr
-goes to `$XDG_RUNTIME_DIR/alexandria/extract.log`.
+goes to `$XDG_STATE_HOME/alexandria/extract.log` (default `~/.local/state/alexandria/`), rotated to
+`extract.log.1` once it passes 1 MiB; marker files in the same directory idle for over
+`ALEXANDRIA_MARKER_MAX_AGE_DAYS` days (default 7) are pruned at the same time, and by the recall hook on
+every prompt; the running session's own markers are never pruned, so a resumed session is not
+re-extracted. The directory is `0700`. Markers from before the move (`$XDG_RUNTIME_DIR/alexandria/` or
+`/tmp/alexandria/`) are deleted by whichever hook first creates the new directory; a session spanning
+that upgrade is re-extracted once.
 
 **Config (env vars, all optional):**
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | Alexandria MCP server URL |
-| `ALEXANDRIA_AUTO_RECALL_LIMIT` | `5` | Max memories retrieved per prompt |
-| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.35` | Minimum similarity to inject a hit (measured; see `[recall]` in [docs/configuration.md](../../docs/configuration.md)) |
+| `ALEXANDRIA_AUTO_RECALL_LIMIT` | `10` | Max memories retrieved per prompt. A recall lever, not just a cap — measured jointly with `MIN_SIMILARITY` (see [docs/minilm-test-data.md](../../docs/minilm-test-data.md)) |
+| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.45` | Minimum similarity to inject a hit (measured at `LIMIT=10` and only valid there — see [docs/minilm-test-data.md](../../docs/minilm-test-data.md) and `[recall]` in [docs/configuration.md](../../docs/configuration.md)) |
 | `ALEXANDRIA_AUTO_RECALL` | (unset) | Set to `off` to disable recall |
-| `ALEXANDRIA_AUTO_STORE` | (unset) | Set to `off` to disable the detectors and extraction |
+| `ALEXANDRIA_AUTO_STORE` | (unset) | Set to `off` to disable the detectors and extraction. Sessions with no human at the prompt (`claude -p`, Agent SDK, `claude mcp serve`, bench, GitHub Action, triggers, Cowork; see `CLAUDE_CODE_ENTRYPOINT` below) default to off so scripted experiments never land in the real database; set `on` to enable there |
+| `ALEXANDRIA_EXTRACT_TOOL_ERRORS` | (unset) | Set to `on` to feed redacted failed tool results to extraction (see "Tool errors are opt-in") |
 | `ALEXANDRIA_EXTRACT_MODEL` | `haiku` | Model passed to `claude -p --model` for extraction |
 | `ALEXANDRIA_EXTRACT_MIN_CHARS` | `1500` | New transcript text required before an extraction call |
 | `ALEXANDRIA_EXTRACT_FLUSH_WAIT` | `1` | Seconds to wait before reading the transcript; Stop fires ~50 ms before the last assistant message is flushed (tests set `0`) |
 | `ALEXANDRIA_EXTRACT_CMD` | (unset) | Replace the `claude -p ...` command (prompt on stdin, JSON on stdout); used by tests |
+| `ALEXANDRIA_MARKER_MAX_AGE_DAYS` | `7` | Per-session marker files idle longer than this are pruned by either hook |
 | `ALEXANDRIA_HOOK_CHILD` | (unset) | Set by the extract hook on its `claude -p` child; every hook exits immediately when set |
 | `ALEXANDRIA_DETACHED` | (unset) | Set by the extract hook on its detached copy; set it yourself to run the hook inline (tests do) |
+
+**Upgrading:** auto-store used to run in every session. If memories stopped arriving from `claude -p`
+scripts or Agent SDK runs, that is this default; set `ALEXANDRIA_AUTO_STORE=on` there.
+
+`CLAUDE_CODE_ENTRYPOINT` is an internal Claude Code variable, not in the documented settings list. The
+gate turns auto-store off for `sdk-*` (`sdk-cli` for `claude -p`, `sdk-ts` and `sdk-py` for the Agent SDKs),
+`mcp` (`claude mcp serve`), `bench`, `claude-code-github-action`, `claude-security`, `*_trigger`, and Cowork
+(`local-agent`, `claude-coworker*`, `remote_cowork`), and leaves every other value on: `cli`, `claude-vscode`,
+`claude-desktop`, and the `remote*` / Slack / Teams family (the remote ones cannot reach a local server
+anyway). The list is the validator table in the 2.1.263 bundle, which knows 26 values. If a release renames
+one, the hooks silently fall back to always-on. After upgrading, re-check with
+
+```bash
+claude -p 'Run with the Bash tool and reply with only its output: echo ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT' --allowedTools Bash
+```
+
+which prints the value the hooks see (a Bash tool call inherits the env; no stub needed). The prompt
+must come before `--allowedTools`, which otherwise swallows it as a tool name.
 
 The hooks are configured by env vars only; they do not read `client.toml` (bash has no TOML parser,
 and a `yq`/`tomlq` dependency for a handful of values is worse than a handful of env vars). Set them
