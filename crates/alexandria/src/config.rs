@@ -68,6 +68,11 @@ pub struct DatabaseConfig {
 pub struct EmbeddingConfig {
     pub model: String,
     pub device: String,
+    /// Facts per `embed()` call during `alexandria migrate-embeddings`, which is also
+    /// how often it writes and logs progress. It does not bound memory: the Candle
+    /// provider runs one forward pass per text whatever the call size. 1..=4096,
+    /// default 32; the server itself embeds one text at a time.
+    pub batch_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -159,6 +164,7 @@ impl Default for EmbeddingConfig {
         Self {
             model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             device: "cpu".to_string(),
+            batch_size: 32,
         }
     }
 }
@@ -290,6 +296,11 @@ impl Config {
         if let Some(device) = env("ALEXANDRIA_EMBEDDING_DEVICE") {
             config.embedding.device = device;
         }
+        if let Some(batch) = env("ALEXANDRIA_EMBEDDING_BATCH_SIZE") {
+            config.embedding.batch_size = batch.parse().map_err(|e| {
+                anyhow::anyhow!("invalid ALEXANDRIA_EMBEDDING_BATCH_SIZE `{batch}`: {e}")
+            })?;
+        }
         if let Some(tz) = env("ALEXANDRIA_REMINDERS_TIMEZONE") {
             config.reminders.timezone = tz;
         }
@@ -298,6 +309,10 @@ impl Config {
                 anyhow::anyhow!("invalid ALEXANDRIA_REMINDERS_ESCALATION_HOURS `{h}`: {e}")
             })?;
         }
+        anyhow::ensure!(
+            (1..=4096).contains(&config.embedding.batch_size),
+            "embedding.batch_size must be between 1 and 4096"
+        );
 
         Ok(config)
     }
@@ -397,7 +412,14 @@ mod tests {
         assert_eq!(config.embedding.model, "other-model");
         // Everything else is default
         assert_eq!(config.embedding.device, "cpu");
+        assert_eq!(config.embedding.batch_size, 32);
         assert_eq!(config.cluster.join_threshold, 0.75);
+    }
+
+    #[test]
+    fn test_embedding_batch_size() {
+        let config = Config::from_toml("[embedding]\nbatch_size = 8\n").unwrap();
+        assert_eq!(config.embedding.batch_size, 8);
     }
 
     #[test]
@@ -477,12 +499,52 @@ mod tests {
             ("ALEXANDRIA_DATA_DIR", "/tmp/env-test"),
             ("ALEXANDRIA_EMBEDDING_MODEL", "env-model"),
             ("ALEXANDRIA_EMBEDDING_DEVICE", "env-device"),
+            ("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "8"),
         ]);
 
         let config = Config::load_from(&env).unwrap();
         assert_eq!(config.database.data_dir, PathBuf::from("/tmp/env-test"));
         assert_eq!(config.embedding.model, "env-model");
         assert_eq!(config.embedding.device, "env-device");
+        assert_eq!(config.embedding.batch_size, 8);
+    }
+
+    #[test]
+    fn test_embedding_env_invalid_batch_size() {
+        let env = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "lots")]);
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("ALEXANDRIA_EMBEDDING_BATCH_SIZE"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_embedding_env_zero_batch_size() {
+        let env = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "0")]);
+        let err = Config::load_from(&env).unwrap_err();
+        assert!(err.to_string().contains("batch_size"), "{err}");
+    }
+
+    #[test]
+    fn test_embedding_env_batch_size_upper_bound() {
+        let ok = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "4096")]);
+        assert_eq!(Config::load_from(&ok).unwrap().embedding.batch_size, 4096);
+        let over = env(&[("ALEXANDRIA_EMBEDDING_BATCH_SIZE", "4097")]);
+        let err = Config::load_from(&over).unwrap_err();
+        assert!(err.to_string().contains("batch_size"), "{err}");
+    }
+
+    #[test]
+    fn test_embedding_toml_zero_batch_size() {
+        let path =
+            std::env::temp_dir().join(format!("alexandria-batch0-{}.toml", std::process::id()));
+        std::fs::write(&path, "[embedding]\nbatch_size = 0\n").unwrap();
+        let vars = [("ALEXANDRIA_CONFIG", path.to_str().unwrap())];
+        let env = env(&vars);
+        let err = Config::load_from(&env).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.to_string().contains("batch_size"), "{err}");
     }
 
     #[test]
