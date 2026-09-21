@@ -23,7 +23,7 @@ a reference survives the next edit.
 | [A2](#a2-the-heat-model-is-inert) | The heat model is inert | Medium, decision needed | small either way |
 | [P3](#p3-inference-runs-inline-on-the-async-runtime-and-never-batches) | Inference runs inline on the async runtime and never batches | Medium | medium |
 | [A3](#a3-no-near-duplicate-check-at-store-time) | No near-duplicate check at store time | Medium | small |
-| [A4](#a4-no-lexical-search) | No lexical search | Medium | medium |
+| [A4](#a4-no-lexical-search) | No lexical search | Medium | **measured 2026-09-10, not shipped** |
 | [P4](#p4-spreading-activation-is-awaited-on-the-retrieve-path) | Spreading activation is awaited on the retrieve path | Low | trivial |
 | [P5](#p5-maintenance-re-reads-every-cluster-after-every-merge) | Maintenance re-reads every cluster after every merge | Low | none yet |
 
@@ -105,6 +105,12 @@ measured under this truncation. They may move once long facts embed on their ful
 
 **Severity:** Medium. Needs a decision. **Effort:** small either way.
 
+**Status (2026-09-19): open, no code change.** Recording an access on each `retrieve_memories`
+top-N result was written and withdrawn after review (#16): it is an unindexed read-modify-write on
+the response path with no transaction, so concurrent retrieves lose updates, and what it counts is
+the cosine ranker's own picks before any client threshold, not use. If a utility signal is wanted,
+collect it client-side on delivery. The wire-or-delete decision below stands as written.
+
 **Where.**
 
 - `projected_heat` and `on_access` (`crates/alexandria-engine/src/heat/decay.rs`) have no callers
@@ -139,6 +145,14 @@ Recommendation: delete unless the measured gain from wiring is real. Half-alive 
 
 **Severity:** Medium. **Effort:** small.
 
+**Status (2026-09-19): open, needs its own design.** Exact-content dedup in `store_memory` was
+written and withdrawn after review (#16): the early return dropped the caller's `tags` and session
+link, `update_memory` and `import_document` did not share the check, and check-then-create is not
+atomic. A design has to cover all three write paths and the response schema. The bar was measured
+(`docs/minilm-test-data.md`, "Duplicate bar", 2026-09-10 and again 2026-09-19): no cosine bar
+separates restatements from adjacent facts or from corrections, and 0.98 equals byte equality, so
+a design that wants more than exact matching needs something other than a threshold.
+
 **Where.** The `store_memory` tool description promises "dedup happens via clustering". Clustering
 groups facts; it never rejects or merges one.
 
@@ -160,6 +174,17 @@ original in the bench and for a 0.63 to 0.76 duplicate band, and derived a 0.95 
 ### A4. No lexical search
 
 **Severity:** Medium. **Effort:** medium.
+
+**Status (2026-09-10):** measured, not shipped. BM25 over `fact.content` fused with cosine by RRF
+was run on a 1173-fact copy of the live corpus (`docs/minilm-test-data.md`, "Lexical search"):
+`mean_rank` on the frozen set went from 3.35 to 6.00 at equal weight and was still 3.90 with BM25
+at a quarter weight, `top1` never rose. The targets cosine misses share no token with their
+question, so BM25 misses them too and fusion pushes them down; the targets fusion moves up all
+score under the client threshold and are discarded anyway. On seven identifier-shaped probes
+(error codes, env var names, flags) cosine alone already ranked every target 1 to 3 above the
+threshold, so the premise below does not hold on this corpus. SurrealDB 3.2 does ship every piece
+the fix names plus a built-in `search::rrf`; cost is not the blocker. Revisit only with a question
+set that cosine demonstrably loses and BM25 can reach.
 
 **Where.** `do_retrieve_memories` is KNN only (`retrieve_core`). The `docs/roadmap.md` v0.4 list
 already names "Full-text search index for keyword matching alongside semantic search".
@@ -285,4 +310,4 @@ merge scan is O(C²) cosine comparisons which is fine until cluster counts reach
 3. A2: decide wire-or-delete. If delete, P4 disappears too.
 4. A3: duplicate check on store, threshold measured first.
 5. P3: move inference off the runtime and batch it.
-6. A4 and P2 step 2: lexical search and index-backed recall, both measured with `bench-retrieval`.
+6. P2 step 2: index-backed recall, measured with `bench-retrieval`. A4 was measured and dropped.
