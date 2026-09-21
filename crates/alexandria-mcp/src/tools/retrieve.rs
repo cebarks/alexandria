@@ -4,7 +4,7 @@ pub struct RetrieveMemoriesParams {
         description = "Natural language description of what you're looking for — phrase it as the fact/decision/preference itself, not a question"
     )]
     pub query: String,
-    #[schemars(description = "Maximum results to return (default 10)")]
+    #[schemars(description = "Maximum results to return (default 10, clamped to 1-100)")]
     pub limit: Option<usize>,
     #[schemars(
         description = "Optional session ID to restrict search to memories from a specific session"

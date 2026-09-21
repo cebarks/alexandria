@@ -100,6 +100,14 @@ pub const DUE_REMINDERS_CAP: i64 = 5;
 /// is a bounded read of `cap + slack`, not a full scan.
 const DUE_SAMPLE_SLACK: i64 = 10;
 
+/// Ceiling on `retrieve_memories`' `limit`. With `KNN_SLACK` it keeps `k` under the HNSW
+/// search breadth (`HNSW_EF` in `memory_repo.rs`).
+pub const MAX_RETRIEVE_LIMIT: usize = 100;
+
+/// Extra neighbours requested beyond `limit`, so an approximate index result still holds the
+/// exact top `limit` after the in-process re-rank.
+const KNN_SLACK: usize = 10;
+
 /// Reminder delivery settings resolved from server config at startup.
 #[derive(Debug, Clone)]
 pub struct RemindersSettings {
@@ -131,6 +139,9 @@ pub struct AlexandriaServer {
     /// split. Carried here so the debug UI shows the same verdict the maintenance task acts on.
     pub cohesion_floor: f32,
     pub reminders: RemindersSettings,
+    /// Whether `schema::ensure_vector_index` succeeded at boot. Off, retrieval stays on the
+    /// brute-force KNN form, which returns the same rows without the index.
+    pub vector_index: bool,
 }
 
 impl AlexandriaServer {
@@ -150,6 +161,7 @@ impl AlexandriaServer {
             retrieve_min_similarity: DEFAULT_MIN_SIMILARITY,
             cohesion_floor: DEFAULT_COHESION_FLOOR,
             reminders: RemindersSettings::default(),
+            vector_index: false,
         }
     }
 
@@ -175,6 +187,11 @@ impl AlexandriaServer {
 
     pub fn with_reminders_config(mut self, settings: RemindersSettings) -> Self {
         self.reminders = settings;
+        self
+    }
+
+    pub fn with_vector_index(mut self, defined: bool) -> Self {
+        self.vector_index = defined;
         self
     }
 }
@@ -650,24 +667,30 @@ impl AlexandriaServer {
         params: RetrieveMemoriesParams,
         options: RetrieveOptions,
     ) -> anyhow::Result<serde_json::Value> {
-        let limit = params.limit.unwrap_or(10);
+        // `limit` is client input and ends up interpolated into the KNN operator, which parses
+        // `k` as a u32: clamp it here rather than fail the whole retrieve on a large value.
+        let limit = params.limit.unwrap_or(10).clamp(1, MAX_RETRIEVE_LIMIT);
 
         // 1. Embed query
         let query_vecs = self.embedding.embed(&[&params.query]).await?;
         let query_emb = &query_vecs[0];
 
-        // 2. Load facts (scoped to session if provided, otherwise all non-deleted)
+        // 2. Load candidates: the session's facts if scoped, otherwise the nearest live facts,
+        // from the HNSW index when boot defined it. The index is approximate, so ask for more
+        // than `limit`; step 3 re-ranks by exact cosine and truncates, which makes the slack
+        // free and keeps a near-miss from displacing a row that was never fetched.
         let facts: Vec<alexandria_storage::models::Fact> =
             if let Some(ref session_id) = params.session_id {
                 let session_repo = SessionRepo::new(self.db.inner());
                 session_repo.get_memories(session_id).await?
             } else {
-                let mut response = self
-                    .db
-                    .inner()
-                    .query("SELECT * FROM fact WHERE deleted = false")
-                    .await?;
-                response.take(0)?
+                let repo = MemoryRepo::new(self.db.inner());
+                let k = limit + KNN_SLACK;
+                if self.vector_index {
+                    repo.nearest_indexed(query_emb, k).await?
+                } else {
+                    repo.nearest(query_emb, k).await?
+                }
             };
 
         if facts.is_empty() {
@@ -1996,6 +2019,52 @@ mod get_info_tests {
         assert_eq!(results.len(), 1, "floor should drop the orthogonal memory");
         assert!(results[0]["content"].as_str().unwrap().contains("near"));
         assert!(results[0]["similarity"].as_f64().unwrap() >= 0.30);
+    }
+
+    /// Same retrieval through the HNSW index, and `limit` is clamped to
+    /// `1..=MAX_RETRIEVE_LIMIT` instead of reaching the KNN operator as sent.
+    #[tokio::test]
+    async fn retrieve_memories_serves_from_vector_index() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        alexandria_storage::schema::ensure_vector_index(db.inner(), 2)
+            .await
+            .unwrap();
+        let server =
+            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0)
+                .with_vector_index(true);
+        for content in ["near one", "near two", "far away"] {
+            server
+                .do_store_memory(StoreMemoryParams {
+                    content: content.to_string(),
+                    tags: None,
+                    session_id: None,
+                    agent_id: None,
+                    model: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let retrieve = |limit| {
+            server.do_retrieve_memories(RetrieveMemoriesParams {
+                query: "anything".to_string(),
+                limit: Some(limit),
+                session_id: None,
+            })
+        };
+        let results = retrieve(2).await.unwrap();
+        let results = results["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        for r in results {
+            assert!(r["content"].as_str().unwrap().contains("near"));
+        }
+        let results = retrieve(0).await.unwrap();
+        assert_eq!(results["results"].as_array().unwrap().len(), 1);
+        let results = retrieve(usize::MAX).await.unwrap();
+        assert!(results["results"].as_array().unwrap().len() >= 2);
     }
 
     /// Stub producing vectors with exact cosine similarity to the query [1, 0]:

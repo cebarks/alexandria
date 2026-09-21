@@ -116,6 +116,26 @@ async fn reembed_rewrites_facts_centroids_and_lock() {
     );
 }
 
+/// The HNSW index rejects vectors of any other dimension, so reembed must drop
+/// it before writing 3-dim vectors over a 2-dim index.
+#[tokio::test]
+async fn reembed_drops_vector_index_before_changing_dimension() {
+    let (db, live1, _, _, _) = seed().await;
+    alexandria_storage::schema::ensure_vector_index(db.inner(), 2)
+        .await
+        .unwrap();
+
+    let outcome = reembed(&db, &ModelB, 2).await.unwrap();
+    assert!(matches!(outcome, ReembedOutcome::Done { facts: 3, .. }));
+
+    let fact = MemoryRepo::new(db.inner())
+        .get_fact(&live1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fact.embedding, embed_b("one"));
+}
+
 #[tokio::test]
 async fn reembed_is_noop_when_lock_matches() {
     let (db, live1, _, _, _) = seed().await;
