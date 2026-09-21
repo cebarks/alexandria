@@ -41,6 +41,24 @@ alexandria
 
 First run downloads the embedding model from HuggingFace Hub (~80MB).
 
+## Command Line
+
+`alexandria` with no arguments starts the server. The two subcommands are maintenance tools
+that run once and exit.
+
+| Command | What it does |
+| --- | --- |
+| `alexandria` | Start the server on the configured transport. |
+| `alexandria migrate-embeddings` | Re-embed the whole corpus with the model in `config.toml`. Needed after a deliberate model change — see [docs/configuration.md](docs/configuration.md). |
+| `alexandria bench-retrieval` | Measure how well the configured model separates a correct answer from the rest of the corpus, and print the score distributions and the limit × threshold grid that the `retrieve.min_similarity` floor and the client recall defaults are judged against — see [docs/minilm-test-data.md](docs/minilm-test-data.md). |
+| `alexandria --help` | Print the same list. |
+
+Both subcommands open the data dir directly and SurrealKV is single-writer, so the server has
+to be stopped first. `bench-retrieval` can instead run against a copy of the data dir via
+`ALEXANDRIA_DATA_DIR`, which keeps the server down only for a `cp`. It is not read-only: like
+server boot it checks the embedding-model lock (refusing on a mismatch) and defines the HNSW
+index if it is missing.
+
 ## MCP Tools
 
 | Tool | Description |
@@ -317,6 +335,7 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | --- | --- |
 | [docs/configuration.md](docs/configuration.md) | Every server and client config key, env overrides, XDG migration |
 | [docs/session-memory.md](docs/session-memory.md) | Session data model, lifecycle, tool semantics, current limitations |
+| [docs/minilm-test-data.md](docs/minilm-test-data.md) | Retrieval measurements for the embedding model: how to rerun `bench-retrieval`, metric definitions, the floor rule and the client threshold sweep |
 | [docs/roadmap.md](docs/roadmap.md) | Shipped milestones, known gaps, planned work |
 | [contrib/pi/README.md](contrib/pi/README.md) | pi skill vs. extension: what each does, install, failure behavior |
 | [AGENTS.md](AGENTS.md) | Working notes for humans and agents on this codebase — SurrealDB 3.2 gotchas, crate boundaries, task runner |

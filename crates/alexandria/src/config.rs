@@ -102,11 +102,12 @@ pub struct RetrieveConfig {
     /// with all-MiniLM-L6-v2 a natural-language question against a stored statement
     /// scores ~0.2 and unrelated text ~0.0, so it must stay low.
     ///
-    /// Derived by the retrieve-floor rule in
-    /// `docs/plans/2026-09-08-embedding-model-swap-design.md`: the median
-    /// non-hit score rounded to two decimals, which must sit below the lowest
-    /// correct hit. The rule gives 0.08 for MiniLM; 0.10 is kept because the
-    /// difference is immaterial.
+    /// A constant kept by hand. `alexandria bench-retrieval` prints a
+    /// retrieve-floor rule (median non-hit score rounded to two decimals, valid
+    /// only below the weakest correct hit), but its output depends on the corpus
+    /// and does not move in one direction — 0.08 at 143 facts, 0.07 at 807,
+    /// 0.08 at 957. 0.10 sits above all of them and far below the weakest true
+    /// hit (0.338). See `docs/minilm-test-data.md`.
     pub min_similarity: f32,
 }
 
