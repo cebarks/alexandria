@@ -27,7 +27,7 @@ input=$(cat)   # before any guard: exiting with stdin unread can SIGPIPE the wri
 # triggers) and Cowork carry a CLAUDE_CODE_ENTRYPOINT the binary reserves for them: auto-store is off there
 # unless ALEXANDRIA_AUTO_STORE=on, so scripted experiments never land in the real database. Everything else
 # (cli, desktop, vscode, the remote family) stays on.
-store=${ALEXANDRIA_AUTO_STORE:-}; [ -n "$store" ] || case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*|mcp|bench|claude-code-github-action|claude-security|*_trigger|local-agent|claude-coworker*|remote_cowork) store=off;; esac
+store=${ALEXANDRIA_AUTO_STORE:-}; [ -n "$store" ] || case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*|mcp|bench|claude-code-github-action|claude-security|*_trigger|local-agent|local_agent|claude-coworker*|remote_cowork) store=off;; esac
 [ "$store" != off ] || exit 0
 
 MCP="$(dirname "$(readlink -f "$0")")/alexandria-recall.sh"   # debug CLI mode = one-shot tool calls

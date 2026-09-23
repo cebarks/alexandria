@@ -61,6 +61,8 @@ CLAUDE_CODE_ENTRYPOINT=sdk-cli hook "never use spaces"
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 6 ]
 CLAUDE_CODE_ENTRYPOINT=claude-code-github-action hook "never use spaces"
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 6 ]
+CLAUDE_CODE_ENTRYPOINT=local_agent hook "never use spaces"
+[ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 6 ]
 CLAUDE_CODE_ENTRYPOINT=sdk-cli ALEXANDRIA_AUTO_STORE=on hook "never use spaces"
 [ "$(./alexandria-recall.sh get_session "$(jq -cn --arg s "$sess" '{session_id:$s}')" | jq '[.memories[] | select(.tags|index("auto-detected"))] | length')" = 7 ]
 
@@ -143,7 +145,7 @@ jq -cn --arg s "$sess" --arg t "$td/t.jsonl" '{session_id:$s,transcript_path:$t,
 [ "$(cat "$td/calls")" = 3 ]
 # Headless sessions: no call, marker untouched.
 jq -cn '{type:"assistant",message:{content:[{type:"text",text:"headless chatter that must not be extracted"}]}}' >>"$td/t.jsonl"
-for ep in sdk-py bench remote_cowork_trigger local-agent; do
+for ep in sdk-py bench remote_cowork_trigger local-agent local_agent; do
   CLAUDE_CODE_ENTRYPOINT=$ep stop; [ "$(cat "$td/calls")" = 3 ]; [ "$(cat "$XDG_STATE_HOME/alexandria/$sess.extracted")" = 15 ]
 done
 # Empty result: exactly one call, nothing stored.

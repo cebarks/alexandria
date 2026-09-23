@@ -151,10 +151,10 @@ scripts or Agent SDK runs, that is this default; set `ALEXANDRIA_AUTO_STORE=on` 
 `CLAUDE_CODE_ENTRYPOINT` is an internal Claude Code variable, not in the documented settings list. The
 gate turns auto-store off for `sdk-*` (`sdk-cli` for `claude -p`, `sdk-ts` and `sdk-py` for the Agent SDKs),
 `mcp` (`claude mcp serve`), `bench`, `claude-code-github-action`, `claude-security`, `*_trigger`, and Cowork
-(`local-agent`, `claude-coworker*`, `remote_cowork`), and leaves every other value on: `cli`, `claude-vscode`,
-`claude-desktop`, and the `remote*` / Slack / Teams family (the remote ones cannot reach a local server
-anyway). The list is the validator table in the 2.1.263 bundle, which knows 26 values. If a release renames
-one, the hooks silently fall back to always-on. After upgrading, re-check with
+(`local-agent`, `local_agent`, `claude-coworker*`, `remote_cowork`), and leaves every other value on: `cli`,
+`claude-vscode`, `claude-desktop`, and the `remote*` / Slack / Teams family (the remote ones cannot reach a
+local server anyway). The list is the validator table in the 2.1.280 bundle, which knows 26 values. If a
+release renames one, the hooks silently fall back to always-on. After upgrading, re-check with
 
 ```bash
 claude -p 'Run with the Bash tool and reply with only its output: echo ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT' --allowedTools Bash
