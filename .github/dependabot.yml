@@ -17,3 +17,16 @@ updates:
     commit-message:
       prefix: 'chore(ci)'
     target-branch: main
+
+  # The pi companion's npm deps. CI installs with `npm ci`, so the lockfile is the
+  # real pin and nothing else moves it forward.
+  - package-ecosystem: npm
+    directory: /contrib/pi/extensions/alexandria
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(pi)'
+    target-branch: main
