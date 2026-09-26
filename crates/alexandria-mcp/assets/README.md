@@ -43,11 +43,13 @@ Recorded here because a license audit of this repository will not find them in `
 ## Byte-for-byte fidelity
 
 These files are committed **exactly as upstream publishes them** and are never edited, minified
-further, or stripped. Both end with a `//# sourceMappingURL=` trailer pointing at a `.map` file that
-is deliberately *not* vendored, so browser devtools will 404 on the source map. That is accepted:
+further, or stripped. `vis-network` ends with a `//# sourceMappingURL=` trailer pointing at a `.map`
+file that is deliberately *not* vendored, so browser devtools will 404 on that source map; `htmx`
+ships no trailer. The 404 is accepted:
 modifying the bytes to remove the trailer would break the guarantee that `SHA256SUMS` can be checked
 against the upstream release, which is worth more than a silent devtools 404 on an internal admin
-surface. Vendoring the maps instead would roughly triple the committed size for no runtime benefit.
+surface. Vendoring the maps instead would add a great deal more than the ~692 KB committed here for no
+runtime benefit.
 
 ## Verifying
 
@@ -72,6 +74,10 @@ just vendor-assets
 
 This re-downloads the exact pinned versions above and re-runs `sha256sum -c SHA256SUMS`, so a
 refresh that changes the bytes fails instead of silently updating the record. To move to a new
-version, change the URLs and filenames in the `justfile` recipes, delete the stale file, and commit
-the updated `SHA256SUMS` alongside it — the sums are the review artifact, so a hash change belongs
+version, four things have to change together: the URLs and filenames in the `justfile` recipes; the
+`include_bytes!` constants, the closed `match` allowlist **and** the `*_URL` constants the templates
+embed via `<script src>`, all in `src/debug/assets.rs` (all three are keyed by literal filename,
+because the files are served `immutable`); the regenerated `SHA256SUMS`; and deleting the stale file.
+A filename that misses the `match` is a 404 at runtime, not a build error, so check the allowlist
+explicitly. The sums are the review artifact, so a hash change belongs
 in a commit that says why.

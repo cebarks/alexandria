@@ -14,7 +14,7 @@ Nothing here auto-installs. Copy what you want into your pi config directory.
 | --- | --- | --- |
 | What it is | Prose guidance in agent context | TypeScript extension with event hooks |
 | Read side | Tells the agent when to call `retrieve_memories` | Calls it for you on every prompt |
-| Time side | — | Calls `check_reminders` per prompt, so reminders actually arrive |
+| Time side | Documents the four reminder tools and when to reach for them | Calls `check_reminders` per prompt, so reminders arrive without the agent having to remember |
 | Write side | Tells the agent when to call `store_memory` | Heuristic detectors + session-end LLM extraction |
 | Cost | Context tokens only | HTTP + embedding round trip per prompt, one LLM call per session |
 | Install | Copy a directory | Copy a directory + `npm install` |
@@ -54,9 +54,10 @@ This is a recall, store, **and** reminders companion (package version 2.1) — f
    "never do Y" — stored from the trigger word on, so a prohibition keeps its negation),
    and error→success pairs per tool, which become "this error resolves this way" memories. Stores are
    fire-and-forget so they never add latency to the turn.
-4. **Dedup tracking** — every heuristic store, and every agent-initiated `store_memory` /
-   `update_memory` the extension observes on the way past `tool_result`, is buffered so the
-   extraction pass below can be told what is already saved.
+4. **Dedup tracking** — correction and preference stores, and every agent-initiated `store_memory` /
+   `update_memory` the extension observes on the way past `tool_result`, are buffered so the
+   extraction pass below can be told what is already saved. Error→success resolutions skip the
+   buffer: `ErrorTracker.flush()` stores them directly at `agent_end`.
 5. **LLM extraction** — on `session_shutdown`, the conversation is serialized and a cheap model
    (`store.extract_model`) extracts durable facts that layers 3–4 missed. Skipped on `reload`, since
    that is not a real conversation boundary.

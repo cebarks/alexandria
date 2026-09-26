@@ -65,9 +65,9 @@ text there:
 | Writer | What it stores | Trust of the source text | Where |
 |---|---|---|---|
 | `store_memory` from an agent | Whatever the agent decides | Agent-mediated | `do_store_memory` in `crates/alexandria-mcp/src/server.rs` |
-| Heuristic detectors | Regex captures from the user's prompt | User text | `contrib/pi/.../detectors/{correction,preference}.ts`, `alexandria-recall.sh` |
-| Error-resolution tracker | First 200 chars of a failed tool result plus the next success | **Tool output** | `contrib/pi/.../detectors/error-tracker.ts` |
-| LLM extraction (pi) | Model-chosen facts from user and assistant text | Assistant text can echo tool output | `contrib/pi/.../extraction.ts` |
+| Heuristic detectors | Regex captures from the user's prompt | User text | `contrib/pi/extensions/alexandria/src/detectors/{correction,preference}.ts`, `alexandria-recall.sh` |
+| Error-resolution tracker | First 200 chars of a failed tool result plus the next success | **Tool output** | `contrib/pi/extensions/alexandria/src/detectors/error-tracker.ts` |
+| LLM extraction (pi) | Model-chosen facts from user and assistant text | Assistant text can echo tool output | `contrib/pi/extensions/alexandria/src/extraction.ts` |
 | LLM extraction (Claude) | Model-chosen facts from user text and assistant text. `tool_result` blocks are filtered out; failed tool results become an opt-in input in #17 | Assistant text can echo tool output | `contrib/claude/hooks/alexandria-extract.sh` |
 | `import_document` | Third-party text verbatim, confidence 1.0, initial heat 2.0 | Whatever the document is | `do_import_document` |
 | Any network client | Anything | None | Docker image on `0.0.0.0` |
@@ -182,7 +182,8 @@ is replayed into every matching prompt across every agent that uses auto-recall,
 
 **Fix, layered, cheapest first.**
 
-1. **Server-set source on the fact.** Add a `source` field (migration `v007`) set by the server,
+1. **Server-set source on the fact.** Add a `source` field (migration `v008`; `v007` is taken by
+   `v007_reminder.surql`) set by the server,
    not the client: `agent` for `store_memory`, `import` for `import_document`. Accept an optional
    `kind` parameter on `store_memory` restricted to an enum (`user`, `heuristic`, `extracted`) so
    the clients can label their own write paths without being able to claim `import` is `user`.

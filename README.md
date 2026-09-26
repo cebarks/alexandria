@@ -7,7 +7,7 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 - **Semantic search** — Cosine similarity over local embeddings (all-MiniLM-L6-v2 via candle, pure Rust)
 - **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool.
 - **Spreading activation** — Accessing a memory warms its graph neighbors. Heat propagates along edges with configurable decay.
-- **Graph edges** — Memories link via `relates_to`, `supports`, `contradicts`, `derived_from`, and `extracted_from` edges
+- **Graph edges** — Memories link via `derived_from` and `extracted_from` edges. `relates_to`, `supports` and `contradicts` exist in the schema but nothing in production writes them yet; auto-linking them is planned v0.3 work
 - **Hierarchical clustering** — Automatic cluster assignment on store, background split/merge maintenance with a queryable audit log
 - **Progressive recall** — Two-phase retrieval: broad cluster matching first, then scope-narrowing within a cluster
 - **Session memory** — Group memories by conversation, search within a session, and close it out with a summary
@@ -155,18 +155,19 @@ Tester's non-dry `retrieve` run performs spreading activation, so it writes heat
   distribution, and the schema version — applied versus compiled-in, with a mismatch called out
 - **Memories** (`/debug/memories`) — paginated search/filter of facts by content and tag; click through to a
   detail view showing heat, stability, timestamps, cluster membership, and graph edges
-- **Clusters** (`/debug/clusters`) — cluster list with live member counts and cohesion; drill into
-  member facts. Cohesion is computed from each cluster's stored centroid, so the verdict matches what
+- **Clusters** (`/debug/clusters`) — cluster list with live member counts and depth; drill into
+  `/debug/clusters/{id}` for member facts and cohesion. Cohesion is computed from each cluster's stored
+  centroid, on the detail page and in the dashboard rollup alike, so the verdict matches what
   the background maintenance task will actually act on
 - **Sessions** (`/debug/sessions`) — every session with agent, model, derived memory count, start and
-  last-activity times, and a finalized/active badge; `/debug/sessions/:external_id` shows the
+  last-activity times, and a finalized/active badge; `/debug/sessions/{external_id}` shows the
   summary, tags, and the session's memories. Keyed by the `external_id` you pass to `store_memory(session_id)`
-- **Graph** (`/debug/graph/:id`) — visualizes a memory's local edge neighborhood: nodes labelled with
+- **Graph** (`/debug/graph/{id}`) — visualizes a memory's local edge neighborhood: nodes labelled with
   content snippets rather than raw record ids (full id and hop distance in the tooltip), colour and
   shape by table, edges styled by `edge_type` with strength banded into width, a legend generated from
   those same maps, and click-through to the memory detail page. `?hops=1..3` sets the radius, clamped
   server-side; the view caps at 200 nodes and says so when it truncates rather than rendering a
-  hairball. The backing JSON is at `/debug/api/graph/:id`
+  hairball. The backing JSON is at `/debug/api/graph/{id}`
 - **Maintenance log** (`/debug/maintenance`) — paginated history of every background cluster split and
   merge: source cluster, resulting clusters, and members moved. The only way to audit *why* the
   clustering changed since you last looked.
@@ -177,7 +178,7 @@ Tester's non-dry `retrieve` run performs spreading activation, so it writes heat
   score-band legend so a similarity number can be read without a ruler
 
 All browser assets (htmx, vis-network) are **vendored** into the binary and served from
-`/debug/assets/:name`, so the UI loads nothing from a CDN and works fully air-gapped.
+`/debug/assets/{name}`, so the UI loads nothing from a CDN and works fully air-gapped.
 
 The debug UI has **no authentication** and is intended for a trusted network boundary (same
 posture as the unauthenticated MCP endpoint) — do not expose it on a public interface without
@@ -270,17 +271,7 @@ model download is the only thing that still needs the internet).
 
 ### MCP client configuration
 
-**Claude Code:**
-
-```bash
-claude mcp add --transport http --scope user alexandria http://127.0.0.1:3000/mcp
-# optional: client-side skill (same as contrib/pi, with Claude Code's mcp__alexandria__<tool> names)
-cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
-# optional: auto-recall hook (see contrib/claude/README.md for the settings.json snippet)
-cp contrib/claude/hooks/alexandria-recall.sh ~/.claude/hooks/
-```
-
-**Generic (any MCP client):**
+#### Generic (any MCP client)
 
 ```json
 {
@@ -300,6 +291,16 @@ Or via stdio (for single-session use):
     "args": []
   }
 }
+```
+
+#### In Claude Code
+
+```bash
+claude mcp add --transport http --scope user alexandria http://127.0.0.1:3000/mcp
+# optional: client-side skill (content-parity with contrib/pi, using Claude Code's mcp__alexandria__<tool> names)
+cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
+# optional: auto-recall hook (see contrib/claude/README.md for the settings.json snippet)
+cp contrib/claude/hooks/alexandria-recall.sh ~/.claude/hooks/
 ```
 
 #### In pi
@@ -339,7 +340,7 @@ Then optionally add the client-side nudges — see
 
 Config loads with precedence: defaults → `$XDG_CONFIG_HOME/alexandria/config.toml` → `ALEXANDRIA_CONFIG` env → individual env vars. Data defaults to `$XDG_DATA_HOME/alexandria/data`.
 
-Legacy `~/.alexandria/` paths are used as fallback if the XDG paths don't exist yet.
+Legacy `~/.alexandria/config.toml` is used as a fallback when the XDG config file does not exist yet. The data directory has no such fallback: it defaults to `$XDG_DATA_HOME/alexandria/data`, and an explicit `data_dir` still pointing at the old location only produces a warning telling you to move it.
 
 Reminder delivery is configured by the `[reminders]` section: `timezone` (IANA name, empty = system-local) governs naive datetime input and pattern/cron evaluation, and `escalation_hours` controls overdue escalation to global delivery.
 
@@ -356,8 +357,16 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | [docs/minilm-test-data.md](docs/minilm-test-data.md) | Retrieval measurements for the embedding model: how to rerun `bench-retrieval`, metric definitions, the floor rule and the client threshold sweep |
 | [docs/roadmap.md](docs/roadmap.md) | Shipped milestones, known gaps, planned work |
 | [contrib/pi/README.md](contrib/pi/README.md) | pi skill vs. extension: what each does, install, failure behavior |
+| [contrib/pi/extensions/alexandria/README.md](contrib/pi/extensions/alexandria/README.md) | The pi companion extension in detail: recall/store/reminders, configuration, known gaps |
+| [contrib/pi/skills/alexandria-memory/SKILL.md](contrib/pi/skills/alexandria-memory/SKILL.md) | The pi client-side skill (`alexandria_<tool>` names) |
+| [contrib/claude/README.md](contrib/claude/README.md) | Claude Code skill and hooks: install, `settings.json`, requirements |
+| [contrib/claude/skills/alexandria-memory/SKILL.md](contrib/claude/skills/alexandria-memory/SKILL.md) | The Claude Code skill (`mcp__alexandria__<tool>` names) |
+| [docs/security-findings.md](docs/security-findings.md) | 2026-09-10 security audit: threat model, the convex-hull paper verdict, findings S1–S6 with current status |
+| [docs/performance-and-ability-findings.md](docs/performance-and-ability-findings.md) | Same audit: performance and retrieval-ability findings A1–A4 / P1–P5 |
+| [docs/prompt-path-stall-attribution.md](docs/prompt-path-stall-attribution.md) | 2026-09-22 investigation record: prompt-path stall attribution, the measured cold-handshake fault, and why the worker isolation it proposed was dropped. Carries a STATUS banner naming what shipped |
+| [crates/alexandria-mcp/assets/README.md](crates/alexandria-mcp/assets/README.md) | Vendored debug-UI assets, checksums, how to re-vendor |
+| [TODO-misc.md](TODO-misc.md) | Unprioritised backlog, grouped by area |
 | [AGENTS.md](AGENTS.md) | Working notes for humans and agents on this codebase — SurrealDB 3.2 gotchas, crate boundaries, task runner |
-| [docs/plans/](docs/plans/) | Dated design and implementation plans for completed work (historical record, not maintained) |
 
 ## Architecture
 
@@ -374,25 +383,33 @@ contrib/pi/              # Optional client-side pi integrations (skill + extensi
 
 Data flows: **MCP request → server handler → engine algorithm → storage repo → SurrealDB**
 
-Crate boundaries are held by convention, not tooling: `storage` owns nearly all SurrealDB access (a
-few inline queries remain in `alexandria-mcp` handlers), `engine` is pure algorithms with no DB or
-async, `pipeline` abstracts embedding providers behind one trait, and only `alexandria-mcp` may see
-engine and storage together. See [AGENTS.md](AGENTS.md) for the full set.
+Crate boundaries are held by convention, not tooling: `storage` owns nearly all SurrealDB access (one
+inline query remains in an `alexandria-mcp` handler, and the binary's maintenance loop reads `cluster`
+directly), `engine` is pure algorithms with no DB or async, `pipeline` abstracts embedding providers
+behind one trait, and `alexandria-mcp` is the crate whose purpose is joining engine to storage — the
+binary also sees both, since it wires them together at startup. See [AGENTS.md](AGENTS.md) for the full
+set.
 
 ## Development
 
 `just` recipes mirror what CI runs — install [just](https://just.systems/) if you don't have it:
 
 ```bash
-just          # list recipes
-just test     # cargo test --workspace --all-features
-just lint     # clippy, warnings as errors (matches CI)
-just fmt-fix  # rustfmt
-just ci       # fmt + lint + test + cargo-deny + verify-assets, the full pre-push check
-just run      # run the server locally (prefix with RUST_LOG=debug for verbose logs)
-just verify-assets   # check crates/alexandria-mcp/assets against SHA256SUMS
-just vendor-assets   # re-download those assets and re-verify the checksums
+just               # list every recipe
+just ext-install   # ONE TIME per checkout: npm install for the pi companion (node_modules/ is gitignored)
+just test          # cargo test --workspace --all-features
+just ext-test      # pi companion: npm run typecheck + npm test (needs ext-install first)
+just lint          # clippy, warnings as errors (matches CI)
+just fmt-fix       # rustfmt
+just ci            # fmt + lint + test + ext-test + cargo-deny + verify-assets, the full pre-push check
+just run           # run the server locally (prefix with RUST_LOG=debug for verbose logs)
+just verify-assets # check crates/alexandria-mcp/assets against SHA256SUMS
+just vendor-assets # re-download those assets and re-verify the checksums
 ```
+
+`just ci` runs `ext-test`, so **`just ext-install` is a prerequisite on a fresh checkout** — without it
+the "full pre-push check" fails in npm before it reaches anything Rust. Bare `just` lists the recipes
+this block omits (`fmt`, `check`, `clean`, `test-all`, `deny`).
 
 Use a **stable** toolchain. Recent nightlies fail to build `diskann-wide` (a SurrealDB
 transitive dependency) on Apple Silicon with a trait-inference error in its NEON intrinsics,
@@ -405,9 +422,10 @@ just install-hooks
 ```
 
 [`deny.toml`](deny.toml) gates licenses and known advisories via `cargo deny`, which runs as its own
-CI job. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs four jobs — `fmt`, `clippy`,
-`test`, `deny` — on push and PR; it does not call `just ci`, so a new local gate has to be wired into
-the workflow as well. `just verify-assets` runs in the `test` job ahead of `just test`.
+CI job. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs five jobs — `fmt`, `clippy`,
+`test`, `extension` (displayed as "Pi companion": the extension's typecheck and tests) and `deny` — on
+PRs against any branch and pushes to `main`; it does not call `just ci`, so a new local gate has to be wired
+into the workflow as well. `just verify-assets` runs in the `test` job ahead of `just test`.
 
 [`.github/workflows/container.yml`](.github/workflows/container.yml) additionally builds the Docker
 image and boot-tests it — waits on `/debug`, then performs a real MCP `initialize` handshake against

@@ -203,8 +203,11 @@ pango markup on a text block"). Those are the cases where an exact token match s
 
 ### P1. Every embedding pays a 128-token forward pass
 
-**Severity:** Medium. **Effort:** trivial. Same root cause as A1. **Fixed 2026-09-10** with A1:
-`tokenizer.with_padding(None)`, at every `max_tokens`. This is a cost cut, not a cost rise: each
+**Status (2026-09-25): fixed 2026-09-10, with A1.** `candle.rs:load_model` sets
+`tokenizer.with_padding(None)` at every `max_tokens`, so an embed pays `min(len, max_tokens)` and no
+embedding pays a fixed-128 forward pass. The rest of this finding describes the audited commit.
+
+**Severity:** Medium. **Effort:** trivial. Same root cause as A1. This is a cost cut, not a cost rise: each
 embed used to pay 128 positions and now pays `min(len, max_tokens)`, so with p50 = 73 the median
 store is about 40% cheaper and only the roughly 9% of facts past 128 cost more, and only at a
 raised limit. Batched calls (P3) still need `BatchLongest` when they land.
@@ -240,9 +243,10 @@ per-cluster query but not that the rows carry embeddings.
 
 **Fix.**
 
-1. Counting: one query, the pattern `SessionRepo::list` already uses:
+1. Counting: one query, the pattern `SessionRepo::list_filtered` already uses:
    `SELECT *, count(->contains_memory->fact) AS member_count FROM cluster`. Replace
-   `list_with_counts` with it.
+   `list_with_counts` with it. (`SessionRepo::list` is the *other* spelling — the traversal
+   `(->…->(fact WHERE …)).len()` form — because it needs a filter inside the target.)
 2. Broad recall: take the top-k facts from `MemoryRepo::nearest_indexed`, group them by cluster via
    `cluster_for_fact` or a single graph query, and rank clusters from that. That makes recall O(k)
    instead of O(N) and keeps it on the index. If the full-member design is kept for now, at least
@@ -256,8 +260,10 @@ per-cluster query but not that the rows carry embeddings.
 
 - `CandleProvider::embed`: "Run inline for now", because `&self` cannot move into `spawn_blocking`.
 - `embed_sync` loops over texts one at a time, building tensors and running a
-  `(1, L)` forward per text. The `batch_size` config for `migrate-embeddings` bounds memory but does
-  not batch inference.
+  `(1, L)` forward per text. The `batch_size` config for `migrate-embeddings` does not batch
+  inference, and does not bound memory either: `config.rs` and `migrate.rs:reembed` both note the
+  corpus is preloaded through `MemoryRepo::all_ids_and_content`, so `batch_size` only sets how often
+  the migration writes and logs progress.
 
 **Impact.** A BERT forward on a tokio worker thread blocks that worker for its duration. With the
 multi-thread runtime other workers keep serving, but a large `import_document` monopolises one for

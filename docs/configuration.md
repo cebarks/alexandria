@@ -29,7 +29,7 @@ device = "cpu"                                       # "cpu" only for now (defau
 batch_size = 32                                      # Facts per embed() call in migrate-embeddings (default: 32)
 
 [heat]
-spacing_halflife_secs = 86400.0   # Spaced repetition half-life in seconds (default: 86400 = 1 day)
+spacing_halflife_secs = 86400.0   # Spaced repetition half-life in seconds (default: 86400 = 1 day). Currently inert — see the [heat] table
 
 [activation]
 propagation_factor = 0.3   # Fraction of heat passed per hop (default: 0.3)
@@ -78,7 +78,7 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 | `model` | string | `"sentence-transformers/all-MiniLM-L6-v2"` | HuggingFace model ID. Must be a BERT-family model compatible with candle. Pooling mode (CLS or mean) is read from the model repo's `1_Pooling/config.json`; models without it use mean pooling. |
 | `device` | string | `"cpu"` | Compute device. Only `"cpu"` is currently supported. |
 | `batch_size` | usize | `32` | Facts per `embed()` call during `alexandria migrate-embeddings`. Sets how often the migration writes and logs progress; it does not bound memory or change speed with the Candle provider, which runs one forward pass per text. Must be between 1 and 4096, checked at config load. The server itself embeds one text at a time. |
-| `max_tokens` | usize | `128` | Longest text one embedding sees, in wordpiece tokens including `[CLS]`/`[SEP]`. A longer memory is still stored whole, but only its first `max_tokens` tokens are searchable; the server logs a warning with the fact id and token count, and `store_memory` returns `truncated: true`. **128** is the standard: it is what the model's `tokenizer.json` ships, so every database created before this key existed is at 128 and boots unchanged. **256** is tested (it is what sentence-transformers serves this model at, and it covered the p99 of the corpus it was measured on; see [docs/minilm-test-data.md](minilm-test-data.md), "256-token re-embed"). Anything above 256 is experimental: the model was trained at 128 and nothing here has measured it. Must be between 3 and 512, checked at config load, and no larger than the model's position table, checked when the model loads. Padding is off at every value, so a text costs its own length, not the limit. |
+| `max_tokens` | usize | `128` | Longest text one embedding sees, in wordpiece tokens including `[CLS]`/`[SEP]`. A longer memory is still stored whole, but only its first `max_tokens` tokens are searchable; the server logs a warning with the fact id and token count, and `store_memory` returns `truncated: true`. **128** is the standard: it is what the model's `tokenizer.json` ships, so every database created before this key existed is at 128 and boots unchanged. **256** is tested (it is what sentence-transformers serves this model at, and it covers all but the longest ~1.7% of the corpus it was measured on — that corpus's p99 is 284 tokens, so 256 falls just short of it; see [docs/minilm-test-data.md](minilm-test-data.md), "256-token re-embed"). Anything above 256 is experimental: the model was trained at 128 and nothing here has measured it. Must be between 3 and 512, checked at config load, and no larger than the model's position table, checked when the model loads. Padding is off at every value, so a text costs its own length, not the limit. |
 
 **Switching models on an existing database:** stop the server, set the new `model`, run `alexandria migrate-embeddings` (re-embeds every memory and cluster centroid, then updates the lock), and start the server again. Thresholds (`[cluster]`, `[retrieve] min_similarity`, and the client's `[recall] min_similarity`) are tuned to the default model; retune them if you switch. `alexandria bench-retrieval` derives the latter two from the new model's own output — see [docs/minilm-test-data.md](minilm-test-data.md). The migration is not transactional: if it fails partway, rerun it. Do not revert `model` in config afterwards, the database may hold a mix of old and new vectors.
 
@@ -94,7 +94,7 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `spacing_halflife_secs` | f64 | `86400.0` | Base half-life for the Ebbinghaus spaced repetition curve, in seconds. Lower values mean memories cool faster without re-access. |
+| `spacing_halflife_secs` | f64 | `86400.0` | **Currently inert.** Intended as the base half-life for the Ebbinghaus spaced-repetition curve, but `decay.rs:projected_heat` hardcodes `tau = stability * 86400.0` and takes no half-life, and nothing outside the engine crate calls it — the configured value is read only to display in the debug dashboard. Wiring it up or deleting it is the open A2 decision in [docs/performance-and-ability-findings.md](performance-and-ability-findings.md). The direction is also the reverse of the intuitive reading: in `decay.rs:on_access` a *lower* value raises the spacing ratio, which grows stability faster and therefore cools *slower*. |
 
 ### `[activation]`
 

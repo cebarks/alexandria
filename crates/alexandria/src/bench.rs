@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use crate::config::Config;
 
 /// Question -> the fact that answers it. The first 12 are verbatim from the 2026-09-08 run
-/// (`docs/plans/2026-09-08-embedding-model-swap-measurements.md`); their targets are all in
+/// (reproduced under "Model selection" in `docs/minilm-test-data.md`); their targets are all in
 /// the baseline window, so the baseline row still reproduces the table recorded there. The
 /// rest (added 2026-09-10) target facts stored after that window, from other projects, so
 /// the live row also checks that a recent memory can be found and is not just measuring
@@ -422,7 +422,7 @@ fn report(label: &str, m: &Metrics, model: &str) {
         );
     }
 
-    // The rule from docs/plans/2026-09-08-embedding-model-swap-design.md: the floor is
+    // The floor rule documented under "Floor" in docs/minilm-test-data.md: the floor is
     // the median non-hit score, and it is only usable if it sits below the weakest hit.
     let floor = (m.nonhit[0] * 100.0).round() / 100.0;
     println!("\nretrieve.min_similarity = round(nonhit_p50, 2) = {floor:.2}");

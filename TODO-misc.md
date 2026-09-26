@@ -22,7 +22,8 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
 - [-] **`recall` walks clusters, not sessions.** Sessions are reachable only through the session
   tools and `/debug/sessions`.
 - [-] **The model fetcher (`alexandria-pipeline/src/embedding/hub.rs`) is snapshot-only.** No
-  `blobs/` symlinks, `.no_exist` markers, or locks in the cache layout; revision `main` only; no
+  `blobs/` symlinks or `.no_exist` markers in the cache layout (locks *are* handled: a cache miss
+  takes an advisory lock on `<repo>/.lock` and re-checks); revision `main` only; no
   `HF_TOKEN` / `HF_ENDPOINT`, so gated or private models cannot be fetched and a cached revision is
   served until its dir is deleted. Add whichever one bites.
 
@@ -37,17 +38,18 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   keeps the record ID while rewriting content, so a frozen `QUESTIONS` target can silently start
   measuring different text with every metric still looking comparable. If the baseline row stops
   reproducing, suspect this before the metrics.
-- [-] **A restated target scores as a miss.** Rank is by record ID, so when a duplicate memory
-  outranks the target the bench records the target's rank even though the user got the answer at
-  rank 1. MiniLM cannot separate duplicates from adjacent memories by score, so this is not
-  detectable automatically. Treat rank as a lower bound on delivery, and read the results above
-  the target before acting on a headroom WARN.
-- [-] **The recall defaults are literals in three places, and today they disagree.**
-  `contrib/claude/hooks/alexandria-recall.sh` ships `5` / `0.35`,
-  `contrib/pi/extensions/alexandria/src/config.ts` ships `5` / `0.58`, and
-  `crates/alexandria/src/bench.rs` checks headroom against the measured pair `10` / `0.45` as
-  `RECALL_LIMIT` / `RECALL_THRESHOLD`. The client changes are pending in #17 and #18. Nothing ties
-  the three together; when changing one, grep the tree for the old value.
+- [-] **A restated target scores as a miss.** Rank comes from exact cosine — `better` counts only
+  strictly-higher scores, so ties resolve optimistically — and `sweep` sorts by score, not by record
+  ID. When a duplicate memory outscores the target the bench still records the target's rank, even
+  though the user got the answer at rank 1. MiniLM cannot separate duplicates from adjacent memories
+  by score, so this is not detectable automatically. Treat rank as a lower bound on delivery, and read
+  the results above the target before acting on a headroom WARN.
+- [-] **The recall defaults are literals in three places.**
+  `contrib/claude/hooks/alexandria-recall.sh`,
+  `contrib/pi/extensions/alexandria/src/config.ts` and `crates/alexandria/src/bench.rs`
+  (`RECALL_LIMIT` / `RECALL_THRESHOLD`) all ship `10` / `0.45` now that #17 and #18 have landed, so
+  they currently agree. Nothing *ties* them together, though: when changing one, grep the tree for the
+  old value.
 
 ## Build / toolchain
 
@@ -65,9 +67,10 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
 
 ## Dependencies
 
-- [-] **`tokenizers` is pinned to 0.22 by candle-core 0.11.** 0.23 builds a second copy, and
-  candle-core enables the `onig` feature itself, so our `default-features = false` cannot drop the C
-  build. Both move together on the next candle bump.
+- [-] **`tokenizers` is pinned to 0.22 by candle-core 0.11.** The lockfile carries exactly one
+  `tokenizers` (0.22.2) with `onig` among its dependencies, and candle-core enables that feature
+  itself, so our `default-features = false` does not drop the C build. A 0.23 alongside it would build
+  a second copy; the two move together on the next candle bump.
 - [-] **`RUSTSEC-2023-0071` (Marvin attack in `rsa`) is ignored in `deny.toml`.** `rsa` 0.9.10
   reaches us via `surrealdb-core -> jsonwebtoken`; nothing here uses RSA. No patched release exists
   (0.10 is still a release candidate). Drop the ignore once `cargo deny` stops needing it, i.e.

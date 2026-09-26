@@ -1,8 +1,8 @@
 # MiniLM retrieval test data
 
 Measurements for `sentence-transformers/all-MiniLM-L6-v2`, the embedding model Alexandria
-runs on. This is the living record; the model-selection passes that chose it are historical
-and live in `docs/plans/2026-09-08-embedding-model-swap-measurements.md`.
+runs on. This is the living record; the model-selection pass that chose it is preserved under
+[Model selection](#model-selection-2026-09-08) below.
 
 Produced by `alexandria bench-retrieval` (`crates/alexandria/src/bench.rs`).
 
@@ -48,7 +48,8 @@ subset runs through 2026-09-08 16:26:33 UTC.
 > **Non-regenerable history.** Every row in this section, the two threshold tables and both
 > 880-fact grids were printed by the 12-question code, up to and including the commit
 > "fix(bench): count recall-limit headroom over targets that clear the threshold". The
-> committed bench scores 20 questions and cannot print an `x/12` row; the corpora they ran on
+> committed bench scores 20 questions, so a live row reads `x/20`; it still prints `9/12` on today's
+> baseline, because only 9 of those 12 targets survive in the corpus. The corpora they ran on
 > were not kept either. They are a record of what was seen, not something a re-run reproduces.
 
 | corpus | facts | mean_rank | top1 | mean_gap | hit_min | hit_max | nonhit_p50 | nonhit_p90 | nonhit_p99 | ff_p50 | ff_p90 | ff_p99 |
@@ -91,8 +92,9 @@ identical across the two rows: the same targets, scored by the same question vec
 the same cosine values. What moved is how many facts sit above them — `mean_rank` 1.42 to
 2.75, `top1` 9/12 to 7/12, `mean_gap` halved from +0.148 to +0.077.
 
-The noise tail moved the other way: `nonhit_p99` 0.373 to 0.341, `ff_p99` 0.562 to 0.507.
-The 590 facts added since are on average *less* similar to these questions than the original
+The noise tail moved the other way: `nonhit_p99` 0.373 to 0.341, `ff_p99` 0.562 to 0.507 (those two
+"from" values are the 2026-09-08 pass; this file's reconstructed baseline row reads 0.372 / 0.560).
+The 600 facts added since are on average *less* similar to these questions than the original
 corpus, which tightens the distribution while still crowding the target on rank. The floor
 rule's output moved a hundredth lower in this pass while ranking got harder — and later passes
 moved it back up (see [Floor](#floor)). **The floor is not a proxy for retrieval quality.**
@@ -119,8 +121,13 @@ rank 10 and a wider limit would buy nothing today.
 
 ### Floor
 
-The rule from `docs/plans/2026-09-08-embedding-model-swap-design.md` — `round(nonhit_p50, 2)`,
-valid only if it sits below `hit_min` — gives:
+The floor rule in use here — `round(nonhit_p50, 2)`, valid only if it sits below `hit_min` — gives:
+
+<!-- The rule as first written for the 2026-09-08 model-selection pass was hit-anchored ("below the
+     lowest hit, above the highest non-hit, midpoint on overlap"), which is where the 0.36 recorded in
+     [Model selection](#model-selection-2026-09-08) came from: midpoint(0.338, 0.373). It has no valid
+     solution once any non-hit outscores the weakest hit, which every real corpus produces, so it was
+     rewritten to the non-hit-median form above the same day. -->
 
 | corpus | floor | sanity check |
 |---|---|---|
@@ -223,9 +230,9 @@ and vary `T`. Both levers gate the same delivery, so neither is readable alone. 
 facts, a superset of the 807 above — the threshold numbers here are the same measurement at a
 larger corpus, not a revision of it) sweeps both. Cells are `hits_delivered` out of 12, with
 `noise_per_q` in parentheses. **`limit = 10, T = 0.45` is the pair chosen off this table** —
-a judgement call on a small hand-authored question set, see [Limitations](#limitations). The client changes that
-ship it are pending in the Claude-hooks and pi-extension PRs (#17, #18); until they land the pi
-extension still defaults to `5` / `0.58`. Cells are transcribed at one decimal, as the
+a judgement call on a small hand-authored question set, see [Limitations](#limitations). The client
+changes that ship it landed in #17 and #18, so both clients now default to `10` / `0.45`. Cells are
+transcribed at one decimal, as the
 formatter printed them then; it prints two since "feat(bench): print noise_per_q to two
 decimals in the grid".
 
@@ -251,12 +258,15 @@ Baseline corpus, 143 facts:
 | 15 | 12 (3.6) | 11 (2.0) | 8 (0.9) | 8 (0.3) | 7 (0.0) | 4 (0.0) |
 | 20 | 12 (3.6) | 11 (2.0) | 8 (0.9) | 8 (0.3) | 7 (0.0) | 4 (0.0) |
 
-**The previous pair was strictly dominated, which is why it changed.** From `limit=5, T=0.35`
+**The previous pair was strictly dominated on the live corpus, which is why it changed.** From
+`limit=5, T=0.35`
 (8 delivered, 3.2 noise), `limit=10, T=0.45` delivers the same 8 at 1.0 — a third of the
 injection for identical recall. There was no trade to weigh in that move: the old setting was
 simply off the frontier, so taking it needed no view on how recall and noise should be priced.
 That is the whole reason this pair was picked over `limit=10, T=0.35` (11 delivered at 4.7),
-which is a genuine trade and would have needed one.
+which is a genuine trade and would have needed one. The dominance is a property of the live corpus
+only — on the baseline row no cell reaches 11 delivered at 1.4 noise or below, so by this file's own
+"strictly dominates on both corpora" rule the same move *was* a trade there.
 
 **The limit is the stronger lever, and by a wide margin.** From the same starting cell,
 lowering `T` to 0.30 buys **zero** hits for +1.05 noise, because the targets it admits by score
@@ -409,8 +419,10 @@ hnsw top-10 vs exact scan: 200/200 ids agree over 20 questions, target delivered
 Every id the exact scan puts in the top 10 comes back from the index, for every question, so
 the recorded metrics describe what the server serves. `19/19` because q12's target ranks 12
 on the exact scan and so is not in the set the index could have delivered; it is not an index
-miss. The index is defined with SurrealDB's default `EFC`/`M`, and this line is where a change
-to either would show.
+miss. The index is defined with SurrealDB's default `EFC`/`M` (the DDL passes only `DIMENSION` and
+`DISTANCE`). A change to either would not necessarily show here: 19/19 has no headroom left to
+regress into, so read this line as a smoke test that the index and the exact scan agree, not as a
+sensitivity check on the index parameters.
 
 ### 256-token re-embed (1139 facts)
 
@@ -530,7 +542,8 @@ and it is a delivered hit at cosine 0.556.
 **Every target fusion rescues is under the client threshold.** q4 (7 to 3–5), q10 (2 to 1–2),
 q15 (2 to 1) and q20 (4 to 3) move up, but their target cosines are 0.369, 0.368, 0.410 and
 0.429, all under the chosen `T = 0.45`, so a client on that pair drops them whatever the server's
-order. At the Claude hook's shipped `limit = 5`, `T = 0.35` three of the four are already delivered
+order. At the `limit = 5`, `T = 0.35` pair the Claude hook shipped at the time of this measurement
+(it is `10` / `0.45` now) three of the four are already delivered
 on cosine alone; fusion's one real rescue is q4, and it costs q9.
 
 **MiniLM already handles identifiers.** Seven throwaway probes were written around a unique
@@ -639,6 +652,44 @@ they are absent from the baseline corpus and print as `absent` on that row.
 19. "would turning on object lock for the backup bucket break restic" -> `fact:61zqxqcijsi7n847632x`
 20. "the lifecycle rule has been on for a day and nothing expired yet, is it broken" -> `fact:i2tf44mnoigxqro4898n`
 
+## Model selection (2026-09-08)
+
+The pass that chose the default model, kept here because it is the only recorded derivation of three
+shipped `[cluster]` defaults. Corpus: 143 active facts from the live database. Questions: 1–12 of the
+[Test data](#test-data) list below, run through `sentence-transformers` on the same candle path. Metric
+definitions are the ones above.
+
+| model | mean_rank | top1 | mean_gap | hit_min | hit_max | nonhit_p50 | nonhit_p90 | nonhit_p99 | ff_p50 | ff_p90 | ff_p99 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| sentence-transformers/all-MiniLM-L6-v2 | 1.42 | 9/12 | +0.148 | 0.338 | 0.667 | 0.077 | 0.212 | 0.373 | 0.130 | 0.298 | 0.562 |
+| sentence-transformers/msmarco-MiniLM-L6-cos-v5 | 12.58 | 6/12 | +0.000 | 0.119 | 0.583 | 0.173 | 0.295 | 0.400 | 0.230 | 0.375 | 0.561 |
+| sentence-transformers/multi-qa-MiniLM-L6-cos-v1 | 2.33 | 8/12 | +0.091 | 0.318 | 0.635 | 0.082 | 0.215 | 0.375 | 0.125 | 0.290 | 0.568 |
+| BAAI/bge-small-en-v1.5 | 5.42 | 7/12 | +0.037 | 0.620 | 0.799 | 0.564 | 0.628 | 0.709 | 0.592 | 0.670 | 0.778 |
+
+**Decision rule:** lowest `mean_rank` wins, ties broken by largest `mean_gap`. No candidate beat the
+incumbent on both, so `all-MiniLM-L6-v2` stayed and **no config default changed** — MiniLM has the
+lowest `mean_rank` (1.42 vs 2.33 / 5.42 / 12.58) and the largest `mean_gap` (+0.148).
+
+The instructive result is bge-small: its absolute scores are much higher across the board
+(`hit_min` 0.620) but so is its noise floor (`nonhit_p50` 0.564, fact-to-fact p50 0.592), so the
+*separation* between a hit and the rest of the corpus is worse, not better. High cosine values on a
+CLS-pooled model are a compression of the range, not better retrieval — which is why every threshold
+in this project is judged on separation rather than on absolute score. `msmarco-cos-v5` lost outright,
+badly missing two of the low-vocabulary-overlap questions (rank 69 and rank 56). bge-small was
+measured without its query instruction prefix.
+
+Thresholds derived here by the "same percentile under the new model" rule, and **not applied** because
+the incumbent won: `cluster.join_threshold` 0.75, `cluster.merge_threshold` 0.88,
+`cluster.cohesion_floor` 0.60 — these are the values the shipped defaults were checked against, which
+is why they are recorded. One quirk worth keeping: the then-current `merge_threshold` of 0.90 sits
+*above* the maximum observed fact-to-fact similarity in this corpus (0.878), so the percentile mapping
+pins to that maximum and rounds to 0.88. The corpus simply contains no pair similar enough to justify
+0.90.
+
+The retrieve floor derived in this pass was **0.36**, under a rule that has since been rewritten — see
+[Floor](#floor) for the current one and for why 0.36 was unusable: it would have cut a true hit at
+0.338, because `nonhit_p99` (0.373) exceeds `hit_min`.
+
 ## Limitations
 
 - **The questions were authored against the corpus.** All 20 were written by reading a stored
@@ -662,8 +713,8 @@ they are absent from the baseline corpus and print as `absent` on that row.
   currently small — the row reproduces within 0.01 — but it grows with every deletion and
   the tool cannot detect it.
 - **A timestamp cutoff cannot be substituted for the size-based baseline.** No active fact
-  predates 2026-09-08 12:30 UTC. The `08:08` in the measurements doc is local time (UTC-4)
-  and is when the data dir was created, not when the measurement ran, so a cutoff built from
+  predates 2026-09-08 12:30 UTC. The data directory was created at 08:08 local (UTC-4) that
+  morning, which is not a measurement timestamp, so a cutoff built from
   it selects nothing.
 - **20 questions is a small sample** (12 on the baseline row). A single question changing rank
   moves `mean_rank` by up to a twentieth of the change. Treat differences of a tenth as noise.

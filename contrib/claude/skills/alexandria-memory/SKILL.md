@@ -1,12 +1,13 @@
 ---
 name: alexandria-memory
-description: Use the Alexandria agent-memory MCP tools (mcp__alexandria__store_memory, mcp__alexandria__retrieve_memories, mcp__alexandria__recall, mcp__alexandria__update_memory, mcp__alexandria__import_document, mcp__alexandria__delete_memory) and its reminder tools (mcp__alexandria__set_reminder, mcp__alexandria__check_reminders, mcp__alexandria__list_reminders, mcp__alexandria__cancel_reminder) to persist and recall durable facts, decisions, and preferences across sessions, and to schedule and manage future follow-ups. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before") or asks for a future nudge ("remind me", "don't let me forget", "check this tomorrow"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
+description: Use the Alexandria agent-memory MCP tools (mcp__alexandria__store_memory, mcp__alexandria__retrieve_memories, mcp__alexandria__recall, mcp__alexandria__update_memory, mcp__alexandria__import_document, mcp__alexandria__delete_memory, mcp__alexandria__list_sessions, mcp__alexandria__get_session, mcp__alexandria__finalize_session) and its reminder tools (mcp__alexandria__set_reminder, mcp__alexandria__check_reminders, mcp__alexandria__list_reminders, mcp__alexandria__cancel_reminder) to persist and recall durable facts, decisions, and preferences across sessions, and to schedule and manage future follow-ups. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before") or asks for a future nudge ("remind me", "don't let me forget", "check this tomorrow"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
 ---
 
 # Alexandria Memory
 
 Alexandria is a persistent, cross-session agent memory server (semantic search + heat-based
-recency + graph clustering) reachable via MCP tools when the `alexandria` server is connected.
+recency + graph clustering + scheduled reminders) reachable via MCP tools when the `alexandria`
+server is connected.
 Its whole value only materializes if it's actually used — an agent that never calls it behaves
 exactly like one with no memory at all. Default to using it; don't wait for an explicit
 "remember this" / "check your memory" instruction.
@@ -16,7 +17,8 @@ exactly like one with no memory at all. Default to using it; don't wait for an e
 - Starting a task in a project/domain you've plausibly touched before (early in the session,
   before diving into research you might have already done).
 - The user references past context: "last time", "we decided", "like before", "you said",
-  "remind me".
+  "remind me what we decided".
+- The user asks for a future nudge ("remind me at 3", "don't let me forget to X") — see Reminders.
 - Before re-deriving an architectural decision, re-debugging something, or re-asking a
   preference question the user may have already answered in a prior session.
 - Before proposing an approach that has tradeoffs — check whether a prior decision/rationale
@@ -57,10 +59,35 @@ Tool choice:
 - **`mcp__alexandria__delete_memory`** — only when the user explicitly wants something forgotten. This is a
   soft-delete; for corrections, prefer `mcp__alexandria__update_memory` so the lineage survives.
 
+## Sessions
+
+`mcp__alexandria__store_memory` accepts an optional `session_id` — an opaque handle you choose,
+typically this conversation's identifier or a task name — which groups that memory under a session and
+creates the session on first use. Worth doing when the grouping itself is the useful thing:
+"everything we learned about the auth refactor" stays retrievable as a unit even though the memories
+are topically scattered across clusters.
+
+- **`mcp__alexandria__list_sessions`** — enumerate sessions newest-first, filterable by `agent_id`,
+  `tag` and whether they were finalized, with `limit`/`offset` paging. This is how you find a session
+  whose id you did not keep.
+- **`mcp__alexandria__get_session`** — review everything stored in one session, oldest first, with its
+  metadata. Use when the user asks what was captured in a specific past conversation, or before
+  writing a session summary so you don't restate something already stored.
+- **`mcp__alexandria__finalize_session`** — set the session's summary, tags, and end timestamp. Call
+  once as work wraps up; it is what makes a session skimmable later instead of a pile of fragments.
+
+Rules that matter: a session's `ended_at` is refreshed by every store, so it tracks last activity,
+not closure — an unfinalized session still has `ended_at` set, and `summary: null` is the real signal
+that it was never closed. Sessions are not searchable by *content*: `mcp__alexandria__list_sessions`
+enumerates them by metadata, and `mcp__alexandria__get_session` needs an id you already have or one you
+just got from the list. Still worth recording the id you chose somewhere durable if you expect to
+revisit it. See `docs/session-memory.md` in the Alexandria repo for details.
+
 ## Reminders
 
-Alexandria also schedules standalone messages ("remind me to X") that are delivered — to the agent
-context and the user together — on the first interaction after they come due. There is no background
+Alexandria also schedules standalone messages ("remind me to X") that are delivered into the agent
+context on the first interaction after they come due. Under Claude Code nothing reaches the user
+automatically — surfacing a delivered reminder is your job. There is no background
 timer and no mid-session wake-up: a reminder waits for the next interaction, in every transport.
 
 When to set (do this unprompted, like writes):
