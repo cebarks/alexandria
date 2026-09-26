@@ -28,6 +28,18 @@ fi
 
 staged=$(git diff --cached --name-only --diff-filter=ACMRD)
 
+# Drop the plumbing git exports to hooks BEFORE running any gate.
+#
+# Computed after `staged` above, which needs GIT_DIR and GIT_INDEX_FILE to see the
+# right index. Everything below shells out to tools that may invoke git themselves,
+# and inheriting these makes them resolve against the hook's repository plumbing
+# instead of the working tree: with GIT_DIR set, `git rev-parse --show-toplevel`
+# returns the cwd rather than the working tree root. That silently broke the pi
+# companion's `getProjectHint` tests, and the same pollution would mis-target
+# reminders in production for anyone running pi from a hook or a git-driving parent.
+unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+	GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX
+
 touches_rust() {
     printf '%s\n' "$staged" | grep -Eq \
         '^(crates/|Cargo\.(toml|lock)$|build\.rs$|Containerfile$|\.cargo/|rust-toolchain|justfile$)'
