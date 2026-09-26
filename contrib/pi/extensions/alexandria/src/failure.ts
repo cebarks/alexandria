@@ -56,3 +56,90 @@ export function describeCause(err: unknown): string {
 
 	return parts.length === 0 ? "unknown error" : parts[parts.length - 1];
 }
+
+/** Which component actually failed. Drives both the wording and whether the
+ *  shared connection gets dropped. */
+export type FailureKind = "cancelled" | "stalled" | "worker" | "transport";
+
+export interface FailureContext {
+	/** The prompt signal was aborted: user interrupt, superseded prompt, reload. */
+	aborted: boolean;
+	/** The failure came from the client-side worker rather than the server.
+	 *  Only the worker-isolated client produces this; the inline client cannot. */
+	workerFault?: boolean;
+	/** The whole-prompt budget expired, rather than a per-call server deadline. */
+	budgetExceeded?: boolean;
+}
+
+export interface ClassifiedFailure {
+	kind: FailureKind;
+	/** Rendered cause, from {@linkcode describeCause}. */
+	cause: string;
+	/** Whether the shared connection should be dropped. */
+	resetConnection: boolean;
+}
+
+/**
+ * Attribute a rejection to the component that actually failed.
+ *
+ * The ordering is the whole point. `aborted` wins over everything because the SDK
+ * labels an aborted request `REQUEST_TIMEOUT`, so the error text alone would report
+ * a benign Esc as a dead server *and* reset a healthy session. `budgetExceeded`
+ * comes next for the same reason one level up: once the per-call deadline is owned
+ * by the worker, the main-thread budget expiring says the prompt path was slow, not
+ * that the server was.
+ *
+ * `resetConnection` is false for `cancelled` and `stalled` deliberately. In both the
+ * connection is fine, and dropping it costs a fresh handshake on the next prompt
+ * while fixing nothing — the old `resetClient = failure !== null` conflated "the
+ * server is gone" with "the user pressed Esc".
+ */
+export function classifyFailure(
+	err: unknown,
+	ctx: FailureContext,
+): ClassifiedFailure {
+	const cause = err instanceof AlexandriaFailure ? err.message : describeCause(err);
+	if (ctx.aborted) return { kind: "cancelled", cause, resetConnection: false };
+	if (ctx.budgetExceeded) return { kind: "stalled", cause, resetConnection: false };
+	if (ctx.workerFault) return { kind: "worker", cause, resetConnection: true };
+	return { kind: "transport", cause, resetConnection: true };
+}
+
+/**
+ * A rejection that already knows what it was.
+ *
+ * The tasks in `index.ts` classify at the throw site, where the signal state and
+ * the bridge's fault flag are still in scope; `buildInjection` then only reads the
+ * result. Without this the merge step would have to re-derive context it cannot
+ * see — it receives a settled promise and nothing else.
+ */
+export class AlexandriaFailure extends Error {
+	readonly kind: FailureKind;
+	readonly resetConnection: boolean;
+
+	constructor(message: string, opts: { kind: FailureKind; resetConnection: boolean }) {
+		super(message);
+		this.name = "AlexandriaFailure";
+		this.kind = opts.kind;
+		this.resetConnection = opts.resetConnection;
+	}
+}
+
+/**
+ * Read the classification off a rejection, falling back to classifying it as a
+ * transport failure.
+ *
+ * The fallback is the pre-existing behaviour on purpose: an unwrapped rejection
+ * must not silently lose its connection reset while throw sites are migrated one
+ * at a time.
+ */
+export function failureOf(reason: unknown): ClassifiedFailure {
+	if (reason instanceof AlexandriaFailure) {
+		return {
+			kind: reason.kind,
+			cause: reason.message,
+			resetConnection: reason.resetConnection,
+		};
+	}
+	return classifyFailure(reason, { aborted: false });
+}

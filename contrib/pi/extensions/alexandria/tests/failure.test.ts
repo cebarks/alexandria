@@ -11,7 +11,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-const { describeCause } = await import("../src/failure.js");
+const { describeCause, classifyFailure, failureOf, AlexandriaFailure } = await import(
+	"../src/failure.js"
+);
+type FailureContext = import("../src/failure.js").FailureContext;
 
 test("names the OS cause undici hides under `fetch failed`", () => {
 	// This is the defect the module exists for: undici wraps every connection
@@ -72,4 +75,98 @@ test("a chain deeper than the cap is truncated, not followed forever", () => {
 		cur = Object.assign(new Error(`level ${i}`), { cause: cur });
 	}
 	assert.match(describeCause(cur), /level/);
+});
+
+// ── classifyFailure ────────────────────────────────────────────────────────────
+
+const ctx = (over: Partial<FailureContext> = {}): FailureContext => ({
+	aborted: false,
+	...over,
+});
+
+test("an aborted signal is a cancellation, not an unreachable server", () => {
+	// The SDK reports an aborted request as SdkErrorCode.REQUEST_TIMEOUT, so the
+	// error alone cannot distinguish Esc from a dead server. Only the signal can.
+	const c = classifyFailure(new Error("Request timed out"), ctx({ aborted: true }));
+	assert.equal(c.kind, "cancelled");
+	assert.equal(c.resetConnection, false, "a healthy session must survive an Esc");
+});
+
+test("cancellation outranks every other classification", () => {
+	// A prompt the user abandoned while the worker was also unhealthy is still
+	// primarily a cancellation: nothing should be torn down on the user's behalf.
+	const c = classifyFailure(new Error("worker exited"),
+		ctx({ aborted: true, workerFault: true, budgetExceeded: true }));
+	assert.equal(c.kind, "cancelled");
+	assert.equal(c.resetConnection, false);
+});
+
+test("the whole-prompt budget expiring is a stall, not a server timeout", () => {
+	// With the per-call deadline owned by the worker, the main-thread budget is a
+	// *delivery* deadline. If it fires without the worker reporting a server
+	// timeout, the prompt path was slow — the server was not necessarily.
+	const c = classifyFailure(new Error("Alexandria prompt budget (10000 ms) exceeded"),
+		ctx({ budgetExceeded: true }));
+	assert.equal(c.kind, "stalled");
+	assert.equal(c.resetConnection, false);
+});
+
+test("a worker fault is attributed to the client and is recoverable", () => {
+	const c = classifyFailure(new Error("worker exited"), ctx({ workerFault: true }));
+	assert.equal(c.kind, "worker");
+	assert.equal(c.resetConnection, true);
+});
+
+test("anything else is a transport failure and keeps the old reset behaviour", () => {
+	const c = classifyFailure(new Error("Request timed out"), ctx());
+	assert.equal(c.kind, "transport");
+	assert.equal(c.resetConnection, true);
+});
+
+test("classification carries the rendered cause, not the raw error", () => {
+	const inner = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:3000"), {
+		code: "ECONNREFUSED",
+	});
+	const outer = Object.assign(new TypeError("fetch failed"), { cause: inner });
+	assert.match(classifyFailure(outer, ctx()).cause, /ECONNREFUSED/);
+});
+
+// ── AlexandriaFailure / failureOf ──────────────────────────────────────────────
+
+test("AlexandriaFailure carries its classification through a rejection", () => {
+	const f = new AlexandriaFailure("Request timed out", {
+		kind: "transport",
+		resetConnection: true,
+	});
+	assert.ok(f instanceof Error);
+	assert.equal(f.name, "AlexandriaFailure");
+	assert.equal(f.kind, "transport");
+	assert.equal(f.message, "Request timed out");
+});
+
+test("failureOf reads a classification back off the rejection", () => {
+	const f = new AlexandriaFailure("This operation was aborted", {
+		kind: "cancelled",
+		resetConnection: false,
+	});
+	const c = failureOf(f);
+	assert.equal(c.kind, "cancelled");
+	assert.equal(c.cause, "This operation was aborted");
+	assert.equal(c.resetConnection, false);
+});
+
+test("failureOf falls back to transport for a throw site not yet converted", () => {
+	// The pre-existing behaviour, so an unwrapped rejection cannot silently lose
+	// its client reset while call sites are migrated one at a time.
+	const c = failureOf(new Error("Request timed out"));
+	assert.equal(c.kind, "transport");
+	assert.equal(c.resetConnection, true);
+});
+
+test("failureOf preserves the cause chain of an unwrapped error", () => {
+	const inner = Object.assign(new Error("getaddrinfo ENOTFOUND relativity.grv.st"), {
+		code: "ENOTFOUND",
+	});
+	const c = failureOf(Object.assign(new TypeError("fetch failed"), { cause: inner }));
+	assert.match(c.cause, /ENOTFOUND/);
 });
