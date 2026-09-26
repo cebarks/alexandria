@@ -52,6 +52,7 @@ import {
 import { retrieveMemories, formatMemoriesBlock } from "./recall.js";
 import { getProjectHint, checkReminders, formatDueBlock } from "./reminders.js";
 import { buildInjection, type FeatureOutcome } from "./injection.js";
+import { asFailure } from "./failure.js";
 import { SessionDedupBuffer } from "./detectors/types.js";
 import { detectCorrection } from "./detectors/correction.js";
 import { detectPreference } from "./detectors/preference.js";
@@ -60,11 +61,6 @@ import { ErrorTracker } from "./detectors/error-tracker.js";
 import { PROMPT_BUDGET_MS } from "./mcp-client.js";
 import { runExtraction } from "./extraction.js";
 import { sessionArgs } from "./session-args.js";
-
-/** Short, readable form of a rejection for a user-facing warning. */
-function reasonText(reason: unknown): string {
-	return reason instanceof Error ? reason.message : String(reason);
-}
 
 /**
  * Extract readable text from a tool_execution_end result.
@@ -136,37 +132,65 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 				once: true,
 			});
 
+			/**
+			 * Which abort source fired, read at catch time — both signals are still
+			 * live until then, so sampling them earlier would classify a cancellation
+			 * that had not happened yet.
+			 *
+			 * `ctx.signal` is pi's: the operator pressed Esc, a newer prompt superseded
+			 * this one, or the session reloaded. `budget` is ours. They are not the same
+			 * claim, and the distinction is the whole fix: the SDK reports an aborted
+			 * request as REQUEST_TIMEOUT, so without this context an operator's Esc is
+			 * indistinguishable from a dead server — it used to warn "Alexandria
+			 * unreachable" *and* drop a healthy MCP session.
+			 *
+			 * Our budget firing while pi's signal is intact is the only combination that
+			 * says the prompt path ran out of time rather than being told to stop.
+			 */
+			const failureContext = () => {
+				const aborted = ctx.signal?.aborted === true;
+				return { aborted, budgetExceeded: budget.signal.aborted && !aborted };
+			};
+
 			// Settled, not awaited: one feature failing must never suppress the
 			// other's injection or its notification.
 			const recallTask: Promise<FeatureOutcome> =
 				!CONFIG.recallDisabled && query
 					? (async () => {
-							const { items, error } = await retrieveMemories(
-								query,
-								undefined,
-								budget.signal,
-							);
-							return {
-								block: items.length > 0 ? formatMemoriesBlock(items) : null,
-								error,
-							};
+							try {
+								const { items, error } = await retrieveMemories(
+									query,
+									undefined,
+									budget.signal,
+								);
+								return {
+									block: items.length > 0 ? formatMemoriesBlock(items) : null,
+									error,
+								};
+							} catch (err) {
+								throw asFailure(err, failureContext());
+							}
 						})()
 					: Promise.resolve({ block: null });
 
 			const remindersTask: Promise<FeatureOutcome> = CONFIG.remindersDisabled
 				? Promise.resolve({ block: null, count: 0 })
 				: (async () => {
-						const project = await getProjectHint(ctx.cwd);
-						const { items, error } = await checkReminders(
-							project,
-							undefined,
-							budget.signal,
-						);
-						return {
-							block: items.length > 0 ? formatDueBlock(items) : null,
-							count: items.length,
-							error,
-						};
+						try {
+							const project = await getProjectHint(ctx.cwd);
+							const { items, error } = await checkReminders(
+								project,
+								undefined,
+								budget.signal,
+							);
+							return {
+								block: items.length > 0 ? formatDueBlock(items) : null,
+								count: items.length,
+								error,
+							};
+						} catch (err) {
+							throw asFailure(err, failureContext());
+						}
 					})();
 
 			const [recallRes, remindersRes] = await Promise.allSettled([
@@ -181,11 +205,12 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 			// is the claim this dispatcher exists to make.
 			const injection = buildInjection(recallRes, remindersRes);
 			if (injection.resetClient) {
-				// A rejection means this call did not reach a usable server response
-				// (unreachable, timed out, or bad config) — `callToolWithRetry` already
-				// handled the stale-session reconnect. Both features share one client,
-				// so either rejection drops it; a cached rejection would otherwise be
-				// replayed on every later prompt, and delivery would never resume.
+				// Only a failure that implicates the connection reaches here —
+				// `buildInjection` has already excluded cancellations and prompt-budget
+				// stalls, where the session is healthy. Dropping it is still right for
+				// the rest: a cached rejection would otherwise be replayed on every
+				// later prompt and delivery could never resume. `callToolWithRetry`
+				// already handled the stale-session reconnect.
 				resetClient();
 			}
 			for (const n of injection.notifications) notify(n.text, n.level);
