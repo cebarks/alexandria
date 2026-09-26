@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import { basename, join } from "node:path";
 import {
 	absentClientToml,
+	execFileAsync,
 	extensionRoot,
 	gitToplevel,
 	inDir,
@@ -324,4 +325,46 @@ test("the session directory decides the hint, not the process cwd", async (t) =>
 		basename(repoRoot),
 		"an explicit session directory wins over the process cwd",
 	);
+});
+
+test("a polluted git environment does not change the hint", async (t) => {
+	if (repoRoot === undefined) {
+		t.skip("git is unavailable, so the probe cannot be exercised");
+		return;
+	}
+	// GIT_DIR is what git exports to hooks, and with it set `git rev-parse
+	// --show-toplevel` answers with the cwd instead of the working tree's root. An
+	// unsanitised probe would therefore report whatever directory the session
+	// started in as the project — and the server matches a reminder target
+	// byte-exactly, so that project's reminders would be held until they arrived
+	// late and escalated.
+	const { stdout } = await execFileAsync(
+		"git",
+		["rev-parse", "--absolute-git-dir"],
+		{ cwd: extensionRoot },
+	);
+	const gitDir = stdout.trim();
+	if (gitDir === "") {
+		t.skip("could not resolve a git dir to pollute the probe with");
+		return;
+	}
+
+	const previous = process.env.GIT_DIR;
+	process.env.GIT_DIR = gitDir;
+	__resetProjectHint();
+	try {
+		const inRepo = join(repoRoot, "contrib");
+		assert.equal(await getProjectHint(inRepo), basename(repoRoot));
+		// Same expectation with the process cwd somewhere else entirely.
+		__resetProjectHint();
+		assert.equal(
+			await inDir(extensionRoot, () => getProjectHint(inRepo)),
+			basename(repoRoot),
+			"the probe must answer for the session directory, not the inherited GIT_DIR",
+		);
+	} finally {
+		if (previous === undefined) delete process.env.GIT_DIR;
+		else process.env.GIT_DIR = previous;
+		__resetProjectHint();
+	}
 });

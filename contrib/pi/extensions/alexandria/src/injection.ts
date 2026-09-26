@@ -47,8 +47,6 @@ function featurePhrase(feature: "recall" | "reminders", kind: FailureKind): stri
 	switch (kind) {
 		case "stalled":
 			return `${what} was cut short`;
-		case "worker":
-			return `memory client failed during ${what}`;
 		default:
 			return `${what} failed`;
 	}
@@ -62,8 +60,6 @@ function collapsedPhrase(kind: FailureKind): string {
 	switch (kind) {
 		case "stalled":
 			return "the Alexandria prompt path was cut short";
-		case "worker":
-			return "the Alexandria memory client failed";
 		default:
 			return "Alexandria unreachable";
 	}

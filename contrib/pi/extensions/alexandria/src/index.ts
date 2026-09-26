@@ -58,7 +58,8 @@ import { detectCorrection } from "./detectors/correction.js";
 import { detectPreference } from "./detectors/preference.js";
 import { trackToolStore } from "./detectors/tool-tracker.js";
 import { ErrorTracker } from "./detectors/error-tracker.js";
-import { PROMPT_BUDGET_MS } from "./mcp-client.js";
+import { PROMPT_BUDGET_MS, prewarm, connectionsEstablished } from "./mcp-client.js";
+import { recordPromptPath, startDriftProbe, outcomeLabel } from "./diag.js";
 import { runExtraction } from "./extraction.js";
 import { sessionArgs } from "./session-args.js";
 
@@ -102,8 +103,19 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 
 	// ── Combined injection dispatcher (recall + reminders) ──────────────
 	if (!CONFIG.recallDisabled || !CONFIG.remindersDisabled) {
+		// Open the connection now rather than on the first prompt. The cold handshake
+		// is the one window measured to turn a healthy server into a false
+		// `REQUEST_TIMEOUT` when pi's event loop stalls, and this is what takes it off
+		// the prompt path. Not awaited: extension load must not block on the server.
+		prewarm();
+
 		pi.on("before_agent_start", async (event, ctx) => {
 			const query = event.prompt?.trim();
+			// Diagnostics start before any await so the recorded window covers the
+			// whole handler, including the git probe and any stall of pi's own loop.
+			const startedAt = Date.now();
+			const generationBefore = connectionsEstablished();
+			const stopDriftProbe = startDriftProbe();
 			// Resolved before any await, and every use guarded: `ctx.ui` is a lazy
 			// getter that throws once the runner is invalidated (a session switch or
 			// reload during the up-to-12 s this handler waits), and an uncaught throw
@@ -198,6 +210,12 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 				remindersTask,
 			]);
 			clearTimeout(timer);
+			// Stopped here rather than at the record below, so the probe cannot outlive
+			// the awaits it measures: everything after this point is synchronous, and a
+			// throw in it would otherwise leak one interval per prompt. The window that
+			// matters — the two settled tasks, where a stall would actually land — is
+			// already closed.
+			const driftMs = stopDriftProbe();
 
 			// Per-feature failure isolation, the merged message, and the wording
 			// for each failure mode all live in `buildInjection` — extracted so the
@@ -214,6 +232,20 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 				resetClient();
 			}
 			for (const n of injection.notifications) notify(n.text, n.level);
+
+			// Recorded last, and never awaited: `recordPromptPath` is fire-and-forget
+			// and swallows its own failures, so a diagnostic cannot delay or break the
+			// prompt it is measuring. `cold` is the field that makes the log worth
+			// keeping — a false timeout on a cold connect is the mechanism measured in
+			// the lab, and one on a warm connection would be something else entirely.
+			recordPromptPath({
+				t: new Date(startedAt).toISOString(),
+				ms: Date.now() - startedAt,
+				cold: connectionsEstablished() !== generationBefore,
+				driftMs,
+				recall: outcomeLabel(recallRes),
+				reminders: outcomeLabel(remindersRes),
+			});
 			// Returned last on purpose: nothing a notification does can now discard an
 			// injection the server has already consumed.
 			return injection.message ? { message: injection.message } : undefined;

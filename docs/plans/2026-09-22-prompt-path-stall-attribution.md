@@ -1,5 +1,26 @@
 # Prompt-Path Stall Attribution & Worker-Isolated MCP Client
 
+> **STATUS (2026-09-22): partially superseded.** Tasks 1–3 were implemented as
+> written. Tasks 4–7 (the worker) were **not**, and the `worker` failure kind they
+> introduced was removed rather than left without a producer.
+>
+> Better-controlled measurement narrowed the fault to the **cold handshake only**:
+> freezing pi's loop 6 s ten milliseconds into a *first* call produced a false
+> `REQUEST_TIMEOUT` in 6/6 fresh processes, the same freeze against an
+> already-connected client resolved normally in 15/15, and warm-call races came back
+> clean. A worker thread would have fixed a window that turned out not to exist, at
+> the cost of a plain-`.mjs` entry point (pi loads extensions through a bundled jiti
+> a spawned worker cannot inherit).
+>
+> What shipped instead: `prewarm()` connects at extension load so no handshake is in
+> flight when a prompt starts (3/3 honoured), and `src/diag.ts` logs one JSON line
+> per prompt — including `cold` and `driftMs` — so the residual reconnect window is
+> observable if it ever fires. See the branch
+> `fix/prompt-path-prewarm-and-diagnostics`.
+>
+> The original plan is retained below unchanged: it is the reasoning that led to the
+> measurements, and Task 8's verification method is what disproved it.
+
 > **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task.
 
 **Goal:** Stop blaming the Alexandria server for client-side event-loop stalls, make genuine connection failures name their real cause, and move the MCP client onto a worker thread so a blocked pi main loop can no longer discard an already-received response.
