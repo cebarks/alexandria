@@ -16,8 +16,10 @@ cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
 
 ## `hooks/`
 
-Equivalent of the Pi auto-recall extension. Needs only `bash`, `curl` ≥ 8, `jq`, and (for
-extraction) the `claude` CLI.
+Equivalent of the Pi auto-recall extension. Needs `bash`, `curl` ≥ 8, `jq`, and (for
+extraction) the `claude` CLI — plus the coreutils/util-linux commands the hooks shell out to:
+`setsid` (detaches the extraction run), `timeout`, `find`, `mktemp`, and GNU `stat -c %s` rather than
+the BSD `stat -f %z` form.
 
 `alexandria-recall.sh` is a `UserPromptSubmit` hook. On every prompt it opens one MCP session and:
 

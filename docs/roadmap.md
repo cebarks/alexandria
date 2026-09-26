@@ -1,6 +1,6 @@
 # Roadmap
 
-**Current state:** 13 MCP tools, schema `v006`, HTTP + stdio + Docker deployment, one
+**Current state:** 13 MCP tools, schema `v007`, HTTP + stdio + Docker deployment, one
 crate per layer and two client-side pi integrations under `contrib/pi/`.
 
 ## Completed
@@ -41,9 +41,9 @@ alone:
   ("call this proactively when...") instead of purely mechanical
 - 86 tests (was 64 — also reflects the v0.2.2 debug web UI milestone merged alongside)
 
-Client-side companions (outside this repo, not shipped with the server): a pi `SKILL.md`
-documenting trigger conditions, and an optional pi extension that auto-calls `retrieve_memories`
-on every prompt via `before_agent_start`.
+Client-side companions (now in-tree under `contrib/pi/`, still not shipped with the server): a pi
+`SKILL.md` documenting trigger conditions, and an optional pi extension that auto-calls
+`retrieve_memories` on every prompt via `before_agent_start`.
 
 ### v0.2.2 — Debug Web UI (2026-08-17)
 
@@ -60,8 +60,7 @@ The gap between "I stored something" and "I can see what the retrieval model act
 - All DB-sourced values HTML-escaped at render time (record IDs appear in `href` attributes,
   including percent-encoded ones)
 
-Documented in the README "Debug Web UI" section; design and implementation plans in
-`docs/plans/2026-08-17-debug-webui-*.md`.
+Documented in the README "Debug Web UI" section.
 
 ### v0.2.3 — Proactive Capture / Auto-Store (2026-08-18)
 
@@ -75,8 +74,7 @@ captured even when the agent doesn't think to store them:
   to the session model), tagging output `extracted` and skipping `reload` shutdowns
 - Fails open: no path in the extension can block an agent turn
 
-See `docs/plans/2026-08-18-auto-store-{extension-design,implementation}.md` and
-`contrib/pi/README.md`.
+See `contrib/pi/README.md`.
 
 ### v0.2.4 — XDG Config and Client Config File (2026-08-19)
 
@@ -85,7 +83,8 @@ See `docs/plans/2026-08-18-auto-store-{extension-design,implementation}.md` and
 - New `$XDG_CONFIG_HOME/alexandria/client.toml` for the pi extension (`smol-toml`), so client tuning
   no longer requires env vars
 - Added `server.sse_keep_alive_secs`, `cluster.maintenance_interval_secs`, `activation.top_n`
-- `serial_test` for env-mutating config tests
+- `serial_test` for env-mutating config tests (since replaced by closure-injected env overrides, so
+  the workspace no longer depends on it — see `AGENTS.md`, "Testing")
 
 ### v0.2.5 — Cluster Maintenance Execution and Audit Log (2026-08-24)
 
@@ -132,10 +131,10 @@ look like that?" — and made the foundation scale past hand-built strings:
   (`crates/alexandria-mcp/templates/`). `html::layout()` and `html::esc()` deleted: escaping is now
   structural, so there is no call site left that can forget to escape
 - htmx 2.0.10 and vis-network 10.1.2 **vendored** into the binary (`include_bytes!`, served from a
-  closed `match` allowlist at `/debug/assets/:name`), with `SHA256SUMS` enforced by
+  closed `match` allowlist at `/debug/assets/{name}`), with `SHA256SUMS` enforced by
   `just verify-assets`. No page loads anything from a CDN any more, so the UI renders air-gapped and
   never executes unsigned third-party script
-- New **Sessions** views (`/debug/sessions`, `/debug/sessions/:external_id`) — the biggest functional
+- New **Sessions** views (`/debug/sessions`, `/debug/sessions/{external_id}`) — the biggest functional
   hole closed: sessions are a first-class table and two of the eight tools, and had no view at all
 - Dashboard gained an **effective-configuration** panel (values read off the live server and embedding
   provider, rendered beside what the TOML asked for, because "asked" vs "loaded" disagreeing *is* the
@@ -153,7 +152,7 @@ look like that?" — and made the foundation scale past hand-built strings:
   applied a floor three times higher. Both now derive from `alexandria_engine::search::DEFAULT_MIN_SIMILARITY`,
   as `cohesion_floor` does from `DEFAULT_COHESION_FLOOR`
 - **Fixed:** cluster cohesion in the UI was recomputed as a member-average while the maintenance loop
-  uses the cluster's stored centroid, so `/debug/clusters/:id` could report "Healthy" for a cluster
+  uses the cluster's stored centroid, so `/debug/clusters/{id}` could report "Healthy" for a cluster
   about to be split. It now reads the stored centroid
 - **Fixed:** session listing ordered by `ended_at DESC` alone, leaving the NULL tail unspecified — with
   `LIMIT`/`START` pagination that let page 2 repeat a row page 1 showed while dropping another. Order is
@@ -163,7 +162,7 @@ look like that?" — and made the foundation scale past hand-built strings:
   `HeatRepo::heat_histogram`, `MemoryRepo::top_tags`, `ClusterRepo::get`
 - Session-scoped soft-delete filtering — closed on 2026-09-08 — is now pinned a second time, at the UI
   layer, so the sessions pages cannot drift from what `get_session` returns
-- `.github/workflows/ci.yml` runs `just verify-assets` in its `test` job — the workflow has four
+- `.github/workflows/ci.yml` runs `just verify-assets` in its `test` job — the workflow has five
   separate jobs and does not call `just ci`, so a justfile-only gate would never have reached it
 - 223 tests
 
@@ -202,6 +201,11 @@ milestone:
 ### v0.3 — Self-Organizing Memory
 
 The goal: memories should organize themselves without manual curation.
+
+> **Revised by [#38](https://github.com/cebarks/alexandria/issues/38)** — treat that spec as current.
+> It defers the async task queue and the Consolidate stage and drops the OpenAI embedding provider,
+> keeping Relate plus real cluster labels; the enrichment pass rides the existing cluster-maintenance
+> tick rather than getting a queue of its own. What follows is the original scope, kept for context.
 
 **Background enrichment pipeline**
 

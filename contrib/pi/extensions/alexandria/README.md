@@ -19,12 +19,12 @@ in-directory reference for behavior and configuration.
 
 | Layer | Hook | Behavior | Disable with |
 | --- | --- | --- | --- |
-| Auto-recall | `before_agent_start` | Embeds the user's prompt, calls `retrieve_memories`, injects hits with `similarity >= recall.min_similarity` (inclusive) as an `alexandria` context message. The injected block tells the agent to verify relevance and to `update_memory` anything stale. | `ALEXANDRIA_AUTO_RECALL=off` or `[recall] enabled = false` |
+| Auto-recall | `before_agent_start` | Sends the user's prompt to `retrieve_memories` — the *server* embeds it; the extension carries no embedding dependency — and injects hits with `similarity >= recall.min_similarity` (inclusive) as an `alexandria` context message. The injected block tells the agent to verify relevance and to `update_memory` anything stale. | `ALEXANDRIA_AUTO_RECALL=off` or `[recall] enabled = false` |
 | Reminder delivery | `before_agent_start` | Calls `check_reminders` once per prompt, injects whatever is due into the same message and shows a count notification. | `ALEXANDRIA_REMINDERS=off` or `[reminders] enabled = false` |
 | Correction detector | `before_agent_start` | Regex over the prompt for correction-shaped language ("no, use X"). Fires only on unambiguous matches; ambiguous cases are left to the extraction pass. | `ALEXANDRIA_AUTO_STORE=off` or `[store] enabled = false` |
 | Preference detector | `before_agent_start` | Regex for forward-looking preference/convention statements ("always do X", "never do Y", "don't do Z"). The stored text starts at the trigger word, so a prohibition keeps its negation; a match with a negation earlier in its clause is not stored at all. | as above |
 | Error tracker | `tool_execution_end` → `agent_end` | Pairs a failing tool call with a later success of the same tool and stores the resolution. Errors must contain a recognized signal to be tracked. | as above |
-| Dedup tracker | `tool_result` | Records content from agent-initiated `store_memory` / `update_memory` calls (matched by tool-name suffix, so the MCP prefix doesn't matter) so extraction doesn't re-report them | — |
+| Dedup tracker | `tool_result` | Records content from agent-initiated `store_memory` / `update_memory` calls (matched by tool-name suffix, so the MCP prefix doesn't matter) so extraction doesn't re-report them | as above |
 | LLM extraction | `session_shutdown` | Serializes the conversation, sends it to `store.extract_model`, stores what's left tagged `extracted`. Skipped when the shutdown reason is `reload`. | `ALEXANDRIA_AUTO_STORE=off` or `[store] enabled = false` |
 
 Every store carries pi's session id, `agent_id = "pi"` and the active model id, so the writes are
@@ -32,6 +32,12 @@ grouped in Alexandria (`get_session`, `list_sessions(agent_id="pi")`). Correctio
 stores are tagged `auto-detected` + `source:regex`, error resolutions `auto-detected`, extraction
 output `extracted`, so quality can be cut by source later. A store the server rejects shows as a
 warning.
+
+The extension itself only ever calls three of the server's 13 tools: `retrieve_memories`,
+`check_reminders` and `store_memory`. The rest are the agent's to call directly — `recall`,
+`update_memory`, `import_document`, `delete_memory`, `get_session`, `list_sessions`,
+`finalize_session`, and the four reminder-management tools. `update_memory` and `delete_memory` are
+named in the injected recall block precisely so the agent knows to reach for them.
 
 Heuristic stores are fire-and-forget and never block a turn. Only the extraction pass can add
 latency, and only at session end.
@@ -59,7 +65,8 @@ this extension is the delivery path: it checks once per prompt, before the agent
   schedules advance to their next fire rather than being consumed (one that has no future fire left
   is consumed on its last delivery).
 - **Missed fires coalesce.** If a daily reminder was due three times while nothing checked, the next
-  check delivers it once and labels it `(missed 3 earlier occurrence(s))` instead of sending three
+  check delivers it once and labels it `(missed 2 earlier occurrence(s))` — the count is the fires
+  *after* the one being delivered, not all of them — instead of sending three
   copies. The engine stops counting at 10 000 occurrences, and when it has, the label reads
   `(missed 10000+ earlier occurrence(s), count capped)` rather than presenting a floor as a fact.
 - **Recurring means wall clock.** Schedules run in the server's `[reminders].timezone`, so a daily
