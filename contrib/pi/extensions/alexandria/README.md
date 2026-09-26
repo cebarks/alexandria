@@ -110,6 +110,53 @@ the lot and closes the dropped connection (a nulled-but-never-closed client leak
 timed-out prompt). Repeated failures warn once per prompt; that is deliberate, since a permanently
 broken delivery path should stay visible rather than latch itself quiet.
 
+The handshake is normally **not** on that path: `prewarm()` connects at extension load, so the first
+prompt of a session reuses it. That is a correctness measure rather than an optimisation. The SDK
+implements its deadline as a `setTimeout` on pi's main loop, which every other in-process extension
+shares, so a stall longer than the remaining budget makes the overdue timer win the race against a
+handshake that was succeeding — reporting a healthy server as timed out. Measured: freezing the loop
+for 6 s 10 ms into a cold first call produced a false `REQUEST_TIMEOUT` in **6 of 6** fresh processes;
+the same freeze against an already-connected client resolved normally in **15 of 15**. Pre-warming
+closed it (3 of 3 honoured). It does not cover a reconnect after `resetClient()` — a server restart or
+transport failure still handshakes on the prompt path — but cancelling a prompt no longer causes one.
+
+A failure is attributed to whatever actually failed, because the SDK reports an *aborted* request as
+`REQUEST_TIMEOUT` and the error text alone cannot distinguish the cases:
+
+| Kind | Meaning | Warns | Drops the connection |
+|---|---|---|---|
+| `cancelled` | you pressed Esc, or a newer prompt superseded this one | no | no |
+| `stalled` | the 10 s path budget expired; the 5 s per-call deadline did not, so the timers themselves ran late | yes | no |
+| `transport` | the server or the network genuinely failed | yes | yes |
+
+Cause text comes from the deepest `err.cause`, so a closed port, a dead DNS name and an unroutable
+host no longer all read as undici's `fetch failed`:
+
+```
+closed port  -> connect ECONNREFUSED 127.0.0.1:3000 [ECONNREFUSED]
+dead DNS     -> getaddrinfo ENOTFOUND relativity.grv.st [ENOTFOUND]
+no route     -> Request timed out [REQUEST_TIMEOUT]
+```
+
+### Diagnostics
+
+Every prompt-path run appends one JSON line to
+`$XDG_STATE_HOME/alexandria-companion/prompt-path.jsonl` (`~/.local/state/...` by default), rolling at
+256 KB:
+
+```json
+{"t":"2026-09-22T20:14:03.112Z","ms":47,"cold":false,"driftMs":0,"recall":"injected","reminders":"none (0 due)"}
+```
+
+`cold` says whether that run paid a handshake — the only window measured to lose the race above.
+`driftMs` is the worst event-loop lateness observed during the run, which is what separates "the server
+was slow" from "the server was fine and something else in pi's process held the loop": a `transport:
+Request timed out` row with `driftMs` in the thousands is a client-side stall, not a server problem.
+This log exists because the failure is intermittent and had never been observed in the field; read it
+with `tail -f` when recall misbehaves. Writing it is async, fire-and-forget and self-swallowing, and
+the probe timer is `unref`'d — a diagnostic that could block the loop would be worse than none,
+since a blocked loop is the suspected cause.
+
 Stale Streamable HTTP sessions — usually an Alexandria restart — are detected and retried once on a
 fresh connection, in every feature.
 

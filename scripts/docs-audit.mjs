@@ -46,6 +46,25 @@ function trackedDocs() {
 const isAuditReport = (f) => /^docs\/audit-\d{4}-\d{2}-\d{2}\.md$/.test(f);
 
 /**
+ * A *record* doc describes a past state on purpose: the two findings reports
+ * ("Reading this after the audit date", with per-finding Status lines) and
+ * `docs/prompt-path-stall-attribution.md` (a top-level STATUS banner naming
+ * which tasks were not implemented). Backticked paths inside one name code that
+ * was planned, prescribed, or has since been removed, so a missing path there is
+ * advisory rather than a defect — reported as `info`, which does not fail the
+ * run. Markdown links are still held to resolving, since those point at docs
+ * rather than at code.
+ */
+function isRecordDoc(f) {
+	if (!f.endsWith(".md") || !existsSync(join(ROOT, f))) return false;
+	const head = read(f).split("\n").slice(0, 12).join("\n");
+	return (
+		/Reading this after the audit date/.test(head) ||
+		/\*\*STATUS[^*]*(superseded|partial|historical)/i.test(head)
+	);
+}
+
+/**
  * Docs that are maintained and therefore must appear in every doc index. Only
  * CLAUDE.md is excluded: it is an 11-byte `@AGENTS.md` import shim, not a
  * document. (`docs/plans/**` used to be excluded here as historical; that
@@ -394,10 +413,18 @@ function checkBacktickedPaths(docs) {
 				continue;
 			}
 			if (!existsSync(join(ROOT, candidate))) {
-				report(1, "path", doc, `\`${candidate}\` does not exist`);
+				report(
+					1,
+					"path",
+					doc,
+					`\`${candidate}\` does not exist`,
+					isRecordDoc(doc) ? "info" : "error",
+				);
 			}
 		}
 	}
+	// Cache nothing: isRecordDoc reads a 12-line head per call, and the set of docs
+	// is small. Keeping it stateless avoids a stale cache across a merge.
 }
 
 /**
@@ -717,11 +744,15 @@ if (asJson) {
 } else {
 	const groups = new Map();
 	for (const f of findings) {
-		const k = `T${f.tier} ${f.check}`;
+		const k = `T${f.tier} ${f.check}${f.severity === "info" ? " (info)" : ""}`;
 		if (!groups.has(k)) groups.set(k, []);
 		groups.get(k).push(f);
 	}
-	console.log(`docs-audit: ${findings.length} finding(s) across ${docs.length} docs\n`);
+	const blocking = findings.filter((f) => f.severity !== "info").length;
+	const advisory = findings.length - blocking;
+	console.log(
+		`docs-audit: ${blocking} finding(s), ${advisory} advisory, across ${docs.length} docs\n`,
+	);
 	for (const [k, list] of [...groups.entries()].sort()) {
 		console.log(`── ${k} (${list.length})`);
 		for (const f of list) console.log(`   ${f.doc}: ${f.detail}`);
@@ -729,4 +760,6 @@ if (asJson) {
 	}
 }
 
-process.exit(findings.length > 0 ? 1 : 0);
+// Advisory findings are reported but do not fail the run, so the script can be
+// gated later without first having to adjudicate every record doc's history.
+process.exit(findings.some((f) => f.severity !== "info") ? 1 : 0);

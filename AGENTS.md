@@ -106,6 +106,11 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Cluster cohesion in the debug UI comes from the cluster's **stored centroid** (`ClusterRepo::get`), never a recomputed member-average. `main.rs`'s maintenance loop uses the stored centroid, so an approximation made `/debug/clusters/{id}` report "Healthy" for a cluster the background task was about to split — a diagnostic surface that disagrees with the mechanism it diagnoses is worse than showing nothing.
 - `debug::router(server)` passes `None` for `DebugContext`; only HTTP mode via `router_with_context` populates it. The dashboard's config panel therefore renders an explicit "unavailable outside HTTP mode" state instead of bogus zeros, because `ClusterConfig` lives in the binary crate and structurally cannot reach `alexandria-mcp`. **Do not change `router()`'s signature** — every call site is inside a `#[cfg(test)]` module under `src/debug/`; production is the single `router_with_context` caller (`main.rs`).
 
+- **pi companion prompt path: a failure is attributed, not guessed.** The MCP SDK reports an *aborted* request as `SdkErrorCode.REQUEST_TIMEOUT`, so the error text alone cannot tell an operator's Esc from a dead server. `src/failure.ts` classifies into `cancelled` (pi's `ctx.signal` aborted) / `stalled` (our 10 s path budget expired while the 5 s per-call deadline did not, which means the timers themselves ran late) / `transport` (everything else), and only `transport` drops the connection. `index.ts` supplies the context via `asFailure()` at the throw site and `injection.ts` consumes it via `failureOf()`; both are exported pure functions because the handler is an inline closure that cannot be reached from a test without module mocking, which hangs under tsx. Do not fold them back into the handler. Every `FailureKind` variant must have a producer — a `worker` variant was added for a planned worker-thread client, the plan was dropped, and the variant was removed rather than left speculative.
+- **`prewarm()` is a correctness measure, not a startup optimisation.** The SDK arms its handshake deadline as a `setTimeout` on pi's main loop, shared with every other in-process extension, so a stall longer than the remaining budget makes the overdue timer win the race against a handshake that was succeeding. Measured: a 6 s freeze 10 ms into a cold first call gave a false `REQUEST_TIMEOUT` in 6/6 fresh processes, the same freeze against a warm client resolved normally in 15/15, and pre-warming gave 3/3 honoured. Connecting at extension load takes the handshake off the prompt path. It does **not** cover a reconnect after `resetClient()`; if false timeouts ever show up with `cold:false` in the diagnostic log, that residual window is the place to look, and the fix would be moving the client to a worker thread (which needs a plain `.mjs` worker, because pi loads extensions through a bundled jiti that a spawned worker cannot inherit).
+- **Anything that shells out to `git` must sanitise `GIT_DIR` and friends.** With `GIT_DIR` set — which git does for hooks, and which a git-driving parent can leak — `git rev-parse --show-toplevel` returns the **cwd** instead of the working tree root. `getProjectHint` probes exactly that, and a wrong hint is not cosmetic: the server matches a reminder target byte-exactly, so that project's reminders get held until they arrive late and escalated. `reminders.ts` strips the `GIT_*` overrides per call (`gitProbeEnv()`), `.githooks/pre-commit` unsets them before running any gate, and `tests/reminders.test.ts` pins the behaviour by setting `GIT_DIR` deliberately. The symptom to recognise: git-dependent tests pass on a direct `npm test` but fail when run from a hook.
+- **`src/diag.ts` appends one JSON line per prompt** to `$XDG_STATE_HOME/alexandria-companion/prompt-path.jsonl`, rolling at 256 KB. It exists because the intermittent false timeout had never been observed in the field and every lab reproduction was synthetic. `cold` marks a run that paid a handshake; `driftMs` is the worst event-loop lateness seen during the run, and is what separates "the server was slow" from "the server was fine and something else in pi's process held the loop". Nothing in it may be awaited by the prompt path or allowed to throw: writes are async and self-swallowing and the probe timer is `unref`'d, because a diagnostic that can block the loop would be worse than none when a blocked loop is the suspected cause. The probe also measures lateness at stop time, not only on ticks — a stall ending just before `stop()` leaves the overdue callback no chance to run, which is how the first implementation reported zero drift for the exact block it existed to catch.
+
 ## askama Templates & Vendored Assets (Debug UI)
 
 - Every template context struct **for a page that extends `layout.html`** must declare `nav: &'static str`, because `layout.html` reads it in base top-level content. Forgetting it is a compile error, by design — a silently unhighlighted nav is worse. Two structs deliberately have no `nav` and must not gain one: the Query Tester's htmx fragment and the pager test scaffold, neither of which extends the layout.
@@ -126,7 +131,9 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Config tests must not touch process env: `Config::load()` delegates to `Config::load_from(&|k| std::env::var(k).ok())`, and tests inject overrides through the closure (`Config::load_from(&env(&[("K", "V")]))`, local helper in `config.rs`). No `serial_test`, no `#[serial]`, no ambient-env races.
 - `debug/test_support.rs` has two embedding stubs, and the difference matters. `StubEmbedding` returns a constant vector, so **every similarity is 1.0** and a `min_similarity` floor can never filter anything — useless for floor tests. `BandedEmbedding` (via `banded_server()`) emits `[s, √(1−s²)]`, so cosine against the query's `[1,0]` is exactly `s` — deterministic straddling of a floor. Do not change `StubEmbedding` or `test_server()`; the whole debug test suite depends on both.
 - `HeatRepo::add_heat` is an `UPDATE heat_state ... WHERE memory = ...` that **silently matches zero rows** when the memory has no `heat_state` row, and its caller swallows the result with `.ok()`. `MemoryRepo::create_fact` creates no heat row, so a "did not write heat" assertion built on it passes **vacuously**. Seed with `do_store_memory` (which writes `heat_state` at 1.0) plus `EdgeRepo::create_edge`, and always pair a "no write" assertion with a positive control proving the fixture can write at all.
-- The pi extension has its own suite: `cd contrib/pi/extensions/alexandria && npm run typecheck && npm test` (node:test + tsx, hermetic — a controlled `ALEXANDRIA_CLIENT_CONFIG`, restored `process.env`, no server or socket). `just ext-test` runs it and `just ci` includes it, so it is not optional. Bare `just` lists every recipe. The detector regexes **are** covered — five test files exercise them. The remaining gap is the LLM extraction prompt and its truncation, and that is what the README says.
+- The pi extension has its own suite: `cd contrib/pi/extensions/alexandria && npm run typecheck && npm test` (node:test + tsx, hermetic — a controlled `ALEXANDRIA_CLIENT_CONFIG`, restored `process.env`, no server or socket). `just ext-test` runs it and `just ci` includes it, so it is not optional. Bare `just` lists every recipe. The detector regexes **are** covered — `tests/detectors-*.test.ts` exercise them. The remaining gap is the LLM extraction prompt and its truncation, and that is what the README says.
+- `tests/diag.test.ts` points `XDG_STATE_HOME` at a per-test `mkdtemp` (restored afterwards), because `logPath()` reads the env at call time rather than import time — that is what makes the rolling-log and unwritable-path cases testable without module mocking. It seeds an oversized file directly instead of appending 256 KB one record at a time. `recordPromptPath` is fire-and-forget with no awaitable handle by design, so those tests poll for the write; do not add a returned promise just to make them tidier, since nothing on the prompt path is allowed to await it.
+- The `.githooks/pre-commit` gates are path-scoped: Rust files stage `just fmt` + `just lint`, `contrib/pi/` stages `just ext-test`, and neither stages nothing. That scoping is load-bearing rather than a convenience — running full clippy on a TypeScript-only change in a fresh worktree is slow enough to tempt sharing `CARGO_TARGET_DIR` with the primary checkout, and doing that poisons the primary's incremental fingerprints (its dep-info files record the worktree's absolute paths, so a Rust edit in the primary can silently fail to rebuild). `just install-hooks` copies the hook into `.git/hooks/`, which is the *common* git dir and therefore shared by every worktree, so an edit there takes effect everywhere immediately while the tracked copy keeps it durable.
 
 ## CI
 
@@ -153,13 +160,36 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Do not test whether a pin is reachable with `gh api repos/<owner>/<repo>/commits/<sha>` — it
   returns 422 "No commit found" for pins that Actions resolves fine. Trust the Actions error text, or
   the fact that a job using that pin passed.
-- Nothing watched the branch while CI was red for 11 days, because no check is required to merge.
-  Revisit branch protection if regressions keep landing.
-- `.github/workflows/ci.yml` is **five separate jobs** (`fmt`, `clippy`, `test`, `extension` — displayed
-  as "Pi companion" — and `deny`) and does **not** call `just ci`. Editing the justfile alone therefore changes nothing on GitHub Actions — a
+- Branch protection here is a **ruleset**, not legacy protection, and it is scoped to every ref:
+  `gh api repos/<owner>/<repo>/rulesets` returns one named `main` with
+  `conditions.ref_name.include = ["~ALL"]`, required status checks `Formatting`, `Clippy`, `Tests`,
+  `cargo-deny`, `strict_required_status_checks_policy: false`, squash as the *only* allowed merge
+  method, and `required_approving_review_count: 0`. The reason it exists is the incident below —
+  and its consequence is that **a PR producing no check runs is `mergeStateStatus=BLOCKED` and
+  cannot merge at all**, however good the code is. That is what makes workflow trigger scoping
+  load-bearing rather than cosmetic: a trigger filtered to `main` combined with checks required on
+  `~ALL` means a PR based on another feature branch can never satisfy its own gate.
+- Squash merges break **stacked** branches, which is the cost of that only-squash policy. Once a
+  base PR is squashed, `main` re-adds files as commits unrelated to the ones the stacked branch
+  descends from, so git sees two independent additions and the stacked PR goes
+  `CONFLICTING` on add/add. Resolve by merging `origin/main` into the branch and taking the branch
+  side (it is the strict descendant), then verify nothing was lost — a rebase needs a force-push,
+  which is a different authorisation.
+- Neither a merge queue nor auto-merge is available: `merge-queues` 404s and
+  `allow_auto_merge` is false, so there is no "queue it" — you wait for checks, or re-trigger them
+  deliberately. A PR base change emits only `edited`, which is *not* a default `pull_request`
+  activity type, so retargeting alone starts nothing; `gh pr close` then `gh pr reopen` fires
+  `reopened` and does.
+- `.github/workflows/ci.yml` is **five separate jobs** (`fmt`, `clippy`, `test`, `extension`,
+  `deny` — `extension` is the job displayed as `Pi companion`) and does
+  **not** call `just ci`. Editing the justfile alone therefore changes nothing on GitHub Actions — a
   new gate has to be added to the workflow too. `just verify-assets` runs as its own step in the
   `test` job, before `just test`, because the year-long `immutable` asset cache header is only safe
   while the filename pins the bytes.
+- `Pi companion` runs but is **not** in the ruleset's required list, so a red companion job merges
+  clean. The extension suite is therefore gated by convention only. Add it to the ruleset via the
+  API rather than by editing a file — required checks are GitHub config, not repo content, and no
+  PR can change them.
 
 ## Docs Map
 
@@ -175,6 +205,10 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
   inert heat model, O(N) cluster counting, ranked findings A1–A4 / P1–P5
 - `docs/*-findings.md` cite code by symbol (`do_store_memory`, `MemoryRepo::nearest`), never by
   `file.rs:NN`. Line numbers go stale on the next commit; a symbol can be grepped.
+- `docs/prompt-path-stall-attribution.md` — 2026-09-22 investigation record for the pi companion's
+  prompt path: the measured cold-handshake fault, `prewarm()`, `src/diag.ts`, and why the proposed
+  worker isolation was dropped. **A record, not a plan** — its STATUS banner names which tasks were
+  never implemented, so paths under those task headings describe work that does not exist.
 - `contrib/pi/README.md` — how the pi skill and extension differ and install
 - `contrib/pi/extensions/alexandria/README.md` — the pi companion extension: what it does, reminders,
   configuration, known gaps

@@ -25,6 +25,25 @@ let clientPromise: Promise<Client> | null = null;
 const HANDSHAKE_TIMEOUT_MS = 5000;
 
 /**
+ * How many connections this process has established, monotonically.
+ *
+ * The prompt path snapshots this before and after so the diagnostic log can record
+ * whether a run paid a handshake. That matters because the cold handshake is the
+ * only window measured to lose the race against a stalled event loop: freezing pi's
+ * loop for 6 s mid-handshake produced a false `REQUEST_TIMEOUT` in 6 of 6 fresh
+ * processes, while the same freeze against an already-connected client resolved
+ * normally in 15 of 15. A false timeout that only happens on cold connects is a
+ * different problem from one that can happen on any call, and the log should be able
+ * to tell them apart.
+ */
+let connectionGeneration = 0;
+
+/** Connections established so far. See {@linkcode connectionGeneration}. */
+export function connectionsEstablished(): number {
+	return connectionGeneration;
+}
+
+/**
  * Budget for the calls made on the prompt path (`retrieve_memories`,
  * `check_reminders`). The SDK waits 60 s per request by default; both injections
  * block the turn and both are best-effort, so they give up early and warn
@@ -57,6 +76,7 @@ async function connect(): Promise<Client> {
 	});
 	const transport = new StreamableHTTPClientTransport(url);
 	await client.connect(transport, { timeout: HANDSHAKE_TIMEOUT_MS });
+	connectionGeneration++;
 	return client;
 }
 
@@ -74,6 +94,32 @@ export async function getClient(): Promise<Client> {
 		});
 	}
 	return clientPromise;
+}
+
+/**
+ * Open the connection during extension load instead of on first use.
+ *
+ * Not an optimisation, though it does remove the handshake from the first prompt of
+ * a session. It is the fix for the one measured false-timeout window: the SDK arms
+ * its handshake deadline as a `setTimeout` on pi's main loop, which every other
+ * in-process extension shares, so a stall of more than the remaining budget makes
+ * the overdue timer win the race against a handshake that was succeeding. Moving the
+ * handshake off the prompt path means nothing is in flight to lose that race when a
+ * prompt starts.
+ *
+ * Deliberately not awaited — extension load must not block on the server — and a
+ * failure is ignored because `getClient()` already refuses to cache a failed connect,
+ * so the first real call simply tries again. Pre-warming can therefore never make
+ * things worse than not pre-warming.
+ *
+ * Does not cover a reconnect after `resetClient()` (server restart, transport
+ * failure); those still handshake on the prompt path. Cancelling a prompt no longer
+ * causes one, which is what made this gap small enough to accept.
+ */
+export function prewarm(): void {
+	void getClient().catch(() => {
+		/* a cold start against a server that is not up yet is normal, not an error */
+	});
 }
 
 /**

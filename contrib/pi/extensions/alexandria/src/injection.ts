@@ -16,6 +16,8 @@
  *    the UI removes that window entirely.
  */
 
+import { failureOf, type ClassifiedFailure, type FailureKind } from "./failure.js";
+
 /** What one feature's probe produced: the block to inject (null when there is
  *  nothing to inject), and a server-reported or unparseable failure worth telling
  *  the user about — which is *not* a transport failure, since the reply arrived.
@@ -31,6 +33,37 @@ export type ReminderOutcome = FeatureOutcome;
 
 /** One settled task, exactly as `Promise.allSettled` reports it. */
 export type Settled<T> = PromiseSettledResult<T>;
+
+/**
+ * Subject and verb for one feature's failure, by kind.
+ *
+ * The kind decides the wording because the old single phrasing — "failed" — told
+ * the operator the server was at fault in every case, including when they had
+ * pressed Esc or when pi's own loop had stalled. Only a transport failure is a
+ * claim about the server, so only that one keeps the old verb.
+ */
+function featurePhrase(feature: "recall" | "reminders", kind: FailureKind): string {
+	const what = feature === "recall" ? "auto-recall" : "reminders check";
+	switch (kind) {
+		case "stalled":
+			return `${what} was cut short`;
+		default:
+			return `${what} failed`;
+	}
+}
+
+/**
+ * Collapsed wording for when both features failed the same way with the same
+ * cause — one shared cause is said once, as before.
+ */
+function collapsedPhrase(kind: FailureKind): string {
+	switch (kind) {
+		case "stalled":
+			return "the Alexandria prompt path was cut short";
+		default:
+			return "Alexandria unreachable";
+	}
+}
 
 export interface Notification {
 	text: string;
@@ -48,15 +81,10 @@ export interface Injection {
 	};
 	/** What to show the human, in order. The caller sends these guarded. */
 	notifications: Notification[];
-	/** Drop the shared MCP client: at least one task did not reach a usable
-	 *  server response, and a cached rejection would otherwise be replayed on
-	 *  every later prompt so delivery could never resume. */
+	/** Drop the shared MCP client: at least one task failed in a way that
+	 *  implicates the connection. A cancellation or a prompt-budget stall does not
+	 *  qualify — the session is fine and reconnecting would fix nothing. */
 	resetClient: boolean;
-}
-
-/** Short, readable form of a rejection for a user-facing warning. */
-export function reasonText(reason: unknown): string {
-	return reason instanceof Error ? reason.message : String(reason);
 }
 
 /**
@@ -87,24 +115,36 @@ export function buildInjection(
 		});
 	}
 
+	// A cancellation is not a failure worth reporting: the user interrupted, or pi
+	// superseded the prompt, and the SDK labels that REQUEST_TIMEOUT. Warning about
+	// it would blame the server for the operator's own Esc. Filtering it here rather
+	// than at the throw site keeps `buildInjection` the single place that decides
+	// what the human is told.
+	const recallFailure =
+		recall.status === "rejected" ? failureOf(recall.reason) : null;
+	const remindersFailure =
+		reminders.status === "rejected" ? failureOf(reminders.reason) : null;
+	const rc = recallFailure?.kind === "cancelled" ? null : recallFailure;
+	const rm = remindersFailure?.kind === "cancelled" ? null : remindersFailure;
+
 	let failure: string | null = null;
-	if (recall.status === "rejected") {
-		const rc = reasonText(recall.reason);
+	if (rc && rm) {
 		failure =
-			reminders.status === "rejected"
-				? reminders.reason !== undefined && rc === reasonText(reminders.reason)
-					? `Alexandria unreachable (${rc}); continuing without recall or reminders.`
-					: `Alexandria recall failed (${rc}) and the reminder check failed (${reasonText(reminders.reason)}); continuing without either.`
-				: `Alexandria auto-recall failed (${rc}); continuing without it.`;
-	} else if (reminders.status === "rejected") {
-		failure = `Alexandria reminders check failed (${reasonText(reminders.reason)}); continuing without it.`;
+			rc.kind === rm.kind && rc.cause === rm.cause
+				? `${collapsedPhrase(rc.kind)} (${rc.cause}); continuing without recall or reminders.`
+				: `Alexandria ${featurePhrase("recall", rc.kind)} (${rc.cause}) and the ${featurePhrase("reminders", rm.kind)} (${rm.cause}); continuing without either.`;
+	} else if (rc) {
+		failure = `Alexandria ${featurePhrase("recall", rc.kind)} (${rc.cause}); continuing without it.`;
+	} else if (rm) {
+		failure = `Alexandria ${featurePhrase("reminders", rm.kind)} (${rm.cause}); continuing without it.`;
 	}
 
-	// A rejection means this call did not reach a usable server response
-	// (unreachable, timed out, or bad config) — `callToolWithRetry` already handled
-	// the stale-session reconnect. Both features share one client, so either
-	// rejection drops it.
-	const resetClient = failure !== null;
+	// Only a failure that implicates the connection drops it. `cancelled` and
+	// `stalled` leave it alone: the session is healthy, and resetting it would cost
+	// a fresh handshake on the next prompt while fixing nothing. This used to be
+	// `failure !== null`, which is how an Esc came to tear down the client.
+	const resetClient =
+		(rc?.resetConnection ?? false) || (rm?.resetConnection ?? false);
 	if (failure !== null) {
 		notifications.push({ text: failure, level: "warning" });
 	}

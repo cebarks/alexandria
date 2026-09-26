@@ -67,6 +67,42 @@ export interface DueReminder {
  *  outcomes are memoized; a transient failure is retried on the next prompt. */
 const projectHints = new Map<string, string | null>();
 
+/**
+ * Git environment variables that would make the probe answer for the wrong
+ * repository.
+ *
+ * `GIT_DIR` is the dangerous one, and it is not hypothetical: git exports it to
+ * hooks, and with it set `git rev-parse --show-toplevel` returns the **cwd** rather
+ * than the working tree's root. Verified — from `contrib/pi/extensions/alexandria`
+ * it returns the worktree root with a clean environment and the extension directory
+ * itself with `GIT_DIR` set. Any process that runs pi from a hook, or that inherits
+ * these from a git-driving parent, would therefore produce a hint equal to whatever
+ * directory the session happened to start in.
+ *
+ * The consequence is not cosmetic. The server matches a reminder's target
+ * byte-exactly, so a wrong hint holds that project's reminders until they arrive
+ * late and escalated while delivering them under the wrong name.
+ */
+const GIT_ENV_OVERRIDES = [
+	"GIT_DIR",
+	"GIT_COMMON_DIR",
+	"GIT_WORK_TREE",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_PREFIX",
+] as const;
+
+/** `process.env` minus the overrides above, so the probe sees the working tree the
+ *  session is actually in. A copy per call rather than a module constant: the
+ *  environment can change under us, and caching it would freeze whatever was set
+ *  when this module first loaded. */
+function gitProbeEnv(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env };
+	for (const key of GIT_ENV_OVERRIDES) delete env[key];
+	return env;
+}
+
 /** Project hint for delivery targeting. Env override wins (direnv-friendly,
  *  also fixes git-worktree dirs whose basename differs from the project).
  *  `cwd` must be the **session's** directory (`ctx.cwd`), not `process.cwd()`: a
@@ -86,7 +122,7 @@ export async function getProjectHint(
     const { stdout } = await execFileAsync(
       "git",
       ["rev-parse", "--show-toplevel"],
-      { cwd: dir, timeout: 2000 },
+      { cwd: dir, timeout: 2000, env: gitProbeEnv() },
     );
     const root = stdout.trim();
     hint = root ? basename(root) : undefined;

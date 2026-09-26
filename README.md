@@ -363,6 +363,7 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | [contrib/claude/skills/alexandria-memory/SKILL.md](contrib/claude/skills/alexandria-memory/SKILL.md) | The Claude Code skill (`mcp__alexandria__<tool>` names) |
 | [docs/security-findings.md](docs/security-findings.md) | 2026-09-10 security audit: threat model, the convex-hull paper verdict, findings S1–S6 with current status |
 | [docs/performance-and-ability-findings.md](docs/performance-and-ability-findings.md) | Same audit: performance and retrieval-ability findings A1–A4 / P1–P5 |
+| [docs/prompt-path-stall-attribution.md](docs/prompt-path-stall-attribution.md) | 2026-09-22 investigation record: prompt-path stall attribution, the measured cold-handshake fault, and why the worker isolation it proposed was dropped. Carries a STATUS banner naming what shipped |
 | [crates/alexandria-mcp/assets/README.md](crates/alexandria-mcp/assets/README.md) | Vendored debug-UI assets, checksums, how to re-vendor |
 | [TODO-misc.md](TODO-misc.md) | Unprioritised backlog, grouped by area |
 | [AGENTS.md](AGENTS.md) | Working notes for humans and agents on this codebase — SurrealDB 3.2 gotchas, crate boundaries, task runner |
@@ -423,7 +424,7 @@ just install-hooks
 [`deny.toml`](deny.toml) gates licenses and known advisories via `cargo deny`, which runs as its own
 CI job. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs five jobs — `fmt`, `clippy`,
 `test`, `extension` (displayed as "Pi companion": the extension's typecheck and tests) and `deny` — on
-PRs to `main` and pushes to `main`; it does not call `just ci`, so a new local gate has to be wired
+PRs against any branch and pushes to `main`; it does not call `just ci`, so a new local gate has to be wired
 into the workflow as well. `just verify-assets` runs in the `test` job ahead of `just test`.
 
 [`.github/workflows/container.yml`](.github/workflows/container.yml) additionally builds the Docker

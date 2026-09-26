@@ -17,6 +17,7 @@ process.env.ALEXANDRIA_CLIENT_CONFIG ??= "/tmp/alexandria-tests-absent-client.to
 
 const { buildInjection } = await import("../src/injection.js");
 type FeatureOutcome = import("../src/injection.js").FeatureOutcome;
+const { AlexandriaFailure } = await import("../src/failure.js");
 
 const ok = <T>(value: T) => ({ status: "fulfilled" as const, value });
 const bad = (reason: unknown) => ({ status: "rejected" as const, reason });
@@ -114,4 +115,89 @@ test("both disabled: nothing injected, nothing said, no client churn", () => {
 test("a rejection reason that is not an Error still produces readable text", () => {
 	const out = buildInjection(bad("string failure"), ok({ block: null }));
 	assert.match(out.notifications[0].text, /string failure/);
+});
+
+// ── attribution: the failure must name the component that actually failed ──────
+
+const cancelled = () =>
+	bad(
+		new AlexandriaFailure("This operation was aborted", {
+			kind: "cancelled",
+			resetConnection: false,
+		}),
+	);
+const stalled = () =>
+	bad(
+		new AlexandriaFailure("Alexandria prompt budget (10000 ms) exceeded", {
+			kind: "stalled",
+			resetConnection: false,
+		}),
+	);
+/** A real transport failure, shaped the way undici actually throws it. */
+const refused = () => {
+	const inner = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:3000"), {
+		code: "ECONNREFUSED",
+	});
+	return bad(Object.assign(new TypeError("fetch failed"), { cause: inner }));
+};
+
+test("a cancelled prompt warns about nothing and keeps the session", () => {
+	// The bug this pins: the SDK reports an abort as REQUEST_TIMEOUT, so Esc used
+	// to render 'Alexandria unreachable' AND drop a healthy MCP session.
+	const out = buildInjection(cancelled(), ok(REMINDERS));
+	assert.equal(
+		out.notifications.some((n) => n.level === "warning"),
+		false,
+		JSON.stringify(out.notifications),
+	);
+	assert.equal(out.resetClient, false);
+	// The reminder half is untouched: it was consumed, so it must still be injected
+	// and still announced.
+	assert.equal(out.message?.content, "REMINDER-BLOCK");
+	assert.ok(out.notifications.some((n) => /reminder\(s\) due/.test(n.text)));
+});
+
+test("both features cancelled says nothing at all", () => {
+	const out = buildInjection(cancelled(), cancelled());
+	assert.deepEqual(out.notifications, []);
+	assert.equal(out.resetClient, false);
+	assert.equal(out.message, undefined);
+});
+
+test("a cancelled recall does not mask a real reminders failure", () => {
+	const out = buildInjection(cancelled(), refused());
+	const warnings = out.notifications.filter((n) => n.level === "warning");
+	assert.equal(warnings.length, 1, JSON.stringify(out.notifications));
+	assert.match(warnings[0].text, /reminders check failed/);
+	assert.match(warnings[0].text, /ECONNREFUSED/);
+	assert.equal(out.resetClient, true);
+});
+
+test("a stall does not claim the server is unreachable", () => {
+	const out = buildInjection(stalled(), ok(REMINDERS));
+	const warn = out.notifications.find((n) => n.level === "warning");
+	assert.ok(warn, "a stall is still worth one warning");
+	assert.doesNotMatch(warn.text, /unreachable/i);
+	assert.match(warn.text, /budget/i);
+	// The connection is fine; resetting it would cost a handshake and fix nothing.
+	assert.equal(out.resetClient, false);
+});
+
+test("a transport failure names the OS cause, not 'fetch failed'", () => {
+	const out = buildInjection(refused(), refused());
+	const warn = out.notifications.find((n) => n.level === "warning");
+	assert.match(warn!.text, /ECONNREFUSED/);
+	assert.match(warn!.text, /127\.0\.0\.1:3000/);
+	assert.doesNotMatch(warn!.text, /fetch failed/);
+	// Same kind and same cause still collapses to one message.
+	assert.match(warn!.text, /without recall or reminders/);
+	assert.equal(out.resetClient, true);
+});
+
+test("distinct kinds are both reported rather than collapsed", () => {
+	const out = buildInjection(stalled(), refused());
+	const warnings = out.notifications.filter((n) => n.level === "warning");
+	assert.equal(warnings.length, 1, "one merged warning, but naming both causes");
+	assert.match(warnings[0].text, /budget/);
+	assert.match(warnings[0].text, /ECONNREFUSED/);
 });
