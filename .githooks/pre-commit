@@ -6,22 +6,91 @@ if ! command -v just >/dev/null; then
     exit 1
 fi
 
-echo "🔍 Running pre-commit checks..."
+# Path scoping, and why it matters rather than being a convenience:
+#
+# Running the Rust gates unconditionally means a TypeScript-only change in a fresh
+# worktree triggers a full cold clippy build of a workspace whose dependency tree
+# includes surrealdb and candle. That is slow enough, and grows a per-worktree
+# target/ large enough, to make sharing CARGO_TARGET_DIR with the primary checkout
+# look like the obvious move — and doing that poisons the primary's incremental
+# fingerprints: its dep-info files end up recording the *worktree's* absolute
+# paths, so cargo building from the primary watches the wrong files and a Rust edit
+# there can silently fail to rebuild. Scoping the gates removes the temptation at
+# the source instead of relying on remembering the rule.
+#
+# The mirror-image gap this also closes: the hook previously ran no extension
+# checks at all, so a commit touching only contrib/pi ran two irrelevant Rust
+# gates and zero relevant ones.
+#
+# CI (.github/workflows/ci.yml) still runs every gate on every push, so scoping
+# here cannot let a broken tree land on the remote — it only stops charging the
+# full cost locally for changes that cannot affect it.
 
-# 1. Formatting check
-echo "  → just fmt"
-if ! just fmt 2>&1; then
-    echo ""
-    echo "❌ Formatting check failed. Run 'just fmt-fix' to fix."
-    exit 1
+staged=$(git diff --cached --name-only --diff-filter=ACMRD)
+
+# Drop the plumbing git exports to hooks BEFORE running any gate.
+#
+# Computed after `staged` above, which needs GIT_DIR and GIT_INDEX_FILE to see the
+# right index. Everything below shells out to tools that may invoke git themselves,
+# and inheriting these makes them resolve against the hook's repository plumbing
+# instead of the working tree: with GIT_DIR set, `git rev-parse --show-toplevel`
+# returns the cwd rather than the working tree root. That silently broke the pi
+# companion's `getProjectHint` tests, and the same pollution would mis-target
+# reminders in production for anyone running pi from a hook or a git-driving parent.
+unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+	GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX
+
+touches_rust() {
+    printf '%s\n' "$staged" | grep -Eq \
+        '^(crates/|Cargo\.(toml|lock)$|build\.rs$|Containerfile$|\.cargo/|rust-toolchain|justfile$)'
+}
+
+touches_extension() {
+    printf '%s\n' "$staged" | grep -Eq '^contrib/pi/'
+}
+
+ran_something=0
+
+if touches_rust; then
+    echo "🔍 Rust changes staged — running pre-commit checks..."
+
+    echo "  → just fmt"
+    if ! just fmt 2>&1; then
+        echo ""
+        echo "❌ Formatting check failed. Run 'just fmt-fix' to fix."
+        exit 1
+    fi
+
+    echo "  → just lint"
+    if ! just lint 2>&1; then
+        echo ""
+        echo "❌ Clippy check failed. Fix the warnings above."
+        exit 1
+    fi
+    ran_something=1
 fi
 
-# 2. Clippy (warnings as errors)
-echo "  → just lint"
-if ! just lint 2>&1; then
-    echo ""
-    echo "❌ Clippy check failed. Fix the warnings above."
-    exit 1
+if touches_extension; then
+    # Requires node_modules, which is gitignored and installed per checkout by
+    # `just ext-install`. A missing install is a setup gap, not a broken commit,
+    # so warn and continue rather than blocking — CI runs ext-test regardless.
+    if [ -d contrib/pi/extensions/alexandria/node_modules ]; then
+        echo "🔍 pi companion changes staged — running extension checks..."
+        echo "  → just ext-test"
+        if ! just ext-test 2>&1; then
+            echo ""
+            echo "❌ Extension checks failed (typecheck or tests)."
+            exit 1
+        fi
+        ran_something=1
+    else
+        echo "⚠️  contrib/pi staged but node_modules is missing; skipping ext-test."
+        echo "    Run 'just ext-install' once in this checkout to enable it."
+    fi
+fi
+
+if [ "$ran_something" -eq 0 ]; then
+    echo "🔍 No Rust or pi-companion changes staged — nothing to check."
 fi
 
 echo "✅ Pre-commit checks passed."
