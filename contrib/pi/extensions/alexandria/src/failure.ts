@@ -143,3 +143,21 @@ export function failureOf(reason: unknown): ClassifiedFailure {
 	}
 	return classifyFailure(reason, { aborted: false });
 }
+
+/**
+ * The throw-site half of the contract: classify and wrap in one step.
+ *
+ * This exists as a function rather than two inline lines in `index.ts` because the
+ * handler is an inline closure over imported functions and cannot be reached from
+ * a test without module mocking, which hangs under tsx. The decision that matters
+ * most here — that an operator's Esc is not a server failure and must not tear down
+ * the session — is otherwise assertable only by reading the handler. Extracting it
+ * makes it a table test.
+ */
+export function asFailure(err: unknown, ctx: FailureContext): AlexandriaFailure {
+	const c = classifyFailure(err, ctx);
+	return new AlexandriaFailure(c.cause, {
+		kind: c.kind,
+		resetConnection: c.resetConnection,
+	});
+}

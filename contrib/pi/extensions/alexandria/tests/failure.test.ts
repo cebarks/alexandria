@@ -11,9 +11,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-const { describeCause, classifyFailure, failureOf, AlexandriaFailure } = await import(
-	"../src/failure.js"
-);
+const { describeCause, classifyFailure, failureOf, asFailure, AlexandriaFailure } =
+	await import("../src/failure.js");
 type FailureContext = import("../src/failure.js").FailureContext;
 
 test("names the OS cause undici hides under `fetch failed`", () => {
@@ -169,4 +168,47 @@ test("failureOf preserves the cause chain of an unwrapped error", () => {
 	});
 	const c = failureOf(Object.assign(new TypeError("fetch failed"), { cause: inner }));
 	assert.match(c.cause, /ENOTFOUND/);
+});
+
+// ── asFailure: the throw-site contract ─────────────────────────────────────
+
+test("asFailure wraps an operator's Esc as a cancellation that keeps the session", () => {
+	// The regression this pins end to end: the SDK reports the abort as
+	// REQUEST_TIMEOUT, so without the signal context this reads as a dead server.
+	const f = asFailure(new Error("Request timed out"), { aborted: true });
+	assert.ok(f instanceof AlexandriaFailure);
+	assert.equal(f.kind, "cancelled");
+	assert.equal(f.resetConnection, false);
+	// And buildInjection's reader agrees, so the verdict survives the rejection.
+	assert.equal(failureOf(f).kind, "cancelled");
+});
+
+test("asFailure separates our own budget from a user cancellation", () => {
+	// index.ts derives these from two different signals: ctx.signal.aborted means
+	// the operator or pi cancelled; our budget firing with ctx.signal intact means
+	// the prompt path was slow. Conflating them would hide a real stall behind
+	// 'cancelled' and suppress a warning that should have been shown.
+	const budget = asFailure(new Error("Alexandria prompt budget (10000 ms) exceeded"), {
+		aborted: false,
+		budgetExceeded: true,
+	});
+	assert.equal(budget.kind, "stalled");
+
+	const userCancelled = asFailure(new Error("Request timed out"), {
+		aborted: true,
+		budgetExceeded: true,
+	});
+	assert.equal(userCancelled.kind, "cancelled", "a user cancel outranks the budget");
+});
+
+test("asFailure renders the deepest cause into the wrapped message", () => {
+	const inner = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:3000"), {
+		code: "ECONNREFUSED",
+	});
+	const f = asFailure(Object.assign(new TypeError("fetch failed"), { cause: inner }), {
+		aborted: false,
+	});
+	assert.equal(f.kind, "transport");
+	assert.match(f.message, /ECONNREFUSED/);
+	assert.doesNotMatch(f.message, /^fetch failed$/);
 });
