@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after } from "node:test";
 
-const execFileAsync = promisify(execFile);
+export const execFileAsync = promisify(execFile);
 
 /** The extension package root — the directory holding `package.json`. */
 export const extensionRoot = fileURLToPath(new URL("../", import.meta.url));

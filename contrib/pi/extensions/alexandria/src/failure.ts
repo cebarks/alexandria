@@ -58,15 +58,14 @@ export function describeCause(err: unknown): string {
 }
 
 /** Which component actually failed. Drives both the wording and whether the
- *  shared connection gets dropped. */
-export type FailureKind = "cancelled" | "stalled" | "worker" | "transport";
+ *  shared connection gets dropped. Every variant has a producer: `cancelled` and
+ *  `stalled` come from the two abort sources in `index.ts`, `transport` is the
+ *  fallback for anything the server or the network did. */
+export type FailureKind = "cancelled" | "stalled" | "transport";
 
 export interface FailureContext {
 	/** The prompt signal was aborted: user interrupt, superseded prompt, reload. */
 	aborted: boolean;
-	/** The failure came from the client-side worker rather than the server.
-	 *  Only the worker-isolated client produces this; the inline client cannot. */
-	workerFault?: boolean;
 	/** The whole-prompt budget expired, rather than a per-call server deadline. */
 	budgetExceeded?: boolean;
 }
@@ -85,9 +84,11 @@ export interface ClassifiedFailure {
  * The ordering is the whole point. `aborted` wins over everything because the SDK
  * labels an aborted request `REQUEST_TIMEOUT`, so the error text alone would report
  * a benign Esc as a dead server *and* reset a healthy session. `budgetExceeded`
- * comes next for the same reason one level up: once the per-call deadline is owned
- * by the worker, the main-thread budget expiring says the prompt path was slow, not
- * that the server was.
+ * comes next: the per-call deadline (5 s) is shorter than the whole-path budget
+ * (10 s), so a genuinely slow server trips the per-call timer first and arrives here
+ * as a transport failure. Reaching the budget instead means the timers themselves
+ * ran late — pi's event loop stalled — which the diagnostic log's `driftMs` field is
+ * there to corroborate.
  *
  * `resetConnection` is false for `cancelled` and `stalled` deliberately. In both the
  * connection is fine, and dropping it costs a fresh handshake on the next prompt
@@ -101,7 +102,6 @@ export function classifyFailure(
 	const cause = err instanceof AlexandriaFailure ? err.message : describeCause(err);
 	if (ctx.aborted) return { kind: "cancelled", cause, resetConnection: false };
 	if (ctx.budgetExceeded) return { kind: "stalled", cause, resetConnection: false };
-	if (ctx.workerFault) return { kind: "worker", cause, resetConnection: true };
 	return { kind: "transport", cause, resetConnection: true };
 }
 

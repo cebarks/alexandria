@@ -92,28 +92,23 @@ test("an aborted signal is a cancellation, not an unreachable server", () => {
 });
 
 test("cancellation outranks every other classification", () => {
-	// A prompt the user abandoned while the worker was also unhealthy is still
-	// primarily a cancellation: nothing should be torn down on the user's behalf.
-	const c = classifyFailure(new Error("worker exited"),
-		ctx({ aborted: true, workerFault: true, budgetExceeded: true }));
+	// A prompt the user abandoned while the whole-path budget was also expiring is
+	// still primarily a cancellation: nothing should be torn down on their behalf.
+	const c = classifyFailure(new Error("Alexandria prompt budget (10000 ms) exceeded"),
+		ctx({ aborted: true, budgetExceeded: true }));
 	assert.equal(c.kind, "cancelled");
 	assert.equal(c.resetConnection, false);
 });
 
 test("the whole-prompt budget expiring is a stall, not a server timeout", () => {
-	// With the per-call deadline owned by the worker, the main-thread budget is a
-	// *delivery* deadline. If it fires without the worker reporting a server
-	// timeout, the prompt path was slow — the server was not necessarily.
+	// The per-call deadline (5 s) is shorter than the whole-path budget (10 s), so a
+	// genuinely slow server trips the per-call timer first and classifies as a
+	// transport failure. Reaching the budget instead means the timers themselves ran
+	// late, i.e. pi's event loop stalled.
 	const c = classifyFailure(new Error("Alexandria prompt budget (10000 ms) exceeded"),
 		ctx({ budgetExceeded: true }));
 	assert.equal(c.kind, "stalled");
 	assert.equal(c.resetConnection, false);
-});
-
-test("a worker fault is attributed to the client and is recoverable", () => {
-	const c = classifyFailure(new Error("worker exited"), ctx({ workerFault: true }));
-	assert.equal(c.kind, "worker");
-	assert.equal(c.resetConnection, true);
 });
 
 test("anything else is a transport failure and keeps the old reset behaviour", () => {

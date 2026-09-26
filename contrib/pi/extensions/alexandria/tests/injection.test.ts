@@ -133,13 +133,6 @@ const stalled = () =>
 			resetConnection: false,
 		}),
 	);
-const workerFault = () =>
-	bad(
-		new AlexandriaFailure("memory worker exited before responding", {
-			kind: "worker",
-			resetConnection: true,
-		}),
-	);
 /** A real transport failure, shaped the way undici actually throws it. */
 const refused = () => {
 	const inner = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:3000"), {
@@ -198,14 +191,6 @@ test("a transport failure names the OS cause, not 'fetch failed'", () => {
 	assert.doesNotMatch(warn!.text, /fetch failed/);
 	// Same kind and same cause still collapses to one message.
 	assert.match(warn!.text, /without recall or reminders/);
-	assert.equal(out.resetClient, true);
-});
-
-test("a worker fault is attributed to the memory client, not the server", () => {
-	const out = buildInjection(workerFault(), ok(REMINDERS));
-	const warn = out.notifications.find((n) => n.level === "warning");
-	assert.match(warn!.text, /memory (client|worker)/i);
-	assert.doesNotMatch(warn!.text, /unreachable/i);
 	assert.equal(out.resetClient, true);
 });
 
