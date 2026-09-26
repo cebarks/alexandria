@@ -151,13 +151,36 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Do not test whether a pin is reachable with `gh api repos/<owner>/<repo>/commits/<sha>` — it
   returns 422 "No commit found" for pins that Actions resolves fine. Trust the Actions error text, or
   the fact that a job using that pin passed.
-- Nothing watched the branch while CI was red for 11 days, because no check is required to merge.
-  Revisit branch protection if regressions keep landing.
-- `.github/workflows/ci.yml` is **four separate jobs** (`fmt`, `clippy`, `test`, `deny`) and does
+- Branch protection here is a **ruleset**, not legacy protection, and it is scoped to every ref:
+  `gh api repos/<owner>/<repo>/rulesets` returns one named `main` with
+  `conditions.ref_name.include = ["~ALL"]`, required status checks `Formatting`, `Clippy`, `Tests`,
+  `cargo-deny`, `strict_required_status_checks_policy: false`, squash as the *only* allowed merge
+  method, and `required_approving_review_count: 0`. The reason it exists is the incident below —
+  and its consequence is that **a PR producing no check runs is `mergeStateStatus=BLOCKED` and
+  cannot merge at all**, however good the code is. That is what makes workflow trigger scoping
+  load-bearing rather than cosmetic: a trigger filtered to `main` combined with checks required on
+  `~ALL` means a PR based on another feature branch can never satisfy its own gate.
+- Squash merges break **stacked** branches, which is the cost of that only-squash policy. Once a
+  base PR is squashed, `main` re-adds files as commits unrelated to the ones the stacked branch
+  descends from, so git sees two independent additions and the stacked PR goes
+  `CONFLICTING` on add/add. Resolve by merging `origin/main` into the branch and taking the branch
+  side (it is the strict descendant), then verify nothing was lost — a rebase needs a force-push,
+  which is a different authorisation.
+- Neither a merge queue nor auto-merge is available: `merge-queues` 404s and
+  `allow_auto_merge` is false, so there is no "queue it" — you wait for checks, or re-trigger them
+  deliberately. A PR base change emits only `edited`, which is *not* a default `pull_request`
+  activity type, so retargeting alone starts nothing; `gh pr close` then `gh pr reopen` fires
+  `reopened` and does.
+- `.github/workflows/ci.yml` is **five separate jobs** (`fmt`, `clippy`, `test`, `extension`,
+  `deny` — `extension` is the job displayed as `Pi companion`) and does
   **not** call `just ci`. Editing the justfile alone therefore changes nothing on GitHub Actions — a
   new gate has to be added to the workflow too. `just verify-assets` runs as its own step in the
   `test` job, before `just test`, because the year-long `immutable` asset cache header is only safe
   while the filename pins the bytes.
+- `Pi companion` runs but is **not** in the ruleset's required list, so a red companion job merges
+  clean. The extension suite is therefore gated by convention only. Add it to the ruleset via the
+  API rather than by editing a file — required checks are GitHub config, not repo content, and no
+  PR can change them.
 
 ## Docs Map
 

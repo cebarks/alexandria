@@ -9,8 +9,18 @@ name: CI
 on:
   push:
     branches: [main]
+  # `pull_request:` is deliberately unfiltered. The branch-protection ruleset requires status
+  # checks on *every* ref (`ref_name: {include: ["~ALL"]}`), so a PR based on another feature
+  # branch still has to be able to produce them; scoping this to `main` left stacked PRs with no
+  # runs at all and `mergeStateStatus=BLOCKED` on "no checks reported" -- unmergeable however
+  # green the code. `push:` stays main-only, and container.yml keeps its own filter: that workflow
+  # is a cold uncached release build of the whole workspace, so every stacked PR touching Cargo.*
+  # or crates/** would pay minutes for a check the merge into main runs anyway.
+  #
+  # No `types:`, so the defaults (opened, synchronize, reopened). A base retarget emits only
+  # `edited`, which is not a default and would also fire on every title/body tweak at a full
+  # five-job run each; when a retarget needs to wake CI, `gh pr close` then `gh pr reopen`.
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
