@@ -74,7 +74,8 @@ session page 1 showed while silently dropping another.
 | `finalize_session` | Takes `session_id` and optional `summary` / `tags`; sets `ended_at = time::now()` plus whichever fields were supplied. Errors if the id is unknown. |
 
 Both `Option` fields on `finalize_session` are genuinely optional: calling it with only
-`session_id` closes the session without recording a summary.
+`session_id` sets `ended_at` without recording a summary — which leaves the session counting as
+*unfinalized*, since a summary is the only closed signal.
 
 ## Current limitations
 
@@ -84,24 +85,25 @@ These are real gaps in the shipped implementation, not usage advice:
   `list_sessions` has no search — it filters on `agent_id`, `tag`, and finalized state only, so
   finding a session by what its summary says means paging through the list. Browsing is the debug
   UI's other route: `/debug/sessions` (list, in the total order above) and
-  `/debug/sessions/:external_id` (detail: summary, tags, the session's memories), HTTP mode only — or
+  `/debug/sessions/{external_id}` (detail: summary, tags, the session's memories), HTTP mode only — or
   query the `session` table directly.
 - **The pi extension groups but does not finalize.** `contrib/pi/` sends pi's session id,
-  `agent_id = "pi"` and the model with every auto-store, so those writes are grouped; it never calls
-  `finalize_session`, so its sessions have no summary.
+  `agent_id = "pi"` and the model with every auto-store, so those writes are grouped; the extension
+  itself never calls `finalize_session`, so sessions created by auto-store have no summary unless the
+  agent calls it directly — which the pi skill does document.
 
 ## SurrealDB 3.2 gotchas in this code path
 
 Non-obvious, and easy to reintroduce:
 
-- `session` is a **reserved word** in SurrealDB 3.2 — every query must write `` `session` `` with
-  backticks, and the table is `SCHEMAFULL` so an undefined field silently fails.
+- `session` is a **reserved word** in SurrealDB 3.2 — this repo backticks it in every query string,
+  and the table is `SCHEMAFULL` so an undefined field silently fails.
 - `$session` is **also reserved** (it is SurrealDB's own session variable). Bind parameters for a
   session record ID must use another name — `session_repo.rs` uses `$sess`.
 - `RELATE` needs a pre-parsed `RecordId` passed through `.bind()`; an inline `type::record()` in a
   `RELATE` statement fails.
-- `SELECT * FROM value` is unusable — `value` is reserved as well (see the project-wide list in
-  [AGENTS.md](../AGENTS.md)).
+- `value` is reserved as well, so `SELECT value FROM <table>` fails — select `*` and read the field
+  out (see the project-wide list in [AGENTS.md](../AGENTS.md)).
 - The derived count has to put its filter **inside** the traversal target's parentheses:
   `(->contains_session_memory->(fact WHERE deleted = false)).len()`. The natural-looking
   `(->contains_session_memory->fact WHERE deleted = false).len()` is a parse error — `Unexpected token

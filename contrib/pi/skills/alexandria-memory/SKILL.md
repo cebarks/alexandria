@@ -1,6 +1,6 @@
 ---
 name: alexandria-memory
-description: Use the Alexandria agent-memory MCP tools (alexandria_store_memory, alexandria_retrieve_memories, alexandria_recall, alexandria_update_memory, alexandria_import_document, alexandria_delete_memory, alexandria_get_session, alexandria_finalize_session) and its reminder tools (alexandria_set_reminder, alexandria_check_reminders, alexandria_list_reminders, alexandria_cancel_reminder) to persist and recall durable facts, decisions, and preferences across sessions, and to schedule and manage future follow-ups. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before") or asks for a future nudge ("remind me", "don't let me forget", "check this tomorrow"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
+description: Use the Alexandria agent-memory MCP tools (alexandria_store_memory, alexandria_retrieve_memories, alexandria_recall, alexandria_update_memory, alexandria_import_document, alexandria_delete_memory, alexandria_list_sessions, alexandria_get_session, alexandria_finalize_session) and its reminder tools (alexandria_set_reminder, alexandria_check_reminders, alexandria_list_reminders, alexandria_cancel_reminder) to persist and recall durable facts, decisions, and preferences across sessions, and to schedule and manage future follow-ups. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before") or asks for a future nudge ("remind me", "don't let me forget", "check this tomorrow"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
 ---
 
 # Alexandria Memory
@@ -67,6 +67,9 @@ the session on first use. Worth doing when the grouping itself is the useful thi
 learned about the auth refactor" stays retrievable as a unit even though the memories are
 topically scattered across clusters.
 
+- **`alexandria_list_sessions`** — enumerate sessions newest-first, filterable by `agent_id`, `tag`
+  and whether they were finalized, with `limit`/`offset` paging. This is how you find a session whose
+  id you did not keep.
 - **`alexandria_get_session`** — review everything stored in one session, oldest first, with its
   metadata. Use when the user asks what was captured in a specific past conversation, or before
   writing a session summary so you don't restate something already stored.
@@ -75,9 +78,10 @@ topically scattered across clusters.
 
 Rules that matter: a session's `ended_at` is refreshed by every store, so it tracks last activity,
 not closure — an unfinalized session still has `ended_at` set, and `summary: null` is the real signal
-that it was never closed. Sessions are not searchable by content and there is no way to enumerate
-them: `get_session` only works for an id you already know, so record the id you chose somewhere
-durable if you expect to revisit it. See `docs/session-memory.md` in the Alexandria repo for details.
+that it was never closed. Sessions are not searchable by *content*: `alexandria_list_sessions`
+enumerates them by metadata, and `alexandria_get_session` needs an id you already have or one you just
+got from the list. Still worth recording the id you chose somewhere durable if you expect to revisit
+it. See `docs/session-memory.md` in the Alexandria repo for details.
 
 ## Reminders
 
@@ -157,7 +161,7 @@ they belong to, so another project's entry is informational — it reaches the u
   user.
 - **Surface conflicts.** If a retrieved memory contradicts what you're about to do or say, flag
   it to the user rather than silently picking one.
-- **Batch queries when exploring multiple angles** — call `retrieve_memories` a few times with
+- **Batch queries when exploring multiple angles** — call `alexandria_retrieve_memories` a few times with
   varied phrasing rather than one query trying to cover everything, same principle as varying
   web-search queries.
 
