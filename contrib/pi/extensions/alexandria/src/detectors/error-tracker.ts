@@ -54,9 +54,7 @@ const MIN_ERROR_LENGTH = 30;
 const TRANSIENT_PATTERNS: RegExp[] = [
 	/RETRYABLE —/,
 	/PARTIAL APPLY —/,
-	/Edit without read/,
 	/fatal: not a git repository/,
-	/Failed to call tool: Missing/,
 ];
 
 /**
@@ -64,60 +62,80 @@ const TRANSIENT_PATTERNS: RegExp[] = [
  * server's tool. NOT applied to the alexandria server's own tools — a rejection
  * from `mcp__alexandria__store_memory` is a constraint of THIS product's API, and
  * it is exactly the "error -> what worked" lesson this module exists to write.
- * Filtering it fleet-wide would keep deleting the evidence for claims like the
- * stored (and still unverified) one that store_memory rejects array tags.
+ *
+ * `Failed to call tool: Missing …` belongs here, not in TRANSIENT_PATTERNS: it is the
+ * same family (a call rejected for its arguments), and in TRANSIENT_PATTERNS it was
+ * evaluated before the exemption, so alexandria's own parameter contract could never
+ * be exempted. `/Edit without read/` was deleted from TRANSIENT_PATTERNS rather than
+ * kept: pi-lens's actual wording carries no ERROR_SIGNAL word, so every occurrence
+ * died at the signal stage first and the rule guarded nothing.
  */
 const CALL_SHAPE_PATTERNS: RegExp[] = [
 	/Validation failed for tool/,
 	/failed to deserialize parameters/i,
+	/Failed to call tool: Missing/,
 ];
 
 /**
+ * Whether this error is about THIS server. The text is consulted because the tool
+ * name alone is not enough: traffic routed through a gateway arrives with toolName
+ * `mcp` and the real call inside its arguments, so a toolName-only exemption silently
+ * deleted this server's own API contracts. pi does emit the inner namespaced name for
+ * its own nested `ctx.executeTool()` calls, so codemode exposure alone is not the
+ * hole — a gateway is.
+ */
+function referencesAlexandria(errorText: string): boolean {
+	return /mcp__alexandria__|alexandria_[a-z_]+/.test(errorText);
+}
+
+/**
  * A path lookup that found nothing is the routine answer to a wrong guess, and pi
- * emits it as the whole message (`Path not found: <path>`, optionally prefixed with
- * "Error: "). It is matched at the HEAD only: the same words inside another tool's
+ * emits it as the whole message (`Path not found: <path>`, sometimes prefixed with
+ * "Error: "). Matched at the HEAD only: the same words inside another tool's
  * failure — "alexandria serve failed: Path not found: ~/.pi/agent/extensions/
- * alexandria" — are the detail of a durable lesson, and keying transience on the
- * *tool* instead of the message turned every grep/find/ls error into a dropped
- * lesson, including pi's own `Failed to run ripgrep:` and `Not a directory:`.
- * Known bound: a blob-wrapped `Path not found:` payload is stored as one row of
- * noise. Accepted, because the alternative is another condition nobody can verify.
- * Re-derive the emission shape with `grep -rn "Path not found" <pi>/dist/core/tools`.
+ * alexandria" — are the detail of a durable lesson.
+ *
+ * Two bounds this comment used to deny, so they are stated here instead:
+ *
+ * 1. Keying transience on the *tool* was worse — it made every grep/find/ls error
+ *    transient at once. Removing the allowlist restores only the failures that carry
+ *    an error signal: pi's `Failed to run ripgrep: …` reaches the gate, but
+ *    `Not a directory: …` and `rg: the literal "\n" is not allowed in a regex` do
+ *    not, because they have no signal word and are dropped by ERROR_SIGNAL first.
+ *    That screen, not this one, is the module's largest filter.
+ * 2. A blob-wrapped `Path not found:` payload is stored as one row of noise.
+ *
+ * Re-derive the emission shapes with
+ * `grep -o '`[^`]*`' <pi>/dist/core/tools/{grep,ls,find}.js`.
  */
 const PATH_LOOKUP_FAILED = /^\s*(Error: )?Path not found:/;
 
 function isTransient(toolName: string, errorText: string): boolean {
 	if (PATH_LOOKUP_FAILED.test(errorText)) return true;
 	if (TRANSIENT_PATTERNS.some((re) => re.test(errorText))) return true;
-	// A validation rejection from THIS server's own tools is a durable API contract,
-	// not call noise. Keyed on the server segment of the tool name, which means the
-	// operator must have registered the server as something containing "alexandria"
-	// — see the known bound in TODO-misc.md.
-	if (toolName.includes("alexandria")) return false;
+	if (toolName.includes("alexandria") || referencesAlexandria(errorText)) return false;
 	return CALL_SHAPE_PATTERNS.some((re) => re.test(errorText));
 }
 
 /**
- * Elide only what a tool echoed back at us, never what a diagnostic asserted.
+ * Whitespace collapse, and nothing else.
  *
- * Three cuts have now been tried. Eliding backticks or quoted runs destroyed the
- * discriminator (`cannot find function \`parse_tags\`` vs \``store_batch\``); eliding
- * any parenthesised run >= 16 chars collapsed `(expected Vec<Memory>, found String)`
- * against its exact opposite; eliding `(ident[N])` index lists merged `(tags[0])`
- * with `(content[0])` and could not even fire on its designed-for input, because the
- * `(edits[0], edits[1])` row is caught by the raw-text transient gate first. So that
- * rule is deleted rather than tightened.
+ * Four cuts of "elide the payload" were tried across three review rounds, and all
+ * four damaged real rows: backticks >= 8 chars and quoted runs >= 24 collapsed
+ * ``cannot find function `parse_tags` `` with ``…`store_batch` ``; any parenthesised
+ * run >= 16 chars collapsed `(expected Vec<Memory>, found String)` against its exact
+ * opposite; the `(ident[N])` span rule merged `(tags[0])` with `(content[0])`; and
+ * the survivor — a quoted run inside parentheses — fired on 3 of 978 real error rows
+ * and on none of the `oldText ("…")` rows it existed for (those die at the transient
+ * gate first), while mangling durable bash output like
+ * `bail!("SteamCMD failed after {attempts}")`.
  *
- * What remains is one shape: a quoted run inside parentheses — a tool restating a
- * string we handed it. Whitespace collapse stays; it only stabilises the class key,
- * and "whitespace-only differences share one class" pins it.
+ * So there is no elision. Every rule that made classes coalesce also ate the
+ * discriminator, and a merged key costs the second lesson for the whole session via
+ * `seen`. Coarser keys are tolerable; wrong ones are not.
  */
-const ECHOED_PAYLOAD: Array<[RegExp, string]> = [[/\("[^"]{16,}"\)/g, '("<elided>")']];
-
 function normalizeErrorText(text: string): string {
-	let out = text;
-	for (const [re, replacement] of ECHOED_PAYLOAD) out = out.replace(re, replacement);
-	return out.replace(/\s+/g, " ").trim();
+	return text.replace(/\s+/g, " ").trim();
 }
 
 /** Error text must contain at least one of these to be worth tracking. */

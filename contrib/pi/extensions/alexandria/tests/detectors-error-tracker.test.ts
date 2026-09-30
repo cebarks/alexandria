@@ -76,10 +76,14 @@ test("flush clears unpaired errors", () => {
 	assert.deepEqual(t.flush(), []);
 });
 
-// The transient classes below are copied verbatim from real rows in the live store.
-// Per-family counts, the populations they were measured over, and their caveats are
-// recorded once in TODO-misc.md ("ErrorTracker's transient gate") — not restated
-// here, because a number in a comment is a number nobody re-derives.
+// Fixtures match shapes seen in the live store and in pi / pi-lens emission
+// templates — NOT verbatim copies. That distinction matters because a
+// "copied verbatim from real rows" claim here was once false: one fixture was an
+// invented "Error executing grep: …" string that neither pi nor pi-lens emits, and it
+// gave a widened rule coverage it did not deserve. Where an emitter exists, the
+// string is checked against its source.
+// Per-family counts and their caveats are recorded once in TODO-misc.md
+// ("ErrorTracker's transient gate") rather than restated here.
 const TRANSIENT: Array<[string, string]> = [
 	[
 		"edit",
@@ -96,7 +100,6 @@ const TRANSIENT: Array<[string, string]> = [
 	["grep", "Path not found: /home/anten/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/surrealdb-3.2.4/src"],
 	["bash", "fatal: not a git repository (or any parent up to mount point /) Stopping at filesystem limit"],
 	["mcp", "Failed to call tool: Missing url Expected parameters: category (string) - Optional filter"],
-	["edit", '{"content":[{"type":"text","text":"🔄 RETRYABLE — Edit without read\\n\\nYou are trying to edit without reading"}]}'],
 ];
 
 test("does not memorise transient tool-misuse errors", () => {
@@ -177,7 +180,10 @@ test("the resolution keeps what actually fixed it", () => {
 test("alexandria's own schema rejections stay trackable", () => {
 	const out = pair(
 		"mcp__alexandria__store_memory",
-		'Validation failed for tool "store_memory":\n  - tags: expected string, found array',
+		// pi's real format is `Validation failed for tool "${toolCall.name}"` — the
+		// namespaced name, not the bare one. A bare-name fixture passes while hiding the
+		// gateway case, which is how that hole survived two review rounds.
+		'Validation failed for tool "mcp__alexandria__store_memory":\n  - tags: expected string, found array',
 		"retried with tags as a newline-separated string and it stored",
 	);
 	assert.equal(out.length, 1, "this server's own API contract is a durable lesson, not call noise");
@@ -224,6 +230,20 @@ test("the marker at the head of a tool-protocol error is still transient", () =>
 	assert.equal(pair("edit", "⚠️ PARTIAL APPLY — 1 edit committed (edits[0]). Do NOT resubmit the applied edits.", "submitted only the remainder").length, 0);
 });
 
+test("pi-lens's Edit-without-read wording is dropped, but not by the gate", () => {
+	// pi-lens 4.3.0 emits this at dist/clients/read-guard.js. It carries no
+	// ERROR_SIGNAL word, so it dies before isTransient() is reached — which is why a
+	// `/Edit without read/` rule was deleted: it guarded nothing, and its only fixture
+	// was a JSON blob that also died at the signal stage. Pinned so nobody re-adds it.
+	assert.equal(
+		pair(
+			"edit",
+			"🔄 RETRYABLE — Edit without read: you have not read the file in this conversation. Read it first, then retry",
+		).length,
+		0,
+	);
+});
+
 // ── Round 2 of the PR #41 review: the elision cut itself was the defect ──
 
 test("two diagnostics that differ only inside parentheses are both kept", () => {
@@ -238,15 +258,13 @@ test("two diagnostics that differ only inside parentheses are both kept", () => 
 	assert.match(out[1].content, /expected String, found Vec<Memory>/);
 });
 
-test("an echoed payload is still elided so one class yields one row", () => {
-	const t = new ErrorTracker();
-	t.recordError("edit", 'Edit failed: the oldText ("use bevy_falling_sand::prelude::{ ChunkRegion, Spawned, ") was not found in the file');
-	t.recordSuccess("edit", "re-read the file and applied a shorter anchor");
-	t.recordError("edit", 'Edit failed: the oldText ("pub(crate) mod test_harness { //! The one harness ") was not found in the file');
-	t.recordSuccess("edit", "re-read the file and applied a shorter anchor");
-	const out = t.flush();
-	assert.equal(out.length, 1, "same class, different echoed source text");
-	assert.doesNotMatch(out[0].content, /bevy_falling_sand|test_harness/);
+test("no payload elision: a durable row keeps its echoed source verbatim", () => {
+	const out = pair(
+		"bash",
+		'cargo build failed: bail!("SteamCMD failed after {STEAMCMD_MAX_ATTEMPTS} attempts") did not compile',
+	);
+	assert.equal(out.length, 1);
+	assert.match(out[0].content, /STEAMCMD_MAX_ATTEMPTS/, "the quoted text is the lesson");
 });
 
 test("the transient gate sees a marker hidden inside parentheses", () => {
@@ -254,13 +272,6 @@ test("the transient gate sees a marker hidden inside parentheses", () => {
 		pair("edit", "Edit failed (PARTIAL APPLY — 2 edits committed, do NOT resubmit the remaining ones)").length,
 		0,
 	);
-});
-
-test("Path not found from a file tool is transient, from a shell failure it is not", () => {
-	assert.equal(pair("grep", "Path not found: /home/anten/.cargo/registry/src/surrealdb-3.2.4/src").length, 0);
-	assert.equal(pair("ls", "Error: Path not found: /home/anten/code/alexandria/crates/alexandria-storage/migrations").length, 0);
-	// The same marker embedded in another tool's failure is a durable environment lesson.
-	assert.equal(pair("bash", "alexandria serve failed: Path not found: /home/anten/.pi/agent/extensions/alexandria").length, 1);
 });
 
 test("an evicted class does not displace a queued neighbour", () => {
@@ -277,15 +288,44 @@ test("an evicted class does not displace a queued neighbour", () => {
 
 // ── Round 3 of the PR #41 review: three of these were confirmed by probe before fixing ──
 
-test("a path tool's non-path errors are still durable lessons", () => {
-	// The round-2 fix keyed transience on the TOOL, which silently made grep/find/ls
-	// a lesson desert. pi's own grep/find/ls emit these alongside "Path not found".
+test("other grep/find/ls failures still reach the gate when they carry a signal word", () => {
+	// Keying transience on the TOOL made grep/find/ls a lesson desert. Removing that
+	// axis restores only the failures that clear ERROR_SIGNAL: pi's `Not a directory:`
+	// and `rg: the literal "\n" is not allowed in a regex` still die at the signal
+	// stage, which is the structural bound recorded in TODO-misc, not something this
+	// test claims to have fixed.
 	assert.equal(
 		pair("grep", "Failed to run ripgrep: spawn EACCES, the rg binary under ~/.local/bin is not executable").length,
 		1,
 	);
 	assert.equal(pair("ls", "Cannot read directory: EACCES, permission denied on /root/.ssh/config").length, 1);
 	assert.equal(pair("find", "Failed to run fd: permission denied on /root/.ssh while searching").length, 1);
+});
+
+test("a call-shape rejection is transient unless it names this server", () => {
+	// Gateway-routed traffic arrives as toolName "mcp" with the real call in the text,
+	// so the exemption has to read the message and not only the tool name.
+	assert.equal(
+		pair("mcp", "Failed to call tool: Missing url Expected parameters: category (string) - Optional filter").length,
+		0,
+		"another server's argument error is noise",
+	);
+	assert.equal(
+		pair(
+			"mcp",
+			'Validation failed for tool "mcp__alexandria__store_memory":\n  - tags: expected string, found array',
+		).length,
+		1,
+		"this server's own contract must survive",
+	);
+	assert.equal(
+		pair(
+			"mcp",
+			"failed to deserialize parameters: missing field `content` — Expected parameters: content (string) *required*",
+		).length,
+		0,
+		"and an unattributed one is still treated as noise",
+	);
 });
 
 test("a class evicted by the ring can be stored on a later turn", () => {
