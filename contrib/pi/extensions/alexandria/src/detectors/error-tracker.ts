@@ -6,10 +6,11 @@
  * Call flush() at agent_end to emit paired resolutions.
  *
  * Not every error is a lesson. recordError() drops the transient tool-protocol
- * classes (see TRANSIENT_PATTERNS), elides the payload a tool quoted back so one
- * class yields one row, and never stores a class twice in a session — without
- * those filters this path wrote 526 rows, 36.5% of the live store, mostly
- * restatements of "the tool already told you to retry".
+ * classes (see TRANSIENT_PATTERNS / isTransient), elides only what a tool echoed
+ * back so one class yields one row, and never stores a class twice in a session.
+ * Without those filters this path was the single largest writer in the store; the
+ * measurements and their caveat live once, in TODO-misc.md under "ErrorTracker's
+ * transient gate", rather than being copied into this comment.
  */
 
 import type { DetectedMemory } from "./types.js";
@@ -43,14 +44,14 @@ const MIN_ERROR_LENGTH = 30;
  * the suite would notice. TODO(debt): pin the markers to pi-lens's emitted strings
  * rather than prose, or gate on the tool's structured error code.
  *
- * The rest are measured from the live store: `Validation failed for tool` ×85,
- * `edit PARTIAL APPLY` ×47, pi `RETRYABLE` ×44, gateway misuse ×26.
+ * Per-family counts and the method behind them live in TODO-misc.md ("ErrorTracker's
+ * transient gate"), not here: a number duplicated in a comment is a number nobody
+ * can re-derive.
  */
 const TRANSIENT_PATTERNS: RegExp[] = [
 	/RETRYABLE —/,
 	/PARTIAL APPLY —/,
 	/Edit without read/,
-	/(^|: )Path not found:/,
 	/fatal: not a git repository/,
 	/Failed to call tool: Missing/,
 ];
@@ -68,25 +69,48 @@ const CALL_SHAPE_PATTERNS: RegExp[] = [
 	/failed to deserialize parameters/i,
 ];
 
+/**
+ * Tools whose whole job is addressing paths. For them "Path not found" is the
+ * routine answer to a wrong guess. For every other tool the same words are usually
+ * the detail *inside* a durable failure — "alexandria serve failed: Path not found:
+ * ~/.pi/agent/extensions/alexandria" is a stale-directory bug worth remembering,
+ * and a text-only rule deleted it. pi 0.99.1 emits this string from its grep/find/ls
+ * tools; re-verify with `grep -rn "Path not found" <pi>/dist/core/tools`.
+ */
+const PATH_LOOKUP_TOOLS = new Set(["grep", "find", "ls", "glob", "fd"]);
+
 function isTransient(toolName: string, errorText: string): boolean {
+	if (PATH_LOOKUP_TOOLS.has(toolName) || /^Path not found:/.test(errorText)) return true;
 	if (TRANSIENT_PATTERNS.some((re) => re.test(errorText))) return true;
+	// A validation rejection from THIS server's own tools is a durable API contract,
+	// not call noise. Keyed on the server segment of the tool name, which means the
+	// operator must have registered the server as something containing "alexandria"
+	// — see the known bound in TODO-misc.md.
 	if (toolName.includes("alexandria")) return false;
 	return CALL_SHAPE_PATTERNS.some((re) => re.test(errorText));
 }
 
 /**
- * Elide the payload a tool echoed back inside parentheses — the `oldText ("…")` /
- * `(edits[0], edits[1])` runs of a drifted edit — so one class yields one row.
+ * Elide only what a tool echoed back at us, never what a diagnostic asserted.
  *
- * Deliberately narrow, because the first version of this was too wide and the
- * review caught it: eliding backticks and quoted runs destroyed the
- * discriminator (``cannot find function `parse_tags` `` and ``…`store_batch```
- * collapsed into one key) and gutted the resolution half of the memory, which is
- * the entire point of the row. Whitespace is still collapsed, since that only
- * stabilises the class key.
+ * The first cut elided any backtick or quoted run; the second elided any
+ * parenthesised run >= 16 chars. Both destroyed the discriminator, because that is
+ * where compilers put it: `(expected Vec<Memory>, found String)` and its exact
+ * opposite collapsed to one class key, and the row that survived described nothing.
+ * So elision is now limited to payload shapes — a quoted run inside parentheses
+ * (the `oldText ("…")` of a drifted edit) and lists of span indices (the
+ * `(edits[0], edits[1])` of a partial apply). Whitespace collapse stays, since it
+ * only stabilises the class key.
  */
+const ECHOED_PAYLOAD: Array<[RegExp, string]> = [
+	[/\("[^"]{16,}"\)/g, '("<elided>")'],
+	[/\(\s*[\w.]+\[\d+\](?:\s*,\s*[\w.]+\[\d+\])*\s*\)/g, "(<elided-spans>)"],
+];
+
 function normalizeErrorText(text: string): string {
-	return text.replace(/\(([^)]{16,})\)/g, "(<elided>)").replace(/\s+/g, " ").trim();
+	let out = text;
+	for (const [re, replacement] of ECHOED_PAYLOAD) out = out.replace(re, replacement);
+	return out.replace(/\s+/g, " ").trim();
 }
 
 /** Error text must contain at least one of these to be worth tracking. */
@@ -106,28 +130,27 @@ export class ErrorTracker {
 	recordError(toolName: string, text: string): void {
 		const raw = text.slice(0, MAX_TEXT_LENGTH).trim();
 
-		// Length and signal are judged on the untouched text: elision normalises the
-		// class key and the stored row, and must never be able to shrink an error out
-		// of existence.
+		// Length, signal and transience are all judged on the untouched text. Eliding
+		// first let a transient marker hide inside a payload the cut removed, so the
+		// gate stored noise it existed to drop; it could also shrink a real error below
+		// the length floor and delete it outright.
 		if (raw.length < MIN_ERROR_LENGTH) return;
 		if (!ERROR_SIGNAL_PATTERN.test(raw)) return;
+		if (isTransient(toolName, raw)) return;
 
 		const errorText = normalizeErrorText(raw);
-
-		// Filter: transient tool protocol, not a lesson
-		if (isTransient(toolName, errorText)) return;
 
 		// Filter: this class is already queued or already stored this session
 		const key = `${toolName}\u0000${errorText}`;
 		if (this.seen.has(key)) return;
 		this.seen.add(key);
 
-		// Ring buffer — drop oldest if full, and release its claim: an error that
-		// left the buffer unpaired taught us nothing, so the class must be able to
-		// queue again and still pair with a later success.
+		// Ring buffer — drop oldest if full. The evicted class deliberately KEEPS its
+		// claim: releasing it let a re-entering error displace the neighbour the
+		// eviction had pushed along, losing a lesson that was still pairable. Keys are
+		// released only in flush(), where the whole queue is being reconsidered anyway.
 		if (this.errors.length >= MAX_ERRORS) {
-			const evicted = this.errors.shift();
-			if (evicted) this.seen.delete(evicted.key);
+			this.errors.shift();
 		}
 
 		this.errors.push({ toolName, errorText, timestamp: Date.now(), key });

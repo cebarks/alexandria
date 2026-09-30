@@ -120,21 +120,15 @@ test("still keeps an error that is a real root cause", () => {
 	assert.match(out[0].content, /diskann-wide/);
 });
 
-test("elides quoted payload so an error class collapses to one row", () => {
-	const t = new ErrorTracker();
-	t.recordError("read", "Error: cannot parse config: unexpected token in block (alpha = 1\nbeta = 2) at line 4");
-	t.recordSuccess("read", "quoted the value");
-	t.recordError("read", "Error: cannot parse config: unexpected token in block (gamma = 9\ndelta = 7) at line 4");
-	t.recordSuccess("read", "quoted the value");
-	const out = t.flush();
-	assert.equal(out.length, 1, "same class, different payload must dedup to one memory");
-	assert.doesNotMatch(out[0].content, /alpha = 1|gamma = 9/);
-	assert.match(out[0].content, /<elided>/);
-});
+// Superseded by the round-2 tests below. This fixture asserted that any
+// parenthesised run should be elided, which is the behaviour the review rejected:
+// eliding `(alpha = 1, beta = 2)`-shaped content is what collapsed distinct root
+// causes together. Both directions are now pinned there — echoed payloads elide,
+// diagnostics do not.
 
 // ── Findings from the pre-merge review of PR #41, each reproduced by probe first ──
 
-const pair = (tool: string, err: string, ok: string) => {
+const pair = (tool: string, err: string, ok = "applied the obvious retry and it worked") => {
 	const t = new ErrorTracker();
 	t.recordError(tool, err);
 	t.recordSuccess(tool, ok);
@@ -217,4 +211,55 @@ test("an error that merely mentions the retry marker is not treated as transient
 test("the marker at the head of a tool-protocol error is still transient", () => {
 	assert.equal(pair("edit", "🔄 RETRYABLE — Edit target not found: the file changed since you read it", "re-read then applied").length, 0);
 	assert.equal(pair("edit", "⚠️ PARTIAL APPLY — 1 edit committed (edits[0]). Do NOT resubmit the applied edits.", "submitted only the remainder").length, 0);
+});
+
+// ── Round 2 of the PR #41 review: the elision cut itself was the defect ──
+
+test("two diagnostics that differ only inside parentheses are both kept", () => {
+	const t = new ErrorTracker();
+	t.recordError("bash", "error[E0308]: mismatched types (expected Vec<Memory>, found String) in the memory repo signature");
+	t.recordSuccess("bash", "swapped the argument order and it compiles");
+	t.recordError("bash", "error[E0308]: mismatched types (expected String, found Vec<Memory>) in the memory repo signature");
+	t.recordSuccess("bash", "swapped the argument order and it compiles");
+	const out = t.flush();
+	assert.equal(out.length, 2, "opposite type directions are two different lessons");
+	assert.match(out[0].content, /expected Vec<Memory>, found String/);
+	assert.match(out[1].content, /expected String, found Vec<Memory>/);
+});
+
+test("an echoed payload is still elided so one class yields one row", () => {
+	const t = new ErrorTracker();
+	t.recordError("edit", 'Edit failed: the oldText ("use bevy_falling_sand::prelude::{ ChunkRegion, Spawned, ") was not found in the file');
+	t.recordSuccess("edit", "re-read the file and applied a shorter anchor");
+	t.recordError("edit", 'Edit failed: the oldText ("pub(crate) mod test_harness { //! The one harness ") was not found in the file');
+	t.recordSuccess("edit", "re-read the file and applied a shorter anchor");
+	const out = t.flush();
+	assert.equal(out.length, 1, "same class, different echoed source text");
+	assert.doesNotMatch(out[0].content, /bevy_falling_sand|test_harness/);
+});
+
+test("the transient gate sees a marker hidden inside parentheses", () => {
+	assert.equal(
+		pair("edit", "Edit failed (PARTIAL APPLY — 2 edits committed, do NOT resubmit the remaining ones)").length,
+		0,
+	);
+});
+
+test("Path not found from a file tool is transient, from a shell failure it is not", () => {
+	assert.equal(pair("grep", "Path not found: /home/anten/.cargo/registry/src/surrealdb-3.2.4/src").length, 0);
+	assert.equal(pair("ls", "Error: Path not found: /home/anten/code/alexandria/crates/alexandria-storage/migrations").length, 0);
+	// The same marker embedded in another tool's failure is a durable environment lesson.
+	assert.equal(pair("bash", "alexandria serve failed: Path not found: /home/anten/.pi/agent/extensions/alexandria").length, 1);
+});
+
+test("an evicted class does not displace a queued neighbour", () => {
+	const t = new ErrorTracker();
+	const mk = (n: string) => `build failed for ${n} crate: linker dropped a section, add the missing crate dependency`;
+	for (const n of ["alpha", "bravo", "charlie", "delta", "echo"]) t.recordError(`t${n}`, mk(n));
+	t.recordError("tzulu", mk("zulu")); // evicts talpha
+	t.recordError("talpha", mk("alpha")); // must NOT re-enter and evict tbravo
+	t.recordSuccess("tbravo", "added the crate to Cargo.toml and the build passed");
+	const out = t.flush();
+	assert.equal(out.length, 1);
+	assert.match(out[0].content, /bravo/);
 });
