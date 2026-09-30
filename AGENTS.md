@@ -106,6 +106,45 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Cluster cohesion in the debug UI comes from the cluster's **stored centroid** (`ClusterRepo::get`), never a recomputed member-average. `main.rs`'s maintenance loop uses the stored centroid, so an approximation made `/debug/clusters/{id}` report "Healthy" for a cluster the background task was about to split — a diagnostic surface that disagrees with the mechanism it diagnoses is worse than showing nothing.
 - `debug::router(server)` passes `None` for `DebugContext`; only HTTP mode via `router_with_context` populates it. The dashboard's config panel therefore renders an explicit "unavailable outside HTTP mode" state instead of bogus zeros, because `ClusterConfig` lives in the binary crate and structurally cannot reach `alexandria-mcp`. **Do not change `router()`'s signature** — every call site is inside a `#[cfg(test)]` module under `src/debug/`; production is the single `router_with_context` caller (`main.rs`).
 
+- **pi ≥ 0.99 owns MCP, and it is the naming contract.** pi's built-in MCP registers one real tool per
+  MCP tool as `mcp__<server>__<tool>` (`mcp__alexandria__store_memory`), sanitised to `[A-Za-z0-9_-]`,
+  with a sha256-8-hex suffix only when the name exceeds 64 chars or collides — so `mcp__alexandria__*`
+  is never truncated, and tool arguments are the server's own flat `inputSchema` (`input.content`, not
+  nested). The skill, the READMEs, and `tool-tracker.ts` all key off that name. Two traps: an installed
+  extension that registers `/mcp` (pi-mcp-adapter does) **replaces** built-in MCP — pi then never reads
+  `mcp.json` nor connects any server; and adapter 3.x published neither name, exposing a `mcp` gateway
+  plus `mcp__<server>` proxies with the real tool in `input.tool`, which the tracker has never matched
+  and does not try to. Default server `exposure` is `codemode` (tools not declared to the model);
+  `direct` is what makes the alexandria tools callable without a lookup round-trip.
+- **The companion's transient-error gate keys off pi-lens, not pi.** `isTransient()` in
+  `src/detectors/error-tracker.ts` recognises `🔄 RETRYABLE — …` and `⚠️ PARTIAL APPLY — …`, which
+  pi-lens 4.3.0 emits. Re-derive with `grep -rE 'RETRYABLE —|PARTIAL APPLY' <pi>/dist` (the em dash is
+  load-bearing: the bare word matches pi's own `RETRYABLE_STATUS_CODES` and friends in
+  `dist/utils/management-http.js`, which looks like a contradiction of this bullet). So the gate is
+  inert on a host without pi-lens and degrades silently if pi-lens rewords — the em dash is required
+  (not the bare word, and not anchored, because the markers reach `tool_execution_end` mid-string
+  inside a result blob). Schema-rejection patterns (`CALL_SHAPE_PATTERNS`) are deliberately NOT
+  applied when the error is about this server, judged from the tool name *and* the message —
+  gateway traffic arrives with toolName `mcp` and names the tool inside its text, so the name alone
+  is not enough. A validation error from alexandria's own tools is a durable API contract, not call
+  noise. `Failed to call tool: Missing …` belongs in that exemptible list rather than the
+  unconditional one: placed unconditionally it is evaluated before the exemption, so it can never be
+  exempted.
+- **The npm side sits outside this repo's supply-chain policy.** Rust has `cargo-deny` for advisories
+  *and* licences; the companion's npm tree has neither (and `deny.toml`'s allowlist would reject
+  `BlueOak-1.0.0` and `0BSD` if it were applied — substantively harmless, but it shows npm is simply
+  ungoverned). Counts and per-family numbers are recorded once, in TODO-misc.md, not here. Posture
+  today: both install paths pass `--ignore-scripts` (justfile `ext-install`, the CI step, and the
+  documented user install), because several packages in the tree declare lifecycle scripts — two
+  `esbuild` copies (`postinstall: node install.js`), `protobufjs`, `@google/genai` — and that is the
+  only third-party-code execution path in CI. Do NOT substitute `--omit=optional` for it: esbuild's
+  `install.js` falls back to `downloadDirectlyFromNPM` when `@esbuild/linux-x64` is missing, so
+  omitting optional *with scripts enabled* re-enables an unpinned registry download, and omitting it
+  *with* `--ignore-scripts` is what actually breaks `tsx`. `@earendil-works/pi-coding-agent` is
+  exact-pinned (type-only: every import is `import type`, and `npm install --omit=dev` leaves just the
+  runtime closure). Nothing compares that pin to the pi actually loading the extension — CI has no
+  host pi, and `just ext-check-pi` was removed rather than left claiming a wiring it never had — so
+  the two agree only because a human keeps them in step.
 - **pi companion prompt path: a failure is attributed, not guessed.** The MCP SDK reports an *aborted* request as `SdkErrorCode.REQUEST_TIMEOUT`, so the error text alone cannot tell an operator's Esc from a dead server. `src/failure.ts` classifies into `cancelled` (pi's `ctx.signal` aborted) / `stalled` (our 10 s path budget expired while the 5 s per-call deadline did not, which means the timers themselves ran late) / `transport` (everything else), and only `transport` drops the connection. `index.ts` supplies the context via `asFailure()` at the throw site and `injection.ts` consumes it via `failureOf()`; both are exported pure functions because the handler is an inline closure that cannot be reached from a test without module mocking, which hangs under tsx. Do not fold them back into the handler. Every `FailureKind` variant must have a producer — a `worker` variant was added for a planned worker-thread client, the plan was dropped, and the variant was removed rather than left speculative.
 - **`prewarm()` is a correctness measure, not a startup optimisation.** The SDK arms its handshake deadline as a `setTimeout` on pi's main loop, shared with every other in-process extension, so a stall longer than the remaining budget makes the overdue timer win the race against a handshake that was succeeding. Measured: a 6 s freeze 10 ms into a cold first call gave a false `REQUEST_TIMEOUT` in 6/6 fresh processes, the same freeze against a warm client resolved normally in 15/15, and pre-warming gave 3/3 honoured. Connecting at extension load takes the handshake off the prompt path. It does **not** cover a reconnect after `resetClient()`; if false timeouts ever show up with `cold:false` in the diagnostic log, that residual window is the place to look, and the fix would be moving the client to a worker thread (which needs a plain `.mjs` worker, because pi loads extensions through a bundled jiti that a spawned worker cannot inherit).
 - **Anything that shells out to `git` must sanitise `GIT_DIR` and friends.** With `GIT_DIR` set — which git does for hooks, and which a git-driving parent can leak — `git rev-parse --show-toplevel` returns the **cwd** instead of the working tree root. `getProjectHint` probes exactly that, and a wrong hint is not cosmetic: the server matches a reminder target byte-exactly, so that project's reminders get held until they arrive late and escalated. `reminders.ts` strips the `GIT_*` overrides per call (`gitProbeEnv()`), `.githooks/pre-commit` unsets them before running any gate, and `tests/reminders.test.ts` pins the behaviour by setting `GIT_DIR` deliberately. The symptom to recognise: git-dependent tests pass on a direct `npm test` but fail when run from a hook.
@@ -212,11 +251,14 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `contrib/pi/README.md` — how the pi skill and extension differ and install
 - `contrib/pi/extensions/alexandria/README.md` — the pi companion extension: what it does, reminders,
   configuration, known gaps
-- `contrib/pi/skills/alexandria-memory/SKILL.md` — the pi client-side skill (`alexandria_<tool>` names)
+- `contrib/pi/skills/alexandria-memory/SKILL.md` — the pi client-side skill (`mcp__alexandria__<tool>`
+  names, as pi's built-in MCP exposes them since 0.99)
 - `contrib/claude/README.md` — the Claude Code skill and hooks
-- `contrib/claude/skills/alexandria-memory/SKILL.md` — the Claude Code skill
-  (`mcp__alexandria__<tool>` names). Must stay at content parity with the pi copy; only the tool-name
-  prefix differs
+- `contrib/claude/skills/alexandria-memory/SKILL.md` — the Claude Code skill, using the same
+  `mcp__alexandria__<tool>` names. Must stay at content parity with the pi copy: since pi 0.99's
+  built-in MCP the two clients spell the tools identically, so the remaining differences are
+  client-specific prose (hooks vs the companion extension), not tool names — `diff` the two files
+  when editing either
 - `crates/alexandria-mcp/assets/README.md` — vendored debug-UI assets, checksums, re-vendoring
 - `TODO-misc.md` — unprioritised backlog, grouped by area
 - `AGENTS.md` — this file. It was named `CLAUDE.md` until the docs sweep that added session memory

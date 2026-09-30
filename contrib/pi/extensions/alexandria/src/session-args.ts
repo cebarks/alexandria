@@ -1,3 +1,5 @@
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+
 /**
  * Session fields sent with every store_memory call so auto-store writes are
  * grouped under pi's session in Alexandria.
@@ -9,11 +11,11 @@ export interface SessionArgs {
 	model?: string;
 }
 
-/** Minimal ctx shape — avoids importing full pi types as a runtime dependency. */
-interface SessionContext {
-	sessionManager: { getSessionId(): string };
-	model: { id: string } | undefined;
-}
+/**
+ * Type-only slice of pi's context, so the fields we reach for are pi's real
+ * declarations rather than a shape we guessed.
+ */
+export type SessionContext = Pick<ExtensionContext, "sessionManager" | "model">;
 
 export function sessionArgs(ctx: SessionContext): SessionArgs {
 	const args: SessionArgs = {

@@ -28,7 +28,7 @@ ext-test:
 # Install the pi companion's dev dependencies (`node_modules/` is gitignored, so a
 # fresh checkout has nothing to type-check or test against until this runs)
 ext-install:
-    cd contrib/pi/extensions/alexandria && npm ci
+    cd contrib/pi/extensions/alexandria && npm ci --ignore-scripts
 
 # All tests, Rust and client-side
 test-all: test ext-test

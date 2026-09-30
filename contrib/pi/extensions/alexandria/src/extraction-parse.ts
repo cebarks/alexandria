@@ -50,6 +50,22 @@ export function serializeEntries(entries: unknown[]): string {
 	return lines.join("\n\n");
 }
 
+/**
+ * The user message the extraction pass sends.
+ *
+ * `timestamp` is required by pi's `UserMessage`. The loose hand-written context
+ * type used to hide that, so the call has been going out without one since this
+ * module was written: providers tolerate it today, which is exactly why nothing
+ * was visibly wrong before the boundary was typed against pi's own declarations.
+ */
+export function extractionMessage(prompt: string, now: number): {
+	role: "user";
+	content: string;
+	timestamp: number;
+} {
+	return { role: "user", content: prompt, timestamp: now };
+}
+
 /** Extract plain text from a message content field (string or content blocks). */
 export function extractText(content: unknown): string {
 	if (typeof content === "string") return content;

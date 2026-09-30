@@ -399,7 +399,7 @@ set.
 
 ```bash
 just               # list every recipe
-just ext-install   # ONE TIME per checkout: npm install for the pi companion (node_modules/ is gitignored)
+just ext-install   # ONE TIME per checkout: npm ci --ignore-scripts for the pi companion (node_modules/ is gitignored)
 just test          # cargo test --workspace --all-features
 just ext-test      # pi companion: npm run typecheck + npm test (needs ext-install first)
 just lint          # clippy, warnings as errors (matches CI)

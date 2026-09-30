@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseExtractionResponse, serializeEntries } from "../src/extraction-parse.js";
+import {
+	extractionMessage,
+	parseExtractionResponse,
+	serializeEntries,
+} from "../src/extraction-parse.js";
 
 const msg = (role: string, content: unknown) => ({ type: "message", message: { role, content } });
 
@@ -73,4 +77,13 @@ test("memories survive an encode -> parse round trip, bare, pretty-printed and f
 		assert.deepEqual(parseExtractionResponse("```json\n" + text + "\n```"), memories);
 		assert.deepEqual(parseExtractionResponse("```\n" + text + "\n```\n"), memories);
 	}
+});
+
+
+test("the extraction request carries the timestamp pi's UserMessage requires", () => {
+	assert.deepEqual(extractionMessage("prompt text", 1_700_000_000_000), {
+		role: "user",
+		content: "prompt text",
+		timestamp: 1_700_000_000_000,
+	});
 });
