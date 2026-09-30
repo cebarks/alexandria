@@ -86,17 +86,43 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   resumed pi session recalls across everything. Pass `ctx.sessionManager.getSessionId()` if
   same-session recall ever matters more than cross-session recall.
 - [-] **`just ext-test` type-checks against whatever `@earendil-works/pi-coding-agent` the lockfile
-  holds.** `package.json` says `latest` but `npm ci` installs the locked `0.84.2`, so the types only move
-  when someone runs `npm install` or Dependabot bumps the lock. A failing typecheck after a lock
-  bump means upstream changed `ExtensionAPI`, not that our code regressed; pin the version if that
-  starts happening.
+  holds.** The lock now pins `0.99.1`, matching the running pi, and the extension's context boundary
+  is declared as `Pick<ExtensionContext, …>` with no casts at the production call sites — so a pi
+  rename or removal fails `npm run typecheck` instead of failing at runtime. A typecheck that starts
+  failing after a lockfile bump still means upstream changed `ExtensionAPI`, not that our code
+  regressed. The remaining gap is pi's *behaviour*, which no typecheck covers: the `0.87` provider
+  contract change and the `0.99` MCP rebuild were both type-compatible and both changed what the
+  companion sees.
+- [-] **ErrorTracker's transient gate stops at pi's own tool protocol (tier 1).** Measured on the
+  live store: this path wrote 526 of 1440 memories (36.5%), collapsing to 396 classes of which 351
+  are singletons. `TRANSIENT_PATTERNS` drops 224 of those 526 (43%). Tier 2 candidates are counted
+  but deliberately not shipped, because each is a judgement about a human's data rather than a tool
+  contract: `No such file or directory` 22, `Command exited with code N` 43 (21 not already caught),
+  `unexpected EOF while looking for matching` 12, `Permission denied` 4, `command not found` 3,
+  `unrecognized/unknown option` 3, `HTTP 4xx` 1, `invalid argument:` 1 — cumulative 55%.
+- [-] **ErrorTracker's premise fails for general executors, and no pattern list fixes that.** Of the
+  235 rows surviving both tiers, 149 are `bash` (plus `grep` 19, `ctx_execute` 10). `event.isError`
+  for bash means *the command exited non-zero*, so `extractResultText` stores whatever stdout came
+  back, and `ERROR_SIGNAL_PATTERN` matches ordinary output containing an error-shaped word. Real
+  rows currently in the store that are not errors at all: a passing `cargo test … 0 failed` captured
+  because the compound command exited non-zero; a `git log --oneline` dump; `movie units 21 missing
+  598.6 GB have 546.3 GB`; a successful `lsar` listing. The fix is structural, not another regex:
+  track only tools that return an error *message* (skip bash/grep/ls/find and the ctx_* sandbox
+  tools), or require message-shaped text (single leading line, no multi-line payload). Worth pairing
+  with the consolidation/"dreaming" pass, which needs the same class keys the normalizer already
+  produces.
 
 ## Claude Code integration
 
 - [-] **The Pi `error-resolution` tag is not ported.** `alexandria-extract.sh` serializes `is_error`
   tool results as `[Tool error]: <tool> ...` and leaves pairing and root-cause judgement to haiku.
-  Permission denials and user rejections go in too. Add a tag filter only if junk memories of that
-  shape appear. `contrib/claude/README.md` records the same non-port; keep the two in step.
+  Permission denials and user rejections go in too. **The junk this warned about has now been
+  measured on the pi side** — 526 rows, 36.5% of the store, dominated by tool-protocol noise
+  (`Validation failed for tool`, `PARTIAL APPLY`, `Path not found`, `not a git repository`) — and pi
+  filters it with `TRANSIENT_PATTERNS` in `src/detectors/error-tracker.ts`. The Claude hook has the
+  same problem and no gate: port the same list, or make the haiku prompt reject it, and keep the two
+  clients' noise floors comparable. `contrib/claude/README.md` records the divergence; keep them in
+  step.
 - [-] **Stop-hook extraction makes one haiku call per turn; the retry on an empty result was
   dropped.** It rested on one observation and doubled the cost of every turn. If `extracted` volume
   drops noticeably, restore the loop gated on transcript size, not unconditionally.
