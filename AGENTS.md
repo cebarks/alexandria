@@ -123,9 +123,13 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
   `dist/utils/management-http.js`, which looks like a contradiction of this bullet). So the gate is
   inert on a host without pi-lens and degrades silently if pi-lens rewords — the em dash is required
   (not the bare word, and not anchored, because the markers reach `tool_execution_end` mid-string
-  inside a result blob). Schema-rejection patterns are deliberately NOT applied when the tool name
-  contains `alexandria`: a validation error from this server's own tools is a durable API contract,
-  which is why `isTransient` takes the tool name at all.
+  inside a result blob). Schema-rejection patterns (`CALL_SHAPE_PATTERNS`) are deliberately NOT
+  applied when the error is about this server, judged from the tool name *and* the message —
+  gateway traffic arrives with toolName `mcp` and names the tool inside its text, so the name alone
+  is not enough. A validation error from alexandria's own tools is a durable API contract, not call
+  noise. `Failed to call tool: Missing …` belongs in that exemptible list rather than the
+  unconditional one: placed unconditionally it is evaluated before the exemption, so it can never be
+  exempted.
 - **The npm side sits outside this repo's supply-chain policy.** Rust has `cargo-deny` for advisories
   *and* licences; the companion's npm tree has neither (and `deny.toml`'s allowlist would reject
   `BlueOak-1.0.0` and `0BSD` if it were applied — substantively harmless, but it shows npm is simply

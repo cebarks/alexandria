@@ -85,12 +85,16 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   the server's registered name, which differs per client (`mcp__alexandria__*` on pi ≥0.99,
   `alexandria_*` on adapter 2.x) and the companion does not know which key an operator chose. If a
   second memory server ever enters the fleet, pin the server segment and add the fixture. The asymmetry
-  with `isTransient()` is then visible, and it is deliberate-but-imperfect: that function *does* key on
-  the server name (`toolName.includes("alexandria")`), so it is right only when the operator registered
-  the server under a name containing it. pi ≥0.99 does emit nested MCP calls under their own name (see
-  `toolName` in pi's `dist/core/nested-tool-calls.js`), so `codemode` exposure does not break it — but a
-  server keyed `mem` loses its own API evidence again, and `mcp__alexandria-indexer__*` is wrongly
-  exempted. Both accepted; both die if the fleet ever standardises the server key.
+  with `isTransient()` is then visible, and it is deliberate-but-imperfect: that function *does* consult
+  the server name — both `toolName.includes("alexandria")` and `referencesAlexandria(errorText)`, which
+  matches `mcp__alexandria__…` or `alexandria_<tool>` in the message, so gateway rows whose toolName is
+  `mcp` are covered too. pi ≥0.99 does emit nested MCP calls under their own name (see `toolName` in
+  pi's `dist/core/nested-tool-calls.js`), so `codemode` exposure does not break it. Remaining bounds,
+  all accepted: a server keyed `mem` with no alexandria-bearing text still loses its own API evidence;
+  the `alexandria_[a-z_]+` alternative also matches this repo's crate names (`alexandria_mcp`) inside
+  bash output, so an unrelated call-shape error quoting one is exempted (no such row exists in the
+  session corpus); and a *different* server whose rejection text quotes `alexandria_store_memory` is
+  exempted. All three die if the fleet ever standardises the server key.
 - [-] **Nothing gates pi's *behavioural* drift, only its types.** `@earendil-works/pi-coding-agent` is
   now exact-pinned, so a bump is a deliberate lockfile edit rather than background float, and CI's
   `npm run typecheck` does catch a bump that breaks the type boundary. What nothing catches is a change
@@ -165,10 +169,13 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   measured on the pi side** — 526 rows, 36.5% of the store, dominated by tool-protocol noise
   (`Validation failed for tool`, `PARTIAL APPLY`, `Path not found`, `not a git repository`) — and pi
   filters it with `isTransient()` in `src/detectors/error-tracker.ts` — two lists, not one:
-  `TRANSIENT_PATTERNS` (unconditional) and `CALL_SHAPE_PATTERNS` (applied only when the tool name does
-  NOT reference this server, because a validation rejection from alexandria's own tools is a durable API
-  contract). Two of the unconditional families are pi-lens's wording, so a porter cannot assume the
-  same strings appear in Claude's transcript. The Claude hook has the same problem and no gate: port
+  `TRANSIENT_PATTERNS` (unconditional: pi-lens's two em-dash markers, a head-anchored `Path not found`,
+  and `fatal: not a git repository`) and `CALL_SHAPE_PATTERNS` (applied only when neither the tool name
+  nor the message references this server, because a validation rejection from alexandria's own tools is
+  a durable API contract). `Failed to call tool: Missing …` sits in the exemptible list on purpose — in
+  the unconditional one it is evaluated before the exemption and can never be exempted. The
+  unconditional families are pi-lens's wording, so a porter cannot assume the same strings appear in
+  Claude's transcript. The Claude hook has the same problem and no gate: port
   `isTransient()`'s shape or make the haiku prompt reject it, and keep the two clients' noise floors
   comparable. `contrib/claude/README.md` records the divergence; keep them in step.
 - [-] **Stop-hook extraction makes one haiku call per turn; the retry on an empty result was

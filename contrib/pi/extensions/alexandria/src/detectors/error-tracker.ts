@@ -6,8 +6,9 @@
  * Call flush() at agent_end to emit paired resolutions.
  *
  * Not every error is a lesson. recordError() drops the transient tool-protocol
- * classes (see TRANSIENT_PATTERNS / isTransient), elides only what a tool echoed
- * back so one class yields one row, and never stores a class twice in a session.
+ * classes (see TRANSIENT_PATTERNS / CALL_SHAPE_PATTERNS / isTransient), collapses
+ * whitespace so one class yields one key, and never stores a class twice in a
+ * session.
  * Without those filters this path was the single largest writer in the store; the
  * measurements and their caveat live once, in TODO-misc.md under "ErrorTracker's
  * transient gate", rather than being copied into this comment.
@@ -77,12 +78,19 @@ const CALL_SHAPE_PATTERNS: RegExp[] = [
 ];
 
 /**
- * Whether this error is about THIS server. The text is consulted because the tool
- * name alone is not enough: traffic routed through a gateway arrives with toolName
- * `mcp` and the real call inside its arguments, so a toolName-only exemption silently
- * deleted this server's own API contracts. pi does emit the inner namespaced name for
- * its own nested `ctx.executeTool()` calls, so codemode exposure alone is not the
- * hole — a gateway is.
+ * Whether this error is about THIS server, judged from the message rather than the
+ * tool name alone: gateway traffic arrives with toolName `mcp` and the real call
+ * inside its arguments, so a toolName-only exemption would drop this server's own API
+ * contract.
+ *
+ * Insurance, not a measured fix. A replay of the session corpus found no row where
+ * this changes the outcome — every `Validation failed for tool "X"` row carried X as
+ * the event's own tool name, and pi does emit the inner namespaced name for its nested
+ * `ctx.executeTool()` calls. It stays because the adapter-2.x shape
+ * (`alexandria_store_memory`) is a real gateway naming and because the failure mode
+ * without it is silent evidence loss. The `alexandria_[a-z_]+` alternative also
+ * matches this repo's own crate names in bash output, so it is pinned by a test rather
+ * than left implicit.
  */
 function referencesAlexandria(errorText: string): boolean {
 	return /mcp__alexandria__|alexandria_[a-z_]+/.test(errorText);
@@ -125,10 +133,12 @@ function isTransient(toolName: string, errorText: string): boolean {
  * ``cannot find function `parse_tags` `` with ``…`store_batch` ``; any parenthesised
  * run >= 16 chars collapsed `(expected Vec<Memory>, found String)` against its exact
  * opposite; the `(ident[N])` span rule merged `(tags[0])` with `(content[0])`; and
- * the survivor — a quoted run inside parentheses — fired on 3 of 978 real error rows
- * and on none of the `oldText ("…")` rows it existed for (those die at the transient
- * gate first), while mangling durable bash output like
- * `bail!("SteamCMD failed after {attempts}")`.
+ * the survivor — a quoted run inside parentheses — fired on almost nothing, and on
+ * none of the `oldText ("…")` rows it existed for (those die at the transient gate
+ * first), while mangling durable bash output like
+ * `bail!("SteamCMD failed after {attempts}")`. A replay of the session corpus put
+ * that at a couple of rows out of ~950 survivors; the script is not committed, so no
+ * figure is quoted here — TODO-misc.md says why that matters.
  *
  * So there is no elision. Every rule that made classes coalesce also ate the
  * discriminator, and a merged key costs the second lesson for the whole session via

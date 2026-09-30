@@ -234,7 +234,10 @@ test("pi-lens's Edit-without-read wording is dropped, but not by the gate", () =
 	// pi-lens 4.3.0 emits this at dist/clients/read-guard.js. It carries no
 	// ERROR_SIGNAL word, so it dies before isTransient() is reached — which is why a
 	// `/Edit without read/` rule was deleted: it guarded nothing, and its only fixture
-	// was a JSON blob that also died at the signal stage. Pinned so nobody re-adds it.
+	// was a JSON blob that also died at the signal stage. The OUTCOME is pinned (the row
+	// is dropped); the MECHANISM is not — re-adding `/Edit without read/` fails no test,
+	// because `RETRYABLE —` already covers every real row and ERROR_SIGNAL drops the
+	// rest. Do not read this test as guarding the deleted rule.
 	assert.equal(
 		pair(
 			"edit",
@@ -325,6 +328,24 @@ test("a call-shape rejection is transient unless it names this server", () => {
 		).length,
 		0,
 		"and an unattributed one is still treated as noise",
+	);
+});
+
+test("adapter-2.x naming inside a gateway row still identifies this server", () => {
+	// `alexandria_[a-z_]+` is the half of referencesAlexandria() that narrowing the regex
+	// to /mcp__alexandria__/ silently deletes — verified: that mutation fails no test
+	// without this fixture. It is also the broader half, since it matches this repo's own
+	// crate names, so both directions are pinned.
+	assert.equal(
+		pair("mcp", 'Validation failed for tool "alexandria_store_memory":\n  - tags: must be either array or null')
+			.length,
+		1,
+		"adapter 2.x names a real gateway shape",
+	);
+	assert.equal(
+		pair("mcp", 'Validation failed for tool "newtopia_count": search_terms field is required').length,
+		0,
+		"another server's argument error stays noise",
 	);
 });
 
