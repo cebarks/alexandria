@@ -212,11 +212,14 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - `contrib/pi/README.md` — how the pi skill and extension differ and install
 - `contrib/pi/extensions/alexandria/README.md` — the pi companion extension: what it does, reminders,
   configuration, known gaps
-- `contrib/pi/skills/alexandria-memory/SKILL.md` — the pi client-side skill (`alexandria_<tool>` names)
+- `contrib/pi/skills/alexandria-memory/SKILL.md` — the pi client-side skill (`mcp__alexandria__<tool>`
+  names, as pi's built-in MCP exposes them since 0.99)
 - `contrib/claude/README.md` — the Claude Code skill and hooks
-- `contrib/claude/skills/alexandria-memory/SKILL.md` — the Claude Code skill
-  (`mcp__alexandria__<tool>` names). Must stay at content parity with the pi copy; only the tool-name
-  prefix differs
+- `contrib/claude/skills/alexandria-memory/SKILL.md` — the Claude Code skill, using the same
+  `mcp__alexandria__<tool>` names. Must stay at content parity with the pi copy: since pi 0.99's
+  built-in MCP the two clients spell the tools identically, so the remaining differences are
+  client-specific prose (hooks vs the companion extension), not tool names — `diff` the two files
+  when editing either
 - `crates/alexandria-mcp/assets/README.md` — vendored debug-UI assets, checksums, re-vendoring
 - `TODO-misc.md` — unprioritised backlog, grouped by area
 - `AGENTS.md` — this file. It was named `CLAUDE.md` until the docs sweep that added session memory

@@ -32,8 +32,10 @@ The tool names in the skill are the forms pi's built-in MCP support exposes: `mc
 i.e. `mcp__alexandria__store_memory`, `mcp__alexandria__retrieve_memories`, … — not the bare
 server-side names the MCP server itself reports. On hosts still running the third-party
 `pi-mcp-adapter` extension with `settings.toolPrefix: "server"`, the same tools appear as
-`alexandria_store_memory`; the skill targets the built-in names, and the companion's detectors match
-on the suffix so either form is recognised.
+`alexandria_store_memory`; the skill targets the built-in names, and the companion's detector reduces
+either form to the bare tool name and matches that exactly, so both are recognised. Adapter 3.x is
+not: it published neither name, exposing a `mcp` gateway and `mcp__<server>` proxies whose real tool
+sat in `input.tool` with arguments nested under `input.args`.
 
 **Install:**
 
