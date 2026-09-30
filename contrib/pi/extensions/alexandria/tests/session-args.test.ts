@@ -1,14 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { sessionArgs } from "../src/session-args.js";
+import {
+	sessionArgs,
+	type SessionContext,
+} from "../src/session-args.js";
 
 // These pin what goes onto the wire, nothing more. Whether the server keeps agent_id and model is
 // its side of the contract (StoreMemoryParams and SessionRepo in the sessions PR, #11); a server
 // without those fields drops them silently and still groups by session_id.
-const ctx = (model: { id: string } | undefined) => ({
-	sessionManager: { getSessionId: () => "abc-123" },
-	model,
-});
+//
+// The fixture is a stub, so it is cast to the production slice: pi's real
+// sessionManager and Model have many members this test does not need. That cast
+// is confined to the fixture on purpose — index.ts calls sessionArgs(ctx) with
+// pi's actual context and no cast, so drift in those members still fails the build.
+const ctx = (model: { id: string } | undefined) =>
+	({
+		sessionManager: { getSessionId: () => "abc-123" },
+		model,
+	}) as unknown as SessionContext;
 
 test("carries pi's session id, agent_id, and model id", () => {
 	assert.deepEqual(sessionArgs(ctx({ id: "claude-haiku-4-5" })), {

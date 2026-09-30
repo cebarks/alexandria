@@ -7,10 +7,12 @@
  * without any provider-specific HTTP code.
  */
 
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG } from "./config.js";
 import type { SessionDedupBuffer, DetectedMemory } from "./detectors/types.js";
 import {
 	extractText,
+	extractionMessage,
 	parseExtractionResponse,
 	serializeEntries,
 } from "./extraction-parse.js";
@@ -68,19 +70,15 @@ ${serializedConversation}
 </conversation>`;
 }
 
-/** Minimal ctx shape — avoids importing full pi types as a runtime dependency. */
-interface ExtractionContext {
-	sessionManager: { buildContextEntries(): unknown[] };
-	modelRegistry: {
-		find(provider: string, modelId: string): unknown | undefined;
-		complete(
-			model: unknown,
-			context: { messages: Array<{ role: string; content: string }> },
-		): Promise<unknown>;
-	};
-	model: unknown;
-	ui: { notify(msg: string, level: string): void };
-}
+/**
+ * The slice of pi's context this module reads. Type-only import, so pi stays out
+ * the runtime graph — but the shape is now pi's own, so a member it removes or
+ * renames fails `npm run typecheck` instead of failing at session shutdown.
+ */
+type ExtractionContext = Pick<
+	ExtensionContext,
+	"sessionManager" | "modelRegistry" | "model" | "ui"
+>;
 
 /**
  * Run the LLM extraction pass. Falls back to ctx.model if the configured
@@ -104,7 +102,6 @@ export async function runExtraction(
 			: serialized;
 
 	const userMessage = buildPrompt(truncated, buffer);
-
 	// Resolve extraction model
 	const [provider, ...modelParts] = CONFIG.extractModel.split("/");
 	const modelId = modelParts.join("/"); // handle model IDs with slashes
@@ -129,12 +126,13 @@ export async function runExtraction(
 	});
 
 	try {
-		const response = (await Promise.race([
-			ctx.modelRegistry.complete(model, {
-				messages: [{ role: "user", content: userMessage }],
-			}),
+		const response = await Promise.race([
+			ctx.modelRegistry.complete(
+				model,
+				{ messages: [extractionMessage(userMessage, Date.now())] },
+			),
 			timeoutPromise,
-		])) as Record<string, unknown>;
+		]);
 
 		return parseExtractionResponse(extractText(response.content));
 	} catch (err) {

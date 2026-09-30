@@ -320,10 +320,7 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 		// LLM extraction — skip on reload (no meaningful conversation boundary)
 		if (!CONFIG.storeDisabled && event.reason !== "reload") {
 			try {
-				const extracted = await runExtraction(
-					ctx as Parameters<typeof runExtraction>[0],
-					dedupBuffer,
-				);
+				const extracted = await runExtraction(ctx, dedupBuffer);
 				for (const mem of extracted) {
 					await storeMemory(mem.content, [...mem.tags, "extracted"], sessionArgs(ctx)).catch((err) =>
 						notifyStoreFailed(ctx, err),
