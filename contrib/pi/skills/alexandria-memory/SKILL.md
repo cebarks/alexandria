@@ -1,6 +1,6 @@
 ---
 name: alexandria-memory
-description: Use the Alexandria agent-memory MCP tools (alexandria_store_memory, alexandria_retrieve_memories, alexandria_recall, alexandria_update_memory, alexandria_import_document, alexandria_delete_memory, alexandria_list_sessions, alexandria_get_session, alexandria_finalize_session) and its reminder tools (alexandria_set_reminder, alexandria_check_reminders, alexandria_list_reminders, alexandria_cancel_reminder) to persist and recall durable facts, decisions, and preferences across sessions, and to schedule and manage future follow-ups. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before") or asks for a future nudge ("remind me", "don't let me forget", "check this tomorrow"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
+description: Use the Alexandria agent-memory MCP tools (mcp__alexandria__store_memory, mcp__alexandria__retrieve_memories, mcp__alexandria__recall, mcp__alexandria__update_memory, mcp__alexandria__import_document, mcp__alexandria__delete_memory, mcp__alexandria__list_sessions, mcp__alexandria__get_session, mcp__alexandria__finalize_session) and its reminder tools (mcp__alexandria__set_reminder, mcp__alexandria__check_reminders, mcp__alexandria__list_reminders, mcp__alexandria__cancel_reminder) to persist and recall durable facts, decisions, and preferences across sessions, and to schedule and manage future follow-ups. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before") or asks for a future nudge ("remind me", "don't let me forget", "check this tomorrow"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
 ---
 
 # Alexandria Memory
@@ -26,10 +26,10 @@ exactly like one with no memory at all. Default to using it; don't wait for an e
 
 Tool choice:
 
-- **`alexandria_retrieve_memories`** — specific lookup, you know roughly what you're searching for. Pass a
+- **`mcp__alexandria__retrieve_memories`** — specific lookup, you know roughly what you're searching for. Pass a
   natural-language statement of the fact/topic (not a question). Returns ranked hits with
   similarity + tags.
-- **`alexandria_recall`** — open-ended/broad exploration ("what do we know about X", "what's the state of
+- **`mcp__alexandria__recall`** — open-ended/broad exploration ("what do we know about X", "what's the state of
   Y"). Call once with no `scope_handle` to get candidate clusters, then call again with the
   returned `scope_handle` to narrow into the most relevant one.
 
@@ -46,40 +46,40 @@ Store as soon as something durable and non-obvious emerges — don't wait to be 
 
 Tool choice:
 
-- **`alexandria_store_memory`** — new fact. Write `content` as a standalone statement that still makes
+- **`mcp__alexandria__store_memory`** — new fact. Write `content` as a standalone statement that still makes
   sense without today's conversation (no "as discussed above", no pronouns without antecedents).
   Add `tags` for the project/domain so future retrieval scopes well.
-- **`alexandria_update_memory`** — you found that an *existing* memory is stale/wrong. Prefer this over
-  `alexandria_store_memory` for corrections — it re-embeds if content changed and preserves the old
+- **`mcp__alexandria__update_memory`** — you found that an *existing* memory is stale/wrong. Prefer this over
+  `mcp__alexandria__store_memory` for corrections — it re-embeds if content changed and preserves the old
   version via a `derived_from` lineage edge instead of leaving a stale duplicate floating
   around.
-- **`alexandria_import_document`** — bulk reference material (a design doc, README, spec, meeting notes)
+- **`mcp__alexandria__import_document`** — bulk reference material (a design doc, README, spec, meeting notes)
   the user shares or points at that's worth retaining long-term. Chunks automatically
   (heading/paragraph/fixed-size) and links chunks back to the source document.
-- **`alexandria_delete_memory`** — only when the user explicitly wants something forgotten. This is a
-  soft-delete; for corrections, prefer `alexandria_update_memory` so the lineage survives.
+- **`mcp__alexandria__delete_memory`** — only when the user explicitly wants something forgotten. This is a
+  soft-delete; for corrections, prefer `mcp__alexandria__update_memory` so the lineage survives.
 
 ## Sessions
 
-`alexandria_store_memory` accepts an optional `session_id` — an opaque handle you choose, typically
+`mcp__alexandria__store_memory` accepts an optional `session_id` — an opaque handle you choose, typically
 this conversation's identifier or a task name — which groups that memory under a session and creates
 the session on first use. Worth doing when the grouping itself is the useful thing: "everything we
 learned about the auth refactor" stays retrievable as a unit even though the memories are
 topically scattered across clusters.
 
-- **`alexandria_list_sessions`** — enumerate sessions newest-first, filterable by `agent_id`, `tag`
+- **`mcp__alexandria__list_sessions`** — enumerate sessions newest-first, filterable by `agent_id`, `tag`
   and whether they were finalized, with `limit`/`offset` paging. This is how you find a session whose
   id you did not keep.
-- **`alexandria_get_session`** — review everything stored in one session, oldest first, with its
+- **`mcp__alexandria__get_session`** — review everything stored in one session, oldest first, with its
   metadata. Use when the user asks what was captured in a specific past conversation, or before
   writing a session summary so you don't restate something already stored.
-- **`alexandria_finalize_session`** — set the session's summary, tags, and end timestamp. Call once
+- **`mcp__alexandria__finalize_session`** — set the session's summary, tags, and end timestamp. Call once
   as work wraps up; it is what makes a session skimmable later instead of a pile of fragments.
 
 Rules that matter: a session's `ended_at` is refreshed by every store, so it tracks last activity,
 not closure — an unfinalized session still has `ended_at` set, and `summary: null` is the real signal
-that it was never closed. Sessions are not searchable by *content*: `alexandria_list_sessions`
-enumerates them by metadata, and `alexandria_get_session` needs an id you already have or one you just
+that it was never closed. Sessions are not searchable by *content*: `mcp__alexandria__list_sessions`
+enumerates them by metadata, and `mcp__alexandria__get_session` needs an id you already have or one you just
 got from the list. Still worth recording the id you chose somewhere durable if you expect to revisit
 it. See `docs/session-memory.md` in the Alexandria repo for details.
 
@@ -99,12 +99,12 @@ When to set (do this unprompted, like writes):
 
 Tool choice:
 
-- **`alexandria_set_reminder`** — schedule a one-shot or recurring message; exactly one of the three
+- **`mcp__alexandria__set_reminder`** — schedule a one-shot or recurring message; exactly one of the three
   kinds below. Write `message` so it still makes sense in a session with none of today's context.
-- **`alexandria_list_reminders`** — what is scheduled and when it fires; filter by `status`
+- **`mcp__alexandria__list_reminders`** — what is scheduled and when it fires; filter by `status`
   (`pending` default, `delivered`, `cancelled`, `all`) and `target_project`. This is where you find an
   id to cancel.
-- **`alexandria_cancel_reminder`** — soft-cancel by id when the user says it's no longer needed, or
+- **`mcp__alexandria__cancel_reminder`** — soft-cancel by id when the user says it's no longer needed, or
   after a delivery for a recurring reminder the user now wants stopped.
 
 Schedule kinds — give exactly one:
@@ -140,16 +140,16 @@ reminder in a project that stops being visited is not lost — once it is at lea
 escalation window overdue (`[reminders].escalation_hours`) it delivers everywhere, flagged
 `escalated: true`.
 
-Delivery happens only when something calls **`alexandria_check_reminders`** — some client
+Delivery happens only when something calls **`mcp__alexandria__check_reminders`** — some client
 integrations do it automatically at the start of each turn; if yours doesn't (check what your client
 actually does), you are that something. That call is the *only* thing that consumes reminders
 (recurring ones advance; missed fires coalesce rather than trickle). So don't call it reflexively;
 call it when the user asks "anything due?", or when a reminder they expected hasn't shown up, passing
 the current project so project-targeted reminders match. The `due_reminders` array on
-`alexandria_retrieve_memories` / `alexandria_recall` responses is a read-only safety net (a small
+`mcp__alexandria__retrieve_memories` / `mcp__alexandria__recall` responses is a read-only safety net (a small
 oldest-due sample) that is *untargeted*: entries appear there with their `target` whatever project
 they belong to, so another project's entry is informational — it reaches the user through the next
-`alexandria_check_reminders` instead.
+`mcp__alexandria__check_reminders` instead.
 
 ## Guidelines
 
@@ -161,13 +161,15 @@ they belong to, so another project's entry is informational — it reaches the u
   user.
 - **Surface conflicts.** If a retrieved memory contradicts what you're about to do or say, flag
   it to the user rather than silently picking one.
-- **Batch queries when exploring multiple angles** — call `alexandria_retrieve_memories` a few times with
+- **Batch queries when exploring multiple angles** — call `mcp__alexandria__retrieve_memories` a few times with
   varied phrasing rather than one query trying to cover everything, same principle as varying
   web-search queries.
 
 ## Availability
 
-These tools come from the `alexandria` MCP server (HTTP, `http://127.0.0.1:3000/mcp`, configured
-with `keep-alive` lifecycle). If the tools aren't present, the server may not be running —
-check `systemctl --user status alexandria` (if deployed as a systemd user service) before
-concluding memory isn't available for this session.
+These tools come from the `alexandria` MCP server (HTTP, `http://127.0.0.1:3000/mcp`), which must be
+configured with `"exposure": "direct"` for them to be declared to the model — the pi default is
+`codemode`, where they are reachable only from scripts. If the tools aren't present, the server may not
+be running or may be signed out: check `systemctl --user status alexandria` (if deployed as a systemd
+user service) and `pi mcp list`, and look for `exposure` before concluding memory isn't available for
+this session.

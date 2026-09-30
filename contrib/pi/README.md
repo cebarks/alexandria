@@ -28,8 +28,12 @@ A pi [skill](https://github.com/earendil-works/pi-mono/blob/main/packages/coding
 documenting concrete trigger conditions for when an agent should read or write memory and which tool
 to pick. Skills are guidance loaded into the agent's context — no code, no dependencies.
 
-The tool names in the skill are the MCP-prefixed forms pi exposes (`alexandria_store_memory`,
-`alexandria_retrieve_memories`, …), not the bare server-side names.
+The tool names in the skill are the forms pi's built-in MCP support exposes: `mcp__<server>__<tool>`,
+i.e. `mcp__alexandria__store_memory`, `mcp__alexandria__retrieve_memories`, … — not the bare
+server-side names the MCP server itself reports. On hosts still running the third-party
+`pi-mcp-adapter` extension with `settings.toolPrefix: "server"`, the same tools appear as
+`alexandria_store_memory`; the skill targets the built-in names, and the companion's detectors match
+on the suffix so either form is recognised.
 
 **Install:**
 

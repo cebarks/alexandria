@@ -2,8 +2,9 @@
  * Tool dedup tracker — watches tool_result events for agent-initiated
  * store_memory/update_memory calls and records their content in the dedup buffer.
  *
- * MCP tool names are server-prefixed (e.g., "alexandria_store_memory").
- * We match by suffix to be resilient to prefix changes.
+ * Pi's built-in MCP names tools mcp__<server>__<tool> (e.g.,
+ * "mcp__alexandria__store_memory"); the pi-mcp-adapter extension used
+ * "alexandria_store_memory". We match by suffix to be resilient to either.
  */
 
 import type { SessionDedupBuffer } from "./types.js";
