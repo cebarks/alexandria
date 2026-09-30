@@ -18,6 +18,8 @@ interface ErrorRecord {
 	toolName: string;
 	errorText: string;
 	timestamp: number;
+	/** Class key held in `seen`, so eviction can release it. */
+	key: string;
 }
 
 interface Resolution {
@@ -30,48 +32,61 @@ const MAX_TEXT_LENGTH = 200;
 const MIN_ERROR_LENGTH = 30;
 
 /**
- * Errors that are not durable lessons: the tool rejected our own call shape, or
- * told us the edit drifted and to retry. Derived from the live store rather than
- * invented — 526 `error-resolution` rows collapsed into 396 classes, 351 of them
- * singletons, and the head of that distribution is entirely these families
- * (`edit` PARTIAL APPLY ×23, `Validation failed for tool` ×22 across ask_user /
- * ask_user_question / ctx_execute, `Path not found` ×9, `fatal: not a git
- * repository` ×7, `Failed to call tool: Missing` ×14).
+ * Errors that are not durable lessons.
  *
- * An allowlist, not a denylist of "interesting" errors, because the two failure
- * directions are not symmetric: a false entry here loses one memory, while a
- * false entry the other way re-poisons every future recall — these rows are
- * retrieved again and again, and 13% of the results on a set of realistic dev
- * probes already were error-resolution rows.
+ * Two of these marker families are pi-lens's (4.3.0 emits `🔄 RETRYABLE — Edit
+ * target not found`, `⚠️ PARTIAL APPLY — N edits committed …`); they are NOT pi's
+ * own wording, which is why each requires the em dash: the dash is what separates
+ * "this is pi-lens telling me to retry" from a durable error that merely mentions
+ * the word. Consequence of the dependency: on a host without pi-lens these two
+ * rules never fire, and a pi-lens reword silently degrades the gate — nothing in
+ * the suite would notice. TODO(debt): pin the markers to pi-lens's emitted strings
+ * rather than prose, or gate on the tool's structured error code.
  *
- * The marker words are pi's own (RETRYABLE / PARTIAL APPLY / Edit without read),
- * so this tracks pi's tool protocol rather than a guess at what is transient.
+ * The rest are measured from the live store: `Validation failed for tool` ×85,
+ * `edit PARTIAL APPLY` ×47, pi `RETRYABLE` ×44, gateway misuse ×26.
  */
 const TRANSIENT_PATTERNS: RegExp[] = [
-	/RETRYABLE/,
-	/PARTIAL APPLY/,
+	/RETRYABLE —/,
+	/PARTIAL APPLY —/,
 	/Edit without read/,
-	/Validation failed for tool/,
-	/failed to deserialize parameters/i,
-	/Failed to call tool:/,
-	/^\s*(Error: )?Path not found:/,
+	/(^|: )Path not found:/,
 	/fatal: not a git repository/,
+	/Failed to call tool: Missing/,
 ];
 
 /**
- * Elide the payload a tool quoted back at us — the `oldText ("…")` of a drifted
- * edit, an inline code span, a long literal — so that one error class reduces to
- * one row. Without this, every occurrence differs by its quoted content, which is
- * what turned 396 classes out of 526 rows into mostly singletons and let the same
- * lesson be stored a dozen times.
+ * Call-shape rejections: usually noise about how the agent addressed some other
+ * server's tool. NOT applied to the alexandria server's own tools — a rejection
+ * from `mcp__alexandria__store_memory` is a constraint of THIS product's API, and
+ * it is exactly the "error -> what worked" lesson this module exists to write.
+ * Filtering it fleet-wide would keep deleting the evidence for claims like the
+ * stored (and still unverified) one that store_memory rejects array tags.
+ */
+const CALL_SHAPE_PATTERNS: RegExp[] = [
+	/Validation failed for tool/,
+	/failed to deserialize parameters/i,
+];
+
+function isTransient(toolName: string, errorText: string): boolean {
+	if (TRANSIENT_PATTERNS.some((re) => re.test(errorText))) return true;
+	if (toolName.includes("alexandria")) return false;
+	return CALL_SHAPE_PATTERNS.some((re) => re.test(errorText));
+}
+
+/**
+ * Elide the payload a tool echoed back inside parentheses — the `oldText ("…")` /
+ * `(edits[0], edits[1])` runs of a drifted edit — so one class yields one row.
+ *
+ * Deliberately narrow, because the first version of this was too wide and the
+ * review caught it: eliding backticks and quoted runs destroyed the
+ * discriminator (``cannot find function `parse_tags` `` and ``…`store_batch```
+ * collapsed into one key) and gutted the resolution half of the memory, which is
+ * the entire point of the row. Whitespace is still collapsed, since that only
+ * stabilises the class key.
  */
 function normalizeErrorText(text: string): string {
-	return text
-		.replace(/\(([^)]{16,})\)/g, "(<elided>)")
-		.replace(/`([^`]{8,})`/g, "`<elided>`")
-		.replace(/"([^"]{24,})"/g, '"<elided>"')
-		.replace(/\s+/g, " ")
-		.trim();
+	return text.replace(/\(([^)]{16,})\)/g, "(<elided>)").replace(/\s+/g, " ").trim();
 }
 
 /** Error text must contain at least one of these to be worth tracking. */
@@ -89,28 +104,33 @@ export class ErrorTracker {
 	 * (not the raw MCP response blob).
 	 */
 	recordError(toolName: string, text: string): void {
-		const errorText = normalizeErrorText(text.slice(0, MAX_TEXT_LENGTH));
+		const raw = text.slice(0, MAX_TEXT_LENGTH).trim();
 
-		// Filter: too short to be meaningful
-		if (errorText.length < MIN_ERROR_LENGTH) return;
+		// Length and signal are judged on the untouched text: elision normalises the
+		// class key and the stored row, and must never be able to shrink an error out
+		// of existence.
+		if (raw.length < MIN_ERROR_LENGTH) return;
+		if (!ERROR_SIGNAL_PATTERN.test(raw)) return;
 
-		// Filter: must contain error-indicative language
-		if (!ERROR_SIGNAL_PATTERN.test(errorText)) return;
+		const errorText = normalizeErrorText(raw);
 
 		// Filter: transient tool protocol, not a lesson
-		if (TRANSIENT_PATTERNS.some((re) => re.test(errorText))) return;
+		if (isTransient(toolName, errorText)) return;
 
 		// Filter: this class is already queued or already stored this session
 		const key = `${toolName}\u0000${errorText}`;
 		if (this.seen.has(key)) return;
 		this.seen.add(key);
 
-		// Ring buffer — drop oldest if full
+		// Ring buffer — drop oldest if full, and release its claim: an error that
+		// left the buffer unpaired taught us nothing, so the class must be able to
+		// queue again and still pair with a later success.
 		if (this.errors.length >= MAX_ERRORS) {
-			this.errors.shift();
+			const evicted = this.errors.shift();
+			if (evicted) this.seen.delete(evicted.key);
 		}
 
-		this.errors.push({ toolName, errorText, timestamp: Date.now() });
+		this.errors.push({ toolName, errorText, timestamp: Date.now(), key });
 	}
 
 	/**
@@ -118,7 +138,9 @@ export class ErrorTracker {
 	 * (not the raw MCP response blob).
 	 */
 	recordSuccess(toolName: string, text: string): void {
-		const successText = normalizeErrorText(text.slice(0, MAX_TEXT_LENGTH));
+		// Not normalised: the resolution is the half of the memory that says what
+		// fixed it, and eliding it makes the row useless in a different way.
+		const successText = text.slice(0, MAX_TEXT_LENGTH).trim();
 		if (!successText) return;
 
 		// Find a matching error for this tool
@@ -137,6 +159,11 @@ export class ErrorTracker {
 			content: `Error with ${r.error.toolName}: ${r.error.errorText}\nResolution: ${r.successText}`,
 			tags: ["error-resolution", "auto-detected", r.error.toolName],
 		}));
+
+		// Errors still unpaired when agent_end arrives have taught us nothing, so
+		// release their class claims — the same error recurring next turn, followed by
+		// a real fix, is still a lesson worth storing.
+		for (const e of this.errors) this.seen.delete(e.key);
 
 		this.resolutions = [];
 		this.errors = [];
