@@ -17,7 +17,7 @@ Nothing here auto-installs. Copy what you want into your pi config directory.
 | Time side | Documents the four reminder tools and when to reach for them | Calls `check_reminders` per prompt, so reminders arrive without the agent having to remember |
 | Write side | Tells the agent when to call `store_memory` | Heuristic detectors + session-end LLM extraction |
 | Cost | Context tokens only | HTTP + embedding round trip per prompt, one LLM call per session |
-| Install | Copy a directory | Copy a directory + `npm install` |
+| Install | Copy a directory | Copy a directory + `npm install --omit=dev` |
 
 Start with the skill. Add the extension only if agents still aren't checking memory often enough,
 or if you want capture to continue even when the agent forgets to write.
@@ -85,7 +85,7 @@ cannot resolve them — this has to be a package-style extension directory with 
 ```bash
 cp -r contrib/pi/extensions/alexandria ~/.pi/agent/extensions/
 cd ~/.pi/agent/extensions/alexandria
-npm install
+npm install --omit=dev
 ```
 
 The directory used to be `extensions/alexandria-auto-recall/`. If the old copy is still in

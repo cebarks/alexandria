@@ -52,7 +52,7 @@ are unaffected by the recall/reminders toggles.
 ```bash
 cp -r contrib/pi/extensions/alexandria ~/.pi/agent/extensions/
 cd ~/.pi/agent/extensions/alexandria
-npm install
+npm install --omit=dev
 ```
 
 ## Reminders
