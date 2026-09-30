@@ -118,21 +118,29 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
   `direct` is what makes the alexandria tools callable without a lookup round-trip.
 - **The companion's transient-error gate keys off pi-lens, not pi.** `isTransient()` in
   `src/detectors/error-tracker.ts` recognises `🔄 RETRYABLE — …` and `⚠️ PARTIAL APPLY — …`, which
-  pi-lens 4.3.0 emits; grepping pi 0.99.1's `dist` for those strings finds nothing. So the gate is
+  pi-lens 4.3.0 emits. Re-derive with `grep -rE 'RETRYABLE —|PARTIAL APPLY' <pi>/dist` (the em dash is
+  load-bearing: the bare word matches pi's own `RETRYABLE_STATUS_CODES` and friends in
+  `dist/utils/management-http.js`, which looks like a contradiction of this bullet). So the gate is
   inert on a host without pi-lens and degrades silently if pi-lens rewords — the em dash is required
   (not the bare word, and not anchored, because the markers reach `tool_execution_end` mid-string
   inside a result blob). Schema-rejection patterns are deliberately NOT applied when the tool name
   contains `alexandria`: a validation error from this server's own tools is a durable API contract,
   which is why `isTransient` takes the tool name at all.
 - **The npm side sits outside this repo's supply-chain policy.** Rust has `cargo-deny` for advisories
-  *and* licences; the ~167-package companion tree has neither, and `deny.toml`'s licence allowlist
-  would reject `BlueOak-1.0.0` and `0BSD` if applied. The posture that exists today: installs run with
-  `--ignore-scripts` (justfile `ext-install` and the CI step) because esbuild's postinstall is the one
-  third-party-code execution path in CI — and note `--omit=optional` is NOT a substitute, it drops
-  `@esbuild/linux-x64` that `tsx` needs, so the suite stops running. `@earendil-works/pi-coding-agent`
-  is exact-pinned (it is type-only: `import type` erases at runtime, and `npm install --omit=dev`
-  leaves exactly the 14 runtime packages), and `just ext-check-pi` compares that pin to the local
-  `pi --version` — CI cannot run it, so the two agree only because a human keeps them in step.
+  *and* licences; the companion's npm tree has neither (and `deny.toml`'s allowlist would reject
+  `BlueOak-1.0.0` and `0BSD` if it were applied — substantively harmless, but it shows npm is simply
+  ungoverned). Counts and per-family numbers are recorded once, in TODO-misc.md, not here. Posture
+  today: both install paths pass `--ignore-scripts` (justfile `ext-install`, the CI step, and the
+  documented user install), because several packages in the tree declare lifecycle scripts — two
+  `esbuild` copies (`postinstall: node install.js`), `protobufjs`, `@google/genai` — and that is the
+  only third-party-code execution path in CI. Do NOT substitute `--omit=optional` for it: esbuild's
+  `install.js` falls back to `downloadDirectlyFromNPM` when `@esbuild/linux-x64` is missing, so
+  omitting optional *with scripts enabled* re-enables an unpinned registry download, and omitting it
+  *with* `--ignore-scripts` is what actually breaks `tsx`. `@earendil-works/pi-coding-agent` is
+  exact-pinned (type-only: every import is `import type`, and `npm install --omit=dev` leaves just the
+  runtime closure). Nothing compares that pin to the pi actually loading the extension — CI has no
+  host pi, and `just ext-check-pi` was removed rather than left claiming a wiring it never had — so
+  the two agree only because a human keeps them in step.
 - **pi companion prompt path: a failure is attributed, not guessed.** The MCP SDK reports an *aborted* request as `SdkErrorCode.REQUEST_TIMEOUT`, so the error text alone cannot tell an operator's Esc from a dead server. `src/failure.ts` classifies into `cancelled` (pi's `ctx.signal` aborted) / `stalled` (our 10 s path budget expired while the 5 s per-call deadline did not, which means the timers themselves ran late) / `transport` (everything else), and only `transport` drops the connection. `index.ts` supplies the context via `asFailure()` at the throw site and `injection.ts` consumes it via `failureOf()`; both are exported pure functions because the handler is an inline closure that cannot be reached from a test without module mocking, which hangs under tsx. Do not fold them back into the handler. Every `FailureKind` variant must have a producer — a `worker` variant was added for a planned worker-thread client, the plan was dropped, and the variant was removed rather than left speculative.
 - **`prewarm()` is a correctness measure, not a startup optimisation.** The SDK arms its handshake deadline as a `setTimeout` on pi's main loop, shared with every other in-process extension, so a stall longer than the remaining budget makes the overdue timer win the race against a handshake that was succeeding. Measured: a 6 s freeze 10 ms into a cold first call gave a false `REQUEST_TIMEOUT` in 6/6 fresh processes, the same freeze against a warm client resolved normally in 15/15, and pre-warming gave 3/3 honoured. Connecting at extension load takes the handshake off the prompt path. It does **not** cover a reconnect after `resetClient()`; if false timeouts ever show up with `cold:false` in the diagnostic log, that residual window is the place to look, and the fix would be moving the client to a worker thread (which needs a plain `.mjs` worker, because pi loads extensions through a bundled jiti that a spawned worker cannot inherit).
 - **Anything that shells out to `git` must sanitise `GIT_DIR` and friends.** With `GIT_DIR` set — which git does for hooks, and which a git-driving parent can leak — `git rev-parse --show-toplevel` returns the **cwd** instead of the working tree root. `getProjectHint` probes exactly that, and a wrong hint is not cosmetic: the server matches a reminder target byte-exactly, so that project's reminders get held until they arrive late and escalated. `reminders.ts` strips the `GIT_*` overrides per call (`gitProbeEnv()`), `.githooks/pre-commit` unsets them before running any gate, and `tests/reminders.test.ts` pins the behaviour by setting `GIT_DIR` deliberately. The symptom to recognise: git-dependent tests pass on a direct `npm test` but fail when run from a hook.

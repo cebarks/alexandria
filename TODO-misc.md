@@ -84,14 +84,24 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   accepted knowingly during the PR #41 review rather than fixed, because scoping to `alexandria` needs
   the server's registered name, which differs per client (`mcp__alexandria__*` on pi ≥0.99,
   `alexandria_*` on adapter 2.x) and the companion does not know which key an operator chose. If a
-  second memory server ever enters the fleet, pin the server segment and add the fixture.
+  second memory server ever enters the fleet, pin the server segment and add the fixture. The asymmetry
+  with `isTransient()` is then visible, and it is deliberate-but-imperfect: that function *does* key on
+  the server name (`toolName.includes("alexandria")`), so it is right only when the operator registered
+  the server under a name containing it. pi ≥0.99 does emit nested MCP calls under their own name (see
+  `toolName` in pi's `dist/core/nested-tool-calls.js`), so `codemode` exposure does not break it — but a
+  server keyed `mem` loses its own API evidence again, and `mcp__alexandria-indexer__*` is wrongly
+  exempted. Both accepted; both die if the fleet ever standardises the server key.
 - [-] **Nothing gates pi's *behavioural* drift, only its types.** `@earendil-works/pi-coding-agent` is
-  now exact-pinned and `just ext-check-pi` compares the pin against the locally installed pi, but CI
-  has no host pi and `pi --version` there resolves nothing — the two versions agree only because a
-  human kept them in step. The missing piece is a smoke job that loads the extension under the real
-  host pi and asserts what it registers (`mcp__alexandria__store_memory` present, `tool_execution_end`
-  shaped as expected). That is the only check which would have caught 0.87's provider-contract change
-  and 0.99's MCP rebuild; both were type-compatible.
+  now exact-pinned, so a bump is a deliberate lockfile edit rather than background float, and CI's
+  `npm run typecheck` does catch a bump that breaks the type boundary. What nothing catches is a change
+  that compiles and still behaves differently: the `0.87` provider-contract change and the `0.99` MCP
+  rebuild were both type-compatible and both changed what the companion sees. `just ext-check-pi` was
+  added mid-review and removed again in the same round — it compared the *installed* copy rather than
+  the declared pin, and claimed a place in `just ci` it never had, so it could print OK while the
+  committed pin was stale. Replacing it needs both fixed: read the pin from `package.json`, treat a
+  pin-vs-lock disagreement as its own failure, and make "no host pi" a skip rather than an error so it
+  can actually live in `ci`. The real gap is a smoke job that loads the extension under the host pi and
+  asserts what it registers — see the next-but-one entry.
 - [-] **Seven lockfile entries have no `integrity`.** The `@earendil-works/*` packages inside pi's
   subtree (`chord`, `pi-agent-core`, `pi-ai`, `pi-codemode`, `pi-mcp`, `pi-telemetry`, `pi-tui`) are
   pinned by URL and version only, because pi ships `npm-shrinkwrap.json` and its generator drops
@@ -117,22 +127,24 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   regressed. The remaining gap is pi's *behaviour*, which no typecheck covers: the `0.87` provider
   contract change and the `0.99` MCP rebuild were both type-compatible and both changed what the
   companion sees.
-- [-] **ErrorTracker's transient gate is bounded by what it can prove is noise (tier 1).** Measured on
-  the live store: this path wrote 526 of 1440 memories (36.5%), collapsing to 396 classes of which 351
-  are singletons. `isTransient()` drops **51–61% of those 526** — measured by replaying the real rows
-  through `ErrorTracker` itself (61% over the 124 rows with full stored text, 51% over the 517
-  dashboard previews, whose truncation changes what the regexes see). An earlier figure of 43% was
-  wrong: it came from a survey script that re-implemented the patterns over raw text, while the shipped
-  code matches normalised text. Re-measure through the class, never beside it.
-  The gate is deliberately narrower than the noise floor, because two of its marker families are
-  **pi-lens's** wording (`🔄 RETRYABLE — …`, `⚠️ PARTIAL APPLY — …`, pi-lens 4.3.0) and not pi's: on a
-  host without pi-lens those rules never fire, and a pi-lens reword silently degrades them — each rule
-  therefore requires the em dash rather than the word, so a durable error that merely mentions
-  "RETRYABLE" survives. Tier 2 candidates are counted but deliberately not shipped, because each is a
-  judgement about a human's data rather than a tool contract: `No such file or directory` 22,
-  `Command exited with code N` 43 (21 not already caught), `unexpected EOF while looking for matching`
-  12, `Permission denied` 4, `command not found` 3, `unrecognized/unknown option` 3, `HTTP 4xx` 1,
-  `invalid argument:` 1.
+- [-] **ErrorTracker's transient gate is bounded by what it can prove is noise.** Per-family counts
+  live *only in this entry* — code comments and AGENTS.md point here rather than repeating them,
+  because a number copied into three files is a number nobody re-derives. Measured 2026-09-30 on the
+  live store: this path had written 526 of 1440 live memories (36.5%), collapsing to 396 classes of
+  which 351 are singletons. Dominant families: tool-schema rejections ×85, `edit PARTIAL APPLY` ×47,
+  pi-lens `RETRYABLE —` ×44, gateway argument errors ×26, `fatal: not a git repository` ×8. Tier-2
+  candidates counted but not shipped, since each is a judgement about human data rather than a tool
+  contract: `Command exited with code N` ×43, `No such file or directory` ×22, `unexpected EOF` ×12,
+  `Permission denied` ×4, `command not found` ×3, `unrecognized option` ×3, `HTTP 4xx` ×1,
+  `invalid argument:` ×1.
+  Carry this caveat with the numbers: they come from replaying **already-stored** rows through
+  `ErrorTracker`, so the input was already normalised and truncated, and two populations were used
+  (124 session-attached rows with full content; 517 parseable dashboard previews out of the same 526).
+  Hence a range, ~51–61% would not have been written, not a constant — and no committed script
+  reproduces it. The earlier 43% was worse than imprecise: it came from a survey script that
+  re-implemented the patterns *beside* the code, which disagreed with the shipped gate for two reasons
+  (raw vs normalised text, and elision deleting the error signal). If this number matters again,
+  commit the replay script, run it over raw `tool_execution_end` text, and state the population.
 - [-] **ErrorTracker's premise fails for general executors, and no pattern list fixes that.** Of the
   235 rows surviving both tiers, 149 are `bash` (plus `grep` 19, `ctx_execute` 10). `event.isError`
   for bash means *the command exited non-zero*, so `extractResultText` stores whatever stdout came
@@ -152,10 +164,13 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   Permission denials and user rejections go in too. **The junk this warned about has now been
   measured on the pi side** — 526 rows, 36.5% of the store, dominated by tool-protocol noise
   (`Validation failed for tool`, `PARTIAL APPLY`, `Path not found`, `not a git repository`) — and pi
-  filters it with `TRANSIENT_PATTERNS` in `src/detectors/error-tracker.ts`. The Claude hook has the
-  same problem and no gate: port the same list, or make the haiku prompt reject it, and keep the two
-  clients' noise floors comparable. `contrib/claude/README.md` records the divergence; keep them in
-  step.
+  filters it with `isTransient()` in `src/detectors/error-tracker.ts` — two lists, not one:
+  `TRANSIENT_PATTERNS` (unconditional) and `CALL_SHAPE_PATTERNS` (applied only when the tool name does
+  NOT reference this server, because a validation rejection from alexandria's own tools is a durable API
+  contract). Two of the unconditional families are pi-lens's wording, so a porter cannot assume the
+  same strings appear in Claude's transcript. The Claude hook has the same problem and no gate: port
+  `isTransient()`'s shape or make the haiku prompt reject it, and keep the two clients' noise floors
+  comparable. `contrib/claude/README.md` records the divergence; keep them in step.
 - [-] **Stop-hook extraction makes one haiku call per turn; the retry on an empty result was
   dropped.** It rested on one observation and doubled the cost of every turn. If `extracted` volume
   drops noticeably, restore the loop gated on transcript size, not unconditionally.

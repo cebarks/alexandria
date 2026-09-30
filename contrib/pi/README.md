@@ -17,7 +17,7 @@ Nothing here auto-installs. Copy what you want into your pi config directory.
 | Time side | Documents the four reminder tools and when to reach for them | Calls `check_reminders` per prompt, so reminders arrive without the agent having to remember |
 | Write side | Tells the agent when to call `store_memory` | Heuristic detectors + session-end LLM extraction |
 | Cost | Context tokens only | HTTP + embedding round trip per prompt, one LLM call per session |
-| Install | Copy a directory | Copy a directory + `npm install --omit=dev` |
+| Install | Copy a directory | Copy a directory + a script-free, locked npm install |
 
 Start with the skill. Add the extension only if agents still aren't checking memory often enough,
 or if you want capture to continue even when the agent forgets to write.
@@ -73,7 +73,7 @@ check never suppresses recall or vice versa. This mirrors the server's own desig
 highest-quality but depends on the agent choosing to act, heuristics are zero-latency but shallow, and
 extraction is thorough but arrives only at the end.
 
-### Requires `npm install`
+### Requires a dependency install
 
 It depends on `@modelcontextprotocol/client` and `smol-toml`. pi's extension loader (jiti) does not
 alias third-party npm packages the way it does pi's own internal packages, so a bare `.ts` file
@@ -85,7 +85,7 @@ cannot resolve them — this has to be a package-style extension directory with 
 ```bash
 cp -r contrib/pi/extensions/alexandria ~/.pi/agent/extensions/
 cd ~/.pi/agent/extensions/alexandria
-npm install --omit=dev
+npm install --omit=dev --ignore-scripts
 ```
 
 The directory used to be `extensions/alexandria-auto-recall/`. If the old copy is still in

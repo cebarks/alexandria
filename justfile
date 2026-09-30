@@ -30,17 +30,6 @@ ext-test:
 ext-install:
     cd contrib/pi/extensions/alexandria && npm ci --ignore-scripts
 
-# Fail when the pinned pi types drift from the pi that actually loads the companion.
-# CI cannot run this (no host pi there); it is for `just ci` locally and for you.
-ext-check-pi:
-    @cd contrib/pi/extensions/alexandria \
-      && locked=$(node -p "require('./node_modules/@earendil-works/pi-coding-agent/package.json').version") \
-      && if command -v pi >/dev/null 2>&1; then \
-           host=$(pi --version | tr -d '[:space:]'); \
-           if [ "$locked" = "$host" ]; then echo "OK: pi types $locked == host pi $host"; \
-           else echo "MISMATCH: companion type-checks against $locked but pi loads the extension with $host" >&2; exit 1; fi; \
-         else echo "pi not on PATH: compared types $locked against nothing"; exit 1; fi
-
 # All tests, Rust and client-side
 test-all: test ext-test
 
