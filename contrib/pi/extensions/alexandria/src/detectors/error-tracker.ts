@@ -19,7 +19,10 @@ interface ErrorRecord {
 	toolName: string;
 	errorText: string;
 	timestamp: number;
-	/** Class key held in `seen`, so eviction can release it. */
+	/**
+	 * Class key. Released by flush() once the record leaves the queue unpaired,
+	 * whether it was evicted by the ring or simply never matched with a success.
+	 */
 	key: string;
 }
 
@@ -70,17 +73,21 @@ const CALL_SHAPE_PATTERNS: RegExp[] = [
 ];
 
 /**
- * Tools whose whole job is addressing paths. For them "Path not found" is the
- * routine answer to a wrong guess. For every other tool the same words are usually
- * the detail *inside* a durable failure — "alexandria serve failed: Path not found:
- * ~/.pi/agent/extensions/alexandria" is a stale-directory bug worth remembering,
- * and a text-only rule deleted it. pi 0.99.1 emits this string from its grep/find/ls
- * tools; re-verify with `grep -rn "Path not found" <pi>/dist/core/tools`.
+ * A path lookup that found nothing is the routine answer to a wrong guess, and pi
+ * emits it as the whole message (`Path not found: <path>`, optionally prefixed with
+ * "Error: "). It is matched at the HEAD only: the same words inside another tool's
+ * failure — "alexandria serve failed: Path not found: ~/.pi/agent/extensions/
+ * alexandria" — are the detail of a durable lesson, and keying transience on the
+ * *tool* instead of the message turned every grep/find/ls error into a dropped
+ * lesson, including pi's own `Failed to run ripgrep:` and `Not a directory:`.
+ * Known bound: a blob-wrapped `Path not found:` payload is stored as one row of
+ * noise. Accepted, because the alternative is another condition nobody can verify.
+ * Re-derive the emission shape with `grep -rn "Path not found" <pi>/dist/core/tools`.
  */
-const PATH_LOOKUP_TOOLS = new Set(["grep", "find", "ls", "glob", "fd"]);
+const PATH_LOOKUP_FAILED = /^\s*(Error: )?Path not found:/;
 
 function isTransient(toolName: string, errorText: string): boolean {
-	if (PATH_LOOKUP_TOOLS.has(toolName) || /^Path not found:/.test(errorText)) return true;
+	if (PATH_LOOKUP_FAILED.test(errorText)) return true;
 	if (TRANSIENT_PATTERNS.some((re) => re.test(errorText))) return true;
 	// A validation rejection from THIS server's own tools is a durable API contract,
 	// not call noise. Keyed on the server segment of the tool name, which means the
@@ -93,19 +100,19 @@ function isTransient(toolName: string, errorText: string): boolean {
 /**
  * Elide only what a tool echoed back at us, never what a diagnostic asserted.
  *
- * The first cut elided any backtick or quoted run; the second elided any
- * parenthesised run >= 16 chars. Both destroyed the discriminator, because that is
- * where compilers put it: `(expected Vec<Memory>, found String)` and its exact
- * opposite collapsed to one class key, and the row that survived described nothing.
- * So elision is now limited to payload shapes — a quoted run inside parentheses
- * (the `oldText ("…")` of a drifted edit) and lists of span indices (the
- * `(edits[0], edits[1])` of a partial apply). Whitespace collapse stays, since it
- * only stabilises the class key.
+ * Three cuts have now been tried. Eliding backticks or quoted runs destroyed the
+ * discriminator (`cannot find function \`parse_tags\`` vs \``store_batch\``); eliding
+ * any parenthesised run >= 16 chars collapsed `(expected Vec<Memory>, found String)`
+ * against its exact opposite; eliding `(ident[N])` index lists merged `(tags[0])`
+ * with `(content[0])` and could not even fire on its designed-for input, because the
+ * `(edits[0], edits[1])` row is caught by the raw-text transient gate first. So that
+ * rule is deleted rather than tightened.
+ *
+ * What remains is one shape: a quoted run inside parentheses — a tool restating a
+ * string we handed it. Whitespace collapse stays; it only stabilises the class key,
+ * and "whitespace-only differences share one class" pins it.
  */
-const ECHOED_PAYLOAD: Array<[RegExp, string]> = [
-	[/\("[^"]{16,}"\)/g, '("<elided>")'],
-	[/\(\s*[\w.]+\[\d+\](?:\s*,\s*[\w.]+\[\d+\])*\s*\)/g, "(<elided-spans>)"],
-];
+const ECHOED_PAYLOAD: Array<[RegExp, string]> = [[/\("[^"]{16,}"\)/g, '("<elided>")']];
 
 function normalizeErrorText(text: string): string {
 	let out = text;
@@ -122,6 +129,8 @@ export class ErrorTracker {
 	private resolutions: Resolution[] = [];
 	/** Normalized class keys already tracked this session, so a class is stored once. */
 	private seen = new Set<string>();
+	/** Keys of ring-evicted records, released at the next flush. */
+	private pendingRelease: string[] = [];
 
 	/**
 	 * Record a tool error. Caller should pass pre-extracted text
@@ -145,12 +154,13 @@ export class ErrorTracker {
 		if (this.seen.has(key)) return;
 		this.seen.add(key);
 
-		// Ring buffer — drop oldest if full. The evicted class deliberately KEEPS its
-		// claim: releasing it let a re-entering error displace the neighbour the
-		// eviction had pushed along, losing a lesson that was still pairable. Keys are
-		// released only in flush(), where the whole queue is being reconsidered anyway.
+		// Ring buffer — drop oldest if full. The claim is released only at the next
+		// flush, not immediately: re-recording within the same turn would otherwise
+		// displace the neighbour the eviction pushed along and lose a still-pairable
+		// lesson, while keeping the claim forever would lose the evicted class instead.
 		if (this.errors.length >= MAX_ERRORS) {
-			this.errors.shift();
+			const evicted = this.errors.shift();
+			if (evicted) this.pendingRelease.push(evicted.key);
 		}
 
 		this.errors.push({ toolName, errorText, timestamp: Date.now(), key });
@@ -185,8 +195,12 @@ export class ErrorTracker {
 
 		// Errors still unpaired when agent_end arrives have taught us nothing, so
 		// release their class claims — the same error recurring next turn, followed by
-		// a real fix, is still a lesson worth storing.
+		// a real fix, is still a lesson worth storing. Evicted keys go the same way
+		// (see recordError): they are unreachable via `errors` by then. A class that
+		// DID produce a memory keeps its claim, which is what stops the flood.
 		for (const e of this.errors) this.seen.delete(e.key);
+		for (const key of this.pendingRelease) this.seen.delete(key);
+		this.pendingRelease = [];
 
 		this.resolutions = [];
 		this.errors = [];

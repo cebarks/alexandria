@@ -76,10 +76,10 @@ test("flush clears unpaired errors", () => {
 	assert.deepEqual(t.flush(), []);
 });
 
-// Transient classes below are taken verbatim from the live store's top families:
-// 526 error-resolution rows collapsing to 396 classes, 351 of them singletons.
-// Every one of these is the tool telling us our own call was malformed or drifted,
-// which the retry already resolves — not a durable lesson.
+// The transient classes below are copied verbatim from real rows in the live store.
+// Per-family counts, the populations they were measured over, and their caveats are
+// recorded once in TODO-misc.md ("ErrorTracker's transient gate") — not restated
+// here, because a number in a comment is a number nobody re-derives.
 const TRANSIENT: Array<[string, string]> = [
 	[
 		"edit",
@@ -183,10 +183,21 @@ test("alexandria's own schema rejections stay trackable", () => {
 	assert.equal(out.length, 1, "this server's own API contract is a durable lesson, not call noise");
 });
 
-test("Path not found is transient whatever wrapped it", () => {
+// Fixtures here use pi 0.99.1's real emission shapes, verified with
+// `grep -o '`[^`]*`' <pi>/dist/core/tools/{grep,ls,find}.js`: grep emits
+// `Path not found: ${searchPath}` and `Failed to run ripgrep: ${error.message}`; ls
+// adds `Cannot read directory: …` and `Not a directory: …`; find emits
+// `Failed to run fd: …`. An earlier version of this test asserted on
+// "Error executing grep: Path not found: …", a string neither pi nor pi-lens
+// produces — it existed only to make a widened rule look covered.
+test("a path lookup that found nothing is transient; the same words mid-message are not", () => {
+	// The whole message is the marker — pi's actual grep/ls/find output.
+	assert.equal(pair("grep", "Path not found: /home/anten/.cargo/registry/src/surrealdb-3.2.4/src").length, 0);
+	assert.equal(pair("ls", "Error: Path not found: /home/anten/code/alexandria/crates/alexandria-storage/migrations").length, 0);
+	// The marker as a detail inside a different failure is a durable lesson.
 	assert.equal(
-		pair("grep", "Error executing grep: Path not found: /home/anten/.cargo/registry/src/surrealdb-3.2.4/src", "re-ran against an existing dir").length,
-		0,
+		pair("bash", "alexandria serve failed: Path not found: /home/anten/.pi/agent/extensions/alexandria").length,
+		1,
 	);
 });
 
@@ -262,4 +273,59 @@ test("an evicted class does not displace a queued neighbour", () => {
 	const out = t.flush();
 	assert.equal(out.length, 1);
 	assert.match(out[0].content, /bravo/);
+});
+
+// ── Round 3 of the PR #41 review: three of these were confirmed by probe before fixing ──
+
+test("a path tool's non-path errors are still durable lessons", () => {
+	// The round-2 fix keyed transience on the TOOL, which silently made grep/find/ls
+	// a lesson desert. pi's own grep/find/ls emit these alongside "Path not found".
+	assert.equal(
+		pair("grep", "Failed to run ripgrep: spawn EACCES, the rg binary under ~/.local/bin is not executable").length,
+		1,
+	);
+	assert.equal(pair("ls", "Cannot read directory: EACCES, permission denied on /root/.ssh/config").length, 1);
+	assert.equal(pair("find", "Failed to run fd: permission denied on /root/.ssh while searching").length, 1);
+});
+
+test("a class evicted by the ring can be stored on a later turn", () => {
+	const mk = (n: string) => `build failed for ${n} crate: linker dropped a section, add the missing crate`;
+	const t = new ErrorTracker();
+	for (const n of ["a", "b", "c", "d", "e"]) t.recordError(`t${n}`, mk(n));
+	t.recordError("tz", mk("z")); // evicts ta
+	t.flush(); // turn boundary
+	t.recordError("ta", mk("a"));
+	t.recordSuccess("ta", "added the crate to Cargo.toml and the build passed");
+	const out = t.flush();
+	assert.equal(out.length, 1, "an evicted class must not be lost for the whole session");
+	assert.match(out[0].content, /for a crate/);
+});
+
+test("indexed fields with different names are different classes", () => {
+	const t = new ErrorTracker();
+	t.recordError("bash", "surrealdb write failed: unknown field (tags[0]) in the memory payload");
+	t.recordSuccess("bash", "dropped the field and the write went through");
+	t.recordError("bash", "surrealdb write failed: unknown field (content[0]) in the memory payload");
+	t.recordSuccess("bash", "dropped the field and the write went through");
+	assert.equal(t.flush().length, 2, "eliding the field name merges two distinct causes");
+});
+
+test("a class that already produced a memory is not stored again next turn", () => {
+	const E = "cargo test failed: 12 passed but the doctest for parse_memory errored on borrow";
+	const t = new ErrorTracker();
+	t.recordError("bash", E);
+	t.recordSuccess("bash", "rewrote the doctest to clone before borrowing");
+	assert.equal(t.flush().length, 1, "first turn stores it");
+	t.recordError("bash", E);
+	t.recordSuccess("bash", "rewrote the doctest to clone before borrowing");
+	assert.equal(t.flush().length, 0, "the same class must stay deduped across turns");
+});
+
+test("whitespace-only differences share one class", () => {
+	const t = new ErrorTracker();
+	t.recordError("bash", "migrate failed: undefined field\n  session\n    on line 4 of the migration");
+	t.recordSuccess("bash", "quoted the reserved word and it applied");
+	t.recordError("bash", "migrate failed: undefined field session on line 4 of the migration");
+	t.recordSuccess("bash", "quoted the reserved word and it applied");
+	assert.equal(t.flush().length, 1, "class keys must be newline-insensitive");
 });
