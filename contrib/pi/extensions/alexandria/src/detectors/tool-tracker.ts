@@ -11,6 +11,12 @@
  * another server's `mcp__agentmemory__auto_store_memory`, whose content was never
  * stored in Alexandria, so the buffer would suppress a real extraction.
  *
+ * What exact matching does NOT do is identify the server: a different server whose
+ * tool is named plainly `store_memory` is still accepted, and the single-`_`
+ * fallback can mis-strip a prefix (`bulk_store_memory`). Both were weighed and
+ * left as-is in the PR #41 review — see "matches the tool name, not the server" in
+ * TODO-misc.md — so treat this as a known bound, not an oversight.
+ *
  * What is deliberately NOT handled is pi-mcp-adapter 3.x, which published neither
  * name: it exposed a `mcp` gateway and `mcp__<server>` proxies whose real tool sat
  * in `input.tool` with arguments nested under `input.args`. This tracker matched

@@ -78,6 +78,30 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
 
 ## Pi extension
 
+- [-] **`tool-tracker.ts` matches the tool name, not the server.** After the exact-match fix, a tool
+  called `store_memory` on a *different* MCP server (`mcp__agentmemory__store_memory`) still feeds the
+  dedup buffer, and the single-`_` prefix fallback mis-strips names like `bulk_store_memory`. Both were
+  accepted knowingly during the PR #41 review rather than fixed, because scoping to `alexandria` needs
+  the server's registered name, which differs per client (`mcp__alexandria__*` on pi ≥0.99,
+  `alexandria_*` on adapter 2.x) and the companion does not know which key an operator chose. If a
+  second memory server ever enters the fleet, pin the server segment and add the fixture.
+- [-] **Nothing gates pi's *behavioural* drift, only its types.** `@earendil-works/pi-coding-agent` is
+  now exact-pinned and `just ext-check-pi` compares the pin against the locally installed pi, but CI
+  has no host pi and `pi --version` there resolves nothing — the two versions agree only because a
+  human kept them in step. The missing piece is a smoke job that loads the extension under the real
+  host pi and asserts what it registers (`mcp__alexandria__store_memory` present, `tool_execution_end`
+  shaped as expected). That is the only check which would have caught 0.87's provider-contract change
+  and 0.99's MCP rebuild; both were type-compatible.
+- [-] **Seven lockfile entries have no `integrity`.** The `@earendil-works/*` packages inside pi's
+  subtree (`chord`, `pi-agent-core`, `pi-ai`, `pi-codemode`, `pi-mcp`, `pi-telemetry`, `pi-tui`) are
+  pinned by URL and version only, because pi ships `npm-shrinkwrap.json` and its generator drops
+  digests for same-version workspace siblings — `npm` copies that omission forward. These are exactly
+  the `.d.ts` files the `Pick<ExtensionContext, …>` boundary resolves through. Guard: a check that
+  fails if any `package-lock.json` entry lacks `integrity` (same shape as `just verify-assets`), plus
+  the upstream ask. Note the asymmetry: Rust has `cargo-deny` for advisories *and* licences; the npm
+  tree has neither, and `deny.toml`'s licence allowlist would reject `BlueOak-1.0.0` and `0BSD` today
+  if it were applied — substantively harmless, but it shows npm sits outside the policy.
+
 - [-] **An assistant reply to a text-less user message shares the previous turn number.**
   `serializeEntries` only advances `turnNum` on user text, so an image-only user message and the
   assistant's answer to it are both labelled with the prior turn. Label the assistant line by its own
@@ -93,13 +117,22 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   regressed. The remaining gap is pi's *behaviour*, which no typecheck covers: the `0.87` provider
   contract change and the `0.99` MCP rebuild were both type-compatible and both changed what the
   companion sees.
-- [-] **ErrorTracker's transient gate stops at pi's own tool protocol (tier 1).** Measured on the
-  live store: this path wrote 526 of 1440 memories (36.5%), collapsing to 396 classes of which 351
-  are singletons. `TRANSIENT_PATTERNS` drops 224 of those 526 (43%). Tier 2 candidates are counted
-  but deliberately not shipped, because each is a judgement about a human's data rather than a tool
-  contract: `No such file or directory` 22, `Command exited with code N` 43 (21 not already caught),
-  `unexpected EOF while looking for matching` 12, `Permission denied` 4, `command not found` 3,
-  `unrecognized/unknown option` 3, `HTTP 4xx` 1, `invalid argument:` 1 — cumulative 55%.
+- [-] **ErrorTracker's transient gate is bounded by what it can prove is noise (tier 1).** Measured on
+  the live store: this path wrote 526 of 1440 memories (36.5%), collapsing to 396 classes of which 351
+  are singletons. `isTransient()` drops **51–61% of those 526** — measured by replaying the real rows
+  through `ErrorTracker` itself (61% over the 124 rows with full stored text, 51% over the 517
+  dashboard previews, whose truncation changes what the regexes see). An earlier figure of 43% was
+  wrong: it came from a survey script that re-implemented the patterns over raw text, while the shipped
+  code matches normalised text. Re-measure through the class, never beside it.
+  The gate is deliberately narrower than the noise floor, because two of its marker families are
+  **pi-lens's** wording (`🔄 RETRYABLE — …`, `⚠️ PARTIAL APPLY — …`, pi-lens 4.3.0) and not pi's: on a
+  host without pi-lens those rules never fire, and a pi-lens reword silently degrades them — each rule
+  therefore requires the em dash rather than the word, so a durable error that merely mentions
+  "RETRYABLE" survives. Tier 2 candidates are counted but deliberately not shipped, because each is a
+  judgement about a human's data rather than a tool contract: `No such file or directory` 22,
+  `Command exited with code N` 43 (21 not already caught), `unexpected EOF while looking for matching`
+  12, `Permission denied` 4, `command not found` 3, `unrecognized/unknown option` 3, `HTTP 4xx` 1,
+  `invalid argument:` 1.
 - [-] **ErrorTracker's premise fails for general executors, and no pattern list fixes that.** Of the
   235 rows surviving both tiers, 149 are `bash` (plus `grep` 19, `ctx_execute` 10). `event.isError`
   for bash means *the command exited non-zero*, so `extractResultText` stores whatever stdout came
