@@ -33,9 +33,11 @@ port = 3000
 [embedding]
 model = "sentence-transformers/all-MiniLM-L6-v2"
 device = "cpu"
-# Tokens of each memory the search sees. 128 is the standard, 256 is tested, up to 512 is
-# experimental. Locked on first run and only ever raised (alexandria migrate-embeddings).
-max_tokens = 128
+# Tokens of each memory the search sees. 256 is the default and what has been measured;
+# up to 512 is experimental. A database created before this key existed is stamped 128 and
+# needs `alexandria migrate-embeddings` before it boots at the default. Locked on first run
+# and only ever raised.
+max_tokens = 256
 EOF
 
 # Run

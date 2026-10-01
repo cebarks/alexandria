@@ -74,10 +74,11 @@ pub struct EmbeddingConfig {
     /// default 32; the server itself embeds one text at a time.
     pub batch_size: usize,
     /// Longest text, in wordpiece tokens including `[CLS]`/`[SEP]`, one embedding sees; the
-    /// rest of a longer text is not searchable. 3..=512, default 128 (what the tokenizer
-    /// ships, so what every database from before this key was embedded at). 256 is tested;
-    /// above that is experimental. Locked on first boot: raising it needs
-    /// `alexandria migrate-embeddings`, and it is never lowered.
+    /// rest of a longer text is not searchable. 3..=512, default 256 (what
+    /// sentence-transformers serves this model at, and the only value besides 128 that has
+    /// been measured); above that is experimental. A corpus stamped before this key existed
+    /// is treated as 128 and must be migrated before it will boot at the default. Locked on
+    /// first boot: raising it needs `alexandria migrate-embeddings`, and it is never lowered.
     pub max_tokens: usize,
 }
 
@@ -540,9 +541,11 @@ mod tests {
 
     #[test]
     fn test_embedding_max_tokens_default_env_and_range() {
-        assert_eq!(Config::default().embedding.max_tokens, 128);
-        let config = Config::from_toml("[embedding]\nmax_tokens = 256\n").unwrap();
-        assert_eq!(config.embedding.max_tokens, 256);
+        assert_eq!(Config::default().embedding.max_tokens, 256);
+        // 128 is still reachable: it is what a pre-lock corpus is stamped at, so a database
+        // that has not been migrated has to be able to express it.
+        let config = Config::from_toml("[embedding]\nmax_tokens = 128\n").unwrap();
+        assert_eq!(config.embedding.max_tokens, 128);
 
         let at =
             |v: &'static str| Config::load_from(&env(&[("ALEXANDRIA_EMBEDDING_MAX_TOKENS", v)]));

@@ -20,12 +20,20 @@ fn cls_pooling_from_json(s: &str) -> bool {
 }
 
 /// Default for `embedding.max_tokens`: the longest input, in wordpiece tokens including
-/// `[CLS]`/`[SEP]`, that one embedding sees. 128 is what the cached `tokenizer.json` ships, so it
-/// is what every corpus from before the key existed was embedded at. sentence-transformers serves
-/// this model at 256 and the live corpus p99 is 284 (docs/performance-and-ability-findings.md,
-/// A1), so 256 is the tested opt-in. The value in use is locked in `system_config` beside the
-/// model id, so raising it forces a re-embed.
-pub const DEFAULT_MAX_TOKENS: usize = 128;
+/// `[CLS]`/`[SEP]`, that one embedding sees. 256 is what sentence-transformers serves this model
+/// at, and it is the only value besides 128 that has been measured here
+/// (docs/minilm-test-data.md, "256-token re-embed"); the live corpus p99 is 284
+/// (docs/performance-and-ability-findings.md, A1), so 256 still truncates the longest ~1.7%.
+/// Above 256 is unmeasured — see issue #26 for the sweep that should set this from a curve
+/// rather than a convention.
+///
+/// This is **not** the same number as [`PRE_LOCK_MAX_TOKENS`], which stays 128 because that is
+/// what corpora predating the lock key were genuinely embedded at. Raising this default means a
+/// database stamped by an older binary refuses to boot until `alexandria migrate-embeddings`
+/// has run. The value in use is locked in `system_config` beside the model id.
+///
+/// [`PRE_LOCK_MAX_TOKENS`]: alexandria_storage::system_config::PRE_LOCK_MAX_TOKENS
+pub const DEFAULT_MAX_TOKENS: usize = 256;
 
 pub struct CandleProvider {
     model: BertModel,

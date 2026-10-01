@@ -428,7 +428,8 @@ sensitivity check on the index parameters.
 
 Finding A1 in `docs/performance-and-ability-findings.md`: the tokenizer shipped a 128-token
 truncation, so every fact longer than that was embedded on its opening. On 2026-09-10 this
-install's limit went to 256 (`embedding.max_tokens`; the default stays 128) and the whole corpus was re-embedded (`alexandria migrate-embeddings`, 1834 facts
+install's limit went to 256 (`embedding.max_tokens`, which was then an opt-in over a default of
+128; the default itself became 256 on 2026-10-01) and the whole corpus was re-embedded (`alexandria migrate-embeddings`, 1834 facts
 including deleted ones, 998 centroids, 68 s). Two snapshots of the same 1139-fact corpus, taken
 minutes apart with the server stopped, one before and one after the re-embed. Both rows are
 `limit = 10`.
@@ -452,6 +453,14 @@ scan with itself; see "HNSW overlap through the index".)
 **What this pass cannot show.** The benefit of the change is that the 100-odd facts past 128
 tokens are now searchable by their second half. No frozen question targets one of them, so
 the bench has no way to register that. A question aimed at the tail of a long fact would.
+
+**This migration is the one that caused [#44](https://github.com/cebarks/alexandria/issues/44).**
+It ran on 2026-09-10, eleven days before `embedding_max_tokens` existed (ca5fa3b, 2026-09-21), so
+it stamped no token lock. The absent key reads back as `PRE_LOCK_MAX_TOKENS` (128), which matched
+the then-default, so every boot check passed while describing a corpus that was really at 256 —
+and once the key existed, new facts were written at 128 into it. Repaired on 2026-10-01 with
+`migrate-embeddings --force` (1855 facts, 1259 centroids). Read the numbers above as measured on
+the 2026-09-10 vectors; the corpus has been re-embedded since.
 
 **The baseline row is no longer byte-identical to 2026-09-08, on three columns.** `ff_p50`,
 `ff_p90`, `ff_p99` went 0.130/0.298/0.560 -> 0.132/0.303/0.569 because some of the 143 oldest
