@@ -176,5 +176,5 @@ in the `env` block of `~/.claude/settings.json`, or in the hook command itself, 
 contrib/claude/hooks/alexandria-recall.sh retrieve_memories '{"query":"which database","limit":3}'
 ```
 
-`hooks/test.sh` is a manual end-to-end check against a running server
-(`ALEXANDRIA_URL=... contrib/claude/hooks/test.sh`).
+`hooks/alexandria-claude-test.sh` is a manual end-to-end check against a running server
+(`ALEXANDRIA_URL=... contrib/claude/hooks/alexandria-claude-test.sh`).
