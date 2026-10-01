@@ -21,7 +21,7 @@
 #   ALEXANDRIA_HOOK_CHILD          set by this hook on the `claude -p` child; every hook exits at once
 #   ALEXANDRIA_DETACHED            set by this hook on its detached copy; tests set it to run inline
 set -uo pipefail
-input=$(cat)   # before any guard: exiting with stdin unread can SIGPIPE the writer (test.sh pipes jq in)
+input=$(cat)   # before any guard: exiting with stdin unread can SIGPIPE the writer (alexandria-claude-test.sh pipes jq in)
 [ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
 # Sessions with no human at the prompt (`claude -p`, Agent SDK, `claude mcp serve`, bench, GitHub Action,
 # triggers) and Cowork carry a CLAUDE_CODE_ENTRYPOINT the binary reserves for them: auto-store is off there

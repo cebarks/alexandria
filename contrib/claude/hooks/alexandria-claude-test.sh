@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Manual end-to-end check for the Claude Code hooks against a running server.
-# Usage: ALEXANDRIA_URL=http://127.0.0.1:3000/mcp ./test.sh
+# Usage: ALEXANDRIA_URL=http://127.0.0.1:3000/mcp ./alexandria-claude-test.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 export ALEXANDRIA_URL="${ALEXANDRIA_URL:-http://127.0.0.1:3000/mcp}"
