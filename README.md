@@ -305,33 +305,36 @@ cp contrib/claude/hooks/alexandria-recall.sh ~/.claude/hooks/
 
 #### In pi
 
-pi reads MCP servers from `~/.pi/agent/mcp.json` (via pi's MCP adapter extension), so a
-long-running Alexandria is a one-entry change there:
+Pi 0.99 and later read MCP servers from `~/.pi/agent/mcp.json` (or a trusted project's
+`.pi/mcp.json`) with built-in support, so a long-running Alexandria is a one-entry change there:
 
 ```json
 {
-  "settings": { "toolPrefix": "server" },
   "mcpServers": {
     "alexandria": {
-      "type": "http",
       "url": "http://127.0.0.1:3000/mcp",
-      "lifecycle": "keep-alive"
+      "exposure": "direct"
     }
   }
 }
 ```
 
-`"lifecycle": "keep-alive"` is the setting that matters for an HTTP server you use constantly:
-`lazy` (the adapter default) idle-disconnects after `settings.idleTimeout` minutes, and the call that
-reconnects also has to re-establish Alexandria's Streamable HTTP session. `keep-alive` connects at
-startup, never idle-times-out, and refreshes the tool catalog before user input — reconnecting when
-the server reports the session expired, which is the client-side half of surviving an Alexandria
-restart. If you run Alexandria over stdio instead (`command`), prefer `lazy-keep-alive`: each
-re-spawn means loading the ~80MB Candle model, so you want the process resident after first use.
+`"exposure": "direct"` is the setting that matters for a memory server you expect to be used on every
+task. Pi's default is `codemode`, which keeps the tools out of the model's declared tool list and makes
+them reachable only from JavaScript the model writes for its `codemode` tool; `deferred` is the middle
+option, where `tool_search` loads matches on demand. An agent that has to *remember to look* for the
+memory tools tends not to, so declare them.
 
-With `toolPrefix: "server"`, pi exposes the tools as `alexandria_store_memory`,
-`alexandria_retrieve_memories`, and so on — the form the skill and the auto-store detectors use. The
-detectors match on the tool-name *suffix*, so a different prefix convention still works.
+Pi connects at session start, retries transient HTTP failures twice, and reconnects a dropped server on
+the next call — there is no idle-eviction or keep-alive knob to tune (the earlier `lifecycle` and
+`settings.idleTimeout` fields belong to the third-party `pi-mcp-adapter` extension, which reads
+`mcp-adapter.json` and is not needed on 0.99+). Check the wiring with `pi mcp list`; for servers that
+use OAuth, `pi mcp login <server>`. If a running session does not see a new or edited server, run
+`/reload` or start a new session.
+
+Pi names these tools `mcp__<server>__<tool>` — `mcp__alexandria__store_memory`,
+`mcp__alexandria__retrieve_memories`, and so on — which is the form the skill uses. The companion's
+auto-store detectors match on the tool-name *suffix*, so they work with either naming convention.
 
 Then optionally add the client-side nudges — see
 [`contrib/pi/README.md`](contrib/pi/README.md).
@@ -396,7 +399,7 @@ set.
 
 ```bash
 just               # list every recipe
-just ext-install   # ONE TIME per checkout: npm install for the pi companion (node_modules/ is gitignored)
+just ext-install   # ONE TIME per checkout: npm ci --ignore-scripts for the pi companion (node_modules/ is gitignored)
 just test          # cargo test --workspace --all-features
 just ext-test      # pi companion: npm run typecheck + npm test (needs ext-install first)
 just lint          # clippy, warnings as errors (matches CI)

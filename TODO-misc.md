@@ -78,6 +78,44 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
 
 ## Pi extension
 
+- [-] **`tool-tracker.ts` matches the tool name, not the server.** After the exact-match fix, a tool
+  called `store_memory` on a *different* MCP server (`mcp__agentmemory__store_memory`) still feeds the
+  dedup buffer, and the single-`_` prefix fallback mis-strips names like `bulk_store_memory`. Both were
+  accepted knowingly during the PR #41 review rather than fixed, because scoping to `alexandria` needs
+  the server's registered name, which differs per client (`mcp__alexandria__*` on pi ≥0.99,
+  `alexandria_*` on adapter 2.x) and the companion does not know which key an operator chose. If a
+  second memory server ever enters the fleet, pin the server segment and add the fixture. The asymmetry
+  with `isTransient()` is then visible, and it is deliberate-but-imperfect: that function *does* consult
+  the server name — both `toolName.includes("alexandria")` and `referencesAlexandria(errorText)`, which
+  matches `mcp__alexandria__…` or `alexandria_<tool>` in the message, so gateway rows whose toolName is
+  `mcp` are covered too. pi ≥0.99 does emit nested MCP calls under their own name (see `toolName` in
+  pi's `dist/core/nested-tool-calls.js`), so `codemode` exposure does not break it. Remaining bounds,
+  all accepted: a server keyed `mem` with no alexandria-bearing text still loses its own API evidence;
+  the `alexandria_[a-z_]+` alternative also matches this repo's crate names (`alexandria_mcp`) inside
+  bash output, so an unrelated call-shape error quoting one is exempted (no such row exists in the
+  session corpus); and a *different* server whose rejection text quotes `alexandria_store_memory` is
+  exempted. All three die if the fleet ever standardises the server key.
+- [-] **Nothing gates pi's *behavioural* drift, only its types.** `@earendil-works/pi-coding-agent` is
+  now exact-pinned, so a bump is a deliberate lockfile edit rather than background float, and CI's
+  `npm run typecheck` does catch a bump that breaks the type boundary. What nothing catches is a change
+  that compiles and still behaves differently: the `0.87` provider-contract change and the `0.99` MCP
+  rebuild were both type-compatible and both changed what the companion sees. `just ext-check-pi` was
+  added mid-review and removed again in the same round — it compared the *installed* copy rather than
+  the declared pin, and claimed a place in `just ci` it never had, so it could print OK while the
+  committed pin was stale. Replacing it needs both fixed: read the pin from `package.json`, treat a
+  pin-vs-lock disagreement as its own failure, and make "no host pi" a skip rather than an error so it
+  can actually live in `ci`. The real gap is a smoke job that loads the extension under the host pi and
+  asserts what it registers — see the next-but-one entry.
+- [-] **Seven lockfile entries have no `integrity`.** The `@earendil-works/*` packages inside pi's
+  subtree (`chord`, `pi-agent-core`, `pi-ai`, `pi-codemode`, `pi-mcp`, `pi-telemetry`, `pi-tui`) are
+  pinned by URL and version only, because pi ships `npm-shrinkwrap.json` and its generator drops
+  digests for same-version workspace siblings — `npm` copies that omission forward. These are exactly
+  the `.d.ts` files the `Pick<ExtensionContext, …>` boundary resolves through. Guard: a check that
+  fails if any `package-lock.json` entry lacks `integrity` (same shape as `just verify-assets`), plus
+  the upstream ask. Note the asymmetry: Rust has `cargo-deny` for advisories *and* licences; the npm
+  tree has neither, and `deny.toml`'s licence allowlist would reject `BlueOak-1.0.0` and `0BSD` today
+  if it were applied — substantively harmless, but it shows npm sits outside the policy.
+
 - [-] **An assistant reply to a text-less user message shares the previous turn number.**
   `serializeEntries` only advances `turnNum` on user text, so an image-only user message and the
   assistant's answer to it are both labelled with the prior turn. Label the assistant line by its own
@@ -86,17 +124,60 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   resumed pi session recalls across everything. Pass `ctx.sessionManager.getSessionId()` if
   same-session recall ever matters more than cross-session recall.
 - [-] **`just ext-test` type-checks against whatever `@earendil-works/pi-coding-agent` the lockfile
-  holds.** `package.json` says `latest` but `npm ci` installs the locked `0.84.2`, so the types only move
-  when someone runs `npm install` or Dependabot bumps the lock. A failing typecheck after a lock
-  bump means upstream changed `ExtensionAPI`, not that our code regressed; pin the version if that
-  starts happening.
+  holds.** The lock now pins `0.99.1`, matching the running pi, and the extension's context boundary
+  is declared as `Pick<ExtensionContext, …>` with no casts at the production call sites — so a pi
+  rename or removal fails `npm run typecheck` instead of failing at runtime. A typecheck that starts
+  failing after a lockfile bump still means upstream changed `ExtensionAPI`, not that our code
+  regressed. The remaining gap is pi's *behaviour*, which no typecheck covers: the `0.87` provider
+  contract change and the `0.99` MCP rebuild were both type-compatible and both changed what the
+  companion sees.
+- [-] **ErrorTracker's transient gate is bounded by what it can prove is noise.** Per-family counts
+  live *only in this entry* — code comments and AGENTS.md point here rather than repeating them,
+  because a number copied into three files is a number nobody re-derives. Measured 2026-09-30 on the
+  live store: this path had written 526 of 1440 live memories (36.5%), collapsing to 396 classes of
+  which 351 are singletons. Dominant families: tool-schema rejections ×85, `edit PARTIAL APPLY` ×47,
+  pi-lens `RETRYABLE —` ×44, gateway argument errors ×26, `fatal: not a git repository` ×8. Tier-2
+  candidates counted but not shipped, since each is a judgement about human data rather than a tool
+  contract: `Command exited with code N` ×43, `No such file or directory` ×22, `unexpected EOF` ×12,
+  `Permission denied` ×4, `command not found` ×3, `unrecognized option` ×3, `HTTP 4xx` ×1,
+  `invalid argument:` ×1.
+  Carry this caveat with the numbers: they come from replaying **already-stored** rows through
+  `ErrorTracker`, so the input was already normalised and truncated, and two populations were used
+  (124 session-attached rows with full content; 517 parseable dashboard previews out of the same 526).
+  Hence a range, ~51–61% would not have been written, not a constant — and no committed script
+  reproduces it. The earlier 43% was worse than imprecise: it came from a survey script that
+  re-implemented the patterns *beside* the code, which disagreed with the shipped gate for two reasons
+  (raw vs normalised text, and elision deleting the error signal). If this number matters again,
+  commit the replay script, run it over raw `tool_execution_end` text, and state the population.
+- [-] **ErrorTracker's premise fails for general executors, and no pattern list fixes that.** Of the
+  235 rows surviving both tiers, 149 are `bash` (plus `grep` 19, `ctx_execute` 10). `event.isError`
+  for bash means *the command exited non-zero*, so `extractResultText` stores whatever stdout came
+  back, and `ERROR_SIGNAL_PATTERN` matches ordinary output containing an error-shaped word. Real
+  rows currently in the store that are not errors at all: a passing `cargo test … 0 failed` captured
+  because the compound command exited non-zero; a `git log --oneline` dump; `movie units 21 missing
+  598.6 GB have 546.3 GB`; a successful `lsar` listing. The fix is structural, not another regex:
+  track only tools that return an error *message* (skip bash/grep/ls/find and the ctx_* sandbox
+  tools), or require message-shaped text (single leading line, no multi-line payload). Worth pairing
+  with the consolidation/"dreaming" pass, which needs the same class keys the normalizer already
+  produces.
 
 ## Claude Code integration
 
 - [-] **The Pi `error-resolution` tag is not ported.** `alexandria-extract.sh` serializes `is_error`
   tool results as `[Tool error]: <tool> ...` and leaves pairing and root-cause judgement to haiku.
-  Permission denials and user rejections go in too. Add a tag filter only if junk memories of that
-  shape appear. `contrib/claude/README.md` records the same non-port; keep the two in step.
+  Permission denials and user rejections go in too. **The junk this warned about has now been
+  measured on the pi side** — 526 rows, 36.5% of the store, dominated by tool-protocol noise
+  (`Validation failed for tool`, `PARTIAL APPLY`, `Path not found`, `not a git repository`) — and pi
+  filters it with `isTransient()` in `src/detectors/error-tracker.ts` — two lists, not one:
+  `TRANSIENT_PATTERNS` (unconditional: pi-lens's two em-dash markers, a head-anchored `Path not found`,
+  and `fatal: not a git repository`) and `CALL_SHAPE_PATTERNS` (applied only when neither the tool name
+  nor the message references this server, because a validation rejection from alexandria's own tools is
+  a durable API contract). `Failed to call tool: Missing …` sits in the exemptible list on purpose — in
+  the unconditional one it is evaluated before the exemption and can never be exempted. The
+  unconditional families are pi-lens's wording, so a porter cannot assume the same strings appear in
+  Claude's transcript. The Claude hook has the same problem and no gate: port
+  `isTransient()`'s shape or make the haiku prompt reject it, and keep the two clients' noise floors
+  comparable. `contrib/claude/README.md` records the divergence; keep them in step.
 - [-] **Stop-hook extraction makes one haiku call per turn; the retry on an empty result was
   dropped.** It rested on one observation and doubled the cost of every turn. If `extracted` volume
   drops noticeably, restore the loop gated on transcript size, not unconditionally.

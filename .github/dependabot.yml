@@ -18,10 +18,15 @@ updates:
       prefix: 'chore(ci)'
     target-branch: main
 
-  # The pi companion's npm deps. CI installs with `npm ci`, so the lockfile is the
-  # real pin and nothing else moves it forward.
+  # The pi companion's npm deps. `@earendil-works/pi-coding-agent` is deliberately
+  # exact-pinned: it is the API the extension type-checks against, so a bump must be a
+  # reviewed change rather than background drift. `increase` is what preserves that —
+  # it rewrites the constraint to the new version verbatim. The default (`auto`)
+  # treats a library-like package as `widen`, which would turn `0.99.1` back into a
+  # range and undo the pin. Check the host pi version before merging one of these.
   - package-ecosystem: npm
     directory: /contrib/pi/extensions/alexandria
+    versioning-strategy: increase
     schedule:
       interval: weekly
     cooldown:
