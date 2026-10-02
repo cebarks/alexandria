@@ -1,20 +1,20 @@
 # Alexandria — Agent Context
 
-## SurrealDB 3.2 Gotchas (Critical)
+## SurrealDB 3.3 Gotchas (Critical)
 
-These will bite you. SurrealDB 3.2 differs from docs and prior versions:
+These will bite you. SurrealDB 3.3 differs from docs and prior versions:
 
 - `value` is a **reserved word** — use `SELECT * FROM table` not `SELECT value FROM table`
 - `session` is a **reserved word** too — every session query needs backticks: ``SELECT * FROM `session` ``. The `session` table is `SCHEMAFULL`, so an undefined field fails rather than being stored.
 - `$session` is a **reserved bind parameter name** (SurrealDB's own connection session). Use another name — `session_repo.rs` uses `$sess`.
-- `DELETE table WHERE ...` and `DELETE FROM table WHERE ...` both parse and commit on the pinned 3.2.4 engine, and the repo uses each (`system_config.rs:set_config` omits `FROM`). A spelling choice, not a constraint
+- `DELETE table WHERE ...` and `DELETE FROM table WHERE ...` both parse and commit on the pinned 3.3.0 engine, and the repo uses each (`system_config.rs:set_config` omits `FROM`). A spelling choice, not a constraint
 - `RELATE` needs pre-parsed `RecordId` via `.bind()` — inline `type::record()` in RELATE fails
 - `type::record()` replaces `type::thing()` (removed in 3.x)
 - Query result structs need `#[derive(SurrealValue)]` from `surrealdb::types`
 - `RecordId` formatting: use `record_id_to_string()` helper, not `.to_string()`
 - Connection: `surrealdb::engine::any::connect("mem://")` with `kv-mem` feature; `surrealkv://path` with `kv-surrealkv`
 - To count filtered records reached by a graph traversal *inline in a SELECT*, the `WHERE` goes **inside** the traversal target's parentheses: `(->contains_session_memory->(fact WHERE deleted = false)).len()`. The obvious `(->edge->fact WHERE ...).len()` fails with `Unexpected token WHERE expected delimiter )`, and so do the `array::len(...)` and `count(...)` spellings — no N+1 fallback is needed once you find this.
-- An absent `option<T>` field is `NONE`, and **`IS NOT NULL` and `!= NULL` are both satisfied by `NONE`** — they filter nothing; only `field != NONE` (or `NOT (field = NONE)`, or `type::is_none(field) = false`) excludes it. Verified against the pinned 3.2.4 engine: with one `NONE` and one set row, `WHERE next_due_at IS NOT NULL` returned both and `WHERE next_due_at != NONE` returned one. This bites ordering too, because `NONE` sorts below every datetime: such a row wins the head of an `ORDER BY next_due_at ASC LIMIT n` page.
+- An absent `option<T>` field is `NONE`, and **`IS NOT NULL` and `!= NULL` are both satisfied by `NONE`** — they filter nothing; only `field != NONE` (or `NOT (field = NONE)`, or `type::is_none(field) = false`) excludes it. Verified against the pinned 3.3.0 engine: with one `NONE` and one set row, `WHERE next_due_at IS NOT NULL` returned both and `WHERE next_due_at != NONE` returned one. This bites ordering too, because `NONE` sorts below every datetime: such a row wins the head of an `ORDER BY next_due_at ASC LIMIT n` page.
 - `ORDER BY x DESC NULLS LAST` does **not** parse, and neither does `ORDER BY type::coalesce(a, b) DESC`. NULL sorts *smaller* than any datetime, so `ORDER BY ended_at DESC` already parks NULL `ended_at` at the tail — but the ties among those rows are unspecified, so any `LIMIT`/`START` pagination needs an explicit unique secondary key (see `SessionRepo::list`).
 
 ## rmcp (MCP SDK) Patterns

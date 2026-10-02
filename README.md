@@ -202,6 +202,11 @@ especially when `host = "0.0.0.0"`.
 
 ## Deployment
 
+**Upgrading from a build on SurrealDB 3.2: back up the data dir first.** A 3.3 build opens a 3.2
+store as it is, but once 3.3 rewrites a schema definition in it (`REBUILD INDEX` does, and so will
+any later schema migration), a 3.2 build can no longer open the store. Rolling back past that point
+means restoring the backup.
+
 ### As a systemd user service (recommended)
 
 ```ini
@@ -371,7 +376,7 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | [docs/prompt-path-stall-attribution.md](docs/prompt-path-stall-attribution.md) | 2026-09-22 investigation record: prompt-path stall attribution, the measured cold-handshake fault, and why the worker isolation it proposed was dropped. Carries a STATUS banner naming what shipped |
 | [crates/alexandria-mcp/assets/README.md](crates/alexandria-mcp/assets/README.md) | Vendored debug-UI assets, checksums, how to re-vendor |
 | [TODO-misc.md](TODO-misc.md) | Unprioritised backlog, grouped by area |
-| [AGENTS.md](AGENTS.md) | Working notes for humans and agents on this codebase — SurrealDB 3.2 gotchas, crate boundaries, task runner |
+| [AGENTS.md](AGENTS.md) | Working notes for humans and agents on this codebase — SurrealDB 3.3 gotchas, crate boundaries, task runner |
 
 ## Architecture
 
