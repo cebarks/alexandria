@@ -1,19 +1,33 @@
-/// Ebbinghaus-inspired heat + stability model.
+//! Ebbinghaus-inspired heat + stability model.
+//!
+//! - `heat`: current intensity (resets to 1.0 on access)
+//! - `stability`: how slowly heat decays (grows with spaced repetition)
+//! - `last_touched`: Unix timestamp (seconds) anchoring the stored `heat` value
+//! - `last_accessed_at`: Unix timestamp (seconds) of the last real access
+//! - `access_count`: total number of accesses
+//!
+//! The two timestamps are deliberately two clocks, not one, and must not be collapsed.
+//! `last_touched` answers "how old is the number in `heat`?" and is written by every
+//! materialisation — an access, a spreading-activation warm, or the sweep. `last_accessed_at`
+//! answers "when did a caller last see this row?" and is written by accesses only, because it is
+//! the sole input to the spacing ratio that grows `stability`. Sharing one field between them
+//! makes the sweep's hourly re-anchoring the spacing reference, capping the ratio at
+//! `sweep_interval / spacing_reference` (~0.04 at the defaults) and silently under-growing
+//! stability ~24x. See GitHub issue #43.
+
+/// Base decay time constant, seconds. `tau = stability * this`; lower cools faster.
 ///
-/// - `heat`: current intensity (resets to 1.0 on access)
-/// - `stability`: how slowly heat decays (grows with spaced repetition)
-/// - `last_touched`: Unix timestamp (seconds) anchoring the stored `heat` value
-/// - `last_accessed_at`: Unix timestamp (seconds) of the last real access
-/// - `access_count`: total number of accesses
-///
-/// The two timestamps are deliberately two clocks, not one, and must not be collapsed.
-/// `last_touched` answers "how old is the number in `heat`?" and is written by every
-/// materialisation — an access, a spreading-activation warm, or the sweep. `last_accessed_at`
-/// answers "when did a caller last see this row?" and is written by accesses only, because it is
-/// the sole input to the spacing ratio that grows `stability`. Sharing one field between them
-/// makes the sweep's hourly re-anchoring the spacing reference, capping the ratio at
-/// `sweep_interval / spacing_reference` (~0.04 at the defaults) and silently under-growing
-/// stability ~24x. See GitHub issue #43.
+/// Named a time constant and not a half-life on purpose: `h(t) = heat · e^(-t/tau)` is an
+/// e-folding, so at `stability = 1.0` one elapsed day leaves `heat/e`, not `heat/2`. The key
+/// this replaced was called `spacing_halflife_secs` while doing neither of those things, which
+/// is how its documented direction ended up inverted relative to the code. GitHub issue #36.
+pub const DEFAULT_DECAY_TAU_SECS: f64 = 86_400.0;
+
+/// Access gap, seconds, at which one access earns FULL stability growth; shorter gaps earn a
+/// proportional fraction. Not a half-life either — it is the denominator of a clamped ratio.
+pub const DEFAULT_SPACING_REFERENCE_SECS: f64 = 86_400.0;
+
+/// One memory's heat state, as the decay functions see it.
 #[derive(Debug, Clone)]
 pub struct HeatState {
     pub heat: f64,
@@ -41,16 +55,14 @@ impl HeatState {
 /// re-anchoring by the sweep is a no-op on this curve: substituting `h(now)` for `h` and `now`
 /// for the anchor leaves every later projection identical, because `exp` composes.
 ///
-/// Uses Ebbinghaus forgetting curve: h(t) = heat * exp(-elapsed / (stability * halflife_base))
-/// where halflife_base normalizes the time constant.
-pub fn projected_heat(state: &HeatState, now: u64) -> f64 {
+/// `decay_tau` is the base time constant ([`DEFAULT_DECAY_TAU_SECS`]); the effective constant
+/// scales with `stability`, so a stability of 1.0 cools with `tau == decay_tau`.
+pub fn projected_heat(state: &HeatState, now: u64, decay_tau: f64) -> f64 {
     if now <= state.last_touched {
         return state.heat;
     }
     let elapsed = (now - state.last_touched) as f64;
-    // Time constant scales with stability. A stability of 1.0 means
-    // heat halves roughly every day (86400 seconds).
-    let tau = state.stability * 86400.0;
+    let tau = state.stability * decay_tau;
     state.heat * (-elapsed / tau).exp()
 }
 

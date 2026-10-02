@@ -1,12 +1,37 @@
-use alexandria_engine::heat::{HeatColumns, HeatState, on_access, projected_heat};
+use alexandria_engine::heat::{
+    DEFAULT_DECAY_TAU_SECS, HeatColumns, HeatState, on_access, projected_heat,
+};
 
 #[test]
 fn test_new_memory_decays_fast() {
     let state = HeatState::new(1.0, 1.0);
-    let heat_after_1_day = projected_heat(&state, 86400);
-    let heat_after_7_days = projected_heat(&state, 86400 * 7);
+    let heat_after_1_day = projected_heat(&state, 86400, DEFAULT_DECAY_TAU_SECS);
+    let heat_after_7_days = projected_heat(&state, 86400 * 7, DEFAULT_DECAY_TAU_SECS);
     assert!(heat_after_1_day < state.heat);
     assert!(heat_after_7_days < heat_after_1_day);
+}
+
+/// `decay_tau` is a real knob now, and the curve is an e-folding rather than a halving. Pinned
+/// because the key this replaces was named `spacing_halflife_secs`, and the name is the reason the
+/// documented direction and the code disagreed (GitHub issue #36).
+#[test]
+fn test_decay_tau_scales_the_curve() {
+    let state = HeatState {
+        heat: 1.0,
+        stability: 1.0,
+        last_touched: 0,
+        last_accessed_at: 0,
+        access_count: 0,
+    };
+    let day = 86_400_u64;
+
+    let base = projected_heat(&state, day, DEFAULT_DECAY_TAU_SECS);
+    let slow = projected_heat(&state, day, DEFAULT_DECAY_TAU_SECS * 2.0);
+    assert!(slow > base, "a longer time constant must decay slower");
+    assert!(
+        (base - (-1.0_f64).exp()).abs() < 1e-12,
+        "stability 1.0 at tau = one day must leave heat/e after a day, got {base}"
+    );
 }
 
 #[test]
@@ -44,7 +69,10 @@ fn test_high_stability_memory_decays_slowly() {
         access_count: 1,
     };
     let day = 86400;
-    assert!(projected_heat(&stable, day * 7) > projected_heat(&unstable, day * 7));
+    assert!(
+        projected_heat(&stable, day * 7, DEFAULT_DECAY_TAU_SECS)
+            > projected_heat(&unstable, day * 7, DEFAULT_DECAY_TAU_SECS)
+    );
 }
 
 #[test]
@@ -54,7 +82,7 @@ fn test_bulk_projected_heat() {
         stability: vec![1.0, 4.0, 1.0],
         last_touched: vec![0, 0, 0],
     };
-    let projected = columns.projected_heat_bulk(86400);
+    let projected = columns.projected_heat_bulk(86400, DEFAULT_DECAY_TAU_SECS);
     assert_eq!(projected.len(), 3);
     assert!(projected[1] > projected[0]);
 }
@@ -79,7 +107,7 @@ fn test_sweep_reanchoring_does_not_attenuate_spacing() {
     // value, then re-anchor the decay clock.
     for hour in 1..=720_u64 {
         let now = hour * 3600;
-        state.heat = projected_heat(&state, now);
+        state.heat = projected_heat(&state, now, DEFAULT_DECAY_TAU_SECS);
         state.last_touched = now;
     }
 
@@ -125,7 +153,10 @@ fn test_projection_reads_the_decay_anchor_not_the_access_stamp() {
     };
     let now = day * 2;
     assert!(
-        (projected_heat(&swept, now) - projected_heat(&just_accessed, now)).abs() < f64::EPSILON,
+        (projected_heat(&swept, now, DEFAULT_DECAY_TAU_SECS)
+            - projected_heat(&just_accessed, now, DEFAULT_DECAY_TAU_SECS))
+        .abs()
+            < f64::EPSILON,
         "projection must ignore last_accessed_at entirely"
     );
 }
@@ -154,9 +185,9 @@ fn test_bulk_matches_scalar() {
         last_touched: states.iter().map(|s| s.last_touched).collect(),
     };
     let now = 86400_u64;
-    let bulk = columns.projected_heat_bulk(now);
+    let bulk = columns.projected_heat_bulk(now, DEFAULT_DECAY_TAU_SECS);
     for (i, state) in states.iter().enumerate() {
-        let scalar = projected_heat(state, now);
+        let scalar = projected_heat(state, now, DEFAULT_DECAY_TAU_SECS);
         assert!(
             (bulk[i] - scalar).abs() < 1e-6,
             "bulk[{i}] ({}) != scalar ({scalar})",
