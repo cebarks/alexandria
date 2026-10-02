@@ -11,6 +11,15 @@ use crate::models::HeatState;
 /// histogram's meaning is the band edges, which are written once in that query.
 pub const HEAT_BANDS: [&str; 4] = ["below 1", "1 to 2", "2 to 3", "3 and above"];
 
+/// One row's new heat values, as computed by the caller — the engine owns the maths and storage
+/// never decays anything.
+pub struct HeatUpdate {
+    pub memory_id: String,
+    pub heat: f64,
+    pub stability: f64,
+    pub access_count: i64,
+}
+
 pub struct HeatRepo<'a> {
     db: &'a Surreal<Any>,
 }
@@ -106,6 +115,79 @@ impl<'a> HeatRepo<'a> {
             .await?
             .check()?;
         Ok(())
+    }
+
+    /// Read the heat rows for a set of memories in **one** round trip.
+    ///
+    /// Retrieval needs every returned row's heat state to record the access, and `get` would cost
+    /// one query per result. `limit` bounds this (default retrieval returns ~10), so the
+    /// OR-expansion of `type::record($mN)` predicates is deliberately preferred over a gamble on
+    /// which of `IN` / `INSIDE` the pinned 3.2.4 engine accepts for a record array — the whole
+    /// point is one round trip, not a cleverer one.
+    ///
+    /// Returns only the rows that exist. A memory with no `heat_state` (imported chunks, or
+    /// anything created through `MemoryRepo::create_fact`) is simply absent; callers decide.
+    pub async fn get_many(&self, memory_ids: &[String]) -> Result<Vec<HeatState>> {
+        if memory_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = String::from("SELECT * FROM heat_state WHERE ");
+        for (i, _) in memory_ids.iter().enumerate() {
+            if i > 0 {
+                query.push_str(" OR ");
+            }
+            query.push_str(&format!("memory = type::record($m{i})"));
+        }
+        let mut prepared = self.db.query(&query);
+        for (i, id) in memory_ids.iter().enumerate() {
+            prepared = prepared.bind((format!("m{i}"), id.clone()));
+        }
+        let mut response = prepared.await?;
+        Ok(response.take(0)?)
+    }
+
+    /// Write several accesses in **one** round trip, as one multi-statement query.
+    ///
+    /// The per-row statements cannot be merged into one `UPDATE ... WHERE memory IN $ids` because
+    /// each row gets its own `heat`/`stability` values, so the batching is in the round trip, not
+    /// the statement count. Named parameters are per-row (`$h0`, `$s0`, …) because bindings are
+    /// shared across the statements of a single `query()`.
+    ///
+    /// Unlike `add_heat`, whose caller discards the result with `.ok()`, this reports how many rows
+    /// were actually written: a zero-row `UPDATE` is not a query error, so `.check()?` alone would
+    /// not notice a row that vanished between the read and the write. `access_count = 0` is the
+    /// field `Appraise` demotes on, so a silently-skipped access has to be visible to the caller.
+    pub async fn record_access_many(&self, updates: &[HeatUpdate]) -> Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let mut query = String::new();
+        for (i, _) in updates.iter().enumerate() {
+            query.push_str(&format!(
+                "UPDATE heat_state SET heat = $h{i}, stability = $s{i}, access_count = $a{i}, \
+                 last_touched = time::now(), last_accessed_at = time::now() \
+                 WHERE memory = type::record($m{i}); "
+            ));
+        }
+        let mut prepared = self.db.query(query);
+        for (i, u) in updates.iter().enumerate() {
+            prepared = prepared
+                .bind((format!("m{i}"), u.memory_id.clone()))
+                .bind((format!("h{i}"), u.heat))
+                .bind((format!("s{i}"), u.stability))
+                .bind((format!("a{i}"), u.access_count));
+        }
+        let mut response = prepared.await?;
+        // Positional per-statement results, the same shape `heat_histogram` relies on. A statement
+        // that matched nothing yields an empty Vec rather than an error; a statement that errored
+        // surfaces through `take`. `check` consumes the response, so it runs last.
+        let mut written = 0usize;
+        for i in 0..updates.len() {
+            let rows: Vec<HeatState> = response.take(i)?;
+            written += rows.len();
+        }
+        response.check()?;
+        Ok(written)
     }
 
     /// Add heat to a memory's heat_state (for spreading activation).
@@ -326,5 +408,113 @@ mod tests {
         assert_eq!(after.access_count, 1);
         assert!(after.last_accessed_at.is_some());
         assert!(after.last_touched.is_some());
+    }
+
+    /// The batch read is what keeps retrieval from costing one round trip per result. It must
+    /// return every row that exists and invent none.
+    #[tokio::test]
+    async fn get_many_returns_only_existing_rows() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+        let heat = HeatRepo::new(db.inner());
+
+        let mut seeded = Vec::new();
+        for n in 0..3 {
+            let fid = memory
+                .create_fact(&format!("row {n}"), 0.5, &vec![0.1_f32; 384], &[])
+                .await
+                .unwrap();
+            heat.create_for_memory(&fid, 1.0).await.unwrap();
+            seeded.push(fid);
+        }
+        // A fact with no heat_state row: exactly what an imported chunk or a create_fact-only row
+        // looks like, and the case a caller has to decide about.
+        let rowless = memory
+            .create_fact("no heat row", 0.5, &vec![0.1_f32; 384], &[])
+            .await
+            .unwrap();
+
+        let mut ids = seeded;
+        ids.push(rowless);
+        let rows = heat.get_many(&ids).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "the row-less memory must be absent, not fabricated"
+        );
+        assert!(heat.get_many(&[]).await.unwrap().is_empty());
+    }
+
+    /// Distinct values per row are the proof that the parameters are per-statement. Reusing `$h`
+    /// for every statement would write row 0's values to all of them and still report success.
+    #[tokio::test]
+    async fn record_access_many_writes_each_row_its_own_values() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+        let heat = HeatRepo::new(db.inner());
+
+        let mut ids = Vec::new();
+        for n in 0..2 {
+            let fid = memory
+                .create_fact(&format!("batched {n}"), 0.5, &vec![0.1_f32; 384], &[])
+                .await
+                .unwrap();
+            heat.create_for_memory(&fid, 1.0).await.unwrap();
+            ids.push(fid);
+        }
+
+        let written = heat
+            .record_access_many(&[
+                HeatUpdate {
+                    memory_id: ids[0].clone(),
+                    heat: 0.25,
+                    stability: 2.0,
+                    access_count: 1,
+                },
+                HeatUpdate {
+                    memory_id: ids[1].clone(),
+                    heat: 0.75,
+                    stability: 9.0,
+                    access_count: 7,
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(written, 2);
+
+        let first = heat.get(&ids[0]).await.unwrap().unwrap();
+        let second = heat.get(&ids[1]).await.unwrap().unwrap();
+        assert_eq!(
+            (first.heat, first.stability, first.access_count),
+            (0.25, 2.0, 1)
+        );
+        assert_eq!(
+            (second.heat, second.stability, second.access_count),
+            (0.75, 9.0, 7),
+            "each statement must carry its own values"
+        );
+        assert!(second.last_accessed_at.is_some());
+
+        // The zero-row case is reported rather than swallowed, which is the whole reason this
+        // method returns a count and `add_heat` does not.
+        let rowless = memory
+            .create_fact("still no heat row", 0.5, &vec![0.1_f32; 384], &[])
+            .await
+            .unwrap();
+        let written = heat
+            .record_access_many(&[HeatUpdate {
+                memory_id: rowless,
+                heat: 1.0,
+                stability: 1.0,
+                access_count: 1,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            written, 0,
+            "an UPDATE matching no row must be visible to the caller"
+        );
     }
 }
