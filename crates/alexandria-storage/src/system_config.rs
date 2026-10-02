@@ -1,4 +1,4 @@
-use crate::repos::MemoryRepo;
+use crate::repos::{FactListQuery, MemoryRepo};
 use anyhow::Result;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
@@ -68,7 +68,16 @@ pub async fn check_embedding_model(
             // limit is not assumed: those facts were embedded at the tokenizer's shipped
             // default, so that is what gets stamped, and the comparison below refuses a
             // configured limit that differs.
-            let facts = MemoryRepo::new(db).count(None, None, true).await?;
+            // Counts every row, deleted and quarantined included: the question is whether the
+            // corpus predates the lock at all, and a soft-deleted or quarantined fact is still a
+            // fact whose vectors were made by some model at some token limit.
+            let facts = MemoryRepo::new(db)
+                .count(&FactListQuery {
+                    include_deleted: true,
+                    include_quarantined: true,
+                    ..Default::default()
+                })
+                .await?;
             let stamp = if facts > 0 {
                 tracing::warn!(
                     "{facts} fact(s) exist but no embedding lock; assuming they were embedded \

@@ -550,7 +550,7 @@ pub async fn run() -> anyhow::Result<()> {
     let db = Database::connect(&config.database.data_dir).await?;
 
     let all: Vec<(String, Vec<f32>, Option<DateTime<Utc>>)> = MemoryRepo::new(db.inner())
-        .list(FactListQuery {
+        .list(&FactListQuery {
             limit: CORPUS_CAP,
             ..Default::default()
         })

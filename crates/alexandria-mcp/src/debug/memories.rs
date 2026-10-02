@@ -242,23 +242,26 @@ pub async fn list(
     let dir = parse_dir(params.get("dir"));
 
     let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
-    let rows = match repo
-        .list(FactListQuery {
-            search,
-            tag,
-            include_deleted,
-            sort,
-            dir,
-            limit,
-            offset,
-        })
-        .await
-    {
+    // One filter value feeds both the page and its total, so the count above the table cannot
+    // disagree with the rows under it. Quarantine stays hidden here for now: #43 promises an
+    // operator can inspect a quarantined fact, and that view is Task 16's job rather than a
+    // half-wired toggle on a page with no auth in front of it.
+    let filter = FactListQuery {
+        search,
+        tag,
+        include_deleted,
+        include_quarantined: false,
+        sort,
+        dir,
+        limit,
+        offset,
+    };
+    let rows = match repo.list(&filter).await {
         Ok(r) => r,
         Err(e) => return error_page("memories", &e.to_string()),
     };
 
-    let total = match repo.count(search, tag, include_deleted).await {
+    let total = match repo.count(&filter).await {
         Ok(n) => n,
         Err(_) => rows.len(), // graceful fallback
     };
@@ -1251,7 +1254,7 @@ mod tests {
         // there, with their content and confidence unchanged.
         let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
         let left = repo
-            .list(FactListQuery {
+            .list(&FactListQuery {
                 include_deleted: true,
                 ..Default::default()
             })

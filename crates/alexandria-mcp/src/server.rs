@@ -3278,6 +3278,83 @@ mod get_info_tests {
     /// Imported chunks and anything written through `MemoryRepo::create_fact` have no `heat_state`
     /// row. Skipping those would leave `access_count` at 0 forever for exactly the rows that are
     /// already poorly covered, and `Appraise` reads 0 as "never surfaced".
+    /// A quarantined fact must be unreachable through the tools an agent actually calls, not just
+    /// through the storage queries behind them — hiding it in `knn_sql` while `do_recall` still
+    /// walked cluster members would leak it back. Both retrieval tools are asserted, and the
+    /// positive control is the same fixture before quarantine is set.
+    #[tokio::test]
+    async fn quarantined_facts_are_unreachable_through_retrieve_and_recall() {
+        let server = heat_server().await;
+        let id = store_one(&server, "the api token rotates nightly").await;
+
+        let params = || RetrieveMemoriesParams {
+            query: "api token".to_string(),
+            limit: Some(5),
+            session_id: None,
+        };
+        let before = server.do_retrieve_memories(params()).await.unwrap();
+        assert!(
+            before.to_string().contains(&id),
+            "positive control: the fact is retrievable before quarantine: {before}"
+        );
+
+        server
+            .db
+            .inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", id.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        // Checked as serialized text rather than a parsed shape: `do_retrieve_memories` returns a
+        // `serde_json::Value` and `do_recall` returns a `String`, and the property under test is
+        // "this id does not appear", which does not depend on either envelope.
+        let checks: Vec<(&str, String)> = vec![
+            (
+                "retrieve",
+                server
+                    .do_retrieve_memories(params())
+                    .await
+                    .unwrap()
+                    .to_string(),
+            ),
+            (
+                "dry retrieve",
+                server
+                    .do_retrieve_memories_dry(params())
+                    .await
+                    .unwrap()
+                    .to_string(),
+            ),
+            (
+                "unfiltered retrieve",
+                server
+                    .do_retrieve_memories_unfiltered(params())
+                    .await
+                    .unwrap()
+                    .to_string(),
+            ),
+            (
+                "recall",
+                server
+                    .do_recall(RecallParams {
+                        query: "api token".to_string(),
+                        scope_handle: None,
+                    })
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        for (label, text) in checks {
+            assert!(
+                !text.contains(&id),
+                "{label} must not surface a quarantined fact: {text}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_returned_row_with_no_heat_state_is_created_and_counted() {
         let server = heat_server().await;

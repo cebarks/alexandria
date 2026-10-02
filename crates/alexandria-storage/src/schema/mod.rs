@@ -211,7 +211,7 @@ mod tests {
         ensure_vector_index(db, 2).await.unwrap();
 
         let rows: Vec<crate::models::Fact> = db
-            .query("SELECT * FROM fact WHERE deleted = false AND embedding <|1,COSINE|> $q")
+            .query("SELECT * FROM fact WHERE deleted = false AND quarantined_at = NONE AND embedding <|1,COSINE|> $q")
             .bind(("q", vec![0.9f32, 0.1]))
             .await
             .unwrap()

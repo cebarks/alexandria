@@ -9,7 +9,7 @@
 //! redefines it.
 
 use alexandria_pipeline::embedding::EmbeddingProvider;
-use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
+use alexandria_storage::repos::{ClusterRepo, FactListQuery, MemoryRepo};
 use alexandria_storage::{Database, record_id_to_string, system_config};
 use anyhow::ensure;
 
@@ -44,7 +44,16 @@ pub async fn reembed(
         None => {
             // A database from before the lock existed has facts but no lock; stamping
             // the new model over them would silently mix vector spaces.
-            let facts = memories.count(None, None, true).await?;
+            // Every row counts here, deleted and quarantined included: a soft-deleted or
+            // quarantined fact still holds vectors made by some model at some token limit, and the
+            // dimension invariant covers those rows too.
+            let facts = memories
+                .count(&FactListQuery {
+                    include_deleted: true,
+                    include_quarantined: true,
+                    ..Default::default()
+                })
+                .await?;
             ensure!(
                 facts == 0,
                 "no embedding lock but {facts} fact(s) exist; the database predates the lock. \
