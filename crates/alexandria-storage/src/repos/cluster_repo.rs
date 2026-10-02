@@ -50,9 +50,16 @@ impl<'a> ClusterRepo<'a> {
     }
 
     pub async fn get_members(&self, cluster_id: &str) -> Result<Vec<Fact>> {
+        // The filter belongs here and not in the callers: every consumer of this method computes
+        // something about the cluster as a whole (`check_cohesion` over member embeddings,
+        // `check_merge` over centroids, `execute_merge` moving edges), so a row nobody can retrieve
+        // silently changes all three verdicts. See `test_get_members_excludes_deleted_and_quarantined`.
         let mut response = self
             .db
-            .query("SELECT * FROM type::record($cluster_id)->contains_memory->fact")
+            .query(
+                "SELECT * FROM type::record($cluster_id)->contains_memory->\
+                 (fact WHERE deleted = false AND quarantined_at = NONE)",
+            )
             .bind(("cluster_id", cluster_id.to_string()))
             .await?;
         let members: Vec<Fact> = response.take(0)?;
@@ -440,5 +447,63 @@ mod tests {
             .find(|(c, _)| c.label.as_deref() == Some("cluster two"))
             .unwrap();
         assert_eq!(*count2, 0);
+    }
+
+    /// The pin `SessionRepo::get_memories` got in 33e17c9 and the cluster path never did.
+    ///
+    /// Today a soft-deleted member still counts toward `list_with_counts`, still feeds
+    /// `check_cohesion`'s member embeddings, and still gets moved by `execute_merge`. That is
+    /// already wrong; it becomes actively wrong the moment `Collapse` soft-deletes duplicates, since
+    /// a cluster of ten near-identical rows would keep behaving like a ten-member cluster after nine
+    /// are collapsed. Quarantined rows are the same defect one rung earlier on the ladder.
+    #[tokio::test]
+    async fn test_get_members_excludes_deleted_and_quarantined() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let clusters = ClusterRepo::new(db.inner());
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+
+        let cid = clusters.create(Some("mixed"), &[0.1, 0.2]).await.unwrap();
+        let keep = memory
+            .create_fact("kept", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let gone = memory
+            .create_fact("deleted", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let secret = memory
+            .create_fact("quarantined", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        for id in [&keep, &gone, &secret] {
+            clusters.add_member(&cid, id).await.unwrap();
+        }
+
+        // Positive control first: without this, every assertion below could be satisfied by a
+        // method that returns nothing at all.
+        let all = clusters.get_members(&cid).await.unwrap();
+        assert_eq!(
+            all.len(),
+            3,
+            "fixture control: all three are members to begin with"
+        );
+
+        memory.soft_delete_fact(&gone).await.unwrap();
+        db.inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", secret.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let members = clusters.get_members(&cid).await.unwrap();
+        let contents: Vec<&str> = members.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["kept"],
+            "a soft-deleted and a quarantined member must both drop out, leaving the live row"
+        );
     }
 }
