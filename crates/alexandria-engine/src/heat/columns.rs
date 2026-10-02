@@ -20,7 +20,8 @@ impl HeatColumns {
                 heat: self.heat[i],
                 stability: self.stability[i],
                 last_touched: self.last_touched[i],
-                access_count: 0, // not needed for projection
+                access_count: 0,     // not needed for projection
+                last_accessed_at: 0, // likewise: projection reads the decay anchor only
             };
             result.push(projected_heat(&state, now));
         }
