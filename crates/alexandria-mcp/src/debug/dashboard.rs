@@ -62,7 +62,11 @@ fn server_rows(server: &AlexandriaServer) -> Vec<ConfigRow> {
         row("activation.max_hops", &server.activation_config.max_hops),
         row("cluster.join_threshold", &server.cluster_join_threshold),
         row("cluster.cohesion_floor", &server.cohesion_floor),
-        row("heat.spacing_halflife_secs", &server.heat_spacing_halflife),
+        row("heat.decay_tau_secs", &server.heat.decay_tau_secs),
+        row(
+            "heat.spacing_reference_secs",
+            &server.heat.spacing_reference_secs,
+        ),
         // The provider, not the config: `model_id()`/`dimensions()` report what was actually
         // loaded, which is the only answer that explains existing vectors in the database.
         // The config-file pair is rendered next to it, labelled, because "asked for" and

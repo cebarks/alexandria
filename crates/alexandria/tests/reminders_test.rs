@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use alexandria_engine::reminders::{human_readable, spec_from_reminder};
-use alexandria_mcp::server::{AlexandriaServer, RemindersSettings};
+use alexandria_mcp::server::{AlexandriaServer, HeatSettings, RemindersSettings};
 use alexandria_mcp::tools::{
     CancelReminderParams, CheckRemindersParams, ListRemindersParams, ReminderPatternParams,
     SetReminderParams,
@@ -50,11 +50,16 @@ async fn setup_with_tz(tz: chrono_tz::Tz) -> AlexandriaServer {
 async fn setup_with_escalation(tz: chrono_tz::Tz, escalation_hours: u64) -> AlexandriaServer {
     let db = Database::connect_embedded().await.unwrap();
     schema::bootstrap(db.inner()).await.unwrap();
-    AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0)
-        .with_reminders_config(RemindersSettings {
-            tz,
-            escalation_hours,
-        })
+    AlexandriaServer::new(
+        Arc::new(db),
+        Arc::new(StubEmbedding),
+        0.75,
+        HeatSettings::default(),
+    )
+    .with_reminders_config(RemindersSettings {
+        tz,
+        escalation_hours,
+    })
 }
 
 /// A rejected schedule must not leave a row behind: a stored row is a promise of

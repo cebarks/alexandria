@@ -1704,7 +1704,7 @@ mod tests {
             std::sync::Arc::new(db),
             std::sync::Arc::new(super::super::test_support::StubEmbedding),
             0.75,
-            86400.0,
+            crate::server::HeatSettings::default(),
         );
         let app = crate::debug::router(server);
         let response = app

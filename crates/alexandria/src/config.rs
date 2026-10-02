@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
+use alexandria_engine::heat::DEFAULT_DECAY_TAU_SECS;
+use alexandria_engine::heat::DEFAULT_SPACING_REFERENCE_SECS;
 use alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS;
 use alexandria_engine::search::DEFAULT_MIN_SIMILARITY;
 use serde::Deserialize;
@@ -85,8 +87,12 @@ pub struct EmbeddingConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct HeatConfig {
-    /// Base half-life for spaced repetition (seconds). Default 1 day.
-    pub spacing_halflife_secs: f64,
+    /// Base decay time constant (seconds). `tau = stability * this`; lower cools faster.
+    /// Default 1 day, matching the value `projected_heat` used before it was configurable.
+    pub decay_tau_secs: f64,
+    /// Access gap (seconds) at which one access earns full stability growth; a shorter gap earns
+    /// a proportional fraction. Lower means stability accrues from less widely spaced accesses.
+    pub spacing_reference_secs: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,7 +187,8 @@ impl Default for EmbeddingConfig {
 impl Default for HeatConfig {
     fn default() -> Self {
         Self {
-            spacing_halflife_secs: 86400.0,
+            decay_tau_secs: DEFAULT_DECAY_TAU_SECS,
+            spacing_reference_secs: DEFAULT_SPACING_REFERENCE_SECS,
         }
     }
 }
@@ -262,6 +269,31 @@ fn config_path_from(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
     xdg_path
 }
 
+/// Warnings for keys a config file still sets that this release removed.
+///
+/// Kept as a pure function over the parsed TOML rather than an inline `tracing::warn!` in the
+/// loader: `main.rs`'s closure and the file-reading path are both unreachable from a test without
+/// module mocking, and this warning is the only migration signal an operator gets.
+pub(crate) fn removed_key_warnings(raw: &toml::Value) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+
+    if raw
+        .get("heat")
+        .and_then(|heat| heat.get("spacing_halflife_secs"))
+        .is_some()
+    {
+        warnings.push(
+            "[heat] spacing_halflife_secs was removed: it named a half-life but was used as the \
+             spacing denominator, and its documented direction was the reverse of the behaviour. \
+             Set [heat] decay_tau_secs (base decay time constant; lower cools faster) and/or \
+             [heat] spacing_reference_secs (access gap earning full stability growth; lower means \
+             shorter gaps earn full credit) instead.",
+        );
+    }
+
+    warnings
+}
+
 impl Config {
     /// Load configuration with the standard precedence chain:
     /// defaults → config file → env overrides
@@ -280,7 +312,16 @@ impl Config {
 
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
-            config = toml::from_str(&contents)?;
+            // Parse generically first: deserialising straight into `Config` lets
+            // `#[serde(default)]` drop a removed key in silence, which is the wrong failure mode
+            // for a breaking change — the operator's tuned value stops applying and nothing says
+            // so. The warning names the replacements, so grepping the service log for the old key
+            // finds the migration path.
+            let raw: toml::Value = toml::from_str(&contents)?;
+            for warning in removed_key_warnings(&raw) {
+                tracing::warn!("{warning}");
+            }
+            config = raw.try_into()?;
             tracing::info!("Loaded config from {}", config_path.display());
         }
 
@@ -392,6 +433,16 @@ mod tests {
             RemindersConfig::default().escalation_hours,
             alexandria_mcp::server::DEFAULT_REMINDER_ESCALATION_HOURS
         );
+        // And for heat: the binary's `[heat]` defaults and the MCP server's construction
+        // fallback are in different crates, so a change to one alone makes a test-built or
+        // debug server cool memories on a different clock than production — with nothing failing.
+        let heat = HeatConfig::default();
+        let server_heat = alexandria_mcp::server::HeatSettings::default();
+        assert_eq!(heat.decay_tau_secs, server_heat.decay_tau_secs);
+        assert_eq!(
+            heat.spacing_reference_secs,
+            server_heat.spacing_reference_secs
+        );
     }
 
     #[test]
@@ -419,7 +470,50 @@ mod tests {
         assert_eq!(config.cluster.join_threshold, 0.8);
         assert_eq!(config.cluster.merge_threshold, 0.95);
         // Heat uses default since not specified
-        assert_eq!(config.heat.spacing_halflife_secs, 86400.0);
+        assert_eq!(config.heat.decay_tau_secs, 86400.0);
+        assert_eq!(config.heat.spacing_reference_secs, 86400.0);
+    }
+
+    /// The engine constants are the single home for these defaults. A config default that
+    /// drifted would make a test-built server decay differently from production — the
+    /// `min_similarity` 0.10-vs-0.30 lesson, re-armed for `[heat]`.
+    #[test]
+    fn heat_config_defaults_match_engine_defaults() {
+        let defaults = HeatConfig::default();
+        assert_eq!(defaults.decay_tau_secs, DEFAULT_DECAY_TAU_SECS);
+        assert_eq!(
+            defaults.spacing_reference_secs,
+            DEFAULT_SPACING_REFERENCE_SECS
+        );
+    }
+
+    /// `#[serde(default)]` would otherwise swallow the removed key and the operator's tuned value
+    /// would stop applying with no signal at all.
+    #[test]
+    fn a_config_using_the_removed_heat_key_is_warned_about() {
+        let raw: toml::Value =
+            toml::from_str("[heat]\nspacing_halflife_secs = 3600.0\n").expect("valid toml");
+        let warnings = removed_key_warnings(&raw);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        for needle in [
+            "spacing_halflife_secs",
+            "decay_tau_secs",
+            "spacing_reference_secs",
+        ] {
+            assert!(
+                warnings[0].contains(needle),
+                "warning must name {needle} so an operator grepping the log for either the old \
+                 key or a replacement finds the migration path"
+            );
+        }
+    }
+
+    #[test]
+    fn current_heat_keys_produce_no_warning() {
+        let raw: toml::Value =
+            toml::from_str("[heat]\ndecay_tau_secs = 3600.0\nspacing_reference_secs = 7200.0\n")
+                .expect("valid toml");
+        assert!(removed_key_warnings(&raw).is_empty());
     }
 
     #[test]

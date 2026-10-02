@@ -14,7 +14,12 @@ async fn setup() -> (AlexandriaServer, Arc<Database>) {
         .unwrap();
 
     let db = Arc::new(db);
-    let server = AlexandriaServer::new(db.clone(), Arc::new(embedding), 0.75, 86400.0);
+    let server = AlexandriaServer::new(
+        db.clone(),
+        Arc::new(embedding),
+        0.75,
+        alexandria_mcp::server::HeatSettings::default(),
+    );
 
     (server, db)
 }

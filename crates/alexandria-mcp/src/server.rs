@@ -33,7 +33,10 @@ fn tool_json(result: anyhow::Result<String>) -> CallToolResult {
 
 use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
 use alexandria_engine::clusters::{ClusterInfo, assign_to_cluster, update_centroid};
-use alexandria_engine::heat::{ActivationConfig, compute_activation_targets};
+use alexandria_engine::heat::{
+    ActivationConfig, DEFAULT_DECAY_TAU_SECS, DEFAULT_SPACING_REFERENCE_SECS,
+    compute_activation_targets,
+};
 use alexandria_engine::recall::{
     ClusterWithMembers, FactSummary, ScopeHandle, broad_recall, focused_recall,
 };
@@ -124,12 +127,38 @@ impl Default for RemindersSettings {
     }
 }
 
+/// The two heat time constants, as configured.
+///
+/// Defaults come from the engine's own constants, so a server built without a config file (debug,
+/// tests) decays exactly as production does at default — the same rule `RemindersSettings` and
+/// `retrieve_min_similarity` follow, and the `min_similarity` 0.10-vs-0.30 drift is what it
+/// prevents. See also `HeatConfig` in the binary crate, whose parity test keeps the two in step.
+#[derive(Debug, Clone, Copy)]
+pub struct HeatSettings {
+    /// Base decay time constant, seconds. `tau = stability * this`; lower cools faster.
+    pub decay_tau_secs: f64,
+    /// Access gap, seconds, at which an access earns full stability growth.
+    pub spacing_reference_secs: f64,
+}
+
+impl Default for HeatSettings {
+    fn default() -> Self {
+        Self {
+            decay_tau_secs: DEFAULT_DECAY_TAU_SECS,
+            spacing_reference_secs: DEFAULT_SPACING_REFERENCE_SECS,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AlexandriaServer {
     pub db: Arc<Database>,
     pub embedding: Arc<dyn EmbeddingProvider>,
     pub cluster_join_threshold: f32,
-    pub heat_spacing_halflife: f64,
+    /// Both heat knobs, as one value. Passed as a struct rather than two adjacent positional
+    /// `f64`s: a transposed pair of same-typed floats is compiler-invisible and would silently
+    /// change how fast memories cool.
+    pub heat: HeatSettings,
     pub activation_config: ActivationConfig,
     pub activation_top_n: usize,
     /// Hard floor on cosine similarity for retrieve_memories results. The
@@ -149,13 +178,13 @@ impl AlexandriaServer {
         db: Arc<Database>,
         embedding: Arc<dyn EmbeddingProvider>,
         cluster_join_threshold: f32,
-        heat_spacing_halflife: f64,
+        heat: HeatSettings,
     ) -> Self {
         Self {
             db,
             embedding,
             cluster_join_threshold,
-            heat_spacing_halflife,
+            heat,
             activation_config: ActivationConfig::default(),
             activation_top_n: 3,
             retrieve_min_similarity: DEFAULT_MIN_SIMILARITY,
@@ -1814,7 +1843,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         let info = server.get_info();
 
@@ -1836,7 +1870,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         assert_eq!(
             server.retrieve_min_similarity,
@@ -1890,7 +1929,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         let mut advertised: Vec<String> = AlexandriaServer::tool_router()
             .list_all()
@@ -1963,9 +2007,13 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server =
-            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0)
-                .with_retrieve_min_similarity(0.30);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(DirectionalEmbedding),
+            0.75,
+            HeatSettings::default(),
+        )
+        .with_retrieve_min_similarity(0.30);
 
         server
             .do_store_memory(StoreMemoryParams {
@@ -2016,9 +2064,13 @@ mod get_info_tests {
         alexandria_storage::schema::ensure_vector_index(db.inner(), 2)
             .await
             .unwrap();
-        let server =
-            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0)
-                .with_vector_index(true);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(DirectionalEmbedding),
+            0.75,
+            HeatSettings::default(),
+        )
+        .with_vector_index(true);
         for content in ["near one", "near two", "far away"] {
             server
                 .do_store_memory(StoreMemoryParams {
@@ -2088,9 +2140,13 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server =
-            AlexandriaServer::new(Arc::new(db), Arc::new(BoundaryEmbedding), 0.75, 86400.0)
-                .with_retrieve_min_similarity(0.30);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(BoundaryEmbedding),
+            0.75,
+            HeatSettings::default(),
+        )
+        .with_retrieve_min_similarity(0.30);
 
         server
             .do_store_memory(StoreMemoryParams {
@@ -2205,7 +2261,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
         let ids = seed_edge_pair(&server).await;
         (server, ids)
     }
@@ -2304,7 +2365,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         for (sess, agent) in [("sess-l1", "pi"), ("sess-l2", "claude-code")] {
             server
@@ -2368,7 +2434,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         let _kept = server
             .do_store_memory(StoreMemoryParams {
@@ -2425,7 +2496,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         server
             .do_store_memory(StoreMemoryParams {
@@ -2476,7 +2552,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         // Store memories with a session_id — session auto-creates
         let _id1 = server
@@ -2584,8 +2665,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server =
-            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(DirectionalEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
         server
             .do_store_memory(StoreMemoryParams {
                 content: "a near match memory".to_string(),
@@ -2669,7 +2754,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(TinyLimit), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(TinyLimit),
+            0.75,
+            HeatSettings::default(),
+        );
         let store = async |content: &str| {
             let result = server
                 .store_memory(Parameters(StoreMemoryParams {
@@ -2696,7 +2786,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         let stored = server
             .store_memory(Parameters(StoreMemoryParams {
@@ -2838,7 +2933,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         let result = server
             .update_memory(Parameters(UpdateMemoryParams {

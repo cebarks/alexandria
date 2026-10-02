@@ -29,7 +29,8 @@ device = "cpu"                                       # "cpu" only for now (defau
 batch_size = 32                                      # Facts per embed() call in migrate-embeddings (default: 32)
 
 [heat]
-spacing_halflife_secs = 86400.0   # Spaced repetition half-life in seconds (default: 86400 = 1 day). Currently inert — see the [heat] table
+decay_tau_secs = 86400.0          # Base decay time constant, seconds; tau = stability * this (default: 86400 = 1 day)
+spacing_reference_secs = 86400.0  # Access gap earning full stability growth, seconds (default: 86400 = 1 day)
 
 [activation]
 propagation_factor = 0.3   # Fraction of heat passed per hop (default: 0.3)
@@ -94,9 +95,16 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 
 ### `[heat]`
 
+Both values are one day by default, which is the number the engine hardcoded before they existed — so at default the curve is arithmetically unchanged. `projected_heat` takes `decay_tau_secs` and `on_access` takes `spacing_reference_secs` as parameters; `DEFAULT_DECAY_TAU_SECS` / `DEFAULT_SPACING_REFERENCE_SECS` in `alexandria_engine::heat` are the single home for both defaults, derived into `HeatConfig` and `HeatSettings` and guarded by `test_server_fallback_defaults_match_config_defaults`.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `spacing_halflife_secs` | f64 | `86400.0` | **Currently inert.** Intended as the base half-life for the Ebbinghaus spaced-repetition curve, but `decay.rs:projected_heat` hardcodes `tau = stability * 86400.0` and takes no half-life, and nothing outside the engine crate calls it — the configured value is read only to display in the debug dashboard. Wiring it up or deleting it is the open A2 decision in [docs/performance-and-ability-findings.md](performance-and-ability-findings.md). The direction is also the reverse of the intuitive reading: in `decay.rs:on_access` a *lower* value raises the spacing ratio, which grows stability faster and therefore cools *slower*. |
+| `decay_tau_secs` | f64 | `86400.0` | Base decay time constant, seconds. The effective constant is `stability * decay_tau_secs`, so a memory with stability 2.0 cools twice as slowly. **Lower = cools faster.** This is an e-folding, not a half-life: at stability 1.0 one elapsed day leaves `heat/e`, pinned by `test_decay_tau_scales_the_curve`. |
+| `spacing_reference_secs` | f64 | `86400.0` | The gap between two accesses at which the later one earns **full** stability growth; a shorter gap earns a proportional fraction (a burst of same-second accesses grows stability by almost nothing). **Lower = stability accrues from less widely spaced accesses, so heat cools slower.** |
+
+**Availability.** Nothing outside the engine called `projected_heat` or `on_access` before [#43](https://github.com/cebarks/alexandria/issues/43), and retrieval does not record accesses yet, so on this branch the keys are wired into the functions but not yet reachable from a running server. The heat model as a whole is still inert until #43's access-recording and sweep jobs land; audit finding A2 in [performance-and-ability-findings.md](performance-and-ability-findings.md) is the record of that.
+
+**Removed in this release:** `spacing_halflife_secs`. It named a half-life while being used only as the spacing denominator above, and its documented direction was the reverse of its behaviour — the name is how that happened, which is why neither replacement key uses the word. Because `[heat]` is `#[serde(default)]`, a leftover key in `config.toml` is otherwise **silently ignored**; the server instead warns at boot naming both replacements, and `a_config_using_the_removed_heat_key_is_warned_about` guards that. The old single control is now two, because the value it named had two effects that pull in opposite directions.
 
 ### `[activation]`
 

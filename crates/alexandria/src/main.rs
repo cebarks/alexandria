@@ -140,7 +140,10 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(db),
         Arc::new(embedding),
         config.cluster.join_threshold,
-        config.heat.spacing_halflife_secs,
+        alexandria_mcp::server::HeatSettings {
+            decay_tau_secs: config.heat.decay_tau_secs,
+            spacing_reference_secs: config.heat.spacing_reference_secs,
+        },
     )
     .with_activation_config(activation_config)
     .with_activation_top_n(config.activation.top_n)
