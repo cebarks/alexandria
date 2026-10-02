@@ -517,4 +517,63 @@ mod tests {
             "an UPDATE matching no row must be visible to the caller"
         );
     }
+
+    /// `idx_heat_state_memory` is what makes the per-prompt heat write cheap, and a duration is not
+    /// a reproducible CI guard. Measured with a throwaway probe on 2026-10-02: ten batched access
+    /// writes cost 11.7ms against a 100-row corpus and 122ms against 1000 rows (a full scan per
+    /// statement); with the index, 1.2ms at both sizes, flat in corpus size.
+    ///
+    /// So the pin is the plan, not the clock — the same reasoning behind
+    /// `test_nearest_indexed_plan_uses_the_hnsw_index`: results cannot tell an index scan from a
+    /// table scan. It asserts the `SELECT` form because this engine rejects `EXPLAIN UPDATE` outright
+    /// (`"EXPLAIN is only supported with the new execution model"`), and the update path resolves
+    /// its rows through the identical predicate, so it is the same lookup.
+    #[tokio::test]
+    async fn heat_lookups_by_memory_reach_the_index() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+        let fid = memory
+            .create_fact("indexed lookups", 0.5, &vec![0.1_f32; 384], &[])
+            .await
+            .unwrap();
+        HeatRepo::new(db.inner())
+            .create_for_memory(&fid, 1.0)
+            .await
+            .unwrap();
+
+        let plan = |statement: String| {
+            let db = db.inner().clone();
+            let fid = fid.clone();
+            async move {
+                let mut response = db
+                    .query(format!("EXPLAIN FORMAT JSON {statement}"))
+                    .bind(("mid", fid))
+                    .await
+                    .unwrap();
+                let plan: surrealdb::types::Value = response.take(0).unwrap();
+                plan.to_sql().replace(' ', "")
+            }
+        };
+
+        let lookup =
+            plan("SELECT * FROM heat_state WHERE memory = type::record($mid)".to_string()).await;
+        assert!(
+            lookup.contains("idx_heat_state_memory") && lookup.contains("IndexScan"),
+            "the per-prompt heat lookup must be an index scan, not a table scan: {lookup}"
+        );
+
+        // The sweep's page, pinned here rather than in its own task so the index it depends on
+        // cannot be dropped without failing something before the job exists.
+        let sweep = plan(
+            "SELECT * FROM heat_state WHERE last_touched < time::now() ORDER BY last_touched ASC \
+             LIMIT 5"
+                .to_string(),
+        )
+        .await;
+        assert!(
+            sweep.contains("idx_heat_state_last_touched"),
+            "the sweep page must be served by the last_touched index: {sweep}"
+        );
+    }
 }

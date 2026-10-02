@@ -33,6 +33,16 @@ DEFINE FIELD OVERWRITE last_accessed_at ON heat_state TYPE option<datetime>;
 -- Without this it is a full scan per tick.
 DEFINE INDEX OVERWRITE idx_heat_state_last_touched ON heat_state FIELDS last_touched;
 
+-- Every heat write is `UPDATE heat_state SET ... WHERE memory = type::record($id)`, and retrieval
+-- issues ten of them per query. Measured before this index existed: ten batched access writes cost
+-- 11.7ms against a 100-row corpus and 122ms against 1000 rows — a full scan per statement, on the
+-- path every agent prompt takes. With it, 1.2ms at both sizes, flat in corpus size. Pinned by
+-- `heat_lookups_by_memory_reach_the_index`, which asserts the plan rather than a duration.
+-- Not UNIQUE: nothing in v001..v007 ever prevented two heat rows for one memory, and a unique index
+-- on a corpus that may already contain duplicates would refuse to build rather than tell anyone.
+-- Making it unique is a data-cleanup decision, not a schema declaration.
+DEFINE INDEX OVERWRITE idx_heat_state_memory ON heat_state FIELDS memory;
+
 -- Attribution. `run_id` is the unit of reversal (one tick that soft-deletes 40 rows is one event
 -- a human wants to undo wholesale) and later the unit an admin would gate. `actor` is written
 -- `system:dreaming`: dreaming is the one writer that can never produce a user identity, so a
