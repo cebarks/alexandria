@@ -466,6 +466,31 @@ impl<'a> MemoryRepo<'a> {
     /// re-delete what `delete_memory` already removed and log it as work. The WHERE clause comes
     /// from `fact_filter_clause` rather than being written out again here, so this read cannot drift
     /// away from the one `list` and `count` use — which is the bug that motivated sharing it.
+    /// Live facts' ids and confidences, for the `Appraise` job.
+    ///
+    /// A projection for the same reason as `collapse_candidates`: demotion reads one number per
+    /// memory and must not pay for embeddings or content to get it. The WHERE clause comes from
+    /// `fact_filter_clause`, so this read cannot drift away from the one `list` and `count` use —
+    /// and reading confidence fresh matters because it is the very value demotion writes.
+    pub async fn live_confidences(&self) -> Result<Vec<(String, f64)>> {
+        let filter = FactListQuery::default();
+        let where_clause = Self::fact_filter_clause(&filter);
+        let sql = format!("SELECT id, confidence FROM fact {where_clause}");
+
+        #[derive(serde::Deserialize, surrealdb::types::SurrealValue)]
+        struct ConfidenceRow {
+            id: surrealdb::types::RecordId,
+            confidence: f64,
+        }
+
+        let mut response = self.db.query(&sql).await?;
+        let rows: Vec<ConfidenceRow> = response.take(0)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (record_id_to_string(&row.id), row.confidence))
+            .collect())
+    }
+
     pub async fn collapse_candidates(&self) -> Result<Vec<CollapseCandidate>> {
         let filter = FactListQuery::default();
         let where_clause = Self::fact_filter_clause(&filter);

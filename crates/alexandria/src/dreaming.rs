@@ -8,6 +8,7 @@
 //!
 //! HTTP mode only, same as before: stdio has no long-lived process to run a clock in.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,8 +16,8 @@ use alexandria_engine::clusters::maintenance::{
     MaintenanceAction, MergeCheck, check_cohesion, check_merge,
 };
 use alexandria_engine::dreaming::collapse::{Candidate, UNKNOWN_CREATED_AT, duplicate_groups};
-use alexandria_engine::dreaming::{Intervals, Job, JobReport};
-use alexandria_engine::heat::HeatColumns;
+use alexandria_engine::dreaming::{DEMOTED_CONFIDENCE, Intervals, Job, JobReport, should_demote};
+use alexandria_engine::heat::{HeatColumns, HeatState as EngineHeatState, projected_heat};
 use alexandria_storage::models::maintenance::{action, disposition, job as job_name};
 use alexandria_storage::repos::{
     AuditContext, ClusterRepo, EdgeRepo, HeatRepo, LogEntry, MaintenanceRepo, MemoryRepo,
@@ -47,6 +48,8 @@ pub(crate) struct Jobs {
     /// place outside retrieval that needs the constant.
     decay_tau_secs: f64,
     max_rows_per_run: usize,
+    cold_heat_floor: f64,
+    demote_confidence_ceiling: f64,
 }
 
 impl Jobs {
@@ -58,6 +61,8 @@ impl Jobs {
             merge_threshold: config.cluster.merge_threshold,
             decay_tau_secs: config.heat.decay_tau_secs,
             max_rows_per_run: config.dreaming.max_rows_per_run,
+            cold_heat_floor: config.dreaming.cold_heat_floor,
+            demote_confidence_ceiling: config.dreaming.demote_confidence_ceiling,
         }
     }
 
@@ -78,12 +83,7 @@ impl Jobs {
             Job::Cluster => self.run_cluster(run_id).await,
             Job::Merge => self.run_merge(run_id).await,
             Job::Collapse => self.run_collapse(run_id).await,
-            // Implemented in the commit that follows this one; the dispatch is total so a new job
-            // cannot silently fall through a `match` arm.
-            job @ Job::Appraise => {
-                tracing::debug!(job = job.as_str(), "dreaming job not yet implemented");
-                Ok(JobReport::new(job))
-            }
+            Job::Appraise => self.run_appraise(run_id).await,
         }
     }
 
@@ -341,6 +341,99 @@ impl Jobs {
                 }
                 report.acted += 1;
             }
+        }
+        Ok(report)
+    }
+
+    /// Cold-row demotion: lower the confidence of memories that are cold, have never been retrieved,
+    /// and were never asserted more strongly than the default.
+    ///
+    /// Demote is the first rung of the ladder and the only one this job can reach. It changes a number
+    /// the ranking already reads, so a demoted memory sinks instead of disappearing, and being wrong
+    /// costs a confidence value rather than a memory. Quarantine (#29) and delete stay out of scope:
+    /// a background job that removes memories on a threshold nobody measured is how a corpus loses
+    /// data quietly.
+    ///
+    /// The near-identical proposal queue from the original design is deliberately absent. Its only
+    /// consumer was #38's judge, and a queue nobody reads is a table of stale assertions.
+    ///
+    /// Heat is **projected** here rather than read as stored, so the job does not depend on the sweep
+    /// having run first: two jobs with independent clocks must not have a hidden ordering contract.
+    async fn run_appraise(&self, run_id: &str) -> anyhow::Result<JobReport> {
+        let heat_repo = HeatRepo::new(self.db.inner());
+        let memories = MemoryRepo::new(self.db.inner());
+        let audit = MaintenanceRepo::with_audit(
+            self.db.inner(),
+            AuditContext::dreaming(run_id, job_name::APPRAISE),
+        );
+
+        // Coldest anchors first — the same paging read the sweep uses, so this job examines the rows
+        // most likely to be cold rather than an arbitrary page of the table.
+        let rows = heat_repo.page_oldest(self.max_rows_per_run).await?;
+        let confidences: HashMap<String, f64> =
+            memories.live_confidences().await?.into_iter().collect();
+
+        let mut report = JobReport::new(Job::Appraise);
+        let now = now_secs();
+
+        for row in &rows {
+            let id = record_id_to_string(&row.memory);
+            // No live fact behind this heat row: the memory was deleted, is quarantined, or the row
+            // is orphaned. Nothing to demote, and not counted as examined either.
+            let Some(confidence) = confidences.get(&id) else {
+                continue;
+            };
+            report.examined += 1;
+
+            let state = EngineHeatState {
+                heat: row.heat,
+                stability: row.stability,
+                last_touched: row
+                    .last_touched
+                    .map(|at| at.timestamp().max(0) as u64)
+                    .unwrap_or(0),
+                // Projection reads the decay anchor only, so the access stamp cannot change the
+                // answer. Carried through rather than zeroed so the state is a faithful copy.
+                last_accessed_at: row
+                    .last_accessed_at
+                    .map(|at| at.timestamp().max(0) as u64)
+                    .unwrap_or(0),
+                access_count: row.access_count.max(0) as u64,
+            };
+            let projected = projected_heat(&state, now, self.decay_tau_secs);
+            if !should_demote(
+                projected,
+                row.access_count,
+                *confidence,
+                self.cold_heat_floor,
+                self.demote_confidence_ceiling,
+            ) {
+                continue;
+            }
+
+            // `update_fact` with only `confidence` set writes that one column, so a demotion cannot
+            // disturb content, tags or the embedding.
+            if let Err(e) = memories
+                .update_fact(&id, None, None, Some(DEMOTED_CONFIDENCE), None)
+                .await
+            {
+                tracing::warn!("Appraise: cannot demote {id}: {e}");
+                continue;
+            }
+            if let Err(e) = audit
+                .record(&LogEntry {
+                    action: action::DEMOTE.to_string(),
+                    source_id: id.clone(),
+                    // A demotion moves nothing, so there is no target.
+                    target_ids: Vec::new(),
+                    members_moved: 0,
+                    disposition: Some(disposition::DEMOTE.to_string()),
+                })
+                .await
+            {
+                tracing::warn!("Appraise: cannot log the demotion of {id}: {e}");
+            }
+            report.acted += 1;
         }
         Ok(report)
     }
@@ -803,5 +896,199 @@ mod tests {
 
         let live = memories.collapse_candidates().await.unwrap();
         assert_eq!(live.len(), 1, "only the survivor is left live");
+    }
+
+    /// Seed one memory plus its heat row. `cold` puts the decay anchor six years back, which at the
+    /// default one-day tau projects to essentially zero; `access_count` is the field the demote rule
+    /// reads, so it is set directly rather than through a retrieval.
+    async fn seed_for_appraise(
+        db: &Database,
+        content: &str,
+        confidence: f64,
+        access_count: i64,
+        cold: bool,
+    ) -> String {
+        let memories = MemoryRepo::new(db.inner());
+        let heat = HeatRepo::new(db.inner());
+        let id = memories
+            .create_fact(content, confidence, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        heat.create_for_memory(&id, 1.0).await.unwrap();
+        let anchor = if cold {
+            "d'2020-01-01T00:00:00Z'"
+        } else {
+            "time::now()"
+        };
+        db.inner()
+            .query(format!(
+                "UPDATE heat_state SET last_touched = {anchor}, last_accessed_at = {anchor}, \
+                 access_count = $count WHERE memory = type::record($m)"
+            ))
+            .bind(("count", access_count))
+            .bind(("m", id.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        id
+    }
+
+    /// The first rung of the ladder: confidence lowered, memory still live and retrievable, one
+    /// attributed audit row. Nothing is deleted or hidden, so being wrong costs a number.
+    #[tokio::test]
+    async fn appraise_demotes_a_cold_never_retrieved_memory_and_logs_it() {
+        let db = migrated_db().await;
+        let id = seed_for_appraise(&db, "nobody ever asked for this", 0.5, 0, true).await;
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs
+            .run_job(Job::Appraise, "run-demote-1")
+            .await
+            .expect("appraise succeeds");
+        assert_eq!((report.examined, report.acted), (1, 1));
+
+        let fact = MemoryRepo::new(db.inner())
+            .get_fact(&id)
+            .await
+            .unwrap()
+            .expect("row still exists");
+        assert_eq!(
+            fact.confidence, DEMOTED_CONFIDENCE,
+            "confidence is the only thing demotion writes"
+        );
+        assert!(!fact.deleted, "demotion is not deletion");
+        assert!(
+            fact.quarantined_at.is_none(),
+            "and not quarantine either: the row stays retrievable, just ranked lower"
+        );
+
+        let logs = ClusterRepo::new(db.inner())
+            .list_maintenance_logs(10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].action, "demote");
+        assert_eq!(logs[0].source_id, id);
+        assert!(logs[0].target_ids.is_empty(), "a demotion moves nothing");
+        assert_eq!(logs[0].disposition.as_deref(), Some("demote"));
+        assert_eq!(logs[0].job.as_deref(), Some("appraise"));
+        assert_eq!(logs[0].run_id.as_deref(), Some("run-demote-1"));
+        assert_eq!(logs[0].actor.as_deref(), Some("system:dreaming"));
+    }
+
+    /// Every condition in the rule is necessary, so each is relaxed on its own row and none of them
+    /// may be demoted. A rule that fired on any of these would be pruning memories that are either
+    /// used, current, or explicitly trusted — which is the complaint that would end this feature.
+    #[tokio::test]
+    async fn appraise_leaves_accessed_warm_and_confident_memories_alone() {
+        let db = migrated_db().await;
+        let accessed = seed_for_appraise(&db, "retrieved three times", 0.5, 3, true).await;
+        let warm = seed_for_appraise(&db, "touched today", 0.5, 0, false).await;
+        let confident = seed_for_appraise(&db, "asserted with confidence", 0.95, 0, true).await;
+        let demotable = seed_for_appraise(&db, "cold and unused", 0.5, 0, true).await;
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs
+            .run_job(Job::Appraise, "run-selective")
+            .await
+            .expect("appraise succeeds");
+        assert_eq!(report.examined, 4);
+        assert_eq!(
+            report.acted, 1,
+            "only the cold, unused, default-confidence row"
+        );
+
+        let memories = MemoryRepo::new(db.inner());
+        for (id, expected, why) in [
+            (accessed, 0.5, "an access exempts it"),
+            (warm, 0.5, "a warm row is not cold"),
+            (confident, 0.95, "above the confidence ceiling"),
+            (demotable, DEMOTED_CONFIDENCE, "the one row that matches"),
+        ] {
+            let fact = memories.get_fact(&id).await.unwrap().unwrap();
+            assert_eq!(fact.confidence, expected, "{why}");
+        }
+    }
+
+    /// The rule exempts the value it writes, so a daily job cannot keep lowering the same row or
+    /// keep logging that it did. Both halves matter: the second is what would make the audit trail
+    /// unreadable, since every run would report the same demotions forever.
+    #[tokio::test]
+    async fn a_second_appraise_run_does_not_demote_the_same_row_twice() {
+        let db = migrated_db().await;
+        seed_for_appraise(&db, "cold and unused", 0.5, 0, true).await;
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let first = jobs
+            .run_job(Job::Appraise, "run-1")
+            .await
+            .expect("appraise succeeds");
+        assert_eq!(first.acted, 1);
+
+        let second = jobs
+            .run_job(Job::Appraise, "run-2")
+            .await
+            .expect("appraise succeeds");
+        assert_eq!(
+            second.acted, 0,
+            "already demoted, so the second run leaves it alone"
+        );
+
+        let logs = ClusterRepo::new(db.inner())
+            .list_maintenance_logs(10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "and wrote no second audit row");
+    }
+
+    /// A memory whose heat row exists but whose fact was deleted or quarantined must not be examined
+    /// or demoted. `page_oldest` reads `heat_state`, which has no `deleted` column of its own, so
+    /// the join against the live-fact read is what keeps dead rows out.
+    #[tokio::test]
+    async fn appraise_skips_heat_rows_whose_fact_is_not_live() {
+        let db = migrated_db().await;
+        let deleted = seed_for_appraise(&db, "already deleted", 0.5, 0, true).await;
+        let quarantined = seed_for_appraise(&db, "quarantined", 0.5, 0, true).await;
+        let live = seed_for_appraise(&db, "still live", 0.5, 0, true).await;
+
+        MemoryRepo::new(db.inner())
+            .soft_delete_fact(&deleted)
+            .await
+            .unwrap();
+        db.inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", quarantined.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs
+            .run_job(Job::Appraise, "run-liveness")
+            .await
+            .expect("appraise succeeds");
+        assert_eq!(
+            (report.examined, report.acted),
+            (1, 1),
+            "only the live fact is examined"
+        );
+
+        let memories = MemoryRepo::new(db.inner());
+        assert_eq!(
+            memories.get_fact(&live).await.unwrap().unwrap().confidence,
+            DEMOTED_CONFIDENCE
+        );
+        assert_eq!(
+            memories
+                .get_fact(&quarantined)
+                .await
+                .unwrap()
+                .unwrap()
+                .confidence,
+            0.5,
+            "a quarantined row is hidden from retrieval already; demoting it would be noise in the              audit log for a row nobody can see"
+        );
     }
 }
