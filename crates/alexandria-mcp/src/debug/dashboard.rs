@@ -101,8 +101,8 @@ fn context_rows(ctx: Option<&DebugContext>) -> Vec<ConfigRow> {
             or_unavailable(ctx.map(|c| c.cluster_merge_threshold)),
         ),
         row_str(
-            "cluster.maintenance_interval_secs",
-            or_unavailable(ctx.map(|c| c.maintenance_interval_secs)),
+            "dreaming",
+            or_unavailable(ctx.map(|c| c.dreaming_summary.clone())),
         ),
         row_str(
             "embedding.model (config file)",
@@ -508,7 +508,7 @@ mod tests {
             "server.port",
             "database.data_dir",
             "cluster.merge_threshold",
-            "cluster.maintenance_interval_secs",
+            "dreaming",
             "embedding.model (config file)",
             "embedding.device (config file)",
         ] {
@@ -542,7 +542,7 @@ mod tests {
             bind_port: 45678,
             data_dir: "/tmp/data-dir-9".to_string(),
             cluster_merge_threshold: 0.875,
-            maintenance_interval_secs: 1234,
+            dreaming_summary: "on - sweep 3600s".to_string(),
             // Host checking is off for this test: `render` below issues a bare `Request::builder()`
             // GET with no Host header, which an armed check would (correctly) refuse.
             allowed_hosts: vec![],
@@ -554,10 +554,7 @@ mod tests {
         assert_eq!(config_value(&html, "server.port"), "45678");
         assert_eq!(config_value(&html, "database.data_dir"), "/tmp/data-dir-9");
         assert_eq!(config_value(&html, "cluster.merge_threshold"), "0.875");
-        assert_eq!(
-            config_value(&html, "cluster.maintenance_interval_secs"),
-            "1234"
-        );
+        assert_eq!(config_value(&html, "dreaming"), "on - sweep 3600s");
         assert_eq!(
             config_value(&html, "embedding.model (config file)"),
             "org/configured-model-v9"

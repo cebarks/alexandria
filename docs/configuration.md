@@ -41,7 +41,17 @@ top_n = 3                  # Number of top retrieval results that trigger spread
 join_threshold = 0.75              # Cosine similarity threshold to join existing cluster (default: 0.75)
 merge_threshold = 0.9              # Centroid similarity above which two clusters merge (default: 0.9)
 cohesion_floor = 0.6               # Avg member-to-centroid similarity below which a cluster splits (default: 0.6)
-maintenance_interval_secs = 300    # Cluster maintenance check interval in seconds (default: 300)
+
+[dreaming]
+enabled = true                     # Master switch for the background scheduler (default: true)
+sweep_interval_secs = 3600         # Heat materialisation cadence (default: 3600 = 1 hour)
+cluster_interval_secs = 300        # Cohesion check → split cadence (default: 300 = 5 minutes)
+merge_interval_secs = 300          # Centroid similarity → merge cadence (default: 300 = 5 minutes)
+collapse_interval_secs = 86400     # Byte-identical duplicate collapse cadence (default: 86400 = 1 day)
+appraise_interval_secs = 86400     # Cold-row demotion cadence (default: 86400 = 1 day)
+max_rows_per_run = 500             # Rows one job may examine per run (default: 500)
+cold_heat_floor = 0.05             # Projected heat at or below which a memory counts as cold (default: 0.05)
+demote_confidence_ceiling = 0.5    # Confidence at or below which a cold, never-accessed memory is demotable (default: 0.5)
 
 [retrieve]
 min_similarity = 0.10              # Server-side hard floor on cosine similarity for retrieve_memories (default: 0.10)
@@ -118,14 +128,61 @@ Controls spreading activation — when a memory is accessed, its graph neighbors
 
 ### `[cluster]`
 
-Controls automatic cluster assignment, splitting, and merging. Maintenance runs periodically in HTTP mode (controlled by `maintenance_interval_secs`).
+Controls automatic cluster assignment, splitting, and merging. The cadences themselves live in
+`[dreaming]` — this section holds only the thresholds the jobs compare against.
 
 | Key | Type | Default | Description |
 | ----- | ------ | --------- | ------------- |
 | `join_threshold` | f32 | `0.75` | Minimum cosine similarity between a new memory's embedding and a cluster centroid to join that cluster. Below this, a new cluster is created. |
-| `merge_threshold` | f32 | `0.9` | Centroid-to-centroid similarity above which two clusters are merged. |
-| `cohesion_floor` | f32 | `0.6` | Average member-to-centroid similarity below which a cluster is split via k-means(k=2). |
-| `maintenance_interval_secs` | u64 | `300` | Interval between cluster maintenance runs in seconds (default: 5 minutes). Only active in HTTP mode. |
+| `merge_threshold` | f32 | `0.9` | Centroid-to-centroid similarity above which two clusters are merged. Read by the `merge` job. |
+| `cohesion_floor` | f32 | `0.6` | Average member-to-centroid similarity below which a cluster is split via k-means(k=2). Read by the `cluster` job. |
+
+> **Removed:** `cluster.maintenance_interval_secs`. Cluster maintenance is no longer one loop with
+> one cadence — it is two of the five dreaming jobs. A config file still setting it boots, but logs a
+> warning naming `dreaming.cluster_interval_secs`, `dreaming.merge_interval_secs` and
+> `dreaming.enabled`.
+
+### `[dreaming]`
+
+The background housekeeping scheduler: **one loop, five independently-due jobs**. HTTP mode only —
+stdio has no long-lived process to run a clock in, so nothing here applies to a stdio server.
+
+Each job carries its own interval and its own last-run stamp, so one job failing or running long
+affects only itself. A process that was down for three intervals catches up with **one** run of each
+job, not three: a missed tick costs latency, never correctness. The loop sleeps until the soonest
+job is due rather than waking on a fixed tick.
+
+| Job | What it does |
+| ----- | ------------- |
+| `sweep` | Materialises decayed heat so stored values are current, and reads the decay anchor forward. Writes no audit rows: it changes ranking by nothing, since every reader projects heat itself. |
+| `cluster` | Cohesion check → split, using `cluster.cohesion_floor`. |
+| `merge` | Centroid similarity → merge, using `cluster.merge_threshold`. Re-reads the cluster set after each merge, because a merge changes the centroids the next comparison would use. |
+| `collapse` | Finds byte-identical duplicates, keeps one, soft-deletes the rest and links them to the survivor. |
+| `appraise` | Demotes memories that are cold, never accessed, and no more confident than the default. |
+
+| Key | Type | Default | Description |
+| ----- | ------ | --------- | ------------- |
+| `enabled` | bool | `true` | Master switch. `false` means the loop is never spawned, so no job writes anything. |
+| `sweep_interval_secs` | u64 | `3600` | Heat materialisation cadence, seconds. |
+| `cluster_interval_secs` | u64 | `300` | Cohesion-check cadence, seconds. Replaces `cluster.maintenance_interval_secs` for splits. |
+| `merge_interval_secs` | u64 | `300` | Merge cadence, seconds. Split from `cluster` because merge is the expensive half — an operator who wants merges rarer should not pay for it in slower splits. |
+| `collapse_interval_secs` | u64 | `86400` | Duplicate-collapse cadence, seconds. |
+| `appraise_interval_secs` | u64 | `86400` | Demotion cadence, seconds. |
+| `max_rows_per_run` | u64 | `500` | Rows one job may examine per run, so a large corpus drains across ticks instead of stalling one. Must be ≥ 1. |
+| `cold_heat_floor` | f64 | `0.05` | Projected heat at or below which a memory counts as cold. **Provisional**: a fraction of the `1.0` a fresh access writes, not a number derived from retrieval measurements. |
+| `demote_confidence_ceiling` | f64 | `0.5` | Stored confidence at or below which a cold, never-accessed memory is demotable. Defaults to the confidence `store_memory` writes when the caller supplies none, so the rule reaches only memories nobody ever asserted more strongly AND nobody ever retrieved. Must be above `0.2`, the value demoted memories are written at. **Provisional**, as above. |
+
+Every interval must be ≥ 1 second: the engine treats a zero interval as "due on every tick", which
+would turn a daily pass into a hot loop, so the server refuses to start on one and names the key.
+
+There are no `ALEXANDRIA_DREAMING_*` environment overrides. Every other section has them, and the
+gap is deliberate rather than an oversight: these are cadences tuned in a file and applied at
+restart, and a partial set of env vars (enabled but not the intervals, say) invites exactly the
+"why is there no env var for this" question a complete set would answer.
+
+Job runs are logged at `debug` with `examined` and `acted` counts. `cluster`, `merge`, `collapse` and
+`appraise` each write a row to `maintenance_log` — visible at `/debug/maintenance` — and `sweep`
+deliberately does not.
 
 ### `[retrieve]`
 

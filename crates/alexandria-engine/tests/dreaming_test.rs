@@ -4,7 +4,9 @@
 //! failure mode of a scheduler is silence: a job that quietly stops running looks healthy for days.
 
 use alexandria_engine::dreaming::{
-    ALL_JOBS, DEFAULT_COLLAPSE_INTERVAL_SECS, Intervals, Job, JobTiming,
+    ALL_JOBS, DEFAULT_COLD_HEAT_FLOOR, DEFAULT_COLLAPSE_INTERVAL_SECS,
+    DEFAULT_DEMOTE_CONFIDENCE_CEILING, DEMOTED_CONFIDENCE, Intervals, Job, JobTiming,
+    should_demote,
 };
 
 fn timing(job: Job, interval: u64, last_run: Option<u64>) -> JobTiming {
@@ -113,6 +115,37 @@ fn a_zero_interval_is_due_every_tick() {
 }
 
 #[test]
+fn the_loop_sleeps_until_the_soonest_job_is_due() {
+    let schedule = Intervals::default().initial_schedule(0);
+    // Cluster and Merge have no last_run, so they are due immediately and the loop must not sleep.
+    assert_eq!(schedule.next_wait_secs(0), 0);
+
+    let mut schedule = Intervals {
+        cluster_secs: 300,
+        merge_secs: 300,
+        sweep_secs: 3600,
+        collapse_secs: 86_400,
+        appraise_secs: 86_400,
+    }
+    .initial_schedule(0);
+    for job in ALL_JOBS {
+        schedule.mark_run(job, 0);
+    }
+    assert_eq!(
+        schedule.next_wait_secs(0),
+        300,
+        "the shortest interval wins"
+    );
+    assert_eq!(schedule.next_wait_secs(250), 50);
+    assert_eq!(schedule.next_wait_secs(300), 0);
+    assert_eq!(
+        schedule.next_wait_secs(100_000),
+        0,
+        "everything overdue sleeps zero, and the tick runs the whole due set"
+    );
+}
+
+#[test]
 fn job_names_match_the_audit_allowlist() {
     let names: Vec<&str> = ALL_JOBS.iter().map(|job| job.as_str()).collect();
     assert_eq!(
@@ -134,4 +167,67 @@ fn every_job_has_an_interval_and_reports_start_empty() {
     }
     let report = alexandria_engine::dreaming::JobReport::new(Job::Sweep);
     assert_eq!((report.examined, report.acted), (0, 0));
+}
+
+/// The demote rule's truth table. Every condition is necessary, so each is tested by relaxing it
+/// alone and asserting nothing is demoted.
+#[test]
+fn demote_requires_cold_unused_and_low_confidence_together() {
+    let (floor, ceiling) = (DEFAULT_COLD_HEAT_FLOOR, DEFAULT_DEMOTE_CONFIDENCE_CEILING);
+    assert!(should_demote(0.0, 0, ceiling, floor, ceiling));
+    assert!(
+        should_demote(floor, 0, ceiling, floor, ceiling),
+        "boundary: heat exactly at the floor counts as cold"
+    );
+
+    assert!(
+        !should_demote(0.0, 1, ceiling, floor, ceiling),
+        "one access is enough to exempt"
+    );
+    assert!(
+        !should_demote(floor * 1.01, 0, ceiling, floor, ceiling),
+        "warm is exempt"
+    );
+    assert!(
+        !should_demote(0.0, 0, ceiling * 1.01, floor, ceiling),
+        "above the confidence ceiling is exempt"
+    );
+}
+
+/// The floor and the ceiling must actually govern the decision. A config key whose value no code
+/// reads is the exact mistake `[heat] spacing_halflife_secs` made before it was split, so the test
+/// takes the knobs as arguments rather than letting the predicate reach for the constants.
+#[test]
+fn the_demote_knobs_govern_the_decision() {
+    assert!(!should_demote(0.4, 0, 0.5, 0.05, 0.5));
+    assert!(
+        should_demote(0.4, 0, 0.5, 0.5, 0.5),
+        "a higher floor demotes it"
+    );
+    assert!(
+        !should_demote(0.4, 0, 0.5, 0.5, 0.4),
+        "a lower ceiling exempts it"
+    );
+}
+
+/// Demoting must not re-arm itself. `Appraise` runs daily, and a rule that matches its own output
+/// would rewrite the same confidence, log the same audit row and report the same "acted" count
+/// forever — which reads like progress in a trace log while doing nothing new. Exempting the
+/// demoted value puts the guarantee in the predicate instead of in a job-side guard that a second
+/// caller would have to remember.
+#[test]
+fn a_demoted_memory_cannot_be_demoted_further() {
+    let (floor, ceiling) = (DEFAULT_COLD_HEAT_FLOOR, DEFAULT_DEMOTE_CONFIDENCE_CEILING);
+    assert!(
+        DEMOTED_CONFIDENCE < ceiling,
+        "the demoted value must sit below the ceiling, or demotion would be a no-op"
+    );
+    assert!(
+        !should_demote(0.0, 0, DEMOTED_CONFIDENCE, floor, ceiling),
+        "already demoted: the second pass must leave it alone"
+    );
+    assert!(
+        should_demote(0.0, 0, DEMOTED_CONFIDENCE * 1.01, floor, ceiling),
+        "anything above the demoted value is still eligible"
+    );
 }

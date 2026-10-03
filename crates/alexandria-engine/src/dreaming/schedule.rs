@@ -135,6 +135,16 @@ impl JobTiming {
             Some(at) => now.saturating_sub(at) >= self.interval_secs,
         }
     }
+
+    /// Seconds until this job is next due, `0` if it is due now. The loop sleeps for the minimum
+    /// across all five jobs rather than polling on a fixed tick, so a config change that makes the
+    /// shortest interval longer cannot leave the process waking up more often than it needs to.
+    pub fn remaining_secs(&self, now: u64) -> u64 {
+        match self.last_run {
+            None => 0,
+            Some(at) => self.interval_secs.saturating_sub(now.saturating_sub(at)),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +163,15 @@ impl Schedule {
             .copied()
             .filter(|job| self.timing(*job).is_some_and(|timing| timing.is_due(now)))
             .collect()
+    }
+
+    /// The soonest any job is next due, used as the loop's sleep length.
+    pub fn next_wait_secs(&self, now: u64) -> u64 {
+        self.timings
+            .iter()
+            .map(|timing| timing.remaining_secs(now))
+            .min()
+            .unwrap_or(0)
     }
 
     pub fn timing(&self, job: Job) -> Option<JobTiming> {

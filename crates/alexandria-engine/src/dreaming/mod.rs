@@ -6,7 +6,13 @@
 //! module. Putting the decisions here makes them testable against the whole engine suite, and keeps
 //! the binary's job to exactly one thing — talking to the database.
 
+pub mod appraise;
 pub mod schedule;
+
+pub use appraise::{
+    DEFAULT_COLD_HEAT_FLOOR, DEFAULT_DEMOTE_CONFIDENCE_CEILING, DEMOTED_CONFIDENCE, is_cold,
+    should_demote,
+};
 
 pub use schedule::{
     ALL_JOBS, DEFAULT_APPRAISE_INTERVAL_SECS, DEFAULT_CLUSTER_INTERVAL_SECS,

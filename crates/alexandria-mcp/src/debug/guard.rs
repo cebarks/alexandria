@@ -237,7 +237,7 @@ mod tests {
             bind_port: 3999,
             data_dir: ":memory:".to_string(),
             cluster_merge_threshold: 0.7,
-            maintenance_interval_secs: 300,
+            dreaming_summary: String::new(),
             allowed_hosts: allowed_hosts.iter().map(|h| (*h).to_string()).collect(),
         }
     }

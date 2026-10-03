@@ -38,7 +38,14 @@ pub struct DebugContext {
     pub bind_port: u16,
     pub data_dir: String,
     pub cluster_merge_threshold: f32,
-    pub maintenance_interval_secs: u64,
+    /// The whole `[dreaming]` cadence as one line, built by the binary that read the file.
+    ///
+    /// A summary string rather than five numeric fields: the dashboard renders one row per key and
+    /// the five jobs are only meaningful together, so six `DebugContext` fields to display one
+    /// sentence would be plumbing for its own sake. Built in the binary because `DreamingConfig`
+    /// lives there and cannot reach this crate — the same reason `ClusterConfig` values arrive
+    /// pre-flattened.
+    pub dreaming_summary: String,
     /// `[server] allowed_hosts`, verbatim.
     ///
     /// The debug UI has no auth, so its only server-side signal that a request is not what it
