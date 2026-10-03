@@ -6,14 +6,44 @@ use tracing::warn;
 
 use crate::models::{Cluster, Fact};
 use crate::record_id_to_string;
+use crate::repos::maintenance_repo::AuditContext;
 
 pub struct ClusterRepo<'a> {
     db: &'a Surreal<Any>,
+    /// Attribution for the audit rows this repo writes. Carried on the repo rather than passed per
+    /// call because it is a property of the writer: one scheduler tick has one `run_id`, and a call
+    /// site that forgot to pass it would produce an unattributable row instead of failing to compile.
+    audit: Option<AuditContext>,
 }
 
 impl<'a> ClusterRepo<'a> {
+    /// Unattributed: `maintenance_log` rows get NONE for run_id/job/actor, as every row written
+    /// before v008 does.
     pub fn new(db: &'a Surreal<Any>) -> Self {
-        Self { db }
+        Self { db, audit: None }
+    }
+
+    /// Attribute the split and merge rows this repo writes to one run of one job.
+    pub fn with_audit(db: &'a Surreal<Any>, audit: AuditContext) -> Self {
+        Self {
+            db,
+            audit: Some(audit),
+        }
+    }
+
+    /// The three attribution binds for a `CREATE maintenance_log`, `None` when the repo is
+    /// unattributed. A split moves
+    /// members between clusters, which is the most destructive thing any job does, so its row is the
+    /// one an operator most needs to be able to tie back to a run.
+    fn audit_binds(&self) -> (Option<String>, Option<String>, Option<String>) {
+        match &self.audit {
+            Some(audit) => (
+                Some(audit.run_id.clone()),
+                Some(audit.job.clone()),
+                Some(audit.actor.clone()),
+            ),
+            None => (None, None, None),
+        }
     }
 
     pub async fn create(&self, label: Option<&str>, centroid: &[f32]) -> Result<String> {
@@ -174,11 +204,20 @@ impl<'a> ClusterRepo<'a> {
 
         // Log the split
         let members_moved = (group_a.len() + group_b.len()) as i64;
-        if let Err(e) = self.db
-            .query("CREATE maintenance_log SET action = 'split', source_id = $source, target_ids = $targets, members_moved = $count")
+        let (run_id, job, actor) = self.audit_binds();
+        if let Err(e) = self
+            .db
+            .query(
+                "CREATE maintenance_log SET action = 'split', source_id = $source, \
+                 target_ids = $targets, members_moved = $count, \
+                 run_id = $run_id, job = $job, actor = $actor",
+            )
             .bind(("source", cluster_id.to_string()))
             .bind(("targets", vec![cid_a.clone(), cid_b.clone()]))
             .bind(("count", members_moved))
+            .bind(("run_id", run_id))
+            .bind(("job", job))
+            .bind(("actor", actor))
             .await
         {
             warn!("Failed to log split: {e}");
@@ -219,11 +258,20 @@ impl<'a> ClusterRepo<'a> {
         self.delete(remove_id).await?;
 
         // Log the merge
-        if let Err(e) = self.db
-            .query("CREATE maintenance_log SET action = 'merge', source_id = $source, target_ids = $targets, members_moved = $count")
+        let (run_id, job, actor) = self.audit_binds();
+        if let Err(e) = self
+            .db
+            .query(
+                "CREATE maintenance_log SET action = 'merge', source_id = $source, \
+                 target_ids = $targets, members_moved = $count, \
+                 run_id = $run_id, job = $job, actor = $actor",
+            )
             .bind(("source", remove_id.to_string()))
             .bind(("targets", vec![keep_id.to_string()]))
             .bind(("count", members_moved))
+            .bind(("run_id", run_id))
+            .bind(("job", job))
+            .bind(("actor", actor))
             .await
         {
             warn!("Failed to log merge: {e}");

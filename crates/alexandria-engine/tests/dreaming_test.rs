@@ -3,11 +3,21 @@
 //! These are the tests that make "one loop, five independent due-times" safe to write, because the
 //! failure mode of a scheduler is silence: a job that quietly stops running looks healthy for days.
 
+use alexandria_engine::dreaming::collapse::{Candidate, UNKNOWN_CREATED_AT, duplicate_groups};
 use alexandria_engine::dreaming::{
     ALL_JOBS, DEFAULT_COLD_HEAT_FLOOR, DEFAULT_COLLAPSE_INTERVAL_SECS,
     DEFAULT_DEMOTE_CONFIDENCE_CEILING, DEMOTED_CONFIDENCE, Intervals, Job, JobTiming,
     should_demote,
 };
+
+fn candidate(id: &str, content: &str, confidence: f64, created_at: i64) -> Candidate {
+    Candidate {
+        id: id.to_string(),
+        content: content.to_string(),
+        confidence,
+        created_at,
+    }
+}
 
 fn timing(job: Job, interval: u64, last_run: Option<u64>) -> JobTiming {
     JobTiming {
@@ -229,5 +239,137 @@ fn a_demoted_memory_cannot_be_demoted_further() {
     assert!(
         should_demote(0.0, 0, DEMOTED_CONFIDENCE * 1.01, floor, ceiling),
         "anything above the demoted value is still eligible"
+    );
+}
+
+/// Only byte-identical content groups. A one-character difference — a trailing space, a different
+/// case — is a judgement call that belongs to #38's judge, not to a background job that soft-deletes
+/// rows on a threshold nobody chose.
+#[test]
+fn only_byte_identical_content_collapses() {
+    assert!(
+        duplicate_groups(&[
+            candidate("fact:a", "the token rotates", 0.5, 100),
+            candidate("fact:b", "the token rotates ", 0.5, 200),
+            candidate("fact:c", "The token rotates", 0.5, 300),
+        ])
+        .is_empty(),
+        "near-identical is not identical"
+    );
+    assert_eq!(
+        duplicate_groups(&[
+            candidate("fact:a", "the token rotates", 0.5, 100),
+            candidate("fact:b", "the token rotates", 0.5, 200),
+        ])
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn singletons_produce_no_group() {
+    assert!(
+        duplicate_groups(&[
+            candidate("fact:a", "one", 0.9, 100),
+            candidate("fact:b", "two", 0.1, 200),
+            candidate("fact:c", "three", 0.5, 300),
+        ])
+        .is_empty(),
+        "a group of one would have the caller soft-delete nothing while logging that it acted"
+    );
+    assert!(
+        duplicate_groups(&[]).is_empty(),
+        "and neither does an empty corpus"
+    );
+}
+
+#[test]
+fn the_survivor_is_the_most_confident() {
+    let groups = duplicate_groups(&[
+        candidate("fact:low", "same", 0.2, 100),
+        candidate("fact:high", "same", 0.9, 500),
+        candidate("fact:mid", "same", 0.5, 300),
+    ]);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].survivor, "fact:high");
+    assert_eq!(
+        groups[0].collapsed,
+        vec!["fact:low", "fact:mid"],
+        "collapsed ids sort, so one run's audit rows come out in a stable order"
+    );
+}
+
+#[test]
+fn a_confidence_tie_goes_to_the_oldest() {
+    let groups = duplicate_groups(&[
+        candidate("fact:new", "same", 0.5, 900),
+        candidate("fact:old", "same", 0.5, 100),
+    ]);
+    assert_eq!(
+        groups[0].survivor, "fact:old",
+        "the row that has been around longest is the one other memories may already reference"
+    );
+}
+
+/// A row nobody can date must not win survivorship over one that can be. The survivor is the row
+/// that stays retrievable, so promoting the undateable one is the worse of the two errors.
+#[test]
+fn an_undateable_row_loses_the_tie() {
+    let groups = duplicate_groups(&[
+        candidate("fact:aaa", "same", 0.5, UNKNOWN_CREATED_AT),
+        candidate("fact:zzz", "same", 0.5, 100),
+    ]);
+    assert_eq!(groups[0].survivor, "fact:zzz");
+}
+
+/// The id tiebreak is what makes the function total. Without it, two rows equal on confidence and
+/// timestamp would be ordered by HashMap iteration, and the same corpus could collapse in the
+/// opposite direction on the next run — an audit trail that contradicts itself.
+#[test]
+fn a_total_tie_breaks_on_id_and_never_flips() {
+    let rows = vec![
+        candidate("fact:bbb", "same", 0.5, 100),
+        candidate("fact:aaa", "same", 0.5, 100),
+    ];
+    let forward = duplicate_groups(&rows);
+    let mut backward = rows.clone();
+    backward.reverse();
+    assert_eq!(forward, duplicate_groups(&backward));
+    assert_eq!(forward[0].survivor, "fact:aaa");
+}
+
+/// The read that feeds this is a database query whose row order carries no guarantee, so the grouping
+/// has to be a function of the input *set* rather than of its order.
+#[test]
+fn grouping_is_independent_of_input_order() {
+    let rows = vec![
+        candidate("fact:a", "alpha", 0.5, 100),
+        candidate("fact:b", "alpha", 0.7, 200),
+        candidate("fact:c", "beta", 0.5, 300),
+        candidate("fact:d", "beta", 0.5, 400),
+        candidate("fact:e", "gamma", 0.5, 500),
+    ];
+    let expected = duplicate_groups(&rows);
+    for rotation in 1..rows.len() {
+        let mut rotated = rows[rotation..].to_vec();
+        rotated.extend_from_slice(&rows[..rotation]);
+        assert_eq!(
+            duplicate_groups(&rotated),
+            expected,
+            "rotation by {rotation} changed the result"
+        );
+    }
+    assert_eq!(
+        expected.len(),
+        2,
+        "alpha and beta each collapse; gamma is a singleton"
+    );
+    assert_eq!(
+        expected
+            .iter()
+            .map(|group| group.survivor.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fact:b", "fact:c"],
+        "groups come back sorted by survivor id"
     );
 }

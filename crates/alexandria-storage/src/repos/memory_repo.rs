@@ -3,7 +3,7 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue, ToSql};
 
-use crate::models::{Fact, RawRecord};
+use crate::models::{CollapseCandidate, Fact, RawRecord};
 use crate::record_id_to_string;
 
 /// A sortable column for [`MemoryRepo::list`].
@@ -459,6 +459,22 @@ impl<'a> MemoryRepo<'a> {
 
     /// Every fact, deleted ones included, as (id, content). Used by the embedding
     /// migration, which must re-embed lineage snapshots too so they stay comparable.
+    /// Live facts projected to the columns the `Collapse` job needs.
+    ///
+    /// Not `all_ids_and_content`, which deliberately includes soft-deleted rows because
+    /// `migrate-embeddings` has to re-embed those too: a collapse pass over deleted rows would
+    /// re-delete what `delete_memory` already removed and log it as work. The WHERE clause comes
+    /// from `fact_filter_clause` rather than being written out again here, so this read cannot drift
+    /// away from the one `list` and `count` use — which is the bug that motivated sharing it.
+    pub async fn collapse_candidates(&self) -> Result<Vec<CollapseCandidate>> {
+        let filter = FactListQuery::default();
+        let where_clause = Self::fact_filter_clause(&filter);
+        let sql = format!("SELECT id, content, confidence, created_at FROM fact {where_clause}");
+
+        let mut response = self.db.query(&sql).await?;
+        Ok(response.take(0)?)
+    }
+
     pub async fn all_ids_and_content(&self) -> Result<Vec<(String, String)>> {
         #[derive(serde::Deserialize, SurrealValue)]
         struct Row {
@@ -1356,6 +1372,54 @@ mod tests {
         assert!(
             plan.contains("KnnScan") && plan.contains("fact_embedding_hnsw"),
             "the extra predicate must not drop the plan out of the index: {plan}"
+        );
+    }
+    /// `Collapse` groups live facts only. Reading through `all_ids_and_content` — which keeps
+    /// soft-deleted rows on purpose for `migrate-embeddings` — would have the job re-delete what
+    /// `delete_memory` already removed and log it as work.
+    #[tokio::test]
+    async fn collapse_candidates_read_live_facts_only() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let live = repo.create_fact("live", 0.5, &[0.1], &[]).await.unwrap();
+        let deleted = repo.create_fact("deleted", 0.5, &[0.1], &[]).await.unwrap();
+        let quarantined = repo
+            .create_fact("quarantined", 0.5, &[0.1], &[])
+            .await
+            .unwrap();
+        repo.soft_delete_fact(&deleted).await.unwrap();
+        db.inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", quarantined.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let candidates = repo.collapse_candidates().await.unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| crate::record_id_to_string(&c.id))
+                .collect::<Vec<_>>(),
+            vec![live],
+            "only the live row is a collapse candidate"
+        );
+        assert_eq!(candidates[0].content, "live");
+        assert_eq!(candidates[0].confidence, 0.5);
+        assert!(
+            candidates[0].created_at.is_some(),
+            "created_at is the survivor tiebreak, so the projection has to carry it"
+        );
+
+        // The two reads that look interchangeable must not be: this is the assertion that would have
+        // caught using all_ids_and_content for collapse.
+        assert_eq!(
+            repo.all_ids_and_content().await.unwrap().len(),
+            3,
+            "all_ids_and_content still includes deleted and quarantined rows, as migrate-embeddings needs"
         );
     }
 }

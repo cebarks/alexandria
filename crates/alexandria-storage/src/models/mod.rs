@@ -11,7 +11,7 @@ pub use cluster::Cluster;
 pub use edge::MemoryEdge;
 pub use heat::HeatState;
 pub use maintenance::MaintenanceLog;
-pub use memory::{Fact, RawRecord};
+pub use memory::{CollapseCandidate, Fact, RawRecord};
 pub use provenance::Provenance;
 pub use reminder::{Reminder, schedule_kind};
 pub use session::{Session, SessionListItem};

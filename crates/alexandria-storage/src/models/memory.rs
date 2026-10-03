@@ -2,6 +2,19 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use surrealdb::types::{RecordId, SurrealValue, Value};
 
+/// The columns `Collapse` needs from a live fact, and nothing else.
+///
+/// A projection rather than `Vec<Fact>`: duplicate grouping compares content strings, so reading
+/// every embedding in the corpus to find byte-identical rows would make the embedding the dominant
+/// cost of a job that never looks at it.
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+pub struct CollapseCandidate {
+    pub id: RecordId,
+    pub content: String,
+    pub confidence: f64,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct Fact {
     pub id: Option<RecordId>,

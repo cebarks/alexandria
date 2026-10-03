@@ -14,9 +14,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alexandria_engine::clusters::maintenance::{
     MaintenanceAction, MergeCheck, check_cohesion, check_merge,
 };
+use alexandria_engine::dreaming::collapse::{Candidate, UNKNOWN_CREATED_AT, duplicate_groups};
 use alexandria_engine::dreaming::{Intervals, Job, JobReport};
 use alexandria_engine::heat::HeatColumns;
-use alexandria_storage::repos::{ClusterRepo, HeatRepo};
+use alexandria_storage::models::maintenance::{action, disposition, job as job_name};
+use alexandria_storage::repos::{
+    AuditContext, ClusterRepo, EdgeRepo, HeatRepo, LogEntry, MaintenanceRepo, MemoryRepo,
+};
 use alexandria_storage::{Database, record_id_to_string};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -68,14 +72,15 @@ impl Jobs {
         tokio::spawn(async move { run(jobs, cancel).await })
     }
 
-    async fn run_job(&self, job: Job) -> anyhow::Result<JobReport> {
+    async fn run_job(&self, job: Job, run_id: &str) -> anyhow::Result<JobReport> {
         match job {
             Job::Sweep => self.run_sweep().await,
-            Job::Cluster => self.run_cluster().await,
-            Job::Merge => self.run_merge().await,
-            // Implemented in the commits that follow this one; the dispatch is total so a new job
+            Job::Cluster => self.run_cluster(run_id).await,
+            Job::Merge => self.run_merge(run_id).await,
+            Job::Collapse => self.run_collapse(run_id).await,
+            // Implemented in the commit that follows this one; the dispatch is total so a new job
             // cannot silently fall through a `match` arm.
-            job @ (Job::Collapse | Job::Appraise) => {
+            job @ Job::Appraise => {
                 tracing::debug!(job = job.as_str(), "dreaming job not yet implemented");
                 Ok(JobReport::new(job))
             }
@@ -133,8 +138,11 @@ impl Jobs {
 
     /// Cohesion check → split. Moved out of `main.rs` verbatim: same ordering, same per-cluster
     /// member read, same logged outcomes.
-    async fn run_cluster(&self) -> anyhow::Result<JobReport> {
-        let cluster_repo = ClusterRepo::new(self.db.inner());
+    async fn run_cluster(&self, run_id: &str) -> anyhow::Result<JobReport> {
+        let cluster_repo = ClusterRepo::with_audit(
+            self.db.inner(),
+            AuditContext::dreaming(run_id, job_name::CLUSTER),
+        );
         let clusters = self.all_clusters().await?;
         let mut report = JobReport::new(Job::Cluster);
 
@@ -194,8 +202,11 @@ impl Jobs {
     /// Centroid similarity → merge. Also moved verbatim, including the labelled break: after each
     /// merge the cluster set is re-read, because a merge changes the centroids the next comparison
     /// would otherwise use.
-    async fn run_merge(&self) -> anyhow::Result<JobReport> {
-        let cluster_repo = ClusterRepo::new(self.db.inner());
+    async fn run_merge(&self, run_id: &str) -> anyhow::Result<JobReport> {
+        let cluster_repo = ClusterRepo::with_audit(
+            self.db.inner(),
+            AuditContext::dreaming(run_id, job_name::MERGE),
+        );
         let mut report = JobReport::new(Job::Merge);
 
         loop {
@@ -257,6 +268,83 @@ impl Jobs {
         Ok(report)
     }
 
+    /// Byte-identical duplicate collapse: keep the strongest copy, soft-delete the rest, and leave a
+    /// `derived_from` edge from each dead row to the survivor.
+    ///
+    /// The grouping and the survivor rule live in `alexandria_engine::dreaming::collapse`, so the
+    /// decisions are tested without a database. What is here is the write order and the audit trail.
+    ///
+    /// The edge is written **before** the delete. Reversed, a failure between the two would leave a
+    /// soft-deleted memory with no path back to the copy that replaced it — the lineage is the only
+    /// thing that makes the deletion reversible, so it has to exist first.
+    async fn run_collapse(&self, run_id: &str) -> anyhow::Result<JobReport> {
+        let memories = MemoryRepo::new(self.db.inner());
+        let edges = EdgeRepo::new(self.db.inner());
+        let audit = MaintenanceRepo::with_audit(
+            self.db.inner(),
+            AuditContext::dreaming(run_id, job_name::COLLAPSE),
+        );
+
+        let rows = memories.collapse_candidates().await?;
+        let mut report = JobReport::new(Job::Collapse);
+        report.examined = rows.len();
+
+        let candidates: Vec<Candidate> = rows
+            .iter()
+            .map(|row| Candidate {
+                id: record_id_to_string(&row.id),
+                content: row.content.clone(),
+                confidence: row.confidence,
+                created_at: row
+                    .created_at
+                    .map(|at| at.timestamp())
+                    .unwrap_or(UNKNOWN_CREATED_AT),
+            })
+            .collect();
+
+        'groups: for group in duplicate_groups(&candidates) {
+            for collapsed in &group.collapsed {
+                // The bound is on writes, not on the read. Stopping mid-group is safe: each collapsed
+                // row is independent, and the next run groups the same survivors against whatever is
+                // left, so nothing is skipped forever.
+                if report.acted >= self.max_rows_per_run {
+                    break 'groups;
+                }
+
+                if let Err(e) = edges
+                    .create_edge(collapsed, &group.survivor, "derived_from", 1.0)
+                    .await
+                {
+                    tracing::warn!(
+                        "Collapse: cannot link {collapsed} -> {}: {e}",
+                        group.survivor
+                    );
+                    continue;
+                }
+                if let Err(e) = memories.soft_delete_fact(collapsed).await {
+                    tracing::warn!("Collapse: cannot soft-delete {collapsed}: {e}");
+                    continue;
+                }
+                // A row that acted but failed to log is worse than the reverse, so the log write is
+                // last and its failure does not unwind the delete — it is warned about instead.
+                if let Err(e) = audit
+                    .record(&LogEntry {
+                        action: action::COLLAPSE.to_string(),
+                        source_id: collapsed.clone(),
+                        target_ids: vec![group.survivor.clone()],
+                        members_moved: 0,
+                        disposition: Some(disposition::SOFT_DELETE.to_string()),
+                    })
+                    .await
+                {
+                    tracing::warn!("Collapse: cannot log the collapse of {collapsed}: {e}");
+                }
+                report.acted += 1;
+            }
+        }
+        Ok(report)
+    }
+
     async fn all_clusters(&self) -> anyhow::Result<Vec<alexandria_storage::models::Cluster>> {
         let clusters = self
             .db
@@ -295,6 +383,7 @@ pub(crate) fn summary(config: &crate::config::DreamingConfig) -> String {
 /// alternative (retry immediately) is what turns one poisoned row into a hot loop.
 pub(crate) async fn run(jobs: Jobs, cancel: CancellationToken) {
     let mut schedule = jobs.intervals.initial_schedule(now_secs());
+    let mut tick: u64 = 0;
     tracing::info!(
         "dreaming scheduler started: sweep {}s, cluster {}s, merge {}s, collapse {}s, appraise {}s",
         jobs.intervals.sweep_secs,
@@ -312,8 +401,17 @@ pub(crate) async fn run(jobs: Jobs, cancel: CancellationToken) {
         }
 
         let now = now_secs();
-        for job in schedule.due(now) {
-            match jobs.run_job(job).await {
+        let due = schedule.due(now);
+        if due.is_empty() {
+            continue;
+        }
+        tick += 1;
+        // One id for the whole tick, shared by every job that runs in it. `run_id` is the unit an
+        // operator would reverse, and a tick that split a cluster and then collapsed duplicates into
+        // it is one event, not two.
+        let run_id = format!("run-{now}-{tick}");
+        for job in due {
+            match jobs.run_job(job, &run_id).await {
                 Ok(report) => tracing::debug!(
                     job = report.job.as_str(),
                     examined = report.examined,
@@ -392,7 +490,10 @@ mod tests {
         let id = seed_cold(&db, "a memory nobody has looked at in years").await;
 
         let jobs = Jobs::new(db.clone(), &Config::default());
-        let report = jobs.run_job(Job::Sweep).await.expect("sweep succeeds");
+        let report = jobs
+            .run_job(Job::Sweep, "run-test")
+            .await
+            .expect("sweep succeeds");
         assert_eq!((report.examined, report.acted), (1, 1));
 
         let state = HeatRepo::new(db.inner())
@@ -433,7 +534,10 @@ mod tests {
         config.dreaming.max_rows_per_run = 2;
         let jobs = Jobs::new(db.clone(), &config);
 
-        let first = jobs.run_job(Job::Sweep).await.expect("sweep succeeds");
+        let first = jobs
+            .run_job(Job::Sweep, "run-test")
+            .await
+            .expect("sweep succeeds");
         assert_eq!(
             (first.examined, first.acted),
             (2, 2),
@@ -445,7 +549,10 @@ mod tests {
             "only the page was materialised"
         );
 
-        let second = jobs.run_job(Job::Sweep).await.expect("sweep succeeds");
+        let second = jobs
+            .run_job(Job::Sweep, "run-test")
+            .await
+            .expect("sweep succeeds");
         assert_eq!(second.examined, 2);
         assert_eq!(
             recently_swept(&db).await,
@@ -461,7 +568,7 @@ mod tests {
         let db = migrated_db().await;
         let jobs = Jobs::new(db.clone(), &Config::default());
         let report = jobs
-            .run_job(Job::Sweep)
+            .run_job(Job::Sweep, "run-test")
             .await
             .expect("no rows is not an error");
         assert_eq!(
@@ -479,11 +586,11 @@ mod tests {
         // the only failure handling. They now return `Result`, so "no clusters at all" has to be the
         // success case rather than an error — a fresh database is the common case on first boot.
         let cluster = jobs
-            .run_job(Job::Cluster)
+            .run_job(Job::Cluster, "run-test")
             .await
             .expect("empty is not an error");
         let merge = jobs
-            .run_job(Job::Merge)
+            .run_job(Job::Merge, "run-test")
             .await
             .expect("empty is not an error");
         assert_eq!(
@@ -534,5 +641,167 @@ mod tests {
         let mut disabled = config.dreaming.clone();
         disabled.enabled = false;
         assert_eq!(summary(&disabled), "off");
+    }
+
+    /// Two byte-identical memories collapse into the more confident one: the survivor stays
+    /// retrievable, the duplicate is soft-deleted, and a `derived_from` edge points from the dead
+    /// row to the copy that replaced it. That edge is what makes the deletion reversible rather than
+    /// merely hidden, so it is asserted and not assumed.
+    #[tokio::test]
+    async fn collapse_keeps_the_stronger_copy_and_links_the_duplicate_to_it() {
+        let db = migrated_db().await;
+        let memories = MemoryRepo::new(db.inner());
+        let weak = memories
+            .create_fact("the token rotates nightly", 0.3, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let strong = memories
+            .create_fact("the token rotates nightly", 0.9, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs
+            .run_job(Job::Collapse, "run-collapse-1")
+            .await
+            .expect("collapse succeeds");
+        assert_eq!((report.examined, report.acted), (2, 1));
+
+        let survivor = memories
+            .get_fact(&strong)
+            .await
+            .unwrap()
+            .expect("survivor still exists");
+        assert!(!survivor.deleted, "the stronger copy stays retrievable");
+
+        let dead = memories
+            .get_fact(&weak)
+            .await
+            .unwrap()
+            .expect("the duplicate is soft-deleted, not removed");
+        assert!(dead.deleted);
+
+        let edges = EdgeRepo::new(db.inner())
+            .get_edges_for(&weak)
+            .await
+            .unwrap();
+        let link = edges
+            .iter()
+            .find(|edge| edge.edge_type == "derived_from")
+            .expect("the lineage edge is written before the delete");
+        assert_eq!(
+            link.out_node.as_ref().map(record_id_to_string),
+            Some(strong.clone()),
+            "the edge points from the collapsed row to the survivor"
+        );
+    }
+
+    /// A daily job must not re-delete and re-log the same pair forever. Once collapsed, the duplicate
+    /// is soft-deleted and therefore not a candidate, so the second run acts on nothing.
+    #[tokio::test]
+    async fn a_second_collapse_run_finds_nothing_to_do() {
+        let db = migrated_db().await;
+        let memories = MemoryRepo::new(db.inner());
+        for confidence in [0.4, 0.8] {
+            memories
+                .create_fact("duplicate content", confidence, &[0.1, 0.2], &[])
+                .await
+                .unwrap();
+        }
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let first = jobs
+            .run_job(Job::Collapse, "run-1")
+            .await
+            .expect("collapse succeeds");
+        assert_eq!(first.acted, 1);
+
+        let second = jobs
+            .run_job(Job::Collapse, "run-2")
+            .await
+            .expect("collapse succeeds");
+        assert_eq!(
+            (second.examined, second.acted),
+            (1, 0),
+            "the collapsed row is no longer a candidate, so the second run has nothing to do"
+        );
+
+        let logs = ClusterRepo::new(db.inner())
+            .list_maintenance_logs(10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "and it wrote no second audit row");
+    }
+
+    /// `run_id` is the unit of reversal, so every row one run writes has to carry the same one,
+    /// along with the job and the writer. Without that, "undo the pass that ate my memories" is a
+    /// timestamp range and a guess.
+    #[tokio::test]
+    async fn collapse_attributes_every_row_to_the_run_that_wrote_it() {
+        let db = migrated_db().await;
+        let memories = MemoryRepo::new(db.inner());
+        for _ in 0..3 {
+            memories
+                .create_fact("three identical rows", 0.5, &[0.1, 0.2], &[])
+                .await
+                .unwrap();
+        }
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs
+            .run_job(Job::Collapse, "run-77")
+            .await
+            .expect("collapse succeeds");
+        assert_eq!(
+            report.acted, 2,
+            "two of the three collapse into the survivor"
+        );
+
+        let logs = ClusterRepo::new(db.inner())
+            .list_maintenance_logs(10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 2, "one audit row per collapsed fact");
+        for log in &logs {
+            assert_eq!(log.run_id.as_deref(), Some("run-77"));
+            assert_eq!(log.job.as_deref(), Some("collapse"));
+            assert_eq!(log.actor.as_deref(), Some("system:dreaming"));
+            assert_eq!(log.disposition.as_deref(), Some("soft_delete"));
+            assert_eq!(log.action, "collapse");
+        }
+    }
+
+    /// The bound is on writes, and stopping mid-group must not strand the rest: the next run picks up
+    /// where this one stopped, because the survivor stays live and the remaining duplicates are
+    /// still candidates.
+    #[tokio::test]
+    async fn collapse_honours_max_rows_per_run_and_finishes_on_the_next_run() {
+        let db = migrated_db().await;
+        let memories = MemoryRepo::new(db.inner());
+        for _ in 0..3 {
+            memories
+                .create_fact("bounded collapse", 0.5, &[0.1, 0.2], &[])
+                .await
+                .unwrap();
+        }
+
+        let mut config = Config::default();
+        config.dreaming.max_rows_per_run = 1;
+        let jobs = Jobs::new(db.clone(), &config);
+
+        let first = jobs
+            .run_job(Job::Collapse, "run-a")
+            .await
+            .expect("collapse succeeds");
+        assert_eq!(first.acted, 1, "one write per run");
+
+        let second = jobs
+            .run_job(Job::Collapse, "run-b")
+            .await
+            .expect("collapse succeeds");
+        assert_eq!(second.acted, 1, "the last duplicate goes on the next run");
+
+        let live = memories.collapse_candidates().await.unwrap();
+        assert_eq!(live.len(), 1, "only the survivor is left live");
     }
 }

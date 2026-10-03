@@ -7,7 +7,10 @@
 //! the binary's job to exactly one thing — talking to the database.
 
 pub mod appraise;
+pub mod collapse;
 pub mod schedule;
+
+pub use collapse::{Candidate, DuplicateGroup, UNKNOWN_CREATED_AT, duplicate_groups};
 
 pub use appraise::{
     DEFAULT_COLD_HEAT_FLOOR, DEFAULT_DEMOTE_CONFIDENCE_CEILING, DEMOTED_CONFIDENCE, is_cold,
