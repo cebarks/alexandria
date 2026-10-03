@@ -5,10 +5,10 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 ## Features
 
 - **Semantic search** — Cosine similarity over local embeddings (all-MiniLM-L6-v2 via candle, pure Rust)
-- **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool.
+- **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool. Heat is recorded on retrieval but is not yet a ranking input — retrieval still ranks by cosine similarity (see [`A2`](docs/performance-and-ability-findings.md#a2-the-heat-model-is-inert)).
 - **Spreading activation** — Accessing a memory warms its graph neighbors. Heat propagates along edges with configurable decay.
 - **Graph edges** — Memories link via `derived_from` and `extracted_from` edges. `relates_to`, `supports` and `contradicts` exist in the schema but nothing in production writes them yet; auto-linking them is planned v0.3 work
-- **Hierarchical clustering** — Automatic cluster assignment on store, background split/merge maintenance with a queryable audit log
+- **Hierarchical clustering** — Automatic cluster assignment on store, plus a background housekeeping scheduler that splits, merges, collapses byte-identical duplicates and demotes cold unused memories, all with a queryable audit log
 - **Progressive recall** — Two-phase retrieval: broad cluster matching first, then scope-narrowing within a cluster
 - **Session memory** — Group memories by conversation, search within a session, and close it out with a summary
 - **Document import** — Chunk by heading, paragraph, or fixed size with batch tracking and `extracted_from` lineage
@@ -170,9 +170,12 @@ Tester's non-dry `retrieve` run performs spreading activation, so it writes heat
   those same maps, and click-through to the memory detail page. `?hops=1..3` sets the radius, clamped
   server-side; the view caps at 200 nodes and says so when it truncates rather than rendering a
   hairball. The backing JSON is at `/debug/api/graph/{id}`
-- **Maintenance log** (`/debug/maintenance`) — paginated history of every background cluster split and
-  merge: source cluster, resulting clusters, and members moved. The only way to audit *why* the
-  clustering changed since you last looked.
+- **Maintenance log** (`/debug/maintenance`) — paginated history of the background scheduler's
+  writes: cluster splits and merges (source, resulting clusters, members moved), duplicate collapses
+  and cold-memory demotions, each carrying the `run_id` of the tick that wrote it so one pass can be
+  selected — or reversed — as a unit. The only way to audit *why* the corpus changed since you last
+  looked. The heat sweep deliberately writes nothing here: it changes ranking by nothing, so an audit
+  trail for it would be hundreds of rows an hour recording that nothing happened.
 - **Query Tester** (`/debug/query`, `POST /debug/query/run`) — run `retrieve_memories`/`recall` live
   against the real embedding model to sanity-check retrieval quality, with optional `session_id`
   scoping and a **Dry run** checkbox. Results report the effective `min_similarity` floor, list what
@@ -377,7 +380,7 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 
 ```text
 crates/
-├── alexandria/          # Binary — config loading, transport setup, main loop, cluster maintenance
+├── alexandria/          # Binary — config loading, transport setup, main loop, dreaming scheduler
 ├── alexandria-mcp/      # MCP tool handlers + debug web UI (askama templates, vendored assets)
 ├── alexandria-engine/   # Core algorithms — clustering, heat, recall, import, activation
 ├── alexandria-pipeline/ # Embedding providers (candle)

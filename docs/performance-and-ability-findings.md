@@ -20,7 +20,7 @@ a reference survives the next edit.
 | [A1](#a1-every-embedding-is-truncated-to-128-tokens) | Every embedding is truncated to 128 tokens | High | **opt-in fix 2026-09-10** (`max_tokens = 256`) |
 | [P1](#p1-every-embedding-pays-a-128-token-forward-pass) | Every embedding pays a 128-token forward pass | Medium | **fixed 2026-09-10** |
 | [P2](#p2-cluster-member-counting-is-on-per-store-and-per-broad-recall) | Cluster member counting is O(N) per store and per broad recall | Medium | small |
-| [A2](#a2-the-heat-model-is-inert) | The heat model is inert | Medium, decision needed | small either way |
+| [A2](#a2-the-heat-model-is-inert) | The heat model is inert | Medium, decision needed | **input wired 2026-10-02** (#43); ranking still ignores heat |
 | [P3](#p3-inference-runs-inline-on-the-async-runtime-and-never-batches) | Inference runs inline on the async runtime and never batches | Medium | medium |
 | [A3](#a3-no-near-duplicate-check-at-store-time) | No near-duplicate check at store time | Medium | small |
 | [A4](#a4-no-lexical-search) | No lexical search | Medium | **measured 2026-09-10, not shipped** |
@@ -104,6 +104,30 @@ measured under this truncation. They may move once long facts embed on their ful
 ### A2. The heat model is inert
 
 **Severity:** Medium. Needs a decision. **Effort:** small either way.
+
+**Status (2026-10-02): the input is wired; the output is still unused (#43).** `retrieve_memories`
+now records an access for every row it returns, so `access_count` and `stability` move and `heat`
+is written by something other than activation. Of the three objections recorded below on 2026-09-19:
+
+- *Unindexed read-modify-write on the response path* — answered by measurement rather than argument.
+  `heat_state.memory` is indexed as of v008, and the write is one batched multi-statement query
+  preceded by one bulk read. On a 1000-row corpus the pair costs ~2ms and is flat in corpus size;
+  before the index existed the same batch cost 122ms, because every statement was a full scan.
+- *No transaction, so concurrent retrieves lose updates* — **still true, and accepted.** Two
+  retrieves returning the same row can lose one increment. For a single-user memory server the cost is
+  a slightly stale `access_count`, not corruption, and the alternatives (a transaction per
+  retrieval, or an atomic server-side increment) cost more on the path every prompt takes than the
+  inaccuracy they remove. Recorded, not fixed.
+- *It counts the ranker's picks before any client threshold, not use* — **still true, and now a
+  decision rather than an oversight.** The access site is "every result actually returned to the
+  caller": after server-side `min_similarity` filtering and `limit` truncation, but a client that
+  applies its own threshold still earns credit for rows it then discards. Collecting the signal
+  client-side on delivery remains the more accurate design and is not implemented.
+
+What is still inert, unchanged: ranking ignores heat (`retrieve_core` ranks by cosine only) and
+`broad_recall` sorts by similarity with member heat hardcoded to `1.0`. Wiring the input does not
+make the output used, so `heat` and `activation` still tune numbers that no ranking reads — that is
+a separate change, and this finding stays open until it lands.
 
 **Status (2026-09-19): open, no code change.** Recording an access on each `retrieve_memories`
 top-N result was written and withdrawn after review (#16): it is an unindexed read-modify-write on
