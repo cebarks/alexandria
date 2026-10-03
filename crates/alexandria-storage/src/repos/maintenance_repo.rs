@@ -110,10 +110,20 @@ mod tests {
     async fn log(db: &Database) -> Vec<MaintenanceLog> {
         let mut response = db
             .inner()
-            .query("SELECT * FROM maintenance_log ORDER BY id ASC")
+            .query("SELECT * FROM maintenance_log")
             .await
             .unwrap();
         response.take(0).unwrap()
+    }
+
+    /// Find a row by what it says rather than by where it sits. `maintenance_log` ids are generated,
+    /// so their sort order is not insertion order — a test that asserts `rows[0]` is the row written
+    /// first passes on one run and fails on the next. Same class of bug as the NULL `ended_at` tail
+    /// that made `SessionRepo::list` pagination repeat a row.
+    fn find<'a>(rows: &'a [MaintenanceLog], action: &str) -> &'a MaintenanceLog {
+        rows.iter()
+            .find(|row| row.action == action)
+            .unwrap_or_else(|| panic!("no {action} row in {rows:?}"))
     }
 
     fn entry(
@@ -163,7 +173,7 @@ mod tests {
         let rows = log(&db).await;
         assert_eq!(rows.len(), 2);
 
-        let collapse = &rows[0];
+        let collapse = find(&rows, action::COLLAPSE);
         assert_eq!(collapse.action, action::COLLAPSE);
         assert_eq!(collapse.source_id, "fact:dup");
         assert_eq!(collapse.target_ids, vec!["fact:survivor".to_string()]);
@@ -178,7 +188,7 @@ mod tests {
             Some(crate::models::maintenance::ACTOR_DREAMING)
         );
 
-        let demote = &rows[1];
+        let demote = find(&rows, action::DEMOTE);
         assert!(demote.target_ids.is_empty(), "a demote moves nothing");
         assert_eq!(demote.run_id, None, "unattributed reads as NONE, not \"\"");
         assert_eq!(demote.job, None);
