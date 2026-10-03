@@ -93,6 +93,13 @@ jobs:
             echo "$response"
             exit 1
           }
+          # rmcp's default advertised version (2026-07-28 since 3.5) has no initialize
+          # handshake; negotiation must still answer a known requested version with itself.
+          echo "$response" | grep -q '"protocolVersion":"2025-03-26"' || {
+            echo "::error::initialize did not negotiate the requested protocolVersion"
+            echo "$response"
+            exit 1
+          }
           echo "$response" | grep -q '"instructions"' || {
             echo "::error::server no longer advertises usage instructions"
             exit 1

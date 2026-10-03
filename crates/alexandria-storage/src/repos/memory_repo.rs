@@ -209,8 +209,8 @@ impl<'a> MemoryRepo<'a> {
     }
 
     /// Same as `nearest`, served from the HNSW index. Only valid once
-    /// `schema::ensure_vector_index` has succeeded: without the index the planner strips
-    /// `<|k,ef|>` to a plain scan.
+    /// `schema::ensure_vector_index` has succeeded: without the index `<|k,ef|>` matches
+    /// no rows.
     pub async fn nearest_indexed(&self, query: &[f32], k: usize) -> Result<Vec<Fact>> {
         self.knn(knn_sql(k, true), query).await
     }

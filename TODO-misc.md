@@ -63,7 +63,7 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   have broken on the missing `mold`, and the Docker build already overrides `rustflags` via
   `RUSTFLAGS`, so neither `target-cpu` nor mold applied there). Dev boxes wanting it keep
   `-C target-cpu=native` + mold in `~/.cargo/config.toml`. Windows `target-cpu` verification is
-  moot. Repo keeps `rust-version = "1.98"` + edition 2024 as the only compiler floor statement.
+  moot. Repo keeps `rust-version = "1.99"` + edition 2024 as the only compiler floor statement.
 
 ## Dependencies
 
@@ -75,6 +75,11 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   reaches us via `surrealdb-core -> jsonwebtoken`; nothing here uses RSA. No patched release exists
   (0.10 is still a release candidate). Drop the ignore once `cargo deny` stops needing it, i.e.
   when surrealdb picks up a `jsonwebtoken` built on `rsa` 0.10.
+- [-] **`RUSTSEC-2026-0194` and `-0195` (`quick-xml` 0.39.4) are ignored in `deny.toml`.** They
+  reach us via `surrealdb-core` 3.3 -> `object_store` 0.13, whose cloud backends surrealdb-core
+  compiles in unconditionally; Alexandria never configures object storage. Both are fixed in
+  `quick-xml` 0.41, which `object_store` 0.13 cannot take. Drop the ignores once surrealdb moves
+  to an `object_store` that can.
 
 ## Pi extension
 

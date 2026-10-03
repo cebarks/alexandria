@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 license = "AGPL-3.0-or-later"
 
 [workspace.lints.rust]
@@ -43,7 +43,7 @@ tokio = { version = "1", default-features = false, features = [
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # Embedded-only: add "protocol-ws" and "rustls" if SurrealDB is ever not on localhost.
-surrealdb = { version = "3.2", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
+surrealdb = { version = "3.3", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
 rmcp = { version = "3.1", default-features = false, features = [
   "server",
   "transport-io",

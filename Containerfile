@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- Build stage ----
-# Workspace rust-version is 1.98 (edition 2024 + dep requirements); keep this base
+# Workspace rust-version is 1.99 (edition 2024 + dep requirements); keep this base
 # at or above it or cargo refuses the build. No rust-toolchain.toml in-tree — the
 # Containerfile pins the compiler, dev machines choose their own.
-FROM rust:1.98.1-alpine3.22 AS builder
+FROM rust:1.99.0-alpine3.22 AS builder
 
 # g++/make for C++ build scripts (tokenizers' esaxx, aws-lc-sys' C sources).
 # No openssl-dev: as of the hf-hub 1.0 bump the network stack is rustls +

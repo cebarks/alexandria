@@ -63,7 +63,7 @@ mod tests {
         repo.create("sess-1", None, None).await.unwrap();
         repo.create("sess-2", None, None).await.unwrap();
 
-        // `session` is a SurrealDB reserved word, so this also proves count_table()'s
+        // `gather` passes `session` backticked, so this also proves count_table()'s
         // interpolation path passes the backticked name through unescaped.
         let stats = gather(db.inner()).await.unwrap();
         assert_eq!(stats.session_count, 2);
