@@ -190,6 +190,65 @@ impl<'a> HeatRepo<'a> {
         Ok(written)
     }
 
+    /// Page the `limit` rows with the oldest decay anchor, oldest first.
+    ///
+    /// `Sweep` walks the corpus in this order and re-anchors what it touches, so the rows it writes
+    /// move to the back of the ordering and the next run picks up where this one stopped: a corpus
+    /// larger than `max_rows_per_run` drains across ticks instead of the same first page being
+    /// swept forever.
+    ///
+    /// The `id` tiebreak is not decoration. `ORDER BY last_touched ASC LIMIT n` alone leaves the
+    /// order among equal timestamps unspecified, so a page boundary landing inside a tie could skip
+    /// rows or re-read the same ones indefinitely — the same reason `SessionRepo::list` needs a
+    /// unique secondary key. Rows whose `last_touched` is `NONE` sort first, which is what a sweep
+    /// wants: an unanchored row is the one whose stored heat is least trustworthy.
+    pub async fn page_oldest(&self, limit: usize) -> Result<Vec<HeatState>> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM heat_state ORDER BY last_touched ASC, id ASC LIMIT $limit")
+            .bind(("limit", limit as i64))
+            .await?;
+        Ok(response.take(0)?)
+    }
+
+    /// Materialise heat for many rows in **one** round trip.
+    ///
+    /// The batched twin of [`Self::materialize_heat`], under the same restriction: it writes `heat`
+    /// and the decay anchor and nothing else. `Sweep` examines up to `max_rows_per_run` rows an
+    /// hour, so per-row round trips would be most of the job's cost — and `heat_state.memory` is
+    /// indexed as of v008, which is what makes the batched form cheap rather than merely fewer
+    /// trips.
+    ///
+    /// Returns the number of rows actually written. As with [`Self::record_access_many`], a
+    /// zero-row `UPDATE` is not a query error, so `.check()?` alone would not notice a memory
+    /// deleted between the read and the write.
+    pub async fn materialize_heat_many(&self, rows: &[(String, f64)]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut query = String::new();
+        for (i, _) in rows.iter().enumerate() {
+            query.push_str(&format!(
+                "UPDATE heat_state SET heat = $h{i}, last_touched = time::now() \
+                 WHERE memory = type::record($m{i}); "
+            ));
+        }
+        let mut prepared = self.db.query(query);
+        for (i, (memory_id, heat)) in rows.iter().enumerate() {
+            prepared = prepared
+                .bind((format!("m{i}"), memory_id.clone()))
+                .bind((format!("h{i}"), *heat));
+        }
+        let mut response = prepared.await?;
+        let mut written = 0usize;
+        for i in 0..rows.len() {
+            let updated: Vec<HeatState> = response.take(i)?;
+            written += updated.len();
+        }
+        response.check()?;
+        Ok(written)
+    }
+
     /// Add heat to a memory's heat_state (for spreading activation).
     ///
     /// Only increases heat. It must NOT touch `stability`, `access_count` or `last_accessed_at`:
@@ -575,5 +634,100 @@ mod tests {
             sweep.contains("idx_heat_state_last_touched"),
             "the sweep page must be served by the last_touched index: {sweep}"
         );
+    }
+
+    /// `page_oldest` is the sweep's cursor, so both its ordering and its bound are load-bearing:
+    /// the ordering decides which rows decay first, and the bound is what keeps an hourly job from
+    /// reading the whole table.
+    #[tokio::test]
+    async fn page_oldest_walks_from_the_stalest_anchor_and_stops_at_the_limit() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let heat = HeatRepo::new(db.inner());
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+
+        let mut ids = Vec::new();
+        for (i, day) in ["2020-01-01", "2021-01-01", "2022-01-01"]
+            .iter()
+            .enumerate()
+        {
+            let fid = memory
+                .create_fact(&format!("f{i}"), 0.5, &[0.1], &[])
+                .await
+                .unwrap();
+            heat.create_for_memory(&fid, 1.0).await.unwrap();
+            db.inner()
+                .query(format!(
+                    "UPDATE heat_state SET last_touched = d'{day}T00:00:00Z' \
+                     WHERE memory = type::record($m)"
+                ))
+                .bind(("m", fid.clone()))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            ids.push(fid);
+        }
+
+        let page = heat.page_oldest(2).await.unwrap();
+        assert_eq!(page.len(), 2, "the limit bounds the read");
+        let anchors: Vec<i64> = page
+            .iter()
+            .map(|row| row.last_touched.unwrap().timestamp())
+            .collect();
+        assert!(anchors[0] < anchors[1], "stalest anchor first: {anchors:?}");
+        assert_eq!(
+            page.iter()
+                .map(|row| crate::record_id_to_string(&row.memory))
+                .collect::<Vec<_>>(),
+            vec![ids[0].clone(), ids[1].clone()],
+            "the two stalest rows are the first page, so the tail of a large corpus is reached by \
+             later runs rather than never"
+        );
+    }
+
+    /// Each row in a batch gets its own value, and the count is the number of rows actually written.
+    /// The per-row `$h{i}` naming is what makes the first half true: bindings are shared across the
+    /// statements of one `query()`, so a single `$heat` would write the last bound value to every
+    /// row and the sweep would flatten the corpus to one number.
+    #[tokio::test]
+    async fn materialize_heat_many_writes_each_rows_own_value() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let heat = HeatRepo::new(db.inner());
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let fid = memory
+                .create_fact(&format!("m{i}"), 0.5, &[0.1], &[])
+                .await
+                .unwrap();
+            heat.create_for_memory(&fid, 1.0).await.unwrap();
+            ids.push(fid);
+        }
+
+        let written = heat
+            .materialize_heat_many(&[(ids[0].clone(), 0.25), (ids[1].clone(), 0.75)])
+            .await
+            .unwrap();
+        assert_eq!(written, 2);
+
+        let first = heat.get(&ids[0]).await.unwrap().unwrap();
+        let second = heat.get(&ids[1]).await.unwrap().unwrap();
+        assert_eq!((first.heat, second.heat), (0.25, 0.75), "per-row values");
+        assert_eq!(
+            (first.access_count, second.access_count),
+            (0, 0),
+            "materialisation is not an access, so the count Appraise demotes on must not move"
+        );
+
+        // A row that vanished between the read and the write is reported, not swallowed: a zero-row
+        // UPDATE is not a query error, so `.check()?` alone would call this a success.
+        let written = heat
+            .materialize_heat_many(&[("fact:no_such_row".to_string(), 0.5)])
+            .await
+            .unwrap();
+        assert_eq!(written, 0);
     }
 }

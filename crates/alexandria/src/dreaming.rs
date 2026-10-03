@@ -15,7 +15,8 @@ use alexandria_engine::clusters::maintenance::{
     MaintenanceAction, MergeCheck, check_cohesion, check_merge,
 };
 use alexandria_engine::dreaming::{Intervals, Job, JobReport};
-use alexandria_storage::repos::ClusterRepo;
+use alexandria_engine::heat::HeatColumns;
+use alexandria_storage::repos::{ClusterRepo, HeatRepo};
 use alexandria_storage::{Database, record_id_to_string};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +39,10 @@ pub(crate) struct Jobs {
     intervals: Intervals,
     cohesion_floor: f32,
     merge_threshold: f32,
+    /// `[heat] decay_tau_secs`. The sweep is the only job that projects heat, so this is the only
+    /// place outside retrieval that needs the constant.
+    decay_tau_secs: f64,
+    max_rows_per_run: usize,
 }
 
 impl Jobs {
@@ -47,6 +52,8 @@ impl Jobs {
             intervals: config.dreaming.intervals(),
             cohesion_floor: config.cluster.cohesion_floor,
             merge_threshold: config.cluster.merge_threshold,
+            decay_tau_secs: config.heat.decay_tau_secs,
+            max_rows_per_run: config.dreaming.max_rows_per_run,
         }
     }
 
@@ -63,15 +70,65 @@ impl Jobs {
 
     async fn run_job(&self, job: Job) -> anyhow::Result<JobReport> {
         match job {
+            Job::Sweep => self.run_sweep().await,
             Job::Cluster => self.run_cluster().await,
             Job::Merge => self.run_merge().await,
             // Implemented in the commits that follow this one; the dispatch is total so a new job
             // cannot silently fall through a `match` arm.
-            job @ (Job::Sweep | Job::Collapse | Job::Appraise) => {
+            job @ (Job::Collapse | Job::Appraise) => {
                 tracing::debug!(job = job.as_str(), "dreaming job not yet implemented");
                 Ok(JobReport::new(job))
             }
         }
+    }
+
+    /// Heat materialisation: project every row's decay to now and store the result, oldest anchor
+    /// first, at most `max_rows_per_run` rows.
+    ///
+    /// Two properties are load-bearing and both are pinned by tests below. It writes `heat` and the
+    /// decay anchor and **nothing else** — touching `last_accessed_at` here is the bug that made an
+    /// hourly sweep cap the spacing ratio at ~0.042 and under-grow stability ~24x. And it writes no
+    /// `maintenance_log` rows: a sweep changes ranking by nothing, because every reader projects
+    /// heat itself, so an audit trail for it would be hundreds of rows an hour recording that
+    /// nothing happened. That is also why `sweep` is absent from the v008 `job` allowlist.
+    async fn run_sweep(&self) -> anyhow::Result<JobReport> {
+        let heat_repo = HeatRepo::new(self.db.inner());
+        let rows = heat_repo.page_oldest(self.max_rows_per_run).await?;
+
+        let mut report = JobReport::new(Job::Sweep);
+        report.examined = rows.len();
+        if rows.is_empty() {
+            return Ok(report);
+        }
+
+        let now = now_secs();
+        let columns = HeatColumns {
+            heat: rows.iter().map(|row| row.heat).collect(),
+            stability: rows.iter().map(|row| row.stability).collect(),
+            // A row with no anchor has nothing to decay from. Epoch reads as "ancient", which
+            // projects it to ~0 — the honest interpretation of a heat value nobody can date.
+            last_touched: rows
+                .iter()
+                .map(|row| {
+                    row.last_touched
+                        .map(|at| at.timestamp().max(0) as u64)
+                        .unwrap_or(0)
+                })
+                .collect(),
+        };
+        let projected = columns.projected_heat_bulk(now, self.decay_tau_secs);
+
+        // Every row in the page is written, including ones whose projected heat barely moved. A
+        // change threshold would skip most writes and save almost nothing: the page is bounded by
+        // `max_rows_per_run` and runs hourly, and skipping rows would leave their anchors stale,
+        // which is the thing materialisation exists to fix.
+        let writes: Vec<(String, f64)> = rows
+            .iter()
+            .zip(projected)
+            .map(|(row, heat)| (record_id_to_string(&row.memory), heat))
+            .collect();
+        report.acted = heat_repo.materialize_heat_many(&writes).await?;
+        Ok(report)
     }
 
     /// Cohesion check → split. Moved out of `main.rs` verbatim: same ordering, same per-cluster
@@ -285,6 +342,132 @@ mod tests {
             .await
             .expect("schema applies to a fresh database");
         db
+    }
+
+    /// A heat row with an old decay anchor and a known access history, so the sweep has something to
+    /// decay and three fields it must leave alone.
+    async fn seed_cold(db: &Database, content: &str) -> String {
+        let memories = alexandria_storage::repos::MemoryRepo::new(db.inner());
+        let heat = HeatRepo::new(db.inner());
+        let id = memories
+            .create_fact(content, 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        heat.create_for_memory(&id, 1.0).await.unwrap();
+        db.inner()
+            .query(
+                "UPDATE heat_state SET last_touched = d'2020-01-01T00:00:00Z', \
+                 last_accessed_at = d'2020-01-01T00:00:00Z', stability = 3.0, access_count = 7 \
+                 WHERE memory = type::record($m)",
+            )
+            .bind(("m", id.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        id
+    }
+
+    /// Rows whose decay anchor is recent, i.e. rows a sweep has already materialised.
+    async fn recently_swept(db: &Database) -> usize {
+        let mut response = db
+            .inner()
+            .query(
+                "SELECT * FROM heat_state WHERE last_touched > d'2021-01-01T00:00:00Z' \
+                 ORDER BY id ASC",
+            )
+            .await
+            .unwrap();
+        let rows: Vec<alexandria_storage::models::HeatState> = response.take(0).unwrap();
+        rows.len()
+    }
+
+    /// The sweep's contract in one test: heat is materialised, the anchor moves, and the three
+    /// fields that belong to accesses do not. `last_accessed_at` is the one that matters — a sweep
+    /// that stamped it would cap the spacing ratio at `sweep_interval / spacing_reference` (~0.042
+    /// at the defaults) and under-grow stability roughly 24x, which is why the column exists.
+    #[tokio::test]
+    async fn the_sweep_materialises_heat_without_touching_the_access_clock() {
+        let db = migrated_db().await;
+        let id = seed_cold(&db, "a memory nobody has looked at in years").await;
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs.run_job(Job::Sweep).await.expect("sweep succeeds");
+        assert_eq!((report.examined, report.acted), (1, 1));
+
+        let state = HeatRepo::new(db.inner())
+            .get(&id)
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert!(
+            state.heat < 0.01,
+            "years past a one-day tau must decay to nothing, not stay at the stored 1.0: {}",
+            state.heat
+        );
+        assert!(
+            state.last_touched.expect("re-anchored").timestamp() > 1_700_000_000,
+            "the anchor moves, because it has to describe the value now stored"
+        );
+        assert_eq!(state.stability, 3.0, "stability is earned by accesses");
+        assert_eq!(state.access_count, 7, "a sweep is not an access");
+        assert_eq!(
+            state.last_accessed_at.expect("untouched").timestamp(),
+            1_577_836_800,
+            "the spacing reference must not move"
+        );
+    }
+
+    /// Bounded per run, and the bound does not strand the tail of the corpus. Sweeping re-anchors
+    /// what it touched, which moves those rows to the back of the oldest-first ordering, so the next
+    /// run picks up the rows this one could not reach. Without that, one page would be swept forever
+    /// and everything past `max_rows_per_run` would never decay at all.
+    #[tokio::test]
+    async fn the_sweep_is_bounded_and_drains_a_larger_corpus_across_runs() {
+        let db = migrated_db().await;
+        for i in 0..3 {
+            seed_cold(&db, &format!("memory {i}")).await;
+        }
+
+        let mut config = Config::default();
+        config.dreaming.max_rows_per_run = 2;
+        let jobs = Jobs::new(db.clone(), &config);
+
+        let first = jobs.run_job(Job::Sweep).await.expect("sweep succeeds");
+        assert_eq!(
+            (first.examined, first.acted),
+            (2, 2),
+            "one run examines at most max_rows_per_run rows"
+        );
+        assert_eq!(
+            recently_swept(&db).await,
+            2,
+            "only the page was materialised"
+        );
+
+        let second = jobs.run_job(Job::Sweep).await.expect("sweep succeeds");
+        assert_eq!(second.examined, 2);
+        assert_eq!(
+            recently_swept(&db).await,
+            3,
+            "the third row is reached on the next run"
+        );
+    }
+
+    /// An empty corpus is the common case on first boot, and must read as a successful run that did
+    /// nothing rather than as an error the scheduler logs every hour.
+    #[tokio::test]
+    async fn the_sweep_on_an_empty_corpus_is_a_quiet_success() {
+        let db = migrated_db().await;
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs
+            .run_job(Job::Sweep)
+            .await
+            .expect("no rows is not an error");
+        assert_eq!(
+            (report.job, report.examined, report.acted),
+            (Job::Sweep, 0, 0)
+        );
     }
 
     #[tokio::test]
