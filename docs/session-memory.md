@@ -92,12 +92,13 @@ These are real gaps in the shipped implementation, not usage advice:
   itself never calls `finalize_session`, so sessions created by auto-store have no summary unless the
   agent calls it directly — which the pi skill does document.
 
-## SurrealDB 3.2 gotchas in this code path
+## SurrealDB gotchas in this code path
 
 Non-obvious, and easy to reintroduce:
 
-- `session` is a **reserved word** in SurrealDB 3.2 — this repo backticks it in every query string,
-  and the table is `SCHEMAFULL` so an undefined field silently fails.
+- The `session` table is `SCHEMAFULL`, so writing an undefined field is an error rather than being
+  stored. (`session` itself is not a reserved word; the backticks in every query string are
+  harmless.)
 - `$session` is **also reserved** (it is SurrealDB's own session variable). Bind parameters for a
   session record ID must use another name — `session_repo.rs` uses `$sess`.
 - `RELATE` needs a pre-parsed `RecordId` passed through `.bind()`; an inline `type::record()` in a

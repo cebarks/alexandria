@@ -202,10 +202,14 @@ especially when `host = "0.0.0.0"`.
 
 ## Deployment
 
-**Upgrading from a build on SurrealDB 3.2: back up the data dir first.** A 3.3 build opens a 3.2
-store as it is, but once 3.3 rewrites a schema definition in it (`REBUILD INDEX` does, and so will
-any later schema migration), a 3.2 build can no longer open the store. Rolling back past that point
-means restoring the backup.
+**Upgrading from a build on SurrealDB 3.2 is one-way: stop the server and copy the data dir
+first** (`$XDG_DATA_HOME/alexandria/data` by default, `/data/db` in the container). A 3.3 build
+opens a 3.2 store, but ordinary use soon writes data 3.2 cannot read. Listing a cluster or session
+with 64 or more members makes 3.3 rewrite that table's definition, and every `store_memory` lists
+every cluster. Writes to the vector index leave entries 3.2 cannot decode. A 3.2 build started on
+the result still boots, then fails cluster queries and vector search, or returns empty member lists
+with no error. Restoring the copy is the only way back, as SurrealDB's own
+[upgrade notes](https://github.com/surrealdb/surrealdb/blob/v3.3.0/doc/UPGRADING.md) say.
 
 ### As a systemd user service (recommended)
 
