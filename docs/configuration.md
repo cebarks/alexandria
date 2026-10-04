@@ -112,7 +112,16 @@ Both values are one day by default, which is the number the engine hardcoded bef
 | `decay_tau_secs` | f64 | `86400.0` | Base decay time constant, seconds. The effective constant is `stability * decay_tau_secs`, so a memory with stability 2.0 cools twice as slowly. **Lower = cools faster.** This is an e-folding, not a half-life: at stability 1.0 one elapsed day leaves `heat/e`, pinned by `test_decay_tau_scales_the_curve`. |
 | `spacing_reference_secs` | f64 | `86400.0` | The gap between two accesses at which the later one earns **full** stability growth; a shorter gap earns a proportional fraction (a burst of same-second accesses grows stability by almost nothing). **Lower = stability accrues from less widely spaced accesses, so heat cools slower.** |
 
-**Availability.** Nothing outside the engine called `projected_heat` or `on_access` before [#43](https://github.com/cebarks/alexandria/issues/43), and retrieval does not record accesses yet, so on this branch the keys are wired into the functions but not yet reachable from a running server. The heat model as a whole is still inert until #43's access-recording and sweep jobs land; audit finding A2 in [performance-and-ability-findings.md](performance-and-ability-findings.md) is the record of that.
+**What each key actually governs.** `spacing_reference_secs` is the denominator `on_access` grows
+`stability` with, and `retrieve_memories` records an access for every row it returns to the caller, so
+it is live on the request path. `decay_tau_secs` is the time constant the `sweep` job materialises
+with and `appraise` judges coldness by.
+
+Neither affects **ranking**: retrieval still orders by cosine similarity alone, so the heat model
+moves real numbers that no ordering reads yet. Audit finding A2 in
+[performance-and-ability-findings.md](performance-and-ability-findings.md) records that and stays
+open for exactly this reason — [#43](https://github.com/cebarks/alexandria/issues/43) wired the
+input, not the output.
 
 **Removed in this release:** `spacing_halflife_secs`. It named a half-life while being used only as the spacing denominator above, and its documented direction was the reverse of its behaviour — the name is how that happened, which is why neither replacement key uses the word. Because `[heat]` is `#[serde(default)]`, a leftover key in `config.toml` is otherwise **silently ignored**; the server instead warns at boot naming both replacements, and `a_config_using_the_removed_heat_key_is_warned_about` guards that. The old single control is now two, because the value it named had two effects that pull in opposite directions.
 
