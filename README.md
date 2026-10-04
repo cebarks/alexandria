@@ -152,11 +152,16 @@ Tester's non-dry `retrieve` run performs spreading activation, so it writes heat
 
 - **Dashboard** (`/debug`) — record counts (facts active/deleted, clusters, edges, raw documents,
   sessions), the **effective configuration** the server is actually running with (retrieval floor,
-  activation knobs, cluster and heat thresholds, live embedding model and dimensions) shown alongside
+  activation knobs, cluster and heat thresholds, the dreaming scheduler's cadences, live embedding
+  model and dimensions) shown alongside
   what the TOML asked for, rollups for cluster health, sessions finalized/idle, top tags and heat
   distribution, and the schema version — applied versus compiled-in, with a mismatch called out
-- **Memories** (`/debug/memories`) — paginated search/filter of facts by content and tag; click through to a
-  detail view showing heat, stability, timestamps, cluster membership, and graph edges
+- **Memories** (`/debug/memories`) — paginated, sortable search/filter of facts by content and tag,
+  with **include deleted** and **include quarantined** checkboxes; click through to a detail view
+  showing heat, stability, timestamps, cluster membership, and graph edges. Quarantine is off by
+  default so the page matches what an agent can retrieve, and this is the operator view for a memory
+  on that middle rung — hidden from every retrieval path, still present, still reversible. Nothing
+  in the UI can put a row into quarantine or take it out
 - **Clusters** (`/debug/clusters`) — cluster list with live member counts and depth; drill into
   `/debug/clusters/{id}` for member facts and cohesion. Cohesion is computed from each cluster's stored
   centroid, on the detail page and in the dashboard rollup alike, so the verdict matches what
