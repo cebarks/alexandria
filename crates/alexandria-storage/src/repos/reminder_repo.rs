@@ -120,11 +120,11 @@ impl<'a> ReminderRepo<'a> {
     ///
     /// `next_due_at != NONE` is also load-bearing for ordering, not just tidiness:
     /// NONE sorts below every datetime and `next_due_at <= $now` *selects* such a
-    /// row (verified against the embedded 3.2 engine), so an admin- or
+    /// row (re-checked on the pinned 3.3.0 engine, and true on 3.2.4 before it), so an admin- or
     /// migration-written row with no due time would otherwise sit at the head of
     /// the sample and displace real reminders, permanently.
     ///
-    /// The spelling is a SurrealDB 3.2 trap, not a style choice: `IS NOT NULL` (and
+    /// The spelling is a SurrealDB trap, not a style choice: `IS NOT NULL` (and
     /// `!= NULL`) are both satisfied by a `NONE` field, so they filter nothing here.
     /// Only `!= NONE` — or `NOT (= NONE)` — distinguishes an absent field.
     pub async fn list_due_sample(&self, now: DateTime<Utc>, cap: i64) -> Result<Vec<Reminder>> {
