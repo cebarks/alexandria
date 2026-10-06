@@ -21,7 +21,8 @@ use alexandria_engine::heat::{HeatColumns, HeatState as EngineHeatState, project
 use alexandria_storage::models::LiveConfidence;
 use alexandria_storage::models::maintenance::{action, disposition, job as job_name};
 use alexandria_storage::repos::{
-    AuditContext, ClusterRepo, EdgeRepo, HeatRepo, LogEntry, MaintenanceRepo, MemoryRepo,
+    AuditContext, ClusterRepo, EdgeRepo, HeatMaterialise, HeatRepo, LogEntry, MaintenanceRepo,
+    MemoryRepo,
 };
 use alexandria_storage::{Database, record_id_to_string, system_config};
 use tokio::task::JoinHandle;
@@ -128,12 +129,20 @@ impl Jobs {
         // change threshold would skip most writes and save almost nothing: the page is bounded by
         // `max_rows_per_run` and runs hourly, and skipping rows would leave their anchors stale,
         // which is the thing materialisation exists to fix.
-        let writes: Vec<(String, f64)> = rows
+        let writes: Vec<HeatMaterialise> = rows
             .iter()
             .zip(projected)
-            .map(|(row, heat)| (record_id_to_string(&row.memory), heat))
+            .map(|(row, heat)| HeatMaterialise {
+                memory_id: record_id_to_string(&row.memory),
+                heat,
+                expected_anchor: row.last_touched,
+            })
             .collect();
         report.acted = heat_repo.materialize_heat_many(&writes).await?;
+        // Rows whose anchor moved between the page read and the write were accessed mid-flight: the
+        // access wins and the sweep simply did not get to them this tick. Counted, not swallowed —
+        // a page where every claim is lost is a signal, and `acted: 0` alone cannot say so.
+        report.skipped = rows.len().saturating_sub(report.acted);
         Ok(report)
     }
 

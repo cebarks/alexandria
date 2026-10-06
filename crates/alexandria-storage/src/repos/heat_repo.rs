@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{SurrealValue, ToSql};
@@ -18,6 +19,25 @@ pub struct HeatUpdate {
     pub heat: f64,
     pub stability: f64,
     pub access_count: i64,
+}
+
+/// One row the sweep wants to materialise: the value to write, and the decay anchor the caller read
+/// to compute it.
+///
+/// The anchor turns the write into a claim instead of a clobber. `Sweep` projects heat from
+/// `(heat, last_touched)`; an access landing between the page read and the batched write sets
+/// `heat = 1.0` **and** re-stamps the anchor, so an unconditional absolute write would put the stale
+/// projection back and date it today — and every reader projects from the anchor, so the row would
+/// then be durably cold rather than briefly wrong. That corrupts the one field #43 is wiring toward
+/// ranking, through a wider window than the accepted lost-increment on the retrieve side. Same
+/// discipline as `ReminderRepo::record_delivery`, which claims on the value it read.
+///
+/// `expected_anchor` is `None` for a row nobody has ever dated, and `last_touched = NONE` is the
+/// test that matches it — `IS NULL` would match a present field too.
+pub struct HeatMaterialise {
+    pub memory_id: String,
+    pub heat: f64,
+    pub expected_anchor: Option<DateTime<Utc>>,
 }
 
 pub struct HeatRepo<'a> {
@@ -219,25 +239,27 @@ impl<'a> HeatRepo<'a> {
     /// indexed as of v008, which is what makes the batched form cheap rather than merely fewer
     /// trips.
     ///
-    /// Returns the number of rows actually written. As with [`Self::record_access_many`], a
-    /// zero-row `UPDATE` is not a query error, so `.check()?` alone would not notice a memory
-    /// deleted between the read and the write.
-    pub async fn materialize_heat_many(&self, rows: &[(String, f64)]) -> Result<usize> {
+    /// Returns the number of rows actually written, which is also the number of claims won: a row
+    /// whose anchor moved under us matches nothing, so the caller sees it as not-written and the
+    /// access that beat it survives. As with [`Self::record_access_many`], a zero-row `UPDATE` is
+    /// not a query error, so `.check()?` alone would not notice either case.
+    pub async fn materialize_heat_many(&self, rows: &[HeatMaterialise]) -> Result<usize> {
         if rows.is_empty() {
             return Ok(0);
         }
         let mut query = String::new();
-        for (i, _) in rows.iter().enumerate() {
+        for i in 0..rows.len() {
             query.push_str(&format!(
                 "UPDATE heat_state SET heat = $h{i}, last_touched = time::now() \
-                 WHERE memory = type::record($m{i}); "
+                 WHERE memory = type::record($m{i}) AND last_touched = $t{i}; "
             ));
         }
         let mut prepared = self.db.query(query);
-        for (i, (memory_id, heat)) in rows.iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             prepared = prepared
-                .bind((format!("m{i}"), memory_id.clone()))
-                .bind((format!("h{i}"), *heat));
+                .bind((format!("m{i}"), row.memory_id.clone()))
+                .bind((format!("h{i}"), row.heat))
+                .bind((format!("t{i}"), row.expected_anchor));
         }
         let mut response = prepared.await?;
         let mut written = 0usize;
@@ -708,7 +730,18 @@ mod tests {
         }
 
         let written = heat
-            .materialize_heat_many(&[(ids[0].clone(), 0.25), (ids[1].clone(), 0.75)])
+            .materialize_heat_many(&[
+                HeatMaterialise {
+                    memory_id: ids[0].clone(),
+                    heat: 0.25,
+                    expected_anchor: heat.get(&ids[0]).await.unwrap().unwrap().last_touched,
+                },
+                HeatMaterialise {
+                    memory_id: ids[1].clone(),
+                    heat: 0.75,
+                    expected_anchor: heat.get(&ids[1]).await.unwrap().unwrap().last_touched,
+                },
+            ])
             .await
             .unwrap();
         assert_eq!(written, 2);
@@ -725,9 +758,90 @@ mod tests {
         // A row that vanished between the read and the write is reported, not swallowed: a zero-row
         // UPDATE is not a query error, so `.check()?` alone would call this a success.
         let written = heat
-            .materialize_heat_many(&[("fact:no_such_row".to_string(), 0.5)])
+            .materialize_heat_many(&[HeatMaterialise {
+                memory_id: "fact:no_such_row".to_string(),
+                heat: 0.5,
+                expected_anchor: None,
+            }])
             .await
             .unwrap();
         assert_eq!(written, 0);
+    }
+
+    /// The write is a claim, not a clobber. A row accessed after the sweep read it must keep that
+    /// access, and the sweep's stale projection must be the thing that loses.
+    ///
+    /// Without the anchor in the WHERE clause the same write restores the pre-access heat **and**
+    /// re-dates the anchor — so the corruption is not a transient every later projection fixes, it is
+    /// durable: readers project from `(heat, last_touched)`, and the row now reads as cold at
+    /// today's date for the rest of its life. That is the field #43 is wiring toward ranking.
+    #[tokio::test]
+    async fn materialize_heat_many_leaves_a_row_accessed_after_the_read_alone() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let heat = HeatRepo::new(db.inner());
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+
+        let fid = memory
+            .create_fact("claimed", 0.5, &[0.1], &[])
+            .await
+            .unwrap();
+        heat.create_for_memory(&fid, 1.0).await.unwrap();
+        let stale_anchor = heat.get(&fid).await.unwrap().unwrap().last_touched;
+
+        // Stand in for an access beating the sweep to the write. Spelled as a fixed far-future date
+        // rather than through `record_access_many`, because that stamps `time::now()` and two calls
+        // this close together can land on the same instant — which would make the claim below match,
+        // and the test would then be asserting whichever way the clock happened to fall.
+        db.inner()
+            .query(
+                "UPDATE heat_state SET heat = 1.0, access_count = 1, \
+                 last_touched = d'2099-01-01T00:00:00Z' WHERE memory = type::record($m)",
+            )
+            .bind(("m", fid.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let written = heat
+            .materialize_heat_many(&[HeatMaterialise {
+                memory_id: fid.clone(),
+                heat: 0.01,
+                expected_anchor: stale_anchor,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            written, 0,
+            "a claim against an anchor that moved matches nothing"
+        );
+
+        let row = heat.get(&fid).await.unwrap().unwrap();
+        assert_eq!(
+            row.heat, 1.0,
+            "the access wins, not the sweep's stale projection"
+        );
+        assert_eq!(
+            row.access_count, 1,
+            "and the count `Appraise` demotes on survived the lost write"
+        );
+
+        // Positive control: the identical write carrying the anchor the reader actually holds does
+        // land. Without this, every assertion above would be satisfied by a method that never writes.
+        let written = heat
+            .materialize_heat_many(&[HeatMaterialise {
+                memory_id: fid.clone(),
+                heat: 0.01,
+                expected_anchor: row.last_touched,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(written, 1, "the same claim with a current anchor wins");
+        assert_eq!(
+            heat.get(&fid).await.unwrap().unwrap().heat,
+            0.01,
+            "and the value is written"
+        );
     }
 }
