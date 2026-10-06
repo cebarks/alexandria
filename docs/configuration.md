@@ -184,10 +184,13 @@ job is due rather than waking on a fixed tick.
 Every interval must be ≥ 1 second: the engine treats a zero interval as "due on every tick", which
 would turn a daily pass into a hot loop, so the server refuses to start on one and names the key.
 
-There are no `ALEXANDRIA_DREAMING_*` environment overrides. Every other section has them, and the
-gap is deliberate rather than an oversight: these are cadences tuned in a file and applied at
-restart, and a partial set of env vars (enabled but not the intervals, say) invites exactly the
-"why is there no env var for this" question a complete set would answer.
+There are no `ALEXANDRIA_DREAMING_*` environment overrides, and the gap is deliberate rather than an
+oversight: these are cadences tuned in a file and applied at restart, and a partial set of env vars
+(enabled but not the intervals, say) invites exactly the "why is there no env var for this" question
+a complete set would answer. `dreaming` is not the only section in that position — `[heat]`,
+`[activation]`, `[cluster]` and `[retrieve]` have no environment overrides either, so the table below
+is the complete list of what the server reads from the environment, not an excerpt of a scheme that
+covers every section.
 
 Job runs are logged at `debug` with `examined` and `acted` counts. `cluster`, `merge`, `collapse` and
 `appraise` each write a row to `maintenance_log` — visible at `/debug/maintenance` — and `sweep`
