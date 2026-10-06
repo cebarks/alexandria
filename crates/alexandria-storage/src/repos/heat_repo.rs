@@ -151,14 +151,7 @@ impl<'a> HeatRepo<'a> {
         if memory_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut query = String::from("SELECT * FROM heat_state WHERE ");
-        for (i, _) in memory_ids.iter().enumerate() {
-            if i > 0 {
-                query.push_str(" OR ");
-            }
-            query.push_str(&format!("memory = type::record($m{i})"));
-        }
-        let mut prepared = self.db.query(&query);
+        let mut prepared = self.db.query(Self::get_many_sql(memory_ids.len()));
         for (i, id) in memory_ids.iter().enumerate() {
             prepared = prepared.bind((format!("m{i}"), id.clone()));
         }
@@ -210,6 +203,30 @@ impl<'a> HeatRepo<'a> {
         Ok(written)
     }
 
+    /// The statement behind [`Self::get_many`], as a function of the id count.
+    ///
+    /// Split out because an index plan is a property of the *shipped string*, and a test that
+    /// EXPLAINs a hand-written approximation of it can stay green while the real query degrades —
+    /// which is exactly how this method's OR-chain came to be pinned by a single-equality query.
+    /// Same reasoning that made `MemoryRepo::list_query` and `knn_sql` builders.
+    pub fn get_many_sql(count: usize) -> String {
+        let mut query = String::from("SELECT * FROM heat_state WHERE ");
+        for i in 0..count {
+            if i > 0 {
+                query.push_str(" OR ");
+            }
+            query.push_str(&format!("memory = type::record($m{i})"));
+        }
+        query
+    }
+
+    /// The statement behind [`Self::page_oldest`], extracted for the same reason as
+    /// [`Self::get_many_sql`]: the pin has to name the query the sweep issues, including the compound
+    /// `ORDER BY` a single-field index cannot necessarily satisfy.
+    pub fn page_oldest_sql() -> &'static str {
+        "SELECT * FROM heat_state ORDER BY last_touched ASC, id ASC LIMIT $limit"
+    }
+
     /// Page the `limit` rows with the oldest decay anchor, oldest first.
     ///
     /// `Sweep` walks the corpus in this order and re-anchors what it touches, so the rows it writes
@@ -225,7 +242,7 @@ impl<'a> HeatRepo<'a> {
     pub async fn page_oldest(&self, limit: usize) -> Result<Vec<HeatState>> {
         let mut response = self
             .db
-            .query("SELECT * FROM heat_state ORDER BY last_touched ASC, id ASC LIMIT $limit")
+            .query(Self::page_oldest_sql())
             .bind(("limit", limit as i64))
             .await?;
         Ok(response.take(0)?)
@@ -629,7 +646,11 @@ mod tests {
             async move {
                 let mut response = db
                     .query(format!("EXPLAIN FORMAT JSON {statement}"))
-                    .bind(("mid", fid))
+                    .bind(("mid", fid.clone()))
+                    .bind(("m0", fid.clone()))
+                    .bind(("m1", fid.clone()))
+                    .bind(("m2", fid.clone()))
+                    .bind(("limit", 5i64))
                     .await
                     .unwrap();
                 let plan: surrealdb::types::Value = response.take(0).unwrap();
@@ -637,24 +658,22 @@ mod tests {
             }
         };
 
-        let lookup =
-            plan("SELECT * FROM heat_state WHERE memory = type::record($mid)".to_string()).await;
+        let lookup = plan(HeatRepo::get_many_sql(3)).await;
         assert!(
             lookup.contains("idx_heat_state_memory") && lookup.contains("IndexScan"),
             "the per-prompt heat lookup must be an index scan, not a table scan: {lookup}"
         );
 
         // The sweep's page, pinned here rather than in its own task so the index it depends on
-        // cannot be dropped without failing something before the job exists.
-        let sweep = plan(
-            "SELECT * FROM heat_state WHERE last_touched < time::now() ORDER BY last_touched ASC \
-             LIMIT 5"
-                .to_string(),
-        )
-        .await;
+        // cannot be dropped without failing something before the job exists. Asserted against
+        // `page_oldest_sql()` — the compound `ORDER BY last_touched ASC, id ASC` is precisely the
+        // detail a hand-written proxy would have missed, since a single-field index does not
+        // obviously satisfy a two-column sort.
+        let sweep = plan(HeatRepo::page_oldest_sql().to_string()).await;
         assert!(
             sweep.contains("idx_heat_state_last_touched"),
-            "the sweep page must be served by the last_touched index: {sweep}"
+            "the sweep page must be served by an index scan on the decay anchor, not a table scan \
+             plus a sort of the whole `heat_state` table: {sweep}"
         );
     }
 
