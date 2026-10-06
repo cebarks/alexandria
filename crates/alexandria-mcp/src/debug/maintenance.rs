@@ -361,7 +361,10 @@ mod tests {
                 MaintenanceRow {
                     action: "demote".into(),
                     source_id: "fact:cold".into(),
-                    targets: vec![],
+                    // A target from a table this UI does not render, so the empty-route branch is
+                    // exercised: the id must appear as text rather than as a link to a page that
+                    // cannot resolve it.
+                    targets: vec![link("raw:doc42")],
                     members_moved: 0,
                     timestamp: html::format_dt(Some(html::example_dt())),
                     run_id: "run-1729".into(),
@@ -425,6 +428,10 @@ mod tests {
         assert!(
             html.contains(&format!("<td>{}</td>", html::ABSENT)),
             "a pre-v008 row must show the shared absent marker; got: {html}"
+        );
+        assert!(
+            html.contains(r#"<td>raw:doc42</td>"#) && !html.contains(r#"href="/debug/raw/doc42""#),
+            "a target with no page for its table renders as text, never as a dead link; got: {html}"
         );
     }
 }
