@@ -50,6 +50,9 @@ pub struct LogEntry {
     /// Which rung of the demote → quarantine → soft-delete ladder the row landed on, or `None` for
     /// the cluster moves, which are not a disposition.
     pub disposition: Option<String>,
+    /// For a value-changing verb, the value before the write. `Appraise` sets it to the confidence it
+    /// is about to overwrite; every other writer passes `None`, which is what pre-v008 rows read as.
+    pub previous_value: Option<f64>,
 }
 
 pub struct MaintenanceRepo<'a> {
@@ -84,6 +87,7 @@ impl<'a> MaintenanceRepo<'a> {
             .query(
                 "CREATE maintenance_log SET action = $action, source_id = $source, \
                  target_ids = $targets, members_moved = $count, disposition = $disposition, \
+                 previous_value = $previous_value, \
                  run_id = $run_id, job = $job, actor = $actor",
             )
             .bind(("action", entry.action.clone()))
@@ -91,6 +95,7 @@ impl<'a> MaintenanceRepo<'a> {
             .bind(("targets", entry.target_ids.clone()))
             .bind(("count", entry.members_moved))
             .bind(("disposition", entry.disposition.clone()))
+            .bind(("previous_value", entry.previous_value))
             .bind(("run_id", run_id))
             .bind(("job", job))
             .bind(("actor", actor))
@@ -138,6 +143,7 @@ mod tests {
             target_ids: targets.into_iter().map(str::to_string).collect(),
             members_moved: 0,
             disposition: disposition.map(str::to_string),
+            previous_value: None,
         }
     }
 

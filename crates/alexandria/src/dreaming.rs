@@ -18,11 +18,12 @@ use alexandria_engine::clusters::maintenance::{
 use alexandria_engine::dreaming::collapse::{Candidate, UNKNOWN_CREATED_AT, duplicate_groups};
 use alexandria_engine::dreaming::{DEMOTED_CONFIDENCE, Intervals, Job, JobReport, should_demote};
 use alexandria_engine::heat::{HeatColumns, HeatState as EngineHeatState, projected_heat};
+use alexandria_storage::models::LiveConfidence;
 use alexandria_storage::models::maintenance::{action, disposition, job as job_name};
 use alexandria_storage::repos::{
     AuditContext, ClusterRepo, EdgeRepo, HeatRepo, LogEntry, MaintenanceRepo, MemoryRepo,
 };
-use alexandria_storage::{Database, record_id_to_string};
+use alexandria_storage::{Database, record_id_to_string, system_config};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -334,6 +335,9 @@ impl Jobs {
                         target_ids: vec![group.survivor.clone()],
                         members_moved: 0,
                         disposition: Some(disposition::SOFT_DELETE.to_string()),
+                        // A collapse overwrites no scalar: the survivor keeps its own confidence and
+                        // the loser stays recoverable through its `derived_from` edge.
+                        previous_value: None,
                     })
                     .await
                 {
@@ -367,11 +371,29 @@ impl Jobs {
             AuditContext::dreaming(run_id, job_name::APPRAISE),
         );
 
+        // The precondition of the whole rule. `access_count` was not written by anything before this
+        // release, so on a store that has never been armed every row would satisfy "never retrieved"
+        // and the first pass would walk the corpus down to `DEMOTED_CONFIDENCE`. No stamp, no
+        // demotions — the fail-closed reading of a missing key, the same posture as refusing to start
+        // on a zero interval rather than hot-looping.
+        let Some(armed_at) = system_config::access_recording_armed_at(self.db.inner()).await?
+        else {
+            tracing::warn!(
+                "Appraise: access recording has never been armed on this store, so demoting nothing. \
+                 Boot arms it via `system_config::arm_access_recording`."
+            );
+            return Ok(JobReport::new(Job::Appraise));
+        };
+
         // Coldest anchors first — the same paging read the sweep uses, so this job examines the rows
         // most likely to be cold rather than an arbitrary page of the table.
         let rows = heat_repo.page_oldest(self.max_rows_per_run).await?;
-        let confidences: HashMap<String, f64> =
-            memories.live_confidences().await?.into_iter().collect();
+        let confidences: HashMap<String, LiveConfidence> = memories
+            .live_confidences()
+            .await?
+            .into_iter()
+            .map(|row| (record_id_to_string(&row.id), row))
+            .collect();
 
         let mut report = JobReport::new(Job::Appraise);
         let now = now_secs();
@@ -379,10 +401,20 @@ impl Jobs {
         for row in &rows {
             let id = record_id_to_string(&row.memory);
             // No live fact behind this heat row: the memory was deleted, is quarantined, or the row
-            // is orphaned. Nothing to demote, and not counted as examined either.
-            let Some(confidence) = confidences.get(&id) else {
+            // is orphaned. Nothing to demote, and counted as skipped rather than examined so a
+            // report of "acted: 0" is not read as "the corpus is healthy".
+            let Some(live) = confidences.get(&id) else {
+                report.skipped += 1;
                 continue;
             };
+            // `access_count == 0` only means "never retrieved" for a memory that was stored after the
+            // retrieve path began recording accesses. For an older one the count is a non-event: nobody
+            // was writing it, so cold-and-never-retrieved is indistinguishable from never-observed, and
+            // every legacy row would satisfy the rule on the first pass. Left alone, permanently.
+            if live.created_at.is_none_or(|at| at < armed_at) {
+                report.skipped += 1;
+                continue;
+            }
             report.examined += 1;
 
             let state = EngineHeatState {
@@ -404,7 +436,7 @@ impl Jobs {
             if !should_demote(
                 projected,
                 row.access_count,
-                *confidence,
+                live.confidence,
                 self.cold_heat_floor,
                 self.demote_confidence_ceiling,
             ) {
@@ -428,6 +460,9 @@ impl Jobs {
                     target_ids: Vec::new(),
                     members_moved: 0,
                     disposition: Some(disposition::DEMOTE.to_string()),
+                    // The whole point of writing it: without the prior value, `run_id` names a pass
+                    // but does not make it reversible.
+                    previous_value: Some(live.confidence),
                 })
                 .await
             {
@@ -901,6 +936,10 @@ mod tests {
     /// Seed one memory plus its heat row. `cold` puts the decay anchor six years back, which at the
     /// default one-day tau projects to essentially zero; `access_count` is the field the demote rule
     /// reads, so it is set directly rather than through a retrieval.
+    ///
+    /// Does not arm access recording — a fixture that silently satisfies a rule's precondition is the
+    /// kind of fixture that stops testing it. Call [`armed_long_ago`] when the row is meant to be
+    /// judgeable, and call neither when it is meant to be the fail-closed case.
     async fn seed_for_appraise(
         db: &Database,
         content: &str,
@@ -934,11 +973,26 @@ mod tests {
         id
     }
 
+    /// Arm recording at the epoch, so every memory this suite can create was stored after it and the
+    /// liveness gate cannot depend on statement ordering inside a test. Written directly rather than
+    /// through `arm_access_recording` because the value, not the stamping, is what these tests are
+    /// about; `arm_access_recording`'s own behaviour is pinned by the boot path test.
+    async fn armed_long_ago(db: &Database) {
+        system_config::set_config(
+            db.inner(),
+            system_config::ACCESS_RECORDING_ARMED_AT,
+            "1970-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    }
+
     /// The first rung of the ladder: confidence lowered, memory still live and retrievable, one
     /// attributed audit row. Nothing is deleted or hidden, so being wrong costs a number.
     #[tokio::test]
     async fn appraise_demotes_a_cold_never_retrieved_memory_and_logs_it() {
         let db = migrated_db().await;
+        armed_long_ago(&db).await;
         let id = seed_for_appraise(&db, "nobody ever asked for this", 0.5, 0, true).await;
 
         let jobs = Jobs::new(db.clone(), &Config::default());
@@ -975,6 +1029,101 @@ mod tests {
         assert_eq!(logs[0].job.as_deref(), Some("appraise"));
         assert_eq!(logs[0].run_id.as_deref(), Some("run-demote-1"));
         assert_eq!(logs[0].actor.as_deref(), Some("system:dreaming"));
+        assert_eq!(
+            logs[0].previous_value,
+            Some(0.5),
+            "the demotion records what it overwrote, or `run_id` names a pass that cannot be undone"
+        );
+    }
+
+    /// The precondition that keeps this release from rewriting the corpus it upgrades. Every memory
+    /// stored before access recording existed has `access_count == 0` because nothing ever wrote the
+    /// field, and the default confidence equals the ceiling, so without this gate the first daily
+    /// pass would walk the legacy corpus down to `DEMOTED_CONFIDENCE` at 500 rows a tick — the oldest
+    /// anchors first, which is precisely the set most likely to have been used a lot before recording
+    /// started. The positive control is the row stored under arming: it must still be demoted, or this
+    /// test would pass for a job that does nothing at all.
+    #[tokio::test]
+    async fn a_memory_stored_before_access_recording_was_armed_is_never_demoted() {
+        let db = migrated_db().await;
+        // Armed now, which is what the first boot of this build does.
+        system_config::arm_access_recording(db.inner())
+            .await
+            .unwrap();
+        let legacy =
+            seed_for_appraise(&db, "stored years before anyone was counting", 0.5, 0, true).await;
+        let current = seed_for_appraise(&db, "stored under recording", 0.5, 0, true).await;
+        // Put the legacy row's birth back before the stamp; `create_fact` cannot make an old row.
+        db.inner()
+            .query("UPDATE type::record($id) SET created_at = d'2020-01-01T00:00:00Z'")
+            .bind(("id", legacy.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs
+            .run_job(Job::Appraise, "run-arming")
+            .await
+            .expect("appraise succeeds");
+        assert_eq!(
+            (report.examined, report.acted, report.skipped),
+            (1, 1, 1),
+            "the pre-arming row is skipped and said so, not quietly examined and left alone"
+        );
+
+        let memories = MemoryRepo::new(db.inner());
+        assert_eq!(
+            memories
+                .get_fact(&legacy)
+                .await
+                .unwrap()
+                .unwrap()
+                .confidence,
+            0.5,
+            "a memory nobody ever counted is untouched"
+        );
+        assert_eq!(
+            memories
+                .get_fact(&current)
+                .await
+                .unwrap()
+                .unwrap()
+                .confidence,
+            DEMOTED_CONFIDENCE,
+            "positive control: the same rule still fires on a row it can honestly judge"
+        );
+    }
+
+    /// Fail closed, not open: with no arming stamp the job has no basis for demoting anything, so it
+    /// writes nothing rather than treating every `access_count == 0` as evidence of disuse.
+    #[tokio::test]
+    async fn appraise_demotes_nothing_until_access_recording_has_been_armed() {
+        let db = migrated_db().await;
+        let id = seed_for_appraise(&db, "cold, unused, unarmed", 0.5, 0, true).await;
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs
+            .run_job(Job::Appraise, "run-unarmed")
+            .await
+            .expect("a missing stamp is not an error");
+        assert_eq!((report.examined, report.acted, report.skipped), (0, 0, 0));
+        assert_eq!(
+            MemoryRepo::new(db.inner())
+                .get_fact(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .confidence,
+            0.5,
+            "nothing was lowered"
+        );
+        let logs = ClusterRepo::new(db.inner())
+            .list_maintenance_logs(10, 0)
+            .await
+            .unwrap();
+        assert!(logs.is_empty(), "and nothing was logged");
     }
 
     /// Every condition in the rule is necessary, so each is relaxed on its own row and none of them
@@ -983,6 +1132,7 @@ mod tests {
     #[tokio::test]
     async fn appraise_leaves_accessed_warm_and_confident_memories_alone() {
         let db = migrated_db().await;
+        armed_long_ago(&db).await;
         let accessed = seed_for_appraise(&db, "retrieved three times", 0.5, 3, true).await;
         let warm = seed_for_appraise(&db, "touched today", 0.5, 0, false).await;
         let confident = seed_for_appraise(&db, "asserted with confidence", 0.95, 0, true).await;
@@ -1017,6 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_appraise_run_does_not_demote_the_same_row_twice() {
         let db = migrated_db().await;
+        armed_long_ago(&db).await;
         seed_for_appraise(&db, "cold and unused", 0.5, 0, true).await;
 
         let jobs = Jobs::new(db.clone(), &Config::default());
@@ -1045,9 +1196,13 @@ mod tests {
     /// A memory whose heat row exists but whose fact was deleted or quarantined must not be examined
     /// or demoted. `page_oldest` reads `heat_state`, which has no `deleted` column of its own, so
     /// the join against the live-fact read is what keeps dead rows out.
+    /// A memory whose heat row exists but whose fact was deleted or quarantined must not be examined
+    /// or demoted. `page_oldest` reads `heat_state`, which has no `deleted` column of its own, so
+    /// the join against the live-fact read is what keeps dead rows out.
     #[tokio::test]
     async fn appraise_skips_heat_rows_whose_fact_is_not_live() {
         let db = migrated_db().await;
+        armed_long_ago(&db).await;
         let deleted = seed_for_appraise(&db, "already deleted", 0.5, 0, true).await;
         let quarantined = seed_for_appraise(&db, "quarantined", 0.5, 0, true).await;
         let live = seed_for_appraise(&db, "still live", 0.5, 0, true).await;

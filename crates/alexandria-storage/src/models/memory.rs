@@ -15,6 +15,18 @@ pub struct CollapseCandidate {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// The columns `Appraise` needs from a live fact, and nothing else.
+///
+/// `created_at` is not decoration: it is what tells a memory that was stored under access recording
+/// from one whose `access_count == 0` merely means nobody was counting. Confidence is the value
+/// demotion writes, so it is read fresh rather than carried in from an earlier query.
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+pub struct LiveConfidence {
+    pub id: RecordId,
+    pub confidence: f64,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct Fact {
     pub id: Option<RecordId>,

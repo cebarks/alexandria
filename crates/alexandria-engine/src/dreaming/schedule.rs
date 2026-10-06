@@ -195,6 +195,11 @@ pub struct JobReport {
     pub examined: usize,
     /// Rows whose stored state actually changed.
     pub acted: usize,
+    /// Rows read but **not eligible** for a reason the operator could act on: a heat row whose fact
+    /// is gone, or a memory that predates access recording. Kept separate from `examined` because
+    /// `examined: N, acted: 0` is otherwise read as "the corpus is fine" when it can also mean
+    /// "every row on this page was unjudgeable".
+    pub skipped: usize,
 }
 
 impl JobReport {
@@ -205,6 +210,7 @@ impl JobReport {
             job,
             examined: 0,
             acted: 0,
+            skipped: 0,
         }
     }
 }

@@ -52,6 +52,12 @@ DEFINE FIELD OVERWRITE actor       ON maintenance_log TYPE option<string>;
 DEFINE FIELD OVERWRITE job         ON maintenance_log TYPE option<string>;
 DEFINE FIELD OVERWRITE disposition ON maintenance_log TYPE option<string>;
 
+-- What a value-changing job overwrote. `Appraise` lowers confidence, and without the prior number
+-- stored alongside it a demotion pass cannot be reversed as a unit — `run_id` says which rows one
+-- tick touched but not what they were before. Only value-changing verbs fill this (a split moves
+-- edges, it overwrites no scalar), so it is NONE for the cluster rows by design.
+DEFINE FIELD OVERWRITE previous_value ON maintenance_log TYPE option<float>;
+
 -- `action` is the verb (split / merge / collapse / demote), `job` which scheduler job wrote the
 -- row, `disposition` which rung of the ladder it landed on. Kept separate because they answer
 -- different questions and only `disposition` is a closed ladder. Values live as constants in

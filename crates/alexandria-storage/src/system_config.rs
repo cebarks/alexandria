@@ -1,5 +1,6 @@
 use crate::repos::{FactListQuery, MemoryRepo};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::SurrealValue;
@@ -32,6 +33,39 @@ pub async fn set_config(db: &Surreal<Any>, key: &str, value: &str) -> Result<()>
         .await?
         .check()?;
     Ok(())
+}
+
+/// The instant the retrieve path began recording accesses, stored so it survives restarts.
+///
+/// `Appraise` reads this before it lowers any confidence. `access_count == 0` does not mean "nobody
+/// ever retrieved this memory" for a row written before recording existed — it means nobody was
+/// counting — and on a corpus that predates the feature those two states are every row.
+pub const ACCESS_RECORDING_ARMED_AT: &str = "access_recording_armed_at";
+
+/// Record the arming instant on first boot, or return the stamp already stored.
+///
+/// Written at boot rather than at first appraisal so the value names when the build started
+/// recording, not when a daily job happened to run.
+pub async fn arm_access_recording(db: &Surreal<Any>) -> Result<DateTime<Utc>> {
+    if let Some(armed) = access_recording_armed_at(db).await? {
+        return Ok(armed);
+    }
+    let now = Utc::now();
+    set_config(db, ACCESS_RECORDING_ARMED_AT, &now.to_rfc3339()).await?;
+    Ok(now)
+}
+
+/// The arming stamp, or `None` when no boot of this build has armed it.
+///
+/// A corrupt value is an error rather than a silent `None`: the reader's fail-closed behaviour means
+/// a typo in this key would stop appraise for the rest of the store's life with no signal at all.
+pub async fn access_recording_armed_at(db: &Surreal<Any>) -> Result<Option<DateTime<Utc>>> {
+    let Some(raw) = get_config(db, ACCESS_RECORDING_ARMED_AT).await? else {
+        return Ok(None);
+    };
+    let parsed = DateTime::parse_from_rfc3339(&raw)
+        .map_err(|e| anyhow::anyhow!("system_config `{ACCESS_RECORDING_ARMED_AT}` holds `{raw}`, which is not an RFC3339 datetime: {e}"))?;
+    Ok(Some(parsed.with_timezone(&Utc)))
 }
 
 /// Token limit a corpus was embedded at when its lock predates `embedding_max_tokens`:

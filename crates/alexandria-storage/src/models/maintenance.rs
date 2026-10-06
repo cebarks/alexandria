@@ -21,6 +21,10 @@ pub struct MaintenanceLog {
     /// Which rung of the demote -> quarantine -> soft-delete ladder the row landed on, or `NONE`
     /// for the cluster moves, which are not a disposition.
     pub disposition: Option<String>,
+    /// The value a value-changing job overwrote — for a demotion, the confidence before the write.
+    /// `NONE` for the cluster moves, which overwrite no scalar. Without it `run_id` names a pass but
+    /// does not make it reversible.
+    pub previous_value: Option<f64>,
 }
 
 /// The writer identity for every dreaming job. Dreaming is the one writer that can never produce

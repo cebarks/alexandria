@@ -69,6 +69,14 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::connect(&config.database.data_dir).await?;
     schema::migrate(db.inner()).await?;
 
+    // 2b. Record the instant this build started counting retrievals, before any job can run.
+    // `Appraise` refuses to demote a memory older than this stamp: on a store that predates access
+    // recording every `access_count` is zero because nothing wrote it, so without the stamp the first
+    // pass reads the whole legacy corpus as unused. Stored once, never rewritten — same shape as the
+    // embedding-model lock beside it.
+    let armed_at = system_config::arm_access_recording(db.inner()).await?;
+    tracing::info!("Access recording armed at {armed_at}");
+
     // 3. Check embedding model safety, then load
     tracing::info!("Loading embedding model: {}", config.embedding.model);
     let embedding = CandleProvider::new(
