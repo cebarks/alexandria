@@ -68,17 +68,101 @@ impl Jobs {
         }
     }
 
-    /// Spawn the loop. Returns the handle so a caller can await it on shutdown; the loop exits on
-    /// `cancel`, which `serve_http` already fires when the HTTP service stops.
+    /// Spawn the loop under a supervisor.
+    ///
+    /// `run` handles job *errors* — each returns `Result`, a failure is warned about and the job is
+    /// still marked, so one bad job cannot abort the rest of the tick. It cannot handle a *panic*: a
+    /// panic anywhere in the five bodies unwinds the single task that also hosts cluster maintenance,
+    /// and until now the returned handle was dropped with nothing watching. The process then kept
+    /// serving — and `/debug` kept printing the configured cadences from `summary()` — while every
+    /// background write stopped for the rest of its life. That is the failure `schedule.rs`'s own
+    /// header calls out: a scheduler that quietly stopped is indistinguishable from a healthy one for
+    /// days, and there are now five jobs and more code in the panic path than there were before.
+    ///
+    /// Restart with a backoff, and give up loudly after a few *consecutive* fast failures: a loop that
+    /// panics on startup will panic again, and restarting it forever converts one bug into permanent
+    /// load against the store with a log line every few seconds as its only trace. A run that survived
+    /// longer than `STABLE_RUN` resets the counter, so a process that panics once in a month restarts
+    /// once rather than being told it has used up its allowance.
     pub(crate) fn spawn(
         db: Arc<Database>,
         config: &Config,
         cancel: CancellationToken,
     ) -> JoinHandle<()> {
-        let jobs = Jobs::new(db, config);
-        tokio::spawn(async move { run(jobs, cancel).await })
+        let jobs = Arc::new(Jobs::new(db, config));
+        // The closure needs its own handle to the token for each attempt, and `supervise` needs one
+        // to watch — `CancellationToken` is cloneable precisely for this, each clone observing the
+        // same cancellation without the loop having to own it.
+        let watch = cancel.clone();
+        tokio::spawn(supervise(
+            move || run(Arc::clone(&jobs), cancel.clone()),
+            watch,
+            Duration::from_secs(30),
+        ))
     }
+}
 
+/// The restart policy, kept separate from the work so the give-up branch is testable without a job
+/// that panics on purpose.
+///
+/// `start` is called once per attempt; each attempt runs in its own task, because a panic is only
+/// observable as a `JoinError` — awaiting it in this task would take the supervisor down with the
+/// work. A clean return, a cancellation, or a non-panic join failure all mean "stop, no restart".
+///
+/// `base_backoff` scales with the consecutive-failure count. It is a parameter rather than a
+/// constant so the restart policy can be tested at millisecond scale: `start_paused` would need
+/// tokio's `test-util` feature, and threading a test-only runtime flag through the crate's dev
+/// dependencies to save six seconds of wall clock is the worse trade.
+pub(crate) async fn supervise<F, Fut>(
+    mut start: F,
+    cancel: CancellationToken,
+    base_backoff: Duration,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+    const STABLE_RUN: Duration = Duration::from_secs(600);
+    let mut failures: u32 = 0;
+
+    loop {
+        let started = tokio::time::Instant::now();
+        let error = match tokio::spawn(start()).await {
+            Ok(()) => return,
+            Err(e) if cancel.is_cancelled() || !e.is_panic() => return,
+            Err(e) => e,
+        };
+
+        if started.elapsed() >= STABLE_RUN {
+            failures = 0;
+        }
+        failures += 1;
+
+        if failures > MAX_CONSECUTIVE_FAILURES {
+            tracing::error!(
+                "dreaming scheduler has panicked {failures} times in a row; giving up. Background \
+                 housekeeping (split, merge, sweep, collapse, appraise) is STOPPED for the life of \
+                 this process: {error}"
+            );
+            return;
+        }
+
+        let backoff = base_backoff * failures;
+        tracing::error!(
+            "dreaming scheduler panicked; restarting ({failures}/{MAX_CONSECUTIVE_FAILURES}) in \
+             {backoff:?}: {error}"
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = cancel.cancelled() => return,
+        }
+    }
+}
+
+/// The rest of the job bodies. `spawn` above closes the first `impl Jobs` block because
+/// `supervise` is a module-level function: it is generic over the attempt, and putting it inside the
+/// impl would tie a testable policy function to the type it restarts.
+impl Jobs {
     async fn run_job(&self, job: Job, run_id: &str) -> anyhow::Result<JobReport> {
         match job {
             Job::Sweep => self.run_sweep().await,
@@ -518,7 +602,7 @@ pub(crate) fn summary(config: &crate::config::DreamingConfig) -> String {
 /// and the loop would spin on it instead of sleeping until its interval. The cost is that a
 /// transient failure waits a full interval for its retry — acceptable for housekeeping, and the
 /// alternative (retry immediately) is what turns one poisoned row into a hot loop.
-pub(crate) async fn run(jobs: Jobs, cancel: CancellationToken) {
+pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
     let mut schedule = jobs.intervals.initial_schedule(now_secs());
     let mut tick: u64 = 0;
     tracing::info!(
@@ -860,13 +944,75 @@ mod tests {
     /// Cancelled after a short delay rather than before the spawn, because `Cluster` and `Merge` are
     /// due on the first tick — cancelling first would race the sleep against the token and exercise
     /// whichever branch `select!` happened to pick.
+    /// The supervisor must restart a panicked loop and must eventually stop trying.
+    ///
+    /// Both halves matter and neither is reachable through the real `run`: a supervisor that restarts
+    /// forever turns one panic into permanent load against the store with a log line every backoff as
+    /// its only trace, and one that never restarts is the silent stop this code exists to prevent.
+    /// `supervise` is generic over the attempt precisely so the policy can be tested without a job
+    /// that panics on purpose.
+    #[tokio::test]
+    async fn the_supervisor_restarts_a_panicking_loop_and_then_gives_up() {
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cancel = CancellationToken::new();
+        let counter = Arc::clone(&attempts);
+
+        supervise(
+            move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    // Never returns normally: every attempt panics, which is the worst case.
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    panic!("attempt panicked on purpose");
+                }
+            },
+            cancel,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        let seen = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            seen, 4,
+            "three restarts after the first failure, then it stops trying — not forever"
+        );
+    }
+
+    /// A loop that exits cleanly must not be restarted, and neither must one that ends because the
+    /// service is shutting down: restarting either would spin the scheduler past the point of its
+    /// own cancellation.
+    #[tokio::test]
+    async fn the_supervisor_does_not_restart_a_clean_exit() {
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cancel = CancellationToken::new();
+        let counter = Arc::clone(&attempts);
+
+        supervise(
+            move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            cancel,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a clean return is the end of the scheduler, not a failure to retry"
+        );
+    }
+
     #[tokio::test]
     async fn the_loop_exits_when_cancelled() {
         let db = migrated_db().await;
         let jobs = Jobs::new(db, &Config::default());
         let cancel = CancellationToken::new();
 
-        let handle = tokio::spawn(run(jobs, cancel.clone()));
+        let handle = tokio::spawn(run(Arc::new(jobs), cancel.clone()));
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancel.cancel();
 
