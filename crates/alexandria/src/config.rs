@@ -247,8 +247,14 @@ pub struct DreamingConfig {
     pub collapse_interval_secs: u64,
     /// Cold-row demotion. Default 86400 (1 day).
     pub appraise_interval_secs: u64,
-    /// Rows one job may examine per run, so a large corpus drains across ticks instead of stalling
-    /// one. Default 500.
+    /// Rows one job may **write** per run. Default 500.
+    ///
+    /// Two of the five jobs read more than this and must, so the bound is on the writes and not on
+    /// the reads: `collapse` needs every live fact's content before it can group duplicates at all,
+    /// and `appraise` reads every live fact's confidence and store time even though it pages only
+    /// this many heat rows. `JobReport::examined` reports what was read, so on an N-fact corpus
+    /// collapse says `examined: N` while acting on at most this many rows — which is the honest
+    /// shape, and the reason the key does not say what a corpus drains per tick.
     pub max_rows_per_run: usize,
     /// Projected heat at or below which a memory counts as cold. Default
     /// [`DEFAULT_COLD_HEAT_FLOOR`]. PROVISIONAL — see that constant.

@@ -49,7 +49,7 @@ cluster_interval_secs = 300        # Cohesion check → split cadence (default: 
 merge_interval_secs = 300          # Centroid similarity → merge cadence (default: 300 = 5 minutes)
 collapse_interval_secs = 86400     # Byte-identical duplicate collapse cadence (default: 86400 = 1 day)
 appraise_interval_secs = 86400     # Cold-row demotion cadence (default: 86400 = 1 day)
-max_rows_per_run = 500             # Rows one job may examine per run (default: 500)
+max_rows_per_run = 500             # Rows one job may write per run (default: 500)
 cold_heat_floor = 0.05             # Projected heat at or below which a memory counts as cold (default: 0.05)
 demote_confidence_ceiling = 0.5    # Confidence at or below which a cold, never-accessed memory is demotable (default: 0.5)
 
@@ -177,7 +177,7 @@ job is due rather than waking on a fixed tick.
 | `merge_interval_secs` | u64 | `300` | Merge cadence, seconds. Split from `cluster` because merge is the expensive half — an operator who wants merges rarer should not pay for it in slower splits. |
 | `collapse_interval_secs` | u64 | `86400` | Duplicate-collapse cadence, seconds. |
 | `appraise_interval_secs` | u64 | `86400` | Demotion cadence, seconds. |
-| `max_rows_per_run` | u64 | `500` | Rows one job may examine per run, so a large corpus drains across ticks instead of stalling one. Must be ≥ 1. |
+| `max_rows_per_run` | u64 | `500` | Rows one job may **write** per run. Not a bound on reads: `collapse` reads every live fact to group duplicates, and `appraise` reads every live fact's confidence and store time while paging only this many heat rows. `examined` in the job's trace line is what was read, so `examined: 12000, acted: 3` is a normal collapse. Must be ≥ 1. |
 | `cold_heat_floor` | f64 | `0.05` | Projected heat at or below which a memory counts as cold. **Provisional**: a fraction of the `1.0` a fresh access writes, not a number derived from retrieval measurements. |
 | `demote_confidence_ceiling` | f64 | `0.5` | Stored confidence at or below which a cold, never-accessed memory is demotable. Defaults to the confidence `store_memory` writes when the caller supplies none, so the rule reaches only memories nobody ever asserted more strongly AND nobody ever retrieved. Must be above `0.2`, the value demoted memories are written at. **Provisional**, as above. |
 

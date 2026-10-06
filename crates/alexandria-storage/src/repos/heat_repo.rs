@@ -234,6 +234,16 @@ impl<'a> HeatRepo<'a> {
     /// larger than `max_rows_per_run` drains across ticks instead of the same first page being
     /// swept forever.
     ///
+    /// Deliberately **not** filtered by fact liveness. A heat row whose fact was soft-deleted sits at
+    /// the head of this ordering for ever (nothing deletes `heat_state`), so the page can carry rows
+    /// no live memory will ever read again — measured on a 1897-fact store that is ~39 of 1936 rows,
+    /// because `update_memory`'s superseded snapshots are created by `create_fact`, which writes no
+    /// heat row, so most deleted facts never had one. Adding the join would trade the plan
+    /// `heat_lookups_by_memory_reach_the_index` just proved (a single `IndexScan` on
+    /// `idx_heat_state_last_touched` carrying the limit) for an unmeasured one, to save writes for
+    /// 2% of rows: the waste is recorded in `TODO-misc.md` instead. `Appraise` reads this same page
+    /// and skips those rows, counting them in `JobReport::skipped` so the report says so.
+    ///
     /// The `id` tiebreak is not decoration. `ORDER BY last_touched ASC LIMIT n` alone leaves the
     /// order among equal timestamps unspecified, so a page boundary landing inside a tie could skip
     /// rows or re-read the same ones indefinitely — the same reason `SessionRepo::list` needs a
