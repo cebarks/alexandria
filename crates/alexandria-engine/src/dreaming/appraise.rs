@@ -29,7 +29,10 @@ pub const DEMOTED_CONFIDENCE: f64 = 0.2;
 ///   never the raw stored `heat`, which is only as fresh as the last sweep.
 /// - `access_count == 0` is the strongest of the three: a memory that has never been returned to a
 ///   caller is the only kind this rule can honestly call unused. Now that retrieval records
-///   accesses, this means "nobody ever retrieved it", not "no heat row exists".
+///   accesses, this means "nobody retrieved it **while recording was armed**", not "no heat row
+///   exists" and not "nobody ever retrieved it": a memory stored before the arming stamp has an
+///   `access_count` of 0 because nothing was writing it. `run_appraise` excludes those rows on their
+///   store time rather than trusting the count — see `system_config::ACCESS_RECORDING_ARMED_AT`.
 /// - `floor` and `ceiling` come from config, with [`DEFAULT_COLD_HEAT_FLOOR`] and
 ///   [`DEFAULT_DEMOTE_CONFIDENCE_CEILING`] as the derived defaults. The predicate takes them rather
 ///   than reading the constants, because a key whose value no code reads is a promise to an operator

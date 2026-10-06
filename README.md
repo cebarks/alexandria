@@ -8,7 +8,7 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 - **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool. Heat is recorded on retrieval but is not yet a ranking input — retrieval still ranks by cosine similarity (see [`A2`](docs/performance-and-ability-findings.md#a2-the-heat-model-is-inert)).
 - **Spreading activation** — Accessing a memory warms its graph neighbors. Heat propagates along edges with configurable decay.
 - **Graph edges** — Memories link via `derived_from` and `extracted_from` edges. `relates_to`, `supports` and `contradicts` exist in the schema but nothing in production writes them yet; auto-linking them is planned v0.3 work
-- **Hierarchical clustering** — Automatic cluster assignment on store, plus a background housekeeping scheduler that splits, merges, collapses byte-identical duplicates and demotes cold unused memories, all with a queryable audit log
+- **Hierarchical clustering** — Automatic cluster assignment on store, plus a background housekeeping scheduler that splits, merges, collapses byte-identical duplicates and lowers the confidence of memories that have gone cold without ever being retrieved, all with a queryable audit log
 - **Progressive recall** — Two-phase retrieval: broad cluster matching first, then scope-narrowing within a cluster
 - **Session memory** — Group memories by conversation, search within a session, and close it out with a summary
 - **Document import** — Chunk by heading, paragraph, or fixed size with batch tracking and `extracted_from` lineage

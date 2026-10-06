@@ -167,7 +167,7 @@ job is due rather than waking on a fixed tick.
 | `cluster` | Cohesion check → split, using `cluster.cohesion_floor`. |
 | `merge` | Centroid similarity → merge, using `cluster.merge_threshold`. Re-reads the cluster set after each merge, because a merge changes the centroids the next comparison would use. |
 | `collapse` | Finds byte-identical duplicates, keeps one, soft-deletes the rest and links them to the survivor. |
-| `appraise` | Demotes memories that are cold, never accessed, and no more confident than the default. |
+| `appraise` | Demotes memories that are cold, never accessed **since access recording was armed**, and no more confident than the default. |
 
 | Key | Type | Default | Description |
 | ----- | ------ | --------- | ------------- |
@@ -179,7 +179,14 @@ job is due rather than waking on a fixed tick.
 | `appraise_interval_secs` | u64 | `86400` | Demotion cadence, seconds. |
 | `max_rows_per_run` | u64 | `500` | Rows one job may **write** per run. Not a bound on reads: `collapse` reads every live fact to group duplicates, and `appraise` reads every live fact's confidence and store time while paging only this many heat rows. `examined` in the job's trace line is what was read, so `examined: 12000, acted: 3` is a normal collapse. Must be ≥ 1. |
 | `cold_heat_floor` | f64 | `0.05` | Projected heat at or below which a memory counts as cold. **Provisional**: a fraction of the `1.0` a fresh access writes, not a number derived from retrieval measurements. |
-| `demote_confidence_ceiling` | f64 | `0.5` | Stored confidence at or below which a cold, never-accessed memory is demotable. Defaults to the confidence `store_memory` writes when the caller supplies none, so the rule reaches only memories nobody ever asserted more strongly AND nobody ever retrieved. Must be above `0.2`, the value demoted memories are written at. **Provisional**, as above. |
+| `demote_confidence_ceiling` | f64 | `0.5` | Stored confidence at or below which a cold, never-accessed memory is demotable. Defaults to the confidence `store_memory` writes when the caller supplies none, so the rule reaches only memories nobody asserted more strongly AND nobody retrieved while recording was armed. Must be above `0.2`, the value demoted memories are written at. **Provisional**, as above. |
+
+**Reach of the rule.** `Appraise` judges only memories stored at or after the boot that armed access
+recording (`system_config::access_recording_armed_at`, stamped on first boot). Every older memory
+reads as `access_count = 0` because nothing wrote that field before this release, so trusting the
+count would walk an existing corpus down to `0.2` at 500 rows a day, oldest anchors first — the rows
+most likely to have been used hardest. The cost of refusing is that pre-arming memories are exempt
+permanently, which is the honest price of not demoting on a number nobody recorded.
 
 Every interval must be ≥ 1 second: the engine treats a zero interval as "due on every tick", which
 would turn a daily pass into a hot loop, so the server refuses to start on one and names the key.

@@ -175,7 +175,7 @@ intervals catches up with one run per job, not three.
 
 - **The five jobs** (`crates/alexandria/src/dreaming.rs`, HTTP mode only): `sweep` materialises
   decayed heat hourly; `cluster` checks cohesion and splits; `merge` compares centroids and merges;
-  `collapse` folds byte-identical duplicates daily; `appraise` demotes cold unused memories daily.
+  `collapse` folds byte-identical duplicates daily; `appraise` demotes memories that have gone cold without being retrieved since access recording was armed, daily, and leaves anything older than that stamp alone.
   Config is `[dreaming]`; `cluster.maintenance_interval_secs` is **removed**, and a config still
   setting it warns at boot naming both replacements
 - **Heat is finally wired to retrieval** (audit finding A2, resolved in the "wire" direction): every
