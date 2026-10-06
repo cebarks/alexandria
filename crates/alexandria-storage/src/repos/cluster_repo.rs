@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue, ToSql};
@@ -94,6 +95,29 @@ impl<'a> ClusterRepo<'a> {
             .await?;
         let members: Vec<Fact> = response.take(0)?;
         Ok(members)
+    }
+
+    /// Every fact id with an edge into this cluster, live or not.
+    ///
+    /// The move steps need exactly what [`Self::get_members`] deliberately hides: a quarantined or
+    /// soft-deleted member is still a member, and this repo's `delete` drops
+    /// `contains_memory WHERE in = $id` with no fact predicate, so anything not moved here is deleted
+    /// with the source cluster. Ids only — a move needs no embeddings.
+    pub async fn get_member_ids(&self, cluster_id: &str) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize, SurrealValue)]
+        struct EdgeRow {
+            out: RecordId,
+        }
+        let mut response = self
+            .db
+            .query("SELECT out FROM type::record($cluster_id)->contains_memory")
+            .bind(("cluster_id", cluster_id.to_string()))
+            .await?;
+        let rows: Vec<EdgeRow> = response.take(0)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| record_id_to_string(&row.out))
+            .collect())
     }
 
     /// Remove a single fact from this cluster (delete the contains_memory edge).
@@ -199,11 +223,51 @@ impl<'a> ClusterRepo<'a> {
             }
         }
 
+        // Everyone the live list accounted for, so the pass below can tell a member it moved from a
+        // member the caller could not see.
+        let moved: HashSet<String> = group_a
+            .iter()
+            .chain(group_b.iter())
+            .filter_map(|&idx| members.get(idx))
+            .filter_map(|fact| fact.id.as_ref())
+            .map(record_id_to_string)
+            .collect();
+
+        // Hidden members follow the larger half. They cannot be routed by k-means — the split's
+        // verdict is computed over live members precisely so a row nobody can retrieve cannot move it
+        // — and dropping their edge is the permanent loss this method used to cause: after a release
+        // a quarantined memory has no cluster, `cluster_for_fact` is None, and the cluster-driven
+        // paths in `recall` never reach it again. Choosing the larger child is a decision made in the
+        // open; ties go to the first.
+        let hidden_target = if group_b.len() > group_a.len() {
+            &cid_b
+        } else {
+            &cid_a
+        };
+        let mut hidden_moved: i64 = 0;
+        for fid in self
+            .get_member_ids(cluster_id)
+            .await?
+            .iter()
+            .filter(|id| !moved.contains(id.as_str()))
+        {
+            if let Err(e) = self.add_member(hidden_target, fid).await {
+                warn!("Split: failed to carry hidden member {fid} into {hidden_target}: {e}");
+                continue;
+            }
+            if let Err(e) = self.remove_member(cluster_id, fid).await {
+                warn!("Split: failed to remove hidden member {fid} from the split cluster: {e}");
+            }
+            hidden_moved += 1;
+        }
+
         // Delete the old cluster (now empty)
         self.delete(cluster_id).await?;
 
-        // Log the split
-        let members_moved = (group_a.len() + group_b.len()) as i64;
+        // Log the split. Counted from the edge writes, not from the group sizes: the groups only
+        // know about the members the caller could see, and under-reporting a move is how a
+        // reconciliation against this row comes out wrong.
+        let members_moved = (group_a.len() + group_b.len()) as i64 + hidden_moved;
         let (run_id, job, actor) = self.audit_binds();
         if let Err(e) = self
             .db
@@ -234,15 +298,12 @@ impl<'a> ClusterRepo<'a> {
         remove_id: &str,
         merged_centroid: &[f32],
     ) -> Result<()> {
-        let removed_members = self.get_members(remove_id).await?;
-
-        // Add to target first, then remove from source (avoids orphaning on failure)
-        for fact in &removed_members {
-            let fid = fact
-                .id
-                .as_ref()
-                .map(record_id_to_string)
-                .unwrap_or_default();
+        // Ids, not `get_members`: every edge has to be carried, including the hidden rows the live
+        // filter excludes, because `delete` below drops them all. The centroid the caller passes is
+        // still a function of live members only — moving a hidden row does not let it decide a
+        // verdict.
+        let mut members_moved: i64 = 0;
+        for fid in self.get_member_ids(remove_id).await? {
             if let Err(e) = self.add_member(keep_id, &fid).await {
                 warn!("Merge: failed to add {fid} to kept cluster {keep_id}: {e}");
                 continue;
@@ -250,9 +311,8 @@ impl<'a> ClusterRepo<'a> {
             if let Err(e) = self.remove_member(remove_id, &fid).await {
                 warn!("Merge: failed to remove {fid} from removed cluster {remove_id}: {e}");
             }
+            members_moved += 1;
         }
-
-        let members_moved = removed_members.len() as i64;
 
         self.update_centroid(keep_id, merged_centroid).await?;
         self.delete(remove_id).await?;
@@ -499,11 +559,15 @@ mod tests {
 
     /// The pin `SessionRepo::get_memories` got in 33e17c9 and the cluster path never did.
     ///
-    /// Today a soft-deleted member still counts toward `list_with_counts`, still feeds
-    /// `check_cohesion`'s member embeddings, and still gets moved by `execute_merge`. That is
-    /// already wrong; it becomes actively wrong the moment `Collapse` soft-deletes duplicates, since
-    /// a cluster of ten near-identical rows would keep behaving like a ten-member cluster after nine
-    /// are collapsed. Quarantined rows are the same defect one rung earlier on the ladder.
+    /// A soft-deleted or quarantined member must not count toward `list_with_counts`, must not feed
+    /// `check_cohesion`'s member embeddings, and must not be able to move a merge verdict — which
+    /// became actively wrong rather than merely untidy the moment `Collapse` started soft-deleting
+    /// duplicates, since a cluster of ten near-identical rows would keep behaving like a ten-member
+    /// cluster after nine are collapsed. Quarantined rows are the same defect one rung earlier on the
+    /// ladder.
+    ///
+    /// Filtering the *verdicts* is this method's job; filtering the *moves* is not, and must not
+    /// become it — see `test_hidden_members_survive_a_split_and_a_merge`.
     #[tokio::test]
     async fn test_get_members_excludes_deleted_and_quarantined() {
         let db = Database::connect_embedded().await.unwrap();
@@ -553,5 +617,112 @@ mod tests {
             ["kept"],
             "a soft-deleted and a quarantined member must both drop out, leaving the live row"
         );
+    }
+
+    /// The other half of the same change, and the half that could silently eat data.
+    ///
+    /// `get_members` filters, so every caller that iterates it sees only live rows — but `delete`
+    /// drops `contains_memory WHERE in = $id` with no fact predicate at all. Before the moves were
+    /// switched to `get_member_ids`, that meant a hidden member's edge was destroyed on every split
+    /// and merge while its fact stayed live-and-recoverable: after a release, `cluster_for_fact`
+    /// returns None and the cluster-driven paths in `recall` can never reach it again. Quarantine is
+    /// documented as the reversible rung, so losing its placement is not a cosmetic consequence.
+    #[tokio::test]
+    async fn test_hidden_members_survive_a_split_and_a_merge() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let clusters = ClusterRepo::new(db.inner());
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+
+        // --- merge: the hidden row follows the live one into the kept cluster ---
+        let source = clusters.create(Some("source"), &[0.1, 0.2]).await.unwrap();
+        let kept = clusters.create(Some("kept"), &[0.1, 0.2]).await.unwrap();
+        let live = memory
+            .create_fact("live", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let quarantined = memory
+            .create_fact("quarantined", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        for id in [&live, &quarantined] {
+            clusters.add_member(&source, id).await.unwrap();
+        }
+        db.inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", quarantined.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        clusters
+            .execute_merge(&kept, &source, &[0.1, 0.2])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            memory
+                .cluster_for_fact(&quarantined)
+                .await
+                .unwrap()
+                .map(|c| c.id.as_ref().map(record_id_to_string).unwrap_or_default()),
+            Some(kept.clone()),
+            "a quarantined member keeps its cluster through a merge, so releasing it does not orphan it"
+        );
+        // Positive control on the same code path: the live row moved too, so the assertion above is
+        // not being satisfied by a move step that carries nobody.
+        assert_eq!(
+            memory.cluster_for_fact(&live).await.unwrap().map(|c| c
+                .id
+                .as_ref()
+                .map(record_id_to_string)
+                .unwrap_or_default()),
+            Some(kept),
+            "the live member moved to the kept cluster as well"
+        );
+
+        // --- split: hidden members follow the larger half, they are not deleted with the source ---
+        let splitting = clusters
+            .create(Some("splitting"), &[0.3, 0.4])
+            .await
+            .unwrap();
+        let left = memory
+            .create_fact("left", 0.5, &[0.3, 0.4], &[])
+            .await
+            .unwrap();
+        let hidden = memory
+            .create_fact("hidden", 0.5, &[0.3, 0.4], &[])
+            .await
+            .unwrap();
+        clusters.add_member(&splitting, &left).await.unwrap();
+        clusters.add_member(&splitting, &hidden).await.unwrap();
+        db.inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", hidden.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let members = clusters.get_members(&splitting).await.unwrap();
+        let (child_a, child_b) = clusters
+            .execute_split(&splitting, &members, &[0], &[], &[0.5, 0.6], &[0.7, 0.8])
+            .await
+            .unwrap();
+
+        assert!(
+            memory.cluster_for_fact(&hidden).await.unwrap().is_some(),
+            "the hidden member still belongs to a cluster after its old one was split away"
+        );
+        assert_eq!(
+            memory.cluster_for_fact(&hidden).await.unwrap().map(|c| c
+                .id
+                .as_ref()
+                .map(record_id_to_string)
+                .unwrap_or_default()),
+            Some(child_a.clone()),
+            "and it went to the larger half (ties to the first), not to a cluster chosen by accident"
+        );
+        assert_ne!(child_a, child_b, "the two children are distinct clusters");
     }
 }
