@@ -557,7 +557,14 @@ pub(crate) async fn run(jobs: Jobs, cancel: CancellationToken) {
                 ),
                 Err(e) => tracing::warn!(job = job.as_str(), "dreaming job failed: {e}"),
             }
-            schedule.mark_run(job, now);
+            // Stamp with a clock read *after* the job, not the tick's start. `is_due` compares against
+            // this value, so a stamp taken before a job that outlived its own interval leaves it due
+            // again the moment the loop recomputes — `next_wait_secs` returns 0, `sleep(0)` returns
+            // immediately, and the job runs back-to-back with no rest for as long as the overrun
+            // lasts. Every job in the due set shared that one stale stamp, so one slow job also
+            // cancelled the wait of every shorter interval in the tick: precisely the hot loop the
+            // loader refuses to start on for a zero interval.
+            schedule.mark_run(job, now_secs());
         }
     }
     tracing::debug!("dreaming scheduler stopped");

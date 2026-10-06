@@ -35,6 +35,40 @@ fn a_job_is_due_once_its_interval_has_elapsed() {
     assert!(timing.is_due(9_000), "and still due well past it");
 }
 
+/// Which clock gets stored is the entire difference between a slow tick and a spin.
+///
+/// The loop stamps each job with the clock read *after* it returned, so `last_run` is a completion
+/// time and the interval measures rest. Stamped with the tick's start instead, a job that outlived
+/// its own interval is due again the moment the loop recomputes: `remaining_secs` saturates to 0,
+/// `sleep(0)` returns immediately, and the job runs back-to-back with no rest for as long as the
+/// overrun lasts — the hot loop the binary refuses to *start* on for a zero interval, arrived at by
+/// a different road. And because one tick's due set shared that single stale stamp, a slow job also
+/// cancelled the wait of every shorter interval in the same tick.
+#[test]
+fn a_job_that_overran_its_interval_waits_a_full_interval_from_completion() {
+    let interval = 300;
+    let tick_started = 1_000;
+    let finished = 1_400;
+
+    let stale = timing(Job::Cluster, interval, Some(tick_started));
+    assert!(
+        stale.is_due(finished),
+        "an overrunning job marked at the tick's start is due again at once"
+    );
+    assert_eq!(
+        stale.remaining_secs(finished),
+        0,
+        "so the loop sleeps nothing and runs it back-to-back"
+    );
+
+    let current = timing(Job::Cluster, interval, Some(finished));
+    assert!(
+        !current.is_due(finished),
+        "a completion stamp measures rest from the end of the work"
+    );
+    assert_eq!(current.remaining_secs(finished), interval);
+}
+
 /// Catch-up is one run, not one per missed interval. A process down for a day runs the daily job
 /// once when it comes back — the same lazy-due discipline the reminder scheduler uses, where a
 /// missed tick costs latency and never correctness.
