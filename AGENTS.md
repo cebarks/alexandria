@@ -202,8 +202,14 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
 - Branch protection here is a **ruleset**, not legacy protection, and it is scoped to every ref:
   `gh api repos/<owner>/<repo>/rulesets` returns one named `main` with
   `conditions.ref_name.include = ["~ALL"]`, required status checks `Formatting`, `Clippy`, `Tests`,
-  `cargo-deny`, `strict_required_status_checks_policy: false`, squash as the *only* allowed merge
-  method, and `required_approving_review_count: 0`. The reason it exists is the incident below —
+  `cargo-deny` and `Pi companion`, `strict_required_status_checks_policy: false`, squash as the *only*
+  allowed merge method, `required_approving_review_count: 0`, `required_review_thread_resolution: true`,
+  `dismiss_stale_reviews_on_push: true`, and `require_extra_approval_for_unattributed_changes: true`
+  — which the docs say has no effect at zero required approvals, so it is not what blocks anything.
+  When a merge is unexpectedly blocked, read the live set with
+  `gh api repos/<owner>/<repo>/rulesets/<id>` instead of trusting this paragraph: required checks are
+  GitHub config, they drift from the file silently, and there is no revision history endpoint to
+  diff against (`/rulesets/<id>/revisions` 404s). The reason it exists is the incident below —
   and its consequence is that **a PR producing no check runs is `mergeStateStatus=BLOCKED` and
   cannot merge at all**, however good the code is. That is what makes workflow trigger scoping
   load-bearing rather than cosmetic: a trigger filtered to `main` combined with checks required on
@@ -225,10 +231,14 @@ These will bite you. SurrealDB 3.2 differs from docs and prior versions:
   new gate has to be added to the workflow too. `just verify-assets` runs as its own step in the
   `test` job, before `just test`, because the year-long `immutable` asset cache header is only safe
   while the filename pins the bytes.
-- `Pi companion` runs but is **not** in the ruleset's required list, so a red companion job merges
-  clean. The extension suite is therefore gated by convention only. Add it to the ruleset via the
-  API rather than by editing a file — required checks are GitHub config, not repo content, and no
-  PR can change them.
+- `Pi companion` **is** in the ruleset's required list, so a red companion job now blocks the merge.
+  It was gated by convention only until the ruleset was edited in the UI, which is why no commit
+  authorises the change and `git log` cannot show it — this bullet is the only in-repo record of the
+  current set. The job runs `npm ci --ignore-scripts`, `npm run typecheck` and `npm test` directly, so
+  it is the same suite `just ext-test` wraps but not the recipe, and it runs on every PR including
+  Rust-only ones. Practical consequence: a break in `contrib/pi/` can no longer land through a
+  change that never touches TypeScript, and `just ci` is not sufficient — the three npm steps have to
+  pass locally too.
 
 ## Docs Map
 
