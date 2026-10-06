@@ -721,6 +721,115 @@ mod tests {
         );
     }
 
+    /// Split and merge are the most destructive things any job does, and this branch gave them a run
+    /// id so an operator could answer "why did my corpus change" — advertised in AGENTS.md and
+    /// README. Nothing tested it: `ClusterRepo::with_audit` was constructed only by `run_cluster` and
+    /// `run_merge`, while `cluster_maintenance_test.rs` still drives split/merge through the
+    /// unattributed `ClusterRepo::new`. A typo in the new `run_id`/`job`/`actor` binds would have
+    /// produced unattributed rows with only a warn to show for it — which is precisely the silent
+    /// breakage the audit trail exists to catch.
+    #[tokio::test]
+    async fn a_split_attributes_its_audit_row_to_the_tick_that_wrote_it() {
+        let db = migrated_db().await;
+        let memories = MemoryRepo::new(db.inner());
+        let clusters = ClusterRepo::new(db.inner());
+
+        // Cohesion is average cosine similarity to the centroid, and the floor is 0.6. With this
+        // centroid the two members pointing along it score 1.0 and the two orthogonal to it score
+        // 0.0, so the average is 0.5 — under the floor, and a real split rather than an empty tick.
+        let wide = clusters
+            .create(Some("wide"), &[1.0_f32, 0.0])
+            .await
+            .unwrap();
+        for (i, point) in [[1.0_f32, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
+            .iter()
+            .enumerate()
+        {
+            let fid = memories
+                .create_fact(&format!("member {i}"), 0.5, point, &[])
+                .await
+                .unwrap();
+            clusters.add_member(&wide, &fid).await.unwrap();
+        }
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs
+            .run_job(Job::Cluster, "run-split-attrib")
+            .await
+            .expect("cluster job succeeds");
+        assert_eq!(
+            report.acted, 1,
+            "the fixture must actually provoke a split, or the assertions below measure nothing"
+        );
+
+        let logs = ClusterRepo::new(db.inner())
+            .list_maintenance_logs(10, 0)
+            .await
+            .unwrap();
+        let split = logs
+            .iter()
+            .find(|row| row.action == "split")
+            .expect("a split was logged");
+        assert_eq!(
+            split.run_id.as_deref(),
+            Some("run-split-attrib"),
+            "the destructive write carries the tick that made it"
+        );
+        assert_eq!(split.job.as_deref(), Some("cluster"));
+        assert_eq!(split.actor.as_deref(), Some("system:dreaming"));
+        assert!(split.members_moved > 0, "and says how many members moved");
+    }
+
+    /// Merge gets its own database: the split children left behind by the test above have centroids
+    /// of their own, and a shared fixture would make "exactly one merge" depend on which pair the
+    /// scan happened to reach first.
+    #[tokio::test]
+    async fn a_merge_attributes_its_audit_row_to_the_tick_that_wrote_it() {
+        let db = migrated_db().await;
+        let memories = MemoryRepo::new(db.inner());
+        let clusters = ClusterRepo::new(db.inner());
+
+        // Centroid similarity well over the 0.75 join threshold, so these two merge.
+        let a = clusters.create(Some("a"), &[1.0_f32, 0.0]).await.unwrap();
+        let b = clusters.create(Some("b"), &[0.99_f32, 0.01]).await.unwrap();
+        let fid = memories
+            .create_fact("shared", 0.5, &[0.99_f32, 0.01], &[])
+            .await
+            .unwrap();
+        clusters.add_member(&b, &fid).await.unwrap();
+
+        let jobs = Jobs::new(db.clone(), &Config::default());
+        let report = jobs
+            .run_job(Job::Merge, "run-merge-attrib")
+            .await
+            .expect("merge job succeeds");
+        assert_eq!(
+            report.acted, 1,
+            "two near-identical centroids must merge, or the assertion measures an empty tick"
+        );
+
+        let logs = ClusterRepo::new(db.inner())
+            .list_maintenance_logs(10, 0)
+            .await
+            .unwrap();
+        let merge = logs
+            .iter()
+            .find(|row| row.action == "merge")
+            .expect("a merge was logged");
+        assert_eq!(merge.run_id.as_deref(), Some("run-merge-attrib"));
+        assert_eq!(merge.job.as_deref(), Some("merge"));
+        assert_eq!(merge.actor.as_deref(), Some("system:dreaming"));
+        // And the direction is the documented one: the kept cluster is the one with more members,
+        // so `b` (one member) survives and `a` (none) is the source. Asserted rather than incidental,
+        // because a merge that deleted the populated cluster would still log an attributed row.
+        assert_eq!(merge.source_id, a, "the empty cluster is the one removed");
+        assert_eq!(
+            merge.target_ids,
+            vec![b],
+            "the cluster holding the member is the one kept"
+        );
+    }
+
     #[tokio::test]
     async fn the_cluster_and_merge_jobs_survive_an_empty_database() {
         let db = migrated_db().await;
