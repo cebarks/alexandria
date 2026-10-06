@@ -499,6 +499,42 @@ impl Config {
             "dreaming.demote_confidence_ceiling must be above {DEMOTED_CONFIDENCE}, the value a \
              demoted memory is written at, or appraise can never demote anything"
         );
+        // The tuning values the intervals' zero-guard does not cover, and they need it more: each one
+        // silently inverts a job rather than stopping it. `projected_heat` uses
+        // `tau = stability * decay_tau_secs`, so a zero tau projects *every* row to heat 0, which
+        // makes `is_cold` true corpus-wide — that is the mass-demotion vector the arming gate exists
+        // to close, reopened by a typo in a different key. A floor of 0 disables appraise with no
+        // signal and a floor of 1.0 or more makes everything cold; a zero spacing reference makes the
+        // denominator in `on_access` either infinite or a division by zero. Refusing by name is the
+        // same posture as the escalation-window check in `main.rs`.
+        anyhow::ensure!(
+            config.heat.decay_tau_secs.is_finite() && config.heat.decay_tau_secs > 0.0,
+            "heat.decay_tau_secs must be a positive number of seconds; zero projects every memory to \
+             heat 0, which makes appraise treat the whole corpus as cold"
+        );
+        anyhow::ensure!(
+            config.heat.spacing_reference_secs.is_finite()
+                && config.heat.spacing_reference_secs > 0.0,
+            "heat.spacing_reference_secs must be a positive number of seconds; it is the denominator \
+             `on_access` grows stability with, and 0 stops stability growing at all"
+        );
+        anyhow::ensure!(
+            config.dreaming.cold_heat_floor.is_finite()
+                && config.dreaming.cold_heat_floor > 0.0
+                && config.dreaming.cold_heat_floor < 1.0,
+            "dreaming.cold_heat_floor must be strictly between 0 and 1 (a fraction of the 1.0 a fresh \
+             access writes); 0 disables appraise and 1.0 or more makes every memory cold"
+        );
+        // An interval so large the job never runs is the mirror image of a zero interval, and just as
+        // likely to be a unit mistake (milliseconds written into a seconds field, or the reverse).
+        const MAX_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
+        for (key, interval) in config.dreaming.interval_keys() {
+            anyhow::ensure!(
+                interval <= MAX_INTERVAL_SECS,
+                "{key} must be at most {MAX_INTERVAL_SECS} (one year); a larger value means the job \
+                 never runs, which is the same outcome as turning the scheduler off"
+            );
+        }
 
         Ok(config)
     }
@@ -756,6 +792,48 @@ mod tests {
             assert!(
                 err.to_string().contains("dreaming.enabled"),
                 "the refusal must name the supported way to turn the scheduler off: {err}"
+            );
+        }
+    }
+
+    /// The mirror image of the zero-interval refusal: every tuning key the scheduler reads must be
+    /// refused when it would silently invert a job instead of stopping it. Each case here is a value
+    /// that loads cleanly, boots, and then makes `Appraise` treat the whole corpus as cold (or do
+    /// nothing forever) with no line of output to say so.
+    #[test]
+    fn test_dreaming_toml_inverted_tuning_values_refuse_to_start() {
+        for (toml, needle) in [
+            ("[heat]\ndecay_tau_secs = 0.0\n", "heat.decay_tau_secs"),
+            ("[heat]\ndecay_tau_secs = -1.0\n", "heat.decay_tau_secs"),
+            (
+                "[heat]\nspacing_reference_secs = 0.0\n",
+                "heat.spacing_reference_secs",
+            ),
+            (
+                "[dreaming]\ncold_heat_floor = 0.0\n",
+                "dreaming.cold_heat_floor",
+            ),
+            (
+                "[dreaming]\ncold_heat_floor = 1.0\n",
+                "dreaming.cold_heat_floor",
+            ),
+            (
+                "[dreaming]\nappraise_interval_secs = 40000000000\n",
+                "dreaming.appraise_interval_secs",
+            ),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "alexandria-tuning-{}-{}.toml",
+                std::process::id(),
+                needle.replace(['.', '_'], "-")
+            ));
+            std::fs::write(&path, toml).unwrap();
+            let err = Config::load_from(&env(&[("ALEXANDRIA_CONFIG", path.to_str().unwrap())]))
+                .unwrap_err();
+            std::fs::remove_file(&path).unwrap();
+            assert!(
+                err.to_string().contains(needle),
+                "{toml} must be refused by naming the key the operator would edit; got: {err}"
             );
         }
     }
