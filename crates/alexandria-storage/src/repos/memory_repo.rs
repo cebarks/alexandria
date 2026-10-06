@@ -361,6 +361,10 @@ impl<'a> MemoryRepo<'a> {
     /// assembly line-for-line while its doc comment claimed they matched. A predicate added to one
     /// copy and not the other makes the debug UI's "N facts" disagree with the rows under it, which
     /// is precisely the drift the quarantine filter must not land in.
+    ///
+    /// Called with the default query by the scans that have no filters to carry — `top_tags`,
+    /// `collapse_candidates`, `live_confidences` — which is the whole point: those three want
+    /// "every live fact" and must not have to re-spell what live means each time.
     fn fact_filter_clause(query: &FactListQuery<'_>) -> String {
         let mut conditions = Vec::new();
         if !query.include_deleted {
@@ -426,13 +430,16 @@ impl<'a> MemoryRepo<'a> {
             tags: Vec<String>,
         }
 
-        let mut response = self
-            .db
-            .query(
-                "SELECT array::flatten(array::group(tags)) AS tags \
-                 FROM fact WHERE deleted = false AND quarantined_at = NONE GROUP ALL",
-            )
-            .await?;
+        // The live predicate comes from the same builder as `list` and `count`, not from a copy of
+        // its text: this query is the one place in the file that used to spell `deleted = false AND
+        // quarantined_at = NONE` by hand, so a fourth condition added to the builder would have
+        // quietly kept `top_tags` counting facts the list page cannot show.
+        let filter = FactListQuery::default();
+        let where_clause = Self::fact_filter_clause(&filter);
+        let sql = format!(
+            "SELECT array::flatten(array::group(tags)) AS tags FROM fact {where_clause} GROUP ALL"
+        );
+        let mut response = self.db.query(&sql).await?;
         let row: Option<TagRow> = response.take(0)?;
 
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
