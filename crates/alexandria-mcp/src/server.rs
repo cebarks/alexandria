@@ -892,15 +892,33 @@ impl AlexandriaServer {
             .map(|row| (record_id_to_string(&row.memory), row))
             .collect();
 
+        // One round trip for the rows that have no heat_state, then one for the accesses. Doing this
+        // per row was correct and read as "two round trips" in the docs, which was true only for a
+        // corpus where every returned row already has a heat row — and memories written through
+        // `create_fact` directly, or predating `do_store_memory`'s heat write, have none. So the
+        // count of statements here is a property of the corpus rather than of the code.
+        let rowless: Vec<&String> = memory_ids
+            .iter()
+            .filter(|id| !by_memory.contains_key(id.as_str()))
+            .collect();
+        heat_repo
+            .create_for_memory_many(
+                rowless
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<&str>>()
+                    .as_slice(),
+            )
+            .await?;
+
         let mut updates = Vec::with_capacity(memory_ids.len());
         for id in memory_ids {
             let mut state = match by_memory.get(id) {
                 Some(row) => heat_engine_state(row),
                 None => {
-                    // Row created just now, so its anchor is this instant: the first sight of a
-                    // brand-new row earns no spacing credit, which is the correct reading rather
-                    // than the accident of `HeatState::new` starting at the epoch.
-                    heat_repo.create_for_memory(id, 1.0).await?;
+                    // Created above, in the batch. Its anchor is this instant: the first sight of a
+                    // brand-new row earns no spacing credit, which is the correct reading rather than
+                    // the accident of `HeatState::new` starting at the epoch.
                     EngineHeatState {
                         heat: 1.0,
                         stability: 1.0,

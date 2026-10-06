@@ -49,6 +49,34 @@ impl<'a> HeatRepo<'a> {
         Self { db }
     }
 
+    /// Create heat rows for many memories in **one** round trip, for the retrieve path's fallback.
+    ///
+    /// `create_for_memory` per row is correct but N round trips deep, and the caller is the per-prompt
+    /// read. A memory can legitimately have no heat row — anything written through
+    /// `MemoryRepo::create_fact` directly, and every row written before `do_store_memory` started
+    /// creating one — so the size of that set is a property of the corpus, not a rare edge.
+    ///
+    /// Returns nothing: the caller has already decided each row's initial values, and the batched
+    /// access write that follows is what makes the anchor current.
+    pub async fn create_for_memory_many(&self, memory_ids: &[&str]) -> Result<()> {
+        if memory_ids.is_empty() {
+            return Ok(());
+        }
+        let mut query = String::new();
+        for i in 0..memory_ids.len() {
+            query.push_str(&format!(
+                "CREATE heat_state SET memory = type::record($m{i}), heat = 1.0, stability = 1.0, \
+                 access_count = 0; "
+            ));
+        }
+        let mut prepared = self.db.query(query);
+        for (i, memory_id) in memory_ids.iter().enumerate() {
+            prepared = prepared.bind((format!("m{i}"), memory_id.to_string()));
+        }
+        prepared.await?.check()?;
+        Ok(())
+    }
+
     pub async fn create_for_memory(&self, memory_id: &str, initial_heat: f64) -> Result<String> {
         let mut response = self
             .db
@@ -735,6 +763,53 @@ mod tests {
             "the two stalest rows are the first page, so the tail of a large corpus is reached by \
              later runs rather than never"
         );
+    }
+
+    /// The batched create backs `record_accesses`' fallback, so its statement count must not depend on
+    /// how many memories turned out to have no heat row. That is a property of the corpus — rows
+    /// written through `create_fact` directly, and everything stored before `do_store_memory` began
+    /// creating heat rows — not a rare edge.
+    #[tokio::test]
+    async fn create_for_memory_many_creates_every_requested_row() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+        let heat = HeatRepo::new(db.inner());
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            ids.push(
+                memory
+                    .create_fact(&format!("rowless {i}"), 0.5, &[0.1, 0.2], &[])
+                    .await
+                    .unwrap(),
+            );
+        }
+        // `create_fact` writes no heat row, which is the entire reason the fallback exists.
+        assert!(
+            heat.get_many(&ids).await.unwrap().is_empty(),
+            "fixture control: none of these rows should already have a heat row"
+        );
+
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        heat.create_for_memory_many(&refs).await.unwrap();
+
+        let created = heat.get_many(&ids).await.unwrap();
+        assert_eq!(
+            created.len(),
+            3,
+            "every requested row must be created, not just the first"
+        );
+        for row in &created {
+            assert_eq!(
+                (row.heat, row.stability, row.access_count),
+                (1.0, 1.0, 0),
+                "a first-sight row starts at full heat with no spacing credit"
+            );
+        }
+
+        // An empty request must not build a query at all, and must not error.
+        heat.create_for_memory_many(&[]).await.unwrap();
     }
 
     /// Each row in a batch gets its own value, and the count is the number of rows actually written.
