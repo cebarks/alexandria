@@ -5,14 +5,21 @@
 {# The `{% for %}`/`{% if %}` lines below are deliberately kept on ONE physical line each:
    newlines inside a <td> render as visible whitespace, and the `, ` separator between target
    links must not gain a stray space before </td>. Do not let a formatter reflow them. #}
+{# The four trailing columns are the v008 attribution. `run_id` is the unit one pass is selected
+   or reversed by, so the table has to carry it; `unknown` stays as the badge for a verb this page
+   has not been taught, because a new job appearing as an existing one is the worse failure. #}
 <table>
-<tr><th>Action</th><th>Source</th><th>Target(s)</th><th>Members Moved</th><th>Time</th></tr>
-{% if logs.is_empty() %}<tr><td colspan="5" class="empty">No maintenance events recorded.</td></tr>{% endif %}
+<tr><th>Action</th><th>Source</th><th>Target(s)</th><th>Members Moved</th><th>Run</th><th>Job</th><th>Disposition</th><th>Was</th><th>Time</th></tr>
+{% if logs.is_empty() %}<tr><td colspan="9" class="empty">No maintenance events recorded.</td></tr>{% endif %}
 {% for log in logs %}<tr>
-<td>{% if log.action == "merge" %}<span class="badge" style="background:#1a3d2a;color:#3fb950;">merge</span>{% elif log.action == "split" %}<span class="badge" style="background:#3d2f1a;color:#d29922;">split</span>{% else %}<span class="badge">unknown</span>{% endif %}</td>
+<td>{% if log.action == "merge" %}<span class="badge" style="background:#1a3d2a;color:#3fb950;">merge</span>{% elif log.action == "split" %}<span class="badge" style="background:#3d2f1a;color:#d29922;">split</span>{% elif log.action == "collapse" %}<span class="badge" style="background:#1a2d3d;color:#58a6ff;">collapse</span>{% elif log.action == "demote" %}<span class="badge" style="background:#2d1a3d;color:#a371f7;">demote</span>{% else %}<span class="badge">unknown</span>{% endif %}</td>
 <td>{{ log.source_id }}</td>
-<td>{% for target in log.targets %}<a class="link" href="/debug/clusters/{{ target|urlencode }}">{{ target }}</a>{% if !loop.last %}, {% endif %}{% endfor %}</td>
+<td>{% for target in log.targets %}{% if target.route != "" %}<a class="link" href="{{ target.route }}{{ target.id|urlencode }}">{{ target.id }}</a>{% else %}{{ target.id }}{% endif %}{% if !loop.last %}, {% endif %}{% endfor %}</td>
 <td>{{ log.members_moved }}</td>
+<td>{{ log.run_id }}</td>
+<td>{{ log.job }}</td>
+<td>{{ log.disposition }}</td>
+<td>{{ log.previous_value }}</td>
 <td>{{ log.timestamp }}</td>
 </tr>
 {% endfor %}</table>
