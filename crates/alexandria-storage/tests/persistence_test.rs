@@ -32,6 +32,38 @@ async fn test_persistent_storage_round_trip() {
         .unwrap();
     schema::migrate(db2.inner()).await.unwrap();
 
+    // 3. Replay every compiled-in migration against the on-disk engine.
+    //
+    // The PR claimed v008 was covered "for both apply and replay on disk", and only apply was true:
+    // the second `migrate` above short-circuits (`current_version == LATEST_VERSION` leaves nothing
+    // pending), so no v008 statement re-ran here at all. Statement-level replay was pinned only
+    // in-memory. That distinction is the entire reason this test opens a disk store rather than
+    // `mem://` — SurrealKV is the engine users actually run, and a `DEFINE ... OVERWRITE` that
+    // replays cleanly in memory is not proven to replay cleanly on disk.
+    //
+    // Rewinding the stamp makes `migrate` treat all eight files as pending again, over a schema that
+    // already exists — the crash-mid-file state the `OVERWRITE`/`IF EXISTS` rule exists for.
+    db2.inner()
+        .query("UPDATE system_config SET value = '1' WHERE key = 'schema_version'")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    schema::migrate(db2.inner())
+        .await
+        .expect("re-applying every migration, v008 included, must succeed against a disk store");
+
+    // The replay must have left the schema at the compiled-in head, not somewhere below it.
+    let applied = alexandria_storage::system_config::get_config(db2.inner(), "schema_version")
+        .await
+        .unwrap()
+        .expect("the stamp is written by every migrate");
+    assert_eq!(
+        applied,
+        schema::LATEST_VERSION.to_string(),
+        "after a full replay the disk store must report the compiled-in head"
+    );
+
     let mut result = db2
         .inner()
         .query("SELECT * FROM fact:persist_test")
