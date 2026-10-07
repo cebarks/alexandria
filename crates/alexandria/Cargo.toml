@@ -30,3 +30,7 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 async-trait = "0.1"
+# The dreaming CLI is tested against a real on-disk SurrealKV store, because the single-writer
+# refusal it reports only exists on the file-backed path: a second `mem://` handle is a different
+# database. Same spelling as the other two crates that open disk stores.
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }

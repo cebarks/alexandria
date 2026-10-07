@@ -31,6 +31,31 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 
+/// The id one scheduler tick writes its audit rows under: `run-<epoch>-<tick>`.
+///
+/// The second component disambiguates ticks *within* one long-lived process, which is what makes it
+/// meaningful there; see [`cli_run_id`] for why the CLI cannot use the same shape.
+pub(crate) fn tick_run_id(now: u64, tick: u64) -> String {
+    format!("run-{now}-{tick}")
+}
+
+/// The id one `alexandria dream` pass writes its audit rows under: `run-cli-<epoch>-<pid>`.
+///
+/// v008 puts **no `ASSERT`** on `maintenance_log.run_id` — it is a plain `option<string>`, so the
+/// only constraints are uniqueness per pass and readability (the pinned engine accepts a
+/// `run-cli-…` row and returns it through the same `?run=` filter `/debug/maintenance` applies —
+/// `a_pass_prints_one_line_per_job_and_ends_with_its_run_id`). The `cli` component is the provenance an operator needs;
+/// `actor` stays `system:dreaming`, because the code path genuinely is the dreaming jobs — the
+/// difference is who pulled the trigger, and that is what the run id is for.
+///
+/// The pid, not a tick counter: a CLI process runs exactly one pass, so a per-process counter would
+/// always read `1` and say nothing, while two invocations landing in the same epoch second are
+/// ordinary (`for j in sweep collapse; do alexandria dream --job $j; done`). The single-writer lock
+/// does not separate those, because it excludes *concurrent* opens, not back-to-back ones.
+pub(crate) fn cli_run_id(now: u64) -> String {
+    format!("run-cli-{now}-{}", std::process::id())
+}
+
 /// Wall clock in whole seconds. The engine stays clock-free so its due-time arithmetic is testable;
 /// this is the one place the process supplies a clock.
 pub(crate) fn now_secs() -> u64 {
@@ -219,7 +244,10 @@ pub(crate) async fn supervise<F, Fut>(
 /// `supervise` is a module-level function: it is generic over the attempt, and putting it inside the
 /// impl would tie a testable policy function to the type it restarts.
 impl Jobs {
-    async fn run_job(&self, job: Job, run_id: &str) -> anyhow::Result<JobReport> {
+    /// Run exactly one job, once, under `run_id`. This is the only entry to the five bodies: the
+    /// scheduler's loop and `alexandria dream` both come through here, so there is no second
+    /// implementation of "run a job now" to keep in step with the first.
+    pub(crate) async fn run_job(&self, job: Job, run_id: &str) -> anyhow::Result<JobReport> {
         match job {
             Job::Sweep => self.run_sweep().await,
             Job::Cluster => self.run_cluster(run_id).await,
@@ -695,7 +723,7 @@ pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
         // One id for the whole tick, shared by every job that runs in it. `run_id` is the unit an
         // operator would reverse, and a tick that split a cluster and then collapsed duplicates into
         // it is one event, not two.
-        let run_id = format!("run-{now}-{tick}");
+        let run_id = tick_run_id(now, tick);
         for job in due {
             match jobs.run_job(job, &run_id).await {
                 Ok(report) => tracing::debug!(

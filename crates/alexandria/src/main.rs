@@ -1,5 +1,6 @@
 mod bench;
 mod config;
+mod dream;
 mod dreaming;
 
 use std::sync::Arc;
@@ -25,9 +26,16 @@ const MAX_PRACTICAL_ESCALATION_HOURS: u64 = 24 * 365 * 10;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    const USAGE: &str =
-        "Usage: alexandria [migrate-embeddings [--force] | bench-retrieval | --help]";
+    const USAGE: &str = "Usage: alexandria [migrate-embeddings [--force] | bench-retrieval \
+                         | dream [--job NAME]... [--max-rows N] | --help]";
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `alexandria dream` takes flags of its own, so it gets the tail of the argument list instead of
+    // a fixed-shape slice pattern like the two subcommands below. Its `--help` is reached through
+    // there, so `dream --help` prints the subcommand's text rather than this one-liner.
+    if args.first().is_some_and(|first| first == "dream") {
+        let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+        return dream::run(&rest).await;
+    }
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [] => {}
         ["migrate-embeddings"] => return migrate_embeddings(false).await,
