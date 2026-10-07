@@ -230,6 +230,11 @@ rather than a tick counter because one process runs exactly one pass, while two 
 invocations can land in the same second (`for j in sweep collapse; do alexandria dream --job $j; done`)
 — the lock excludes concurrent openers, not sequential ones.
 
+The report lines go to stdout, and so does the embedded engine's startup chatter — about two dozen
+`INFO` lines at the default level. `RUST_LOG=error alexandria dream --job sweep` leaves the report
+lines and SurrealDB's own shutdown messages, which is worth knowing when something other than a human
+is reading the output; `grep -E '^(job=|run id )'` selects just the report.
+
 `alexandria dream` does **not** arm access recording; that is a boot step, and a stamp written by a
 one-shot CLI would mean something false. So `appraise` on a store that has never booted this build
 demotes nothing and logs why, which is the fail-closed gate above working rather than the command
