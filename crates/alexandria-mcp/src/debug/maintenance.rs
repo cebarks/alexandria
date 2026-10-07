@@ -8,6 +8,11 @@ use crate::AlexandriaServer;
 #[derive(serde::Deserialize)]
 pub struct Pagination {
     pub page: Option<usize>,
+    /// Narrow the whole page to one scheduler tick (`maintenance_log.run_id`).
+    ///
+    /// An absent or empty value means unfiltered, and is treated as the same question rather than two
+    /// — a `?run=` left blank in the form should not become a filter that matches nothing.
+    pub run: Option<String>,
 }
 
 const PAGE_SIZE: usize = 50;
@@ -67,6 +72,9 @@ struct MaintenanceTemplate {
     summary: String,
     total_pages: usize,
     total: usize,
+    /// The active filter, empty when unfiltered. Rendered both as the form's current value and as the
+    /// thing a clear-link has to remove, so the page cannot show a filter it is not applying.
+    run: String,
 }
 
 pub async fn list(
@@ -76,10 +84,16 @@ pub async fn list(
     // `current_page`, not `page`: the render helper `html::page` is in scope in this module.
     let current_page = params.page.unwrap_or(1).max(1);
     let offset = (current_page - 1) * PAGE_SIZE;
+    // Blank and absent are the same question. A form submitted with the field left empty arrives as
+    // `?run=`, and treating that as a filter would render "0 entries" for a store with thousands.
+    let run = params.run.as_deref().filter(|r| !r.trim().is_empty());
 
     let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
-    let total = cluster_repo.count_maintenance_logs().await.unwrap_or(0);
-    let logs = match cluster_repo.list_maintenance_logs(PAGE_SIZE, offset).await {
+    let total = cluster_repo.count_maintenance_logs(run).await.unwrap_or(0);
+    let logs = match cluster_repo
+        .list_maintenance_logs(PAGE_SIZE, offset, run)
+        .await
+    {
         Ok(l) => l,
         Err(e) => return error_page("maintenance", &e.to_string()),
     };
@@ -117,17 +131,27 @@ pub async fn list(
         .collect();
 
     let total_pages = total.div_ceil(PAGE_SIZE);
+    // The filter has to survive the hop to the next page. `pager` is presentational and takes complete
+    // hrefs, which is exactly why it can: each page owns its own query string, and this one has a
+    // second parameter to carry. Dropping `run` here would show page 2 of the *unfiltered* set under
+    // a heading that still names the filter.
+    let href = |target: usize| page_href(run, target);
     let prev_href = if current_page > 1 {
-        format!("/debug/maintenance?page={}", current_page - 1)
+        href(current_page - 1)
     } else {
         String::new()
     };
     let next_href = if current_page < total_pages {
-        format!("/debug/maintenance?page={}", current_page + 1)
+        href(current_page + 1)
     } else {
         String::new()
     };
-    let summary = format!("Page {current_page} of {total_pages} ({total} entries)");
+    let summary = match run {
+        Some(run) => {
+            format!("Page {current_page} of {total_pages} ({total} entries for run {run})")
+        }
+        None => format!("Page {current_page} of {total_pages} ({total} entries)"),
+    };
 
     page(MaintenanceTemplate {
         nav: "maintenance",
@@ -137,12 +161,43 @@ pub async fn list(
         summary,
         total_pages,
         total,
+        run: run.unwrap_or_default().to_string(),
     })
+}
+
+/// The href for one page of the log, carrying the active run filter.
+///
+/// `pager` is presentational and takes complete hrefs, which is what lets each page own its own query
+/// string — and the price of that design is that a page with a second parameter has to remember to
+/// re-attach it here. Dropping `run` would render page 2 of the *unfiltered* set under a heading that
+/// still names the filter, which is the bug `_pagination.html`'s comment warns about by name.
+fn page_href(run: Option<&str>, target: usize) -> String {
+    match run {
+        Some(run) => format!("/debug/maintenance?run={}&page={}", urlencode(run), target),
+        None => format!("/debug/maintenance?page={target}"),
+    }
+}
+
+/// Percent-encode a run id for a query string.
+///
+/// Run ids are built as `run-{secs}-{tick}` so nothing here is dangerous today, but the value comes
+/// from a query parameter and is echoed back into an href — encoding unconditionally is what keeps
+/// that true if the id format ever grows.
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::MaintenanceTemplate;
+    use super::{MaintenanceTemplate, page_href};
     use askama::Template;
     use axum::body::Body;
     use axum::http::Request;
@@ -228,6 +283,7 @@ mod tests {
             summary: "Page 2 of 3 (101 entries)".to_string(),
             total_pages: 3,
             total: 101,
+            run: String::new(),
         }
         .render()
         .unwrap();
@@ -289,6 +345,7 @@ mod tests {
             summary: String::new(),
             total_pages: 1,
             total: 2,
+            run: String::new(),
         }
         .render()
         .unwrap();
@@ -314,6 +371,7 @@ mod tests {
             summary: "0 entries".into(),
             total_pages: 1,
             total: 0,
+            run: String::new(),
         }
         .render()
         .unwrap();
@@ -389,6 +447,7 @@ mod tests {
             summary: String::new(),
             total_pages: 1,
             total: 3,
+            run: String::new(),
         }
         .render()
         .unwrap();
@@ -432,6 +491,93 @@ mod tests {
         assert!(
             html.contains(r#"<td>raw:doc42</td>"#) && !html.contains(r#"href="/debug/raw/doc42""#),
             "a target with no page for its table renders as text, never as a dead link; got: {html}"
+        );
+    }
+
+    /// The filter must survive the hop to the next page, in the hrefs, the summary and the form.
+    ///
+    /// This is the specific failure mode of a presentational pager: the hrefs are the caller's job, so
+    /// a page that builds them from `?page=` alone silently shows page 2 of the *unfiltered* set under
+    /// a summary that still names the filter — a plausible-looking page of wrong rows, which is worse
+    /// than an obvious break. `_pagination.html` warns about this by name; these are the assertions.
+    #[test]
+    fn the_run_filter_is_carried_across_pagination_and_echoed_in_the_form() {
+        assert_eq!(
+            page_href(Some("run-1759-3"), 2),
+            "/debug/maintenance?run=run-1759-3&page=2"
+        );
+        assert_eq!(page_href(None, 3), "/debug/maintenance?page=3");
+        // The run id came from a query parameter and is echoed into an href, so it is encoded rather
+        // than interpolated.
+        assert_eq!(
+            page_href(Some("a b&c"), 1),
+            "/debug/maintenance?run=a%20b%26c&page=1"
+        );
+
+        let html = MaintenanceTemplate {
+            nav: "maintenance",
+            logs: vec![],
+            prev_href: page_href(Some("run-1759-3"), 2),
+            next_href: page_href(Some("run-1759-3"), 4),
+            summary: "Page 3 of 5 (42 entries for run run-1759-3)".to_string(),
+            total_pages: 5,
+            total: 42,
+            run: "run-1759-3".to_string(),
+        }
+        .render()
+        .unwrap();
+
+        // Askama 0.16 escapes to decimal character references, so the `&` joining the two parameters
+        // renders as `&#38;`. A browser decodes it back; asserting the escaped form is what keeps a
+        // future `|safe` — forbidden by this repo's own rule — from slipping through as a raw `&`.
+        assert!(
+            html.contains(r#"href="/debug/maintenance?run=run-1759-3&#38;page=2""#),
+            "prev must carry the filter; got: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/debug/maintenance?run=run-1759-3&#38;page=4""#),
+            "next must carry the filter; got: {html}"
+        );
+        assert!(
+            html.contains(r#"name="run" value="run-1759-3""#),
+            "the form must show the filter it is applying; got: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/debug/maintenance">clear"#),
+            "a filtered page must offer a way back to unfiltered; got: {html}"
+        );
+        assert!(
+            html.contains("42 entries for run run-1759-3"),
+            "got: {html}"
+        );
+    }
+
+    /// The panel is unauthenticated, and its no-auth argument rests on nothing mutating except the one
+    /// disclosed Query Tester write. A filter form on the maintenance page must therefore be a GET to
+    /// the same route — asserted rather than relied on, because the day it becomes a POST the argument
+    /// in README has to be rewritten.
+    #[test]
+    fn the_filter_form_is_a_get_and_omits_the_clear_link_when_unfiltered() {
+        let html = MaintenanceTemplate {
+            nav: "maintenance",
+            logs: vec![],
+            prev_href: String::new(),
+            next_href: String::new(),
+            summary: "0 entries".into(),
+            total_pages: 1,
+            total: 0,
+            run: String::new(),
+        }
+        .render()
+        .unwrap();
+
+        assert!(
+            html.contains(r#"<form method="get" action="/debug/maintenance">"#),
+            "the maintenance page may not introduce a mutation: {html}"
+        );
+        assert!(
+            !html.contains(">clear<"),
+            "an unfiltered page must not offer to clear a filter that is not set; got: {html}"
         );
     }
 }

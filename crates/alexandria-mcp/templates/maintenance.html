@@ -2,6 +2,12 @@
 {% import "_pagination.html" as p %}
 {% block title %}Maintenance Log{% endblock %}
 {% block body %}<h1>Maintenance Log</h1>
+{# A GET form to this same route: no new path, no mutation, so the read-only posture the unauthenticated panel rests on is unchanged. `run` is the only field and the pager below carries it. `{{ run }}` is escaped by askama at compile time, which is why there is no `|safe` here — the value came from a query parameter. #}
+<form method="get" action="/debug/maintenance">
+<input type="text" name="run" value="{{ run }}" placeholder="run id, e.g. run-1759-3">
+<button type="submit">Filter by run</button>
+{% if run != "" %}<a class="link" href="/debug/maintenance">clear</a>{% endif %}
+</form>
 {# The `{% for %}`/`{% if %}` lines below are deliberately kept on ONE physical line each:
    newlines inside a <td> render as visible whitespace, and the `, ` separator between target
    links must not gain a stray space before </td>. Do not let a formatter reflow them. #}

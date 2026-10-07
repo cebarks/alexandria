@@ -177,8 +177,10 @@ Tester's non-dry `retrieve` run performs spreading activation, so it writes heat
   hairball. The backing JSON is at `/debug/api/graph/{id}`
 - **Maintenance log** (`/debug/maintenance`) — paginated history of the background scheduler's
   writes: cluster splits and merges (source, resulting clusters, members moved), duplicate collapses
-  and cold-memory demotions, each carrying the `run_id` of the tick that wrote it so one pass can be
-  selected — or reversed — as a unit. The only way to audit *why* the corpus changed since you last
+  and cold-memory demotions, each carrying the `run_id` of the tick that wrote it, the job that ran,
+  the disposition and — for a demotion — the confidence it replaced. `?run=` narrows the whole page
+  to one tick, which is how a pass gets reviewed as a unit or reversed as one; the filter is carried
+  across pagination, and the form is a GET to the same route (the panel stays read-only). The only way to audit *why* the corpus changed since you last
   looked. The heat sweep deliberately writes nothing here: it changes ranking by nothing, so an audit
   trail for it would be hundreds of rows an hour recording that nothing happened.
 - **Query Tester** (`/debug/query`, `POST /debug/query/run`) — run `retrieve_memories`/`recall` live

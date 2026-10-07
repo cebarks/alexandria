@@ -340,31 +340,58 @@ impl<'a> ClusterRepo<'a> {
         Ok(())
     }
 
-    /// List all clusters along with their live member counts.
-    /// List maintenance log entries, newest first.
+    /// The WHERE fragment for the maintenance log pages, shared by the list and the count.
+    ///
+    /// One builder for both because the bug this prevents is on the record: `MemoryRepo::count` once
+    /// duplicated `list`'s clause line-for-line while its doc claimed they matched, and the result was
+    /// a debug page whose "N entries" disagreed with the rows under it. A filtered page whose pager
+    /// total came from the unfiltered count is the same defect with a parameter in it.
+    fn maintenance_filter_clause(run: Option<&str>) -> String {
+        match run {
+            // `run_id = $run` cannot be reached by a NULL-style trap: the filter is only emitted when
+            // the caller asked for a run, and an unattributed row simply never matches a run id.
+            Some(_) => "WHERE run_id = $run".to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// List maintenance log entries, newest first, optionally narrowed to one scheduler tick.
+    ///
+    /// `run` is the unit README describes a pass being selected or reversed by, so the page needs it
+    /// to be more than a column you can eyeball: a collapse tick that soft-deleted 40 rows is 40 rows
+    /// to review, and on a busy store they are not near the top of an unfiltered list.
     pub async fn list_maintenance_logs(
         &self,
         limit: usize,
         offset: usize,
+        run: Option<&str>,
     ) -> Result<Vec<crate::models::MaintenanceLog>> {
-        let mut response = self
+        let clause = Self::maintenance_filter_clause(run);
+        let sql = format!(
+            "SELECT * FROM maintenance_log {clause} ORDER BY created_at DESC LIMIT $limit START $offset"
+        );
+        let mut query = self
             .db
-            .query(
-                "SELECT * FROM maintenance_log ORDER BY created_at DESC LIMIT $limit START $offset",
-            )
+            .query(sql)
             .bind(("limit", limit as i64))
-            .bind(("offset", offset as i64))
-            .await?;
+            .bind(("offset", offset as i64));
+        if let Some(run) = run {
+            query = query.bind(("run", run.to_string()));
+        }
+        let mut response = query.await?;
         let logs: Vec<crate::models::MaintenanceLog> = response.take(0)?;
         Ok(logs)
     }
 
-    /// Count total maintenance log entries.
-    pub async fn count_maintenance_logs(&self) -> Result<usize> {
-        let mut response = self
-            .db
-            .query("SELECT count() as total FROM maintenance_log GROUP ALL")
-            .await?;
+    /// Count maintenance log entries, under the same filter as [`Self::list_maintenance_logs`].
+    pub async fn count_maintenance_logs(&self, run: Option<&str>) -> Result<usize> {
+        let clause = Self::maintenance_filter_clause(run);
+        let sql = format!("SELECT count() as total FROM maintenance_log {clause} GROUP ALL");
+        let mut query = self.db.query(sql);
+        if let Some(run) = run {
+            query = query.bind(("run", run.to_string()));
+        }
+        let mut response = query.await?;
         #[derive(serde::Deserialize, SurrealValue)]
         struct CountRow {
             total: i64,
@@ -568,6 +595,87 @@ mod tests {
     ///
     /// Filtering the *verdicts* is this method's job; filtering the *moves* is not, and must not
     /// become it — see `test_hidden_members_survive_a_split_and_a_merge`.
+    /// The run filter exists because a tick that collapses 40 duplicates writes 40 rows, and on a busy
+    /// store they are nowhere near the top of a newest-first list. Asserted against both queries at
+    /// once: the page renders `total` from the count and the rows from the list, and the defect this
+    /// repo already documents for `MemoryRepo::count` is precisely those two disagreeing.
+    #[tokio::test]
+    async fn maintenance_logs_can_be_filtered_to_one_run() {
+        use crate::models::maintenance::{action, disposition, job};
+        use crate::repos::{LogEntry, MaintenanceRepo};
+
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let clusters = ClusterRepo::new(db.inner());
+        let alpha = MaintenanceRepo::with_audit(
+            db.inner(),
+            AuditContext::dreaming("run-alpha", job::COLLAPSE),
+        );
+        let beta = MaintenanceRepo::with_audit(
+            db.inner(),
+            AuditContext::dreaming("run-beta", job::COLLAPSE),
+        );
+
+        for (audit, source) in [(&alpha, "fact:a1"), (&alpha, "fact:a2"), (&beta, "fact:b1")] {
+            audit
+                .record(&LogEntry {
+                    action: action::COLLAPSE.to_string(),
+                    source_id: source.to_string(),
+                    target_ids: vec!["fact:survivor".to_string()],
+                    members_moved: 0,
+                    disposition: Some(disposition::SOFT_DELETE.to_string()),
+                    previous_value: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Positive control: unfiltered, everything is present and the count matches the rows.
+        assert_eq!(
+            clusters
+                .list_maintenance_logs(10, 0, None)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(clusters.count_maintenance_logs(None).await.unwrap(), 3);
+
+        let filtered = clusters
+            .list_maintenance_logs(10, 0, Some("run-alpha"))
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered.len(),
+            2,
+            "the filter must select the whole tick, not one row of it"
+        );
+        assert!(
+            filtered
+                .iter()
+                .all(|row| row.run_id.as_deref() == Some("run-alpha")),
+            "every returned row must belong to the run asked for"
+        );
+        assert_eq!(
+            clusters
+                .count_maintenance_logs(Some("run-alpha"))
+                .await
+                .unwrap(),
+            filtered.len(),
+            "the pager's total must come from the same clause as its rows"
+        );
+
+        // A run nobody wrote is empty rather than an error.
+        assert!(
+            clusters
+                .list_maintenance_logs(10, 0, Some("run-missing"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unknown run must read as no rows, not as every row"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_members_excludes_deleted_and_quarantined() {
         let db = Database::connect_embedded().await.unwrap();
