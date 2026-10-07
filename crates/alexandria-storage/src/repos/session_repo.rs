@@ -268,7 +268,8 @@ impl<'a> SessionRepo<'a> {
         // The `deleted = false` filter must sit *inside* the traversal target's parentheses.
         // `(->contains_session_memory->fact WHERE deleted = false).len()`,
         // `array::len(... WHERE ...)`, `count(... WHERE ...)` and the same with bound
-        // parameters are all parse errors on SurrealDB 3.2:
+        // parameters are all parse errors on the pinned engine (re-checked on 3.3.0, and the same on
+        // 3.2.4):
         //   "Unexpected token `WHERE` expected delimiter `)`"
         let mut response = self
             .db

@@ -9,6 +9,13 @@ ignore = [
     # Marvin Attack timing sidechannel in `rsa` crate — no upstream fix available.
     # Transitive dep via surrealdb -> jsonwebtoken -> rsa. We don't use RSA directly.
     "RUSTSEC-2023-0071",
+    # Two quick-xml 0.39.4 denial-of-service bugs: quadratic duplicate-attribute checking
+    # (RUSTSEC-2026-0194) and unbounded `NsReader` namespace allocation (RUSTSEC-2026-0195).
+    # Transitive via surrealdb-core 3.3 -> object_store 0.13, which surrealdb-core builds with its
+    # cloud backends on and no feature to drop them. Fixed in quick-xml 0.41, which object_store
+    # 0.13 cannot take. We never configure object storage, so that XML parser never runs.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
@@ -37,10 +44,30 @@ confidence-threshold = 0.8
 # We consume it as a library dependency, not as a competing service.
 exceptions = [
     { allow = ["BUSL-1.1"], crate = "surrealdb" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-catalog" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-cnf" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-collections" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-common" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-core" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-datastore" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-engine-api" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-engine-local" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-expr" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-iam" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-idx" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-keyspace-macro" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-kvs" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-kvs-any" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-kvs-mem" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-kvs-surrealkv" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-observe" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-parse-common" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-protocol" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-rpc" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-runtime" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-sql" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-strand" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-syn" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-types" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-types-derive" },
 ]

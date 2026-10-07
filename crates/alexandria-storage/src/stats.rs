@@ -16,8 +16,11 @@ pub struct Stats {
 }
 
 async fn count_table(db: &Surreal<Any>, table: &str, where_clause: &str) -> Result<usize> {
-    // `table` is interpolated verbatim, so reserved-word tables must arrive already
-    // backticked by the caller (see the `session` entry in `gather`).
+    // `table` is interpolated verbatim, so a caller naming a table that *is* a reserved word has to
+    // bring its own backticks. That is a live requirement for a word like `value`; it is not why
+    // `gather` backticks `session`, which is not a reserved word on this engine and parses either
+    // way. Nothing here can demonstrate the interpolation, because no table in this schema needs
+    // quoting — so do not add an assertion claiming to.
     #[derive(serde::Deserialize, surrealdb::types::SurrealValue)]
     struct CountRow {
         count: i64,
@@ -68,8 +71,9 @@ mod tests {
         repo.create("sess-1", None, None).await.unwrap();
         repo.create("sess-2", None, None).await.unwrap();
 
-        // `session` is a SurrealDB reserved word, so this also proves count_table()'s
-        // interpolation path passes the backticked name through unescaped.
+        // `gather` passes `session` backticked and `session` is not a reserved word, so this proves
+        // the count is right — nothing more. It deliberately does not claim to test the quoting, and
+        // an earlier version of this comment said it did.
         let stats = gather(db.inner()).await.unwrap();
         assert_eq!(stats.session_count, 2);
         assert_eq!(stats.fact_count, 0);
