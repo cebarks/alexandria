@@ -176,7 +176,7 @@ impl<'a> SessionRepo<'a> {
             .db
             .query(
                 "SELECT * FROM $sess->contains_session_memory->fact \
-                 WHERE deleted = false ORDER BY created_at ASC",
+                 WHERE deleted = false AND quarantined_at = NONE ORDER BY created_at ASC",
             )
             .bind(("sess", sess))
             .await?;
@@ -201,7 +201,7 @@ impl<'a> SessionRepo<'a> {
         let mut response = self
             .db
             .query(
-                "SELECT *,                  count(->contains_session_memory->(fact WHERE deleted = false)) AS memory_count                  FROM `session`                  WHERE ($agent_id IS NONE OR agent_id = $agent_id)                  AND ($tag IS NONE OR $tag IN tags)                  AND ($finalized IS NONE OR (summary IS NOT NONE) = $finalized)                  ORDER BY started_at DESC LIMIT $limit START $offset",
+                "SELECT *,                  count(->contains_session_memory->(fact WHERE deleted = false AND quarantined_at = NONE)) AS memory_count                  FROM `session`                  WHERE ($agent_id IS NONE OR agent_id = $agent_id)                  AND ($tag IS NONE OR $tag IN tags)                  AND ($finalized IS NONE OR (summary IS NOT NONE) = $finalized)                  ORDER BY started_at DESC LIMIT $limit START $offset",
             )
             .bind(("agent_id", agent_id.map(str::to_string)))
             .bind(("tag", tag.map(str::to_string)))
@@ -275,7 +275,7 @@ impl<'a> SessionRepo<'a> {
             .db
             .query(
                 "SELECT *, \
-                 (->contains_session_memory->(fact WHERE deleted = false)).len() AS memory_count \
+                 (->contains_session_memory->(fact WHERE deleted = false AND quarantined_at = NONE)).len() AS memory_count \
                  FROM `session` \
                  ORDER BY ended_at DESC, external_id ASC LIMIT $limit START $offset",
             )
@@ -941,5 +941,70 @@ mod tests {
         let page = repo.list_filtered(None, None, None, 1, 1).await.unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].external_id, "sess-b");
+    }
+
+    /// The session-scoped path hides quarantine exactly as the unscoped one does, and the
+    /// `memory_count` the session list renders agrees with what `get_memories` returns — the same
+    /// `deleted = false` pairing AGENTS.md records for soft-delete, extended one rung.
+    #[tokio::test]
+    async fn test_get_memories_excludes_quarantined() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = SessionRepo::new(db.inner());
+        let memory_repo = crate::repos::MemoryRepo::new(db.inner());
+
+        let session_id = repo.create("sess-quarantine", None, None).await.unwrap();
+        let keep = memory_repo
+            .create_fact("kept", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let secret = memory_repo
+            .create_fact("quarantined", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        repo.add_memory(&session_id, &keep).await.unwrap();
+        repo.add_memory(&session_id, &secret).await.unwrap();
+
+        let all = repo.get_memories("sess-quarantine").await.unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "positive control: both are linked to start with"
+        );
+
+        db.inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", secret.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let memories = repo.get_memories("sess-quarantine").await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, "kept");
+
+        // The derived count in the same module reads the same traversal, so a quarantined member
+        // must drop out of it too. Queried directly rather than through a repo method, because the
+        // count is a projection of `list` and the assertion is about the SQL, not the plumbing.
+        let mut response = db
+            .inner()
+            .query(
+                "SELECT (->contains_session_memory->(fact WHERE deleted = false \
+                 AND quarantined_at = NONE)).len() AS memory_count FROM type::record($sid)",
+            )
+            .bind(("sid", session_id.clone()))
+            .await
+            .unwrap();
+        #[derive(serde::Deserialize, surrealdb::types::SurrealValue)]
+        struct Row {
+            memory_count: i64,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap();
+        assert_eq!(
+            rows.first().map(|r| r.memory_count),
+            Some(1),
+            "the derived count must hide quarantine exactly as get_memories does"
+        );
     }
 }

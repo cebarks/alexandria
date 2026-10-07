@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -33,14 +34,19 @@ fn tool_json(result: anyhow::Result<String>) -> CallToolResult {
 
 use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
 use alexandria_engine::clusters::{ClusterInfo, assign_to_cluster, update_centroid};
-use alexandria_engine::heat::{ActivationConfig, compute_activation_targets};
+use alexandria_engine::heat::{
+    ActivationConfig, DEFAULT_DECAY_TAU_SECS, DEFAULT_SPACING_REFERENCE_SECS,
+    HeatState as EngineHeatState, compute_activation_targets, on_access,
+};
 use alexandria_engine::recall::{
     ClusterWithMembers, FactSummary, ScopeHandle, broad_recall, focused_recall,
 };
 use alexandria_engine::search::{DEFAULT_MIN_SIMILARITY, rank_by_similarity};
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::Database;
-use alexandria_storage::repos::{ClusterRepo, EdgeRepo, HeatRepo, MemoryRepo, SessionRepo};
+use alexandria_storage::repos::{
+    ClusterRepo, EdgeRepo, HeatRepo, HeatUpdate, MemoryRepo, SessionRepo,
+};
 use chrono::{DateTime, SecondsFormat, Utc, Weekday};
 
 use crate::tools::{
@@ -124,12 +130,58 @@ impl Default for RemindersSettings {
     }
 }
 
+/// Storage row -> engine state. The engine counts seconds since an epoch and storage keeps UTC
+/// datetimes, so the conversion lives where the two crates meet — `alexandria-storage` does not
+/// depend on `alexandria-engine` (by design: storage is DB access, engine is pure algorithms), and
+/// a `From` impl is impossible from here anyway under the orphan rules.
+///
+/// `last_accessed_at` is `NONE` only on rows that predate v008; the decay anchor is then the best
+/// available bound on the true last access. Stated once so no call site re-implements the fallback
+/// differently.
+fn heat_engine_state(row: &alexandria_storage::models::HeatState) -> EngineHeatState {
+    let seconds = |value: Option<DateTime<Utc>>| value.map(|t| t.timestamp().max(0) as u64);
+    let last_touched = seconds(row.last_touched).unwrap_or(0);
+    EngineHeatState {
+        heat: row.heat,
+        stability: row.stability,
+        last_touched,
+        last_accessed_at: seconds(row.last_accessed_at).unwrap_or(last_touched),
+        access_count: row.access_count.max(0) as u64,
+    }
+}
+
+/// The two heat time constants, as configured.
+///
+/// Defaults come from the engine's own constants, so a server built without a config file (debug,
+/// tests) decays exactly as production does at default — the same rule `RemindersSettings` and
+/// `retrieve_min_similarity` follow, and the `min_similarity` 0.10-vs-0.30 drift is what it
+/// prevents. See also `HeatConfig` in the binary crate, whose parity test keeps the two in step.
+#[derive(Debug, Clone, Copy)]
+pub struct HeatSettings {
+    /// Base decay time constant, seconds. `tau = stability * this`; lower cools faster.
+    pub decay_tau_secs: f64,
+    /// Access gap, seconds, at which an access earns full stability growth.
+    pub spacing_reference_secs: f64,
+}
+
+impl Default for HeatSettings {
+    fn default() -> Self {
+        Self {
+            decay_tau_secs: DEFAULT_DECAY_TAU_SECS,
+            spacing_reference_secs: DEFAULT_SPACING_REFERENCE_SECS,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AlexandriaServer {
     pub db: Arc<Database>,
     pub embedding: Arc<dyn EmbeddingProvider>,
     pub cluster_join_threshold: f32,
-    pub heat_spacing_halflife: f64,
+    /// Both heat knobs, as one value. Passed as a struct rather than two adjacent positional
+    /// `f64`s: a transposed pair of same-typed floats is compiler-invisible and would silently
+    /// change how fast memories cool.
+    pub heat: HeatSettings,
     pub activation_config: ActivationConfig,
     pub activation_top_n: usize,
     /// Hard floor on cosine similarity for retrieve_memories results. The
@@ -149,13 +201,13 @@ impl AlexandriaServer {
         db: Arc<Database>,
         embedding: Arc<dyn EmbeddingProvider>,
         cluster_join_threshold: f32,
-        heat_spacing_halflife: f64,
+        heat: HeatSettings,
     ) -> Self {
         Self {
             db,
             embedding,
             cluster_join_threshold,
-            heat_spacing_halflife,
+            heat,
             activation_config: ActivationConfig::default(),
             activation_top_n: 3,
             retrieve_min_similarity: DEFAULT_MIN_SIMILARITY,
@@ -388,8 +440,14 @@ impl ServerHandler for AlexandriaServer {}
 /// something agents could set.
 #[derive(Debug, Clone, Copy)]
 struct RetrieveOptions {
-    /// Fire spreading activation for the kept top-`top_n` results, i.e. write heat.
+    /// Fire spreading activation for the kept top-`top_n` results, i.e. warm neighbours' heat.
     activate: bool,
+    /// Record this retrieval as an access on every row actually returned: reset its heat, grow
+    /// stability by the spacing ratio, and count it. This is the signal `Appraise`'s demote rule
+    /// reads (`access_count = 0` means "no retrieval has ever surfaced this row"), so it is a
+    /// separate flag from `activate` rather than the same one under two names — a caller that
+    /// legitimately suppresses activation must not silently stop counting accesses.
+    record_access: bool,
     /// Drop ranked results below `retrieve_min_similarity`.
     apply_floor: bool,
 }
@@ -624,6 +682,7 @@ impl AlexandriaServer {
             params,
             RetrieveOptions {
                 activate: true,
+                record_access: true,
                 apply_floor: true,
             },
         )
@@ -632,9 +691,10 @@ impl AlexandriaServer {
 
     /// Non-mutating retrieval for the debug UI's dry-run mode.
     ///
-    /// Identical results to [`Self::do_retrieve_memories`] — the only difference is that the
-    /// spreading-activation write is skipped, so a diagnostic query stops perturbing the heat
-    /// that feeds the ranking it is trying to explain.
+    /// Identical results to [`Self::do_retrieve_memories`] — the only difference is that both heat
+    /// writes are skipped: the spreading-activation warm and the access recording. A diagnostic
+    /// query must not perturb the heat it is trying to explain, and an access counted by a dry run
+    /// would make a memory look surfaced-but-never-seen.
     pub async fn do_retrieve_memories_dry(
         &self,
         params: RetrieveMemoriesParams,
@@ -643,6 +703,7 @@ impl AlexandriaServer {
             params,
             RetrieveOptions {
                 activate: false,
+                record_access: false,
                 apply_floor: true,
             },
         )
@@ -651,11 +712,12 @@ impl AlexandriaServer {
 
     /// The ranked window *before* the similarity floor, for the debug Query Tester.
     ///
-    /// Non-mutating (`activate: false`), so unlike [`Self::do_retrieve_memories`] it never warms
-    /// heat — the honest default for a surface that exists to explain a ranking rather than change
-    /// it. Returning the unfiltered window is what lets the tester name the results the floor
-    /// suppressed. Note the window is still only the top `limit` rows: the tool truncates to
-    /// `limit` *before* filtering, so neither path can see anything ranked below that.
+    /// Non-mutating (`activate: false`, `record_access: false`), so unlike
+    /// [`Self::do_retrieve_memories`] it never writes heat at all — the honest default for a surface
+    /// that exists to explain a ranking rather than change it. Returning the unfiltered window is
+    /// what lets the tester name the results the floor suppressed. Note the window is still only
+    /// the top `limit` rows: the tool truncates to `limit` *before* filtering, so neither path can
+    /// see anything ranked below that.
     pub async fn do_retrieve_memories_unfiltered(
         &self,
         params: RetrieveMemoriesParams,
@@ -664,6 +726,7 @@ impl AlexandriaServer {
             params,
             RetrieveOptions {
                 activate: false,
+                record_access: false,
                 apply_floor: false,
             },
         )
@@ -732,11 +795,45 @@ impl AlexandriaServer {
             ranked.retain(|(_, sim)| *sim >= self.retrieve_min_similarity);
         }
 
-        // 4. Trigger spreading activation for top results.
+        // 4. Record the access for every row actually returned.
+        //
+        // Boundary: the rows the caller sees, not the `activation_top_n` seeds and not the wider
+        // candidate window. That is what makes `access_count = 0` mean "no retrieval has ever
+        // surfaced this row" — the strongest available evidence of dead weight, and the field
+        // `Appraise` demotes on. It mirrors the reasoning step 5 documents for activation: touch
+        // what a caller actually saw, never a row they did not.
+        //
+        // This runs BEFORE activation and the order is load-bearing: an access resets heat to 1.0
+        // and activation adds to it, so recording after warming erases the warm on every row that is
+        // both surfaced and an activation seed. `test_wet_run_does_write_heat` and
+        // `test_query_run_retrieve_writes_heat_without_dry_run` caught exactly that on the first
+        // attempt at this code. Reset, then propagate.
+        //
+        // Two round trips regardless of `limit` (one bulk read, one batched write) rather than two
+        // per result, because this path runs on every agent prompt. Failures are logged, never
+        // propagated: housekeeping must not turn a working retrieve into a tool error, but it is not
+        // swallowed the way `add_heat`'s `.ok()` swallows either — a persistent breakage here
+        // silently stops accesses being counted, which is the failure mode this branch exists to fix.
+        if options.record_access {
+            let ids: Vec<String> = ranked
+                .iter()
+                .filter_map(|(idx, _)| facts[*idx].id.as_ref())
+                .map(record_id_to_string)
+                .collect();
+            if let Err(e) = self.record_accesses(&ids).await {
+                tracing::warn!(
+                    "retrieve: could not record accesses for {} results: {e}",
+                    ids.len()
+                );
+            }
+        }
+
+        // 5. Trigger spreading activation for top results.
         //
         // Order matters and is load-bearing (AGENTS.md documents it): this runs after ranking
         // and after the `retrieve_min_similarity` filter dropped the noise, so it warms the
-        // results a caller actually sees — never a row they did not.
+        // results a caller actually sees — never a row they did not. It also runs after the access
+        // reset, so a seeded row's warm lands on top of 1.0 instead of being erased by it.
         //
         // Every `add_heat` it issues is a real database write, which is why the debug UI's
         // dry-run mode passes `activate: false` rather than calling this unconditionally.
@@ -750,8 +847,7 @@ impl AlexandriaServer {
                 }
             }
         }
-
-        // 5. Build results
+        // 6. Build results
         let results: Vec<serde_json::Value> = ranked
             .iter()
             .map(|(idx, sim)| {
@@ -774,6 +870,82 @@ impl AlexandriaServer {
             "results": results,
             "due_reminders": self.due_reminders_summary(DUE_REMINDERS_CAP as usize).await,
         }))
+    }
+
+    /// Materialise "a caller saw these rows" for the retrieve path: read the heat state of every
+    /// returned row in one query, advance it through the engine, and write all of it back in one
+    /// batched query.
+    ///
+    /// A returned row with no `heat_state` yet (an imported chunk, or anything written through
+    /// `MemoryRepo::create_fact`) gets one created at the access values rather than being skipped:
+    /// skipping would leave `access_count` at 0 forever for precisely those rows, and `Appraise`
+    /// reads 0 as "never surfaced".
+    async fn record_accesses(&self, memory_ids: &[String]) -> anyhow::Result<()> {
+        if memory_ids.is_empty() {
+            return Ok(());
+        }
+        let heat_repo = HeatRepo::new(self.db.inner());
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let rows = heat_repo.get_many(memory_ids).await?;
+        let by_memory: HashMap<String, alexandria_storage::models::HeatState> = rows
+            .into_iter()
+            .map(|row| (record_id_to_string(&row.memory), row))
+            .collect();
+
+        // One round trip for the rows that have no heat_state, then one for the accesses. Doing this
+        // per row was correct and read as "two round trips" in the docs, which was true only for a
+        // corpus where every returned row already has a heat row — and memories written through
+        // `create_fact` directly, or predating `do_store_memory`'s heat write, have none. So the
+        // count of statements here is a property of the corpus rather than of the code.
+        let rowless: Vec<&String> = memory_ids
+            .iter()
+            .filter(|id| !by_memory.contains_key(id.as_str()))
+            .collect();
+        heat_repo
+            .create_for_memory_many(
+                rowless
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<&str>>()
+                    .as_slice(),
+            )
+            .await?;
+
+        let mut updates = Vec::with_capacity(memory_ids.len());
+        for id in memory_ids {
+            let mut state = match by_memory.get(id) {
+                Some(row) => heat_engine_state(row),
+                None => {
+                    // Created above, in the batch. Its anchor is this instant: the first sight of a
+                    // brand-new row earns no spacing credit, which is the correct reading rather than
+                    // the accident of `HeatState::new` starting at the epoch.
+                    EngineHeatState {
+                        heat: 1.0,
+                        stability: 1.0,
+                        last_touched: now,
+                        last_accessed_at: now,
+                        access_count: 0,
+                    }
+                }
+            };
+            on_access(&mut state, now, self.heat.spacing_reference_secs);
+            updates.push(HeatUpdate {
+                memory_id: id.clone(),
+                heat: state.heat,
+                stability: state.stability,
+                access_count: state.access_count as i64,
+            });
+        }
+
+        let written = heat_repo.record_access_many(&updates).await?;
+        if written != updates.len() {
+            tracing::warn!(
+                "retrieve: recorded access for {written} of {} rows; the rest lost their \
+                 heat_state between the read and the write",
+                updates.len()
+            );
+        }
+        Ok(())
     }
 
     pub async fn do_recall(&self, params: RecallParams) -> anyhow::Result<String> {
@@ -1814,7 +1986,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         let info = server.get_info();
 
@@ -1836,7 +2013,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         assert_eq!(
             server.retrieve_min_similarity,
@@ -1890,7 +2072,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         let mut advertised: Vec<String> = AlexandriaServer::tool_router()
             .list_all()
@@ -1963,9 +2150,13 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server =
-            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0)
-                .with_retrieve_min_similarity(0.30);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(DirectionalEmbedding),
+            0.75,
+            HeatSettings::default(),
+        )
+        .with_retrieve_min_similarity(0.30);
 
         server
             .do_store_memory(StoreMemoryParams {
@@ -2016,9 +2207,13 @@ mod get_info_tests {
         alexandria_storage::schema::ensure_vector_index(db.inner(), 2)
             .await
             .unwrap();
-        let server =
-            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0)
-                .with_vector_index(true);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(DirectionalEmbedding),
+            0.75,
+            HeatSettings::default(),
+        )
+        .with_vector_index(true);
         for content in ["near one", "near two", "far away"] {
             server
                 .do_store_memory(StoreMemoryParams {
@@ -2088,9 +2283,13 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server =
-            AlexandriaServer::new(Arc::new(db), Arc::new(BoundaryEmbedding), 0.75, 86400.0)
-                .with_retrieve_min_similarity(0.30);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(BoundaryEmbedding),
+            0.75,
+            HeatSettings::default(),
+        )
+        .with_retrieve_min_similarity(0.30);
 
         server
             .do_store_memory(StoreMemoryParams {
@@ -2205,7 +2404,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
         let ids = seed_edge_pair(&server).await;
         (server, ids)
     }
@@ -2304,7 +2508,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         for (sess, agent) in [("sess-l1", "pi"), ("sess-l2", "claude-code")] {
             server
@@ -2368,7 +2577,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         let _kept = server
             .do_store_memory(StoreMemoryParams {
@@ -2425,7 +2639,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         server
             .do_store_memory(StoreMemoryParams {
@@ -2476,7 +2695,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         // Store memories with a session_id — session auto-creates
         let _id1 = server
@@ -2584,8 +2808,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server =
-            AlexandriaServer::new(Arc::new(db), Arc::new(DirectionalEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(DirectionalEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
         server
             .do_store_memory(StoreMemoryParams {
                 content: "a near match memory".to_string(),
@@ -2669,7 +2897,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(TinyLimit), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(TinyLimit),
+            0.75,
+            HeatSettings::default(),
+        );
         let store = async |content: &str| {
             let result = server
                 .store_memory(Parameters(StoreMemoryParams {
@@ -2696,7 +2929,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         let stored = server
             .store_memory(Parameters(StoreMemoryParams {
@@ -2838,7 +3076,12 @@ mod get_info_tests {
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
-        let server = AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0);
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
 
         let result = server
             .update_memory(Parameters(UpdateMemoryParams {
@@ -2882,6 +3125,289 @@ mod get_info_tests {
         assert!(
             msg.contains("Minutes must be less than 59"),
             "must carry the cron crate's reason: {msg}"
+        );
+    }
+
+    // --- retrieve-path access recording (GitHub issue #43) --------------------------------
+
+    /// A migrated in-memory server with the stub embedding. Retrieval tests need the store and the
+    /// read side, not a particular provider.
+    async fn heat_server() -> AlexandriaServer {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        )
+    }
+
+    async fn store_one(server: &AlexandriaServer, content: &str) -> String {
+        server
+            .do_store_memory(StoreMemoryParams {
+                content: content.to_string(),
+                tags: None,
+                session_id: None,
+                agent_id: None,
+                model: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Every heat row in the store. Reading the whole table rather than the row under test is what
+    /// makes the boundary assertions mean something: a leak onto a row nobody saw would otherwise
+    /// be invisible. Ids are formatted with `record_id_to_string` on both sides of every
+    /// comparison, because the storage layer returns `to_sql()` strings and the tool response
+    /// returns `record_id_to_string` ones.
+    async fn all_heat(server: &AlexandriaServer) -> Vec<alexandria_storage::models::HeatState> {
+        let mut response = server
+            .db
+            .inner()
+            .query("SELECT * FROM heat_state")
+            .await
+            .unwrap();
+        response.take(0).unwrap()
+    }
+
+    /// `StubEmbedding` gives every fact the same vector, so which rows survive `limit` is the
+    /// engine's business. The assertions therefore read the returned ids out of the response
+    /// instead of assuming an order.
+    #[tokio::test]
+    async fn retrieve_records_an_access_on_every_returned_row_and_only_those() {
+        let server = heat_server().await;
+        for n in 0..3 {
+            store_one(&server, &format!("candidate row {n}")).await;
+        }
+
+        let out = server
+            .do_retrieve_memories(RetrieveMemoriesParams {
+                query: "candidate row".to_string(),
+                limit: Some(1),
+                session_id: None,
+            })
+            .await
+            .unwrap();
+        let ids: Vec<String> = out["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 1, "limit 1 must return exactly one row");
+
+        let counted: Vec<String> = all_heat(&server)
+            .await
+            .into_iter()
+            .filter(|row| row.access_count == 1)
+            .map(|row| record_id_to_string(&row.memory))
+            .collect();
+        assert_eq!(
+            counted, ids,
+            "exactly the rows the caller saw must be counted, and no others — access_count = 0 is \
+             what Appraise demotes on"
+        );
+        let surfaced = all_heat(&server)
+            .await
+            .into_iter()
+            .find(|row| record_id_to_string(&row.memory) == ids[0])
+            .expect("the returned row has a heat_state");
+        assert_eq!(surfaced.heat, 1.0, "an access resets heat");
+        assert!(surfaced.last_accessed_at.is_some());
+    }
+
+    /// The end-to-end half of the clock split. The decay anchor is left at now (what a swept row
+    /// looks like) while the access stamp is years old, so full spacing credit is only reachable if
+    /// `on_access` reads the stamp. Measuring growth from the anchor instead would leave stability
+    /// at ~1.04 and still pass every other test in this file.
+    #[tokio::test]
+    async fn access_growth_reads_the_access_stamp_not_the_decay_anchor() {
+        let server = heat_server().await;
+        let id = store_one(&server, "spaced repetition growth").await;
+
+        server
+            .db
+            .inner()
+            .query(
+                "UPDATE heat_state SET last_accessed_at = type::datetime('2020-01-01T00:00:00Z') \
+                 WHERE memory = type::record($mid)",
+            )
+            .bind(("mid", id.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        server
+            .do_retrieve_memories(RetrieveMemoriesParams {
+                query: "spaced repetition".to_string(),
+                limit: Some(5),
+                session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let row = HeatRepo::new(server.db.inner())
+            .get(&id)
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(
+            row.stability, 2.0,
+            "a six-year gap must saturate the spacing clamp and add a full 1.0"
+        );
+        assert_eq!(row.access_count, 1);
+    }
+
+    /// The debug UI's read-only claim depends on this, so the dry assertions are paired with a
+    /// positive control on the same fixture: without the second half, "nothing was written" would
+    /// also be satisfied by a server that could not write at all.
+    #[tokio::test]
+    async fn dry_run_writes_no_access_and_the_tool_path_is_the_positive_control() {
+        let server = heat_server().await;
+        let id = store_one(&server, "dry run boundary").await;
+        let heat = HeatRepo::new(server.db.inner());
+        let params = || RetrieveMemoriesParams {
+            query: "dry run".to_string(),
+            limit: Some(5),
+            session_id: None,
+        };
+
+        server.do_retrieve_memories_dry(params()).await.unwrap();
+        let after_dry = heat.get(&id).await.unwrap().expect("row exists");
+        assert_eq!(
+            after_dry.access_count, 0,
+            "a diagnostic query must not count as an access"
+        );
+        assert!(after_dry.last_accessed_at.is_none());
+
+        server.do_retrieve_memories(params()).await.unwrap();
+        let after_tool = heat.get(&id).await.unwrap().expect("row exists");
+        assert_eq!(
+            after_tool.access_count, 1,
+            "positive control: the same row and the same fixture do change on the tool path"
+        );
+        assert!(after_tool.last_accessed_at.is_some());
+    }
+
+    /// Imported chunks and anything written through `MemoryRepo::create_fact` have no `heat_state`
+    /// row. Skipping those would leave `access_count` at 0 forever for exactly the rows that are
+    /// already poorly covered, and `Appraise` reads 0 as "never surfaced".
+    /// A quarantined fact must be unreachable through the tools an agent actually calls, not just
+    /// through the storage queries behind them — hiding it in `knn_sql` while `do_recall` still
+    /// walked cluster members would leak it back. Both retrieval tools are asserted, and the
+    /// positive control is the same fixture before quarantine is set.
+    #[tokio::test]
+    async fn quarantined_facts_are_unreachable_through_retrieve_and_recall() {
+        let server = heat_server().await;
+        let id = store_one(&server, "the api token rotates nightly").await;
+
+        let params = || RetrieveMemoriesParams {
+            query: "api token".to_string(),
+            limit: Some(5),
+            session_id: None,
+        };
+        let before = server.do_retrieve_memories(params()).await.unwrap();
+        assert!(
+            before.to_string().contains(&id),
+            "positive control: the fact is retrievable before quarantine: {before}"
+        );
+
+        server
+            .db
+            .inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", id.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        // Checked as serialized text rather than a parsed shape: `do_retrieve_memories` returns a
+        // `serde_json::Value` and `do_recall` returns a `String`, and the property under test is
+        // "this id does not appear", which does not depend on either envelope.
+        let checks: Vec<(&str, String)> = vec![
+            (
+                "retrieve",
+                server
+                    .do_retrieve_memories(params())
+                    .await
+                    .unwrap()
+                    .to_string(),
+            ),
+            (
+                "dry retrieve",
+                server
+                    .do_retrieve_memories_dry(params())
+                    .await
+                    .unwrap()
+                    .to_string(),
+            ),
+            (
+                "unfiltered retrieve",
+                server
+                    .do_retrieve_memories_unfiltered(params())
+                    .await
+                    .unwrap()
+                    .to_string(),
+            ),
+            (
+                "recall",
+                server
+                    .do_recall(RecallParams {
+                        query: "api token".to_string(),
+                        scope_handle: None,
+                    })
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        for (label, text) in checks {
+            assert!(
+                !text.contains(&id),
+                "{label} must not surface a quarantined fact: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_returned_row_with_no_heat_state_is_created_and_counted() {
+        let server = heat_server().await;
+        let id = MemoryRepo::new(server.db.inner())
+            .create_fact("chunk with no heat row", 0.5, &[0.1_f32, 0.2], &[])
+            .await
+            .unwrap();
+        assert!(
+            HeatRepo::new(server.db.inner())
+                .get(&id)
+                .await
+                .unwrap()
+                .is_none(),
+            "fixture control: this row must start with no heat_state"
+        );
+
+        server
+            .do_retrieve_memories(RetrieveMemoriesParams {
+                query: "chunk".to_string(),
+                limit: Some(5),
+                session_id: None,
+            })
+            .await
+            .unwrap();
+
+        let row = HeatRepo::new(server.db.inner())
+            .get(&id)
+            .await
+            .unwrap()
+            .expect("surfacing the row must create and count it");
+        assert_eq!(row.access_count, 1);
+        assert!(row.last_accessed_at.is_some());
+        assert_eq!(
+            row.stability, 1.0,
+            "a row created at this instant earns no spacing credit"
         );
     }
 }

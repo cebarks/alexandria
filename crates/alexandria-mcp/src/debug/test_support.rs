@@ -28,7 +28,12 @@ pub(super) async fn test_server() -> AlexandriaServer {
     alexandria_storage::schema::migrate(db.inner())
         .await
         .unwrap();
-    AlexandriaServer::new(Arc::new(db), Arc::new(StubEmbedding), 0.75, 86400.0)
+    AlexandriaServer::new(
+        Arc::new(db),
+        Arc::new(StubEmbedding),
+        0.75,
+        crate::server::HeatSettings::default(),
+    )
 }
 
 /// The floor [`banded_server`] runs with.
@@ -90,8 +95,13 @@ pub(super) async fn banded_server() -> AlexandriaServer {
     alexandria_storage::schema::migrate(db.inner())
         .await
         .unwrap();
-    AlexandriaServer::new(Arc::new(db), Arc::new(BandedEmbedding), 0.75, 86400.0)
-        .with_retrieve_min_similarity(BANDED_FLOOR)
+    AlexandriaServer::new(
+        Arc::new(db),
+        Arc::new(BandedEmbedding),
+        0.75,
+        crate::server::HeatSettings::default(),
+    )
+    .with_retrieve_min_similarity(BANDED_FLOOR)
 }
 
 /// The plain average of a set of embeddings — the centroid the cluster detail page *used* to

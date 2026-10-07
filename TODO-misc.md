@@ -4,6 +4,17 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
 
 ## Server
 
+- [ ] **Orphan `heat_state` rows are never deleted.** Nothing removes a heat row when its fact is
+  soft-deleted, so those rows sit at the head of `HeatRepo::page_oldest` for the life of the store and
+  the sweep writes values nobody will read. Sized before deciding: ~39 of 1936 heat rows on a
+  1897-fact store, because `update_memory`'s superseded snapshots come from `create_fact`, which
+  writes no heat row — so most deleted facts never had one. Not worth the join today: filtering the
+  page would trade the plan pinned by `heat_lookups_by_memory_reach_the_index` (a single `IndexScan`
+  carrying the limit) for an unmeasured one to save writes on 2% of rows. Revisit if the orphan
+  fraction grows (a `delete_memory`-heavy workflow would do it) or if `Appraise`'s `skipped` count
+  starts dominating its page; the cleanup is `DELETE heat_state WHERE memory = $id` in
+  `soft_delete_fact`, and the sweep's plan assertion must be re-run afterwards, not assumed.
+
 - [-] **`raw` record carries no session.** `import_document` links the chunks to the session; the
   `raw` document is reachable only via `extracted_from`. `contains_session_memory` is `IN session OUT
   fact`, so linking `raw` needs a new edge table plus a migration, and nothing reads it. Add one if a

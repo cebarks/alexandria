@@ -38,7 +38,23 @@ pub struct DebugContext {
     pub bind_port: u16,
     pub data_dir: String,
     pub cluster_merge_threshold: f32,
-    pub maintenance_interval_secs: u64,
+    /// The whole `[dreaming]` cadence as one line, built by the binary that read the file.
+    ///
+    /// A summary string rather than five numeric fields: the dashboard renders one row per key and
+    /// the five jobs are only meaningful together, so six `DebugContext` fields to display one
+    /// sentence would be plumbing for its own sake. Built in the binary because `DreamingConfig`
+    /// lives there and cannot reach this crate — the same reason `ClusterConfig` values arrive
+    /// pre-flattened.
+    pub dreaming_summary: String,
+    /// The scheduler's heartbeat, shared with the loop that writes it. `None` when
+    /// `[dreaming] enabled = false`, which the dashboard renders as "not running" rather than as
+    /// the no-context `UNAVAILABLE` — "turned off" and "this process cannot tell you" are different
+    /// answers and collapsing them would be a lie.
+    ///
+    /// The type lives in `alexandria-engine` because neither the binary nor this crate can own it:
+    /// `alexandria-mcp` cannot name a type defined in a binary crate, which is the same constraint
+    /// that forces the cadences above to arrive pre-flattened.
+    pub dreaming_liveness: Option<std::sync::Arc<alexandria_engine::dreaming::Liveness>>,
     /// `[server] allowed_hosts`, verbatim.
     ///
     /// The debug UI has no auth, so its only server-side signal that a request is not what it

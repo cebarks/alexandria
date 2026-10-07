@@ -1,6 +1,13 @@
 use std::path::PathBuf;
 
 use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
+use alexandria_engine::dreaming::{
+    DEFAULT_APPRAISE_INTERVAL_SECS, DEFAULT_CLUSTER_INTERVAL_SECS, DEFAULT_COLD_HEAT_FLOOR,
+    DEFAULT_COLLAPSE_INTERVAL_SECS, DEFAULT_DEMOTE_CONFIDENCE_CEILING, DEFAULT_MAX_ROWS_PER_RUN,
+    DEFAULT_MERGE_INTERVAL_SECS, DEFAULT_SWEEP_INTERVAL_SECS, DEMOTED_CONFIDENCE, Intervals,
+};
+use alexandria_engine::heat::DEFAULT_DECAY_TAU_SECS;
+use alexandria_engine::heat::DEFAULT_SPACING_REFERENCE_SECS;
 use alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS;
 use alexandria_engine::search::DEFAULT_MIN_SIMILARITY;
 use serde::Deserialize;
@@ -21,6 +28,7 @@ pub struct Config {
     pub heat: HeatConfig,
     pub activation: ActivationConfig,
     pub cluster: ClusterConfig,
+    pub dreaming: DreamingConfig,
     pub retrieve: RetrieveConfig,
     pub reminders: RemindersConfig,
 }
@@ -85,8 +93,12 @@ pub struct EmbeddingConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct HeatConfig {
-    /// Base half-life for spaced repetition (seconds). Default 1 day.
-    pub spacing_halflife_secs: f64,
+    /// Base decay time constant (seconds). `tau = stability * this`; lower cools faster.
+    /// Default 1 day, matching the value `projected_heat` used before it was configurable.
+    pub decay_tau_secs: f64,
+    /// Access gap (seconds) at which one access earns full stability growth; a shorter gap earns
+    /// a proportional fraction. Lower means stability accrues from less widely spaced accesses.
+    pub spacing_reference_secs: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,8 +140,6 @@ pub struct ClusterConfig {
     /// Avg member-to-centroid similarity below which a cluster splits. Defaults to
     /// `DEFAULT_COHESION_FLOOR` in `alexandria_engine::clusters::maintenance`.
     pub cohesion_floor: f32,
-    /// Cluster maintenance check interval in seconds. Default: 300 (5 minutes).
-    pub maintenance_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,7 +191,8 @@ impl Default for EmbeddingConfig {
 impl Default for HeatConfig {
     fn default() -> Self {
         Self {
-            spacing_halflife_secs: 86400.0,
+            decay_tau_secs: DEFAULT_DECAY_TAU_SECS,
+            spacing_reference_secs: DEFAULT_SPACING_REFERENCE_SECS,
         }
     }
 }
@@ -210,8 +221,95 @@ impl Default for ClusterConfig {
             join_threshold: 0.75,
             merge_threshold: 0.9,
             cohesion_floor: DEFAULT_COHESION_FLOOR,
-            maintenance_interval_secs: 300,
         }
+    }
+}
+
+/// Background housekeeping: one scheduler, five independently-due jobs. HTTP mode only, same as the
+/// cluster maintenance loop it replaces — stdio has no long-lived process to run a clock in.
+///
+/// Every interval defaults to a constant in `alexandria_engine::dreaming` rather than to a literal
+/// here, because the same numbers bound the scheduler's due-time tests. Two homes for one default
+/// is how `min_similarity` ended up drifting between config and server.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DreamingConfig {
+    /// Master switch. `false` means the loop is never spawned, so no job writes anything.
+    pub enabled: bool,
+    /// Heat materialisation. Default 3600 (1 hour).
+    pub sweep_interval_secs: u64,
+    /// Cohesion check → split. Default 300 (5 minutes), the old cluster-maintenance cadence.
+    pub cluster_interval_secs: u64,
+    /// Centroid similarity → merge. Default 300. Split from `cluster` because merge is the
+    /// expensive half and an operator who wants it rarer should not pay for slower splits.
+    pub merge_interval_secs: u64,
+    /// Byte-identical duplicate collapse. Default 86400 (1 day).
+    pub collapse_interval_secs: u64,
+    /// Cold-row demotion. Default 86400 (1 day).
+    pub appraise_interval_secs: u64,
+    /// Rows one job may **write** per run. Default 500.
+    ///
+    /// Two of the five jobs read more than this and must, so the bound is on the writes and not on
+    /// the reads: `collapse` needs every live fact's content before it can group duplicates at all,
+    /// and `appraise` reads every live fact's confidence and store time even though it pages only
+    /// this many heat rows. `JobReport::examined` reports what was read, so on an N-fact corpus
+    /// collapse says `examined: N` while acting on at most this many rows — which is the honest
+    /// shape, and the reason the key does not say what a corpus drains per tick.
+    pub max_rows_per_run: usize,
+    /// Projected heat at or below which a memory counts as cold. Default
+    /// [`DEFAULT_COLD_HEAT_FLOOR`]. PROVISIONAL — see that constant.
+    pub cold_heat_floor: f64,
+    /// Stored confidence at or below which a cold, never-accessed memory is demotable. Default
+    /// [`DEFAULT_DEMOTE_CONFIDENCE_CEILING`]. PROVISIONAL — see that constant.
+    pub demote_confidence_ceiling: f64,
+}
+
+impl Default for DreamingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sweep_interval_secs: DEFAULT_SWEEP_INTERVAL_SECS,
+            cluster_interval_secs: DEFAULT_CLUSTER_INTERVAL_SECS,
+            merge_interval_secs: DEFAULT_MERGE_INTERVAL_SECS,
+            collapse_interval_secs: DEFAULT_COLLAPSE_INTERVAL_SECS,
+            appraise_interval_secs: DEFAULT_APPRAISE_INTERVAL_SECS,
+            max_rows_per_run: DEFAULT_MAX_ROWS_PER_RUN,
+            cold_heat_floor: DEFAULT_COLD_HEAT_FLOOR,
+            demote_confidence_ceiling: DEFAULT_DEMOTE_CONFIDENCE_CEILING,
+        }
+    }
+}
+
+impl DreamingConfig {
+    /// The cadences in the shape the engine's scheduler wants.
+    pub fn intervals(&self) -> Intervals {
+        Intervals {
+            sweep_secs: self.sweep_interval_secs,
+            cluster_secs: self.cluster_interval_secs,
+            merge_secs: self.merge_interval_secs,
+            collapse_secs: self.collapse_interval_secs,
+            appraise_secs: self.appraise_interval_secs,
+        }
+    }
+
+    /// Every non-zero interval, paired with the key name an operator would edit. A zero interval
+    /// means "due on every tick" in the engine, which turns a daily pass into a hot loop, so the
+    /// binary refuses to start on one — the same posture as the escalation-window check in
+    /// `main.rs`, which refuses a window too large to represent.
+    pub fn interval_keys(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("dreaming.sweep_interval_secs", self.sweep_interval_secs),
+            ("dreaming.cluster_interval_secs", self.cluster_interval_secs),
+            ("dreaming.merge_interval_secs", self.merge_interval_secs),
+            (
+                "dreaming.collapse_interval_secs",
+                self.collapse_interval_secs,
+            ),
+            (
+                "dreaming.appraise_interval_secs",
+                self.appraise_interval_secs,
+            ),
+        ]
     }
 }
 
@@ -262,6 +360,45 @@ fn config_path_from(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
     xdg_path
 }
 
+/// Warnings for keys a config file still sets that this release removed.
+///
+/// Kept as a pure function over the parsed TOML rather than an inline `tracing::warn!` in the
+/// loader: `main.rs`'s closure and the file-reading path are both unreachable from a test without
+/// module mocking, and this warning is the only migration signal an operator gets.
+pub(crate) fn removed_key_warnings(raw: &toml::Value) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+
+    if raw
+        .get("heat")
+        .and_then(|heat| heat.get("spacing_halflife_secs"))
+        .is_some()
+    {
+        warnings.push(
+            "[heat] spacing_halflife_secs was removed: it named a half-life but was used as the \
+             spacing denominator, and its documented direction was the reverse of the behaviour. \
+             Set [heat] decay_tau_secs (base decay time constant; lower cools faster) and/or \
+             [heat] spacing_reference_secs (access gap earning full stability growth; lower means \
+             shorter gaps earn full credit) instead.",
+        );
+    }
+
+    if raw
+        .get("cluster")
+        .and_then(|cluster| cluster.get("maintenance_interval_secs"))
+        .is_some()
+    {
+        warnings.push(
+            "[cluster] maintenance_interval_secs was removed: cluster maintenance is no longer one \
+             loop with one cadence, it is two of the five dreaming jobs. Set \
+             dreaming.cluster_interval_secs (cohesion check, splits) and/or \
+             dreaming.merge_interval_secs (centroid similarity, merges) instead, and \
+             dreaming.enabled = false if you want the background work off.",
+        );
+    }
+
+    warnings
+}
+
 impl Config {
     /// Load configuration with the standard precedence chain:
     /// defaults → config file → env overrides
@@ -280,7 +417,16 @@ impl Config {
 
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
-            config = toml::from_str(&contents)?;
+            // Parse generically first: deserialising straight into `Config` lets
+            // `#[serde(default)]` drop a removed key in silence, which is the wrong failure mode
+            // for a breaking change — the operator's tuned value stops applying and nothing says
+            // so. The warning names the replacements, so grepping the service log for the old key
+            // finds the migration path.
+            let raw: toml::Value = toml::from_str(&contents)?;
+            for warning in removed_key_warnings(&raw) {
+                tracing::warn!("{warning}");
+            }
+            config = raw.try_into()?;
             tracing::info!("Loaded config from {}", config_path.display());
         }
 
@@ -333,6 +479,62 @@ impl Config {
             (3..=512).contains(&config.embedding.max_tokens),
             "embedding.max_tokens must be between 3 and 512"
         );
+        // The scheduler's own arithmetic treats a zero interval as "due on every tick", so a typo
+        // here would turn a daily pass into a hot loop that never sleeps. Refusing to start says
+        // which key is wrong instead of burning a core.
+        for (key, interval) in config.dreaming.interval_keys() {
+            anyhow::ensure!(
+                interval > 0,
+                "{key} must be greater than 0 (a zero interval makes the job due on every tick). \
+                 Set dreaming.enabled = false to turn the scheduler off instead."
+            );
+        }
+        anyhow::ensure!(
+            config.dreaming.max_rows_per_run > 0,
+            "dreaming.max_rows_per_run must be greater than 0, or every job examines nothing and \
+             reports success"
+        );
+        anyhow::ensure!(
+            config.dreaming.demote_confidence_ceiling > DEMOTED_CONFIDENCE,
+            "dreaming.demote_confidence_ceiling must be above {DEMOTED_CONFIDENCE}, the value a \
+             demoted memory is written at, or appraise can never demote anything"
+        );
+        // The tuning values the intervals' zero-guard does not cover, and they need it more: each one
+        // silently inverts a job rather than stopping it. `projected_heat` uses
+        // `tau = stability * decay_tau_secs`, so a zero tau projects *every* row to heat 0, which
+        // makes `is_cold` true corpus-wide — that is the mass-demotion vector the arming gate exists
+        // to close, reopened by a typo in a different key. A floor of 0 disables appraise with no
+        // signal and a floor of 1.0 or more makes everything cold; a zero spacing reference makes the
+        // denominator in `on_access` either infinite or a division by zero. Refusing by name is the
+        // same posture as the escalation-window check in `main.rs`.
+        anyhow::ensure!(
+            config.heat.decay_tau_secs.is_finite() && config.heat.decay_tau_secs > 0.0,
+            "heat.decay_tau_secs must be a positive number of seconds; zero projects every memory to \
+             heat 0, which makes appraise treat the whole corpus as cold"
+        );
+        anyhow::ensure!(
+            config.heat.spacing_reference_secs.is_finite()
+                && config.heat.spacing_reference_secs > 0.0,
+            "heat.spacing_reference_secs must be a positive number of seconds; it is the denominator \
+             `on_access` grows stability with, and 0 stops stability growing at all"
+        );
+        anyhow::ensure!(
+            config.dreaming.cold_heat_floor.is_finite()
+                && config.dreaming.cold_heat_floor > 0.0
+                && config.dreaming.cold_heat_floor < 1.0,
+            "dreaming.cold_heat_floor must be strictly between 0 and 1 (a fraction of the 1.0 a fresh \
+             access writes); 0 disables appraise and 1.0 or more makes every memory cold"
+        );
+        // An interval so large the job never runs is the mirror image of a zero interval, and just as
+        // likely to be a unit mistake (milliseconds written into a seconds field, or the reverse).
+        const MAX_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
+        for (key, interval) in config.dreaming.interval_keys() {
+            anyhow::ensure!(
+                interval <= MAX_INTERVAL_SECS,
+                "{key} must be at most {MAX_INTERVAL_SECS} (one year); a larger value means the job \
+                 never runs, which is the same outcome as turning the scheduler off"
+            );
+        }
 
         Ok(config)
     }
@@ -392,6 +594,16 @@ mod tests {
             RemindersConfig::default().escalation_hours,
             alexandria_mcp::server::DEFAULT_REMINDER_ESCALATION_HOURS
         );
+        // And for heat: the binary's `[heat]` defaults and the MCP server's construction
+        // fallback are in different crates, so a change to one alone makes a test-built or
+        // debug server cool memories on a different clock than production — with nothing failing.
+        let heat = HeatConfig::default();
+        let server_heat = alexandria_mcp::server::HeatSettings::default();
+        assert_eq!(heat.decay_tau_secs, server_heat.decay_tau_secs);
+        assert_eq!(
+            heat.spacing_reference_secs,
+            server_heat.spacing_reference_secs
+        );
     }
 
     #[test]
@@ -419,7 +631,238 @@ mod tests {
         assert_eq!(config.cluster.join_threshold, 0.8);
         assert_eq!(config.cluster.merge_threshold, 0.95);
         // Heat uses default since not specified
-        assert_eq!(config.heat.spacing_halflife_secs, 86400.0);
+        assert_eq!(config.heat.decay_tau_secs, 86400.0);
+        assert_eq!(config.heat.spacing_reference_secs, 86400.0);
+    }
+
+    /// The engine constants are the single home for these defaults. A config default that
+    /// drifted would make a test-built server decay differently from production — the
+    /// `min_similarity` 0.10-vs-0.30 lesson, re-armed for `[heat]`.
+    #[test]
+    fn heat_config_defaults_match_engine_defaults() {
+        let defaults = HeatConfig::default();
+        assert_eq!(defaults.decay_tau_secs, DEFAULT_DECAY_TAU_SECS);
+        assert_eq!(
+            defaults.spacing_reference_secs,
+            DEFAULT_SPACING_REFERENCE_SECS
+        );
+    }
+
+    /// `#[serde(default)]` would otherwise swallow the removed key and the operator's tuned value
+    /// would stop applying with no signal at all.
+    #[test]
+    fn a_config_using_the_removed_heat_key_is_warned_about() {
+        let raw: toml::Value =
+            toml::from_str("[heat]\nspacing_halflife_secs = 3600.0\n").expect("valid toml");
+        let warnings = removed_key_warnings(&raw);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        for needle in [
+            "spacing_halflife_secs",
+            "decay_tau_secs",
+            "spacing_reference_secs",
+        ] {
+            assert!(
+                warnings[0].contains(needle),
+                "warning must name {needle} so an operator grepping the log for either the old \
+                 key or a replacement finds the migration path"
+            );
+        }
+    }
+
+    #[test]
+    fn current_heat_keys_produce_no_warning() {
+        let raw: toml::Value =
+            toml::from_str("[heat]\ndecay_tau_secs = 3600.0\nspacing_reference_secs = 7200.0\n")
+                .expect("valid toml");
+        assert!(removed_key_warnings(&raw).is_empty());
+    }
+
+    /// `cluster.maintenance_interval_secs` moved rather than vanished: one loop with one cadence
+    /// became two of the five dreaming jobs. `#[serde(default)]` would swallow the old key, so the
+    /// warning has to name both replacements — an operator who tuned 600 needs to know which of the
+    /// two it fed.
+    #[test]
+    fn a_config_using_the_removed_cluster_interval_key_is_warned_about() {
+        let raw: toml::Value =
+            toml::from_str("[cluster]\nmaintenance_interval_secs = 600\n").expect("valid toml");
+        let warnings = removed_key_warnings(&raw);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        for needle in [
+            "maintenance_interval_secs",
+            "dreaming.cluster_interval_secs",
+            "dreaming.merge_interval_secs",
+            "dreaming.enabled",
+        ] {
+            assert!(
+                warnings[0].contains(needle),
+                "warning must name {needle} so an operator grepping the log for either the old \
+                 key or a replacement finds the migration path"
+            );
+        }
+    }
+
+    #[test]
+    fn current_dreaming_keys_produce_no_warning() {
+        let raw: toml::Value = toml::from_str(
+            "[dreaming]\nenabled = true\ncluster_interval_secs = 600\nmerge_interval_secs = 900\n",
+        )
+        .expect("valid toml");
+        assert!(removed_key_warnings(&raw).is_empty(), "{:?}", raw);
+    }
+
+    /// Same drift guard as the heat and reminders ones above: the binary's defaults must be the
+    /// engine's constants, because those constants are what the scheduler's due-time tests pin.
+    #[test]
+    fn test_dreaming_defaults_derive_from_engine_constants() {
+        let defaults = DreamingConfig::default();
+        assert!(defaults.enabled, "the scheduler is on by default");
+        assert_eq!(defaults.sweep_interval_secs, DEFAULT_SWEEP_INTERVAL_SECS);
+        assert_eq!(
+            defaults.cluster_interval_secs,
+            DEFAULT_CLUSTER_INTERVAL_SECS
+        );
+        assert_eq!(defaults.merge_interval_secs, DEFAULT_MERGE_INTERVAL_SECS);
+        assert_eq!(
+            defaults.collapse_interval_secs,
+            DEFAULT_COLLAPSE_INTERVAL_SECS
+        );
+        assert_eq!(
+            defaults.appraise_interval_secs,
+            DEFAULT_APPRAISE_INTERVAL_SECS
+        );
+        assert_eq!(defaults.max_rows_per_run, DEFAULT_MAX_ROWS_PER_RUN);
+        assert_eq!(defaults.cold_heat_floor, DEFAULT_COLD_HEAT_FLOOR);
+        assert_eq!(
+            defaults.demote_confidence_ceiling,
+            DEFAULT_DEMOTE_CONFIDENCE_CEILING
+        );
+
+        let intervals = defaults.intervals();
+        assert_eq!(intervals, Intervals::default());
+        assert_eq!(
+            intervals.interval_for(alexandria_engine::dreaming::Job::Collapse),
+            DEFAULT_COLLAPSE_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn test_dreaming_toml_overrides_intervals() {
+        let path =
+            std::env::temp_dir().join(format!("alexandria-dream-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[dreaming]\nenabled = false\nsweep_interval_secs = 60\nmax_rows_per_run = 25\n",
+        )
+        .unwrap();
+        let config =
+            Config::load_from(&env(&[("ALEXANDRIA_CONFIG", path.to_str().unwrap())])).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(!config.dreaming.enabled);
+        assert_eq!(config.dreaming.sweep_interval_secs, 60);
+        assert_eq!(config.dreaming.max_rows_per_run, 25);
+        assert_eq!(
+            config.dreaming.collapse_interval_secs, DEFAULT_COLLAPSE_INTERVAL_SECS,
+            "keys the operator left alone keep their defaults"
+        );
+    }
+
+    /// A zero interval means "due on every tick" in the engine, so a typo turns a daily pass into a
+    /// hot loop. Refusing to start names the key instead of burning a core.
+    #[test]
+    fn test_dreaming_toml_zero_interval_refuses_to_start() {
+        for (key, needle) in [
+            ("sweep_interval_secs", "dreaming.sweep_interval_secs"),
+            ("cluster_interval_secs", "dreaming.cluster_interval_secs"),
+            ("merge_interval_secs", "dreaming.merge_interval_secs"),
+            ("collapse_interval_secs", "dreaming.collapse_interval_secs"),
+            ("appraise_interval_secs", "dreaming.appraise_interval_secs"),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "alexandria-dream0-{}-{key}.toml",
+                std::process::id()
+            ));
+            std::fs::write(&path, format!("[dreaming]\n{key} = 0\n")).unwrap();
+            let err = Config::load_from(&env(&[("ALEXANDRIA_CONFIG", path.to_str().unwrap())]))
+                .unwrap_err();
+            std::fs::remove_file(&path).unwrap();
+            assert!(
+                err.to_string().contains(needle),
+                "{key} must be refused by name: {err}"
+            );
+            assert!(
+                err.to_string().contains("dreaming.enabled"),
+                "the refusal must name the supported way to turn the scheduler off: {err}"
+            );
+        }
+    }
+
+    /// The mirror image of the zero-interval refusal: every tuning key the scheduler reads must be
+    /// refused when it would silently invert a job instead of stopping it. Each case here is a value
+    /// that loads cleanly, boots, and then makes `Appraise` treat the whole corpus as cold (or do
+    /// nothing forever) with no line of output to say so.
+    #[test]
+    fn test_dreaming_toml_inverted_tuning_values_refuse_to_start() {
+        for (toml, needle) in [
+            ("[heat]\ndecay_tau_secs = 0.0\n", "heat.decay_tau_secs"),
+            ("[heat]\ndecay_tau_secs = -1.0\n", "heat.decay_tau_secs"),
+            (
+                "[heat]\nspacing_reference_secs = 0.0\n",
+                "heat.spacing_reference_secs",
+            ),
+            (
+                "[dreaming]\ncold_heat_floor = 0.0\n",
+                "dreaming.cold_heat_floor",
+            ),
+            (
+                "[dreaming]\ncold_heat_floor = 1.0\n",
+                "dreaming.cold_heat_floor",
+            ),
+            (
+                "[dreaming]\nappraise_interval_secs = 40000000000\n",
+                "dreaming.appraise_interval_secs",
+            ),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "alexandria-tuning-{}-{}.toml",
+                std::process::id(),
+                needle.replace(['.', '_'], "-")
+            ));
+            std::fs::write(&path, toml).unwrap();
+            let err = Config::load_from(&env(&[("ALEXANDRIA_CONFIG", path.to_str().unwrap())]))
+                .unwrap_err();
+            std::fs::remove_file(&path).unwrap();
+            assert!(
+                err.to_string().contains(needle),
+                "{toml} must be refused by naming the key the operator would edit; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dreaming_toml_zero_max_rows_refuses_to_start() {
+        let path =
+            std::env::temp_dir().join(format!("alexandria-rows0-{}.toml", std::process::id()));
+        std::fs::write(&path, "[dreaming]\nmax_rows_per_run = 0\n").unwrap();
+        let err =
+            Config::load_from(&env(&[("ALEXANDRIA_CONFIG", path.to_str().unwrap())])).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.to_string().contains("max_rows_per_run"), "{err}");
+    }
+
+    /// A ceiling at or below the value demoted memories are written at makes the predicate
+    /// unsatisfiable, so `appraise` would run forever and demote nothing.
+    #[test]
+    fn test_dreaming_demote_ceiling_below_the_demoted_value_refuses_to_start() {
+        let path =
+            std::env::temp_dir().join(format!("alexandria-ceil-{}.toml", std::process::id()));
+        std::fs::write(&path, "[dreaming]\ndemote_confidence_ceiling = 0.1\n").unwrap();
+        let err =
+            Config::load_from(&env(&[("ALEXANDRIA_CONFIG", path.to_str().unwrap())])).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            err.to_string().contains("demote_confidence_ceiling"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -482,7 +925,10 @@ mod tests {
     fn test_new_config_defaults() {
         let config = Config::default();
         assert_eq!(config.server.sse_keep_alive_secs, 15);
-        assert_eq!(config.cluster.maintenance_interval_secs, 300);
+        assert_eq!(
+            config.dreaming.cluster_interval_secs, DEFAULT_CLUSTER_INTERVAL_SECS,
+            "the cadence the old cluster.maintenance_interval_secs controlled"
+        );
         assert_eq!(config.activation.top_n, 3);
     }
 
@@ -492,15 +938,15 @@ mod tests {
             [server]
             sse_keep_alive_secs = 30
 
-            [cluster]
-            maintenance_interval_secs = 600
+            [dreaming]
+            cluster_interval_secs = 600
 
             [activation]
             top_n = 5
         "#;
         let config = Config::from_toml(toml).unwrap();
         assert_eq!(config.server.sse_keep_alive_secs, 30);
-        assert_eq!(config.cluster.maintenance_interval_secs, 600);
+        assert_eq!(config.dreaming.cluster_interval_secs, 600);
         assert_eq!(config.activation.top_n, 5);
         // retrieve uses default since not specified
         assert_eq!(config.retrieve.min_similarity, 0.10);

@@ -1,6 +1,6 @@
 # Roadmap
 
-**Current state:** 13 MCP tools, schema `v007`, HTTP + stdio + Docker deployment, one
+**Current state:** 13 MCP tools, schema `v008`, HTTP + stdio + Docker deployment, one
 crate per layer and two client-side pi integrations under `contrib/pi/`.
 
 ## Completed
@@ -166,6 +166,54 @@ look like that?" — and made the foundation scale past hand-built strings:
   separate jobs and does not call `just ci`, so a justfile-only gate would never have reached it
 - 223 tests
 
+### v0.2.8 — Dreaming: one scheduler, five housekeeping jobs (2026-10-02)
+
+Issue #43. Background work used to be one `tokio::spawn` with one interval covering two cluster
+phases; it is now one loop with five independently-due jobs, each carrying its own cadence and
+last-run stamp, so one failing or running long affects only itself. A process down for three
+intervals catches up with one run per job, not three.
+
+- **The five jobs** (`crates/alexandria/src/dreaming.rs`, HTTP mode only): `sweep` materialises
+  decayed heat hourly; `cluster` checks cohesion and splits; `merge` compares centroids and merges;
+  `collapse` folds byte-identical duplicates daily; `appraise` demotes memories that have gone cold without being retrieved since access recording was armed, daily, and leaves anything older than that stamp alone.
+  Config is `[dreaming]`; `cluster.maintenance_interval_secs` is **removed**, and a config still
+  setting it warns at boot naming both replacements
+- **Heat is finally wired to retrieval** (audit finding A2, resolved in the "wire" direction): every
+  row `retrieve_memories` returns records an access, so `access_count` and `stability` move. One
+  bulk read plus one batched write per retrieval, issued after the response is built — measured ~2ms
+  on a 1000-row corpus and flat in corpus size, because `heat_state.memory` is now indexed. Without
+  that index the same batch cost 122ms at 1000 rows: a full table scan per statement, on the path
+  every agent prompt takes
+- **Two clocks, not one** (`heat_state.last_accessed_at`, v008): `last_touched` anchors the decay of
+  the stored value and moves on every materialisation; `last_accessed_at` is the spacing reference
+  and moves only on a real access. Sharing one field made an hourly sweep the spacing reference,
+  capping the ratio at ~0.042 and under-growing stability roughly 24x
+- `[heat] spacing_halflife_secs` is **removed** and split into `decay_tau_secs` and
+  `spacing_reference_secs` (#36): the old key named a half-life while being used as a spacing
+  denominator, and documented the opposite direction from the code
+- **Quarantine** (`fact.quarantined_at`, v008) is the middle rung of a demote → quarantine →
+  soft-delete ladder: hidden from every live read path, still inspectable by an operator, reversible.
+  Nothing writes it yet — #29's secret scanning is the first producer. Nine read paths filter on it,
+  and the predicate must be `= NONE`, because on this engine both `IS NOT NULL` and `!= NULL` are
+  satisfied by `NONE` and filter nothing
+- **Audit**: `maintenance_log` gained `run_id`, `job`, `actor` and `disposition` (v008). Collapse and
+  demote write rows, and splits and merges now carry the run id too, because a split moves members
+  between clusters and is the most destructive thing any job does. One `run_id` per tick is the unit
+  an operator would reverse. `sweep` deliberately writes none: it is a proven no-op on ranking, so an
+  audit trail for it would be hundreds of rows an hour recording that nothing happened
+- `ClusterRepo::get_members` now excludes deleted and quarantined facts, mirroring the filter
+  `SessionRepo::get_memories` already had — soft-deleted duplicates were contaminating cohesion
+- Schema head is `v008`. Due-time arithmetic and both job predicates live in
+  `alexandria_engine::dreaming`, pure and clock-free, because the binary crate cannot
+  integration-test its own modules
+- Storage additions: `HeatRepo::record_access`/`materialize_heat` and their batched forms
+  (`get_many`, `record_access_many`, `materialize_heat_many`, `page_oldest`), `MaintenanceRepo`,
+  `MemoryRepo::collapse_candidates`/`live_confidences`
+- `MemoryRepo::list` and `count` now share one WHERE-clause builder; `count` used to duplicate
+  `list`'s condition assembly line-for-line while its doc comment claimed they matched
+- No new MCP tools
+- 468 tests
+
 ## Planned
 
 ### v0.2.x — Known Gaps From Shipped Work
@@ -243,7 +291,8 @@ The goal: memories should organize themselves without manual curation.
 - ~~SurrealDB vector index for DB-side cosine similarity~~ Done 2026-09-18 (HNSW, defined at boot, queried with `<|k,ef|>`; the 2026-09-09 version defined the index but never queried it)
 - ~~Full-text search index for keyword matching alongside semantic search~~ Measured 2026-09-10 and dropped: RRF with BM25 made the bench worse and MiniLM already finds identifiers (`docs/minilm-test-data.md`, "Lexical search")
 - Cluster heat caching with TTL
-- Bulk heat maintenance sweep for untouched records
+- ~~Bulk heat maintenance sweep for untouched records~~ Done 2026-10-02 (the `sweep` job, paged by
+  `max_rows_per_run` and draining across ticks)
 
 **Operational**
 

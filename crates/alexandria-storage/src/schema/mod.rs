@@ -26,6 +26,7 @@ pub const MIGRATIONS: &[(u32, &str, &str)] = &[
         include_str!("v006_drop_session_memory_count.surql"),
     ),
     (7, "reminder", include_str!("v007_reminder.surql")),
+    (8, "dreaming", include_str!("v008_dreaming.surql")),
 ];
 
 /// Version a fully migrated database reports in `system_config.schema_version`.
@@ -210,7 +211,7 @@ mod tests {
         ensure_vector_index(db, 2).await.unwrap();
 
         let rows: Vec<crate::models::Fact> = db
-            .query("SELECT * FROM fact WHERE deleted = false AND embedding <|1,COSINE|> $q")
+            .query("SELECT * FROM fact WHERE deleted = false AND quarantined_at = NONE AND embedding <|1,COSINE|> $q")
             .bind(("q", vec![0.9f32, 0.1]))
             .await
             .unwrap()

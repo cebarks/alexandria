@@ -29,7 +29,8 @@ device = "cpu"                                       # "cpu" only for now (defau
 batch_size = 32                                      # Facts per embed() call in migrate-embeddings (default: 32)
 
 [heat]
-spacing_halflife_secs = 86400.0   # Spaced repetition half-life in seconds (default: 86400 = 1 day). Currently inert — see the [heat] table
+decay_tau_secs = 86400.0          # Base decay time constant, seconds; tau = stability * this (default: 86400 = 1 day)
+spacing_reference_secs = 86400.0  # Access gap earning full stability growth, seconds (default: 86400 = 1 day)
 
 [activation]
 propagation_factor = 0.3   # Fraction of heat passed per hop (default: 0.3)
@@ -40,7 +41,17 @@ top_n = 3                  # Number of top retrieval results that trigger spread
 join_threshold = 0.75              # Cosine similarity threshold to join existing cluster (default: 0.75)
 merge_threshold = 0.9              # Centroid similarity above which two clusters merge (default: 0.9)
 cohesion_floor = 0.6               # Avg member-to-centroid similarity below which a cluster splits (default: 0.6)
-maintenance_interval_secs = 300    # Cluster maintenance check interval in seconds (default: 300)
+
+[dreaming]
+enabled = true                     # Master switch for the background scheduler (default: true)
+sweep_interval_secs = 3600         # Heat materialisation cadence (default: 3600 = 1 hour)
+cluster_interval_secs = 300        # Cohesion check → split cadence (default: 300 = 5 minutes)
+merge_interval_secs = 300          # Centroid similarity → merge cadence (default: 300 = 5 minutes)
+collapse_interval_secs = 86400     # Byte-identical duplicate collapse cadence (default: 86400 = 1 day)
+appraise_interval_secs = 86400     # Cold-row demotion cadence (default: 86400 = 1 day)
+max_rows_per_run = 500             # Rows one job may write per run (default: 500)
+cold_heat_floor = 0.05             # Projected heat at or below which a memory counts as cold (default: 0.05)
+demote_confidence_ceiling = 0.5    # Confidence at or below which a cold, never-accessed memory is demotable (default: 0.5)
 
 [retrieve]
 min_similarity = 0.10              # Server-side hard floor on cosine similarity for retrieve_memories (default: 0.10)
@@ -94,9 +105,25 @@ The data directory contains SurrealKV files (LOCK, manifest, sstables, vlog, wal
 
 ### `[heat]`
 
+Both values are one day by default, which is the number the engine hardcoded before they existed — so at default the curve is arithmetically unchanged. `projected_heat` takes `decay_tau_secs` and `on_access` takes `spacing_reference_secs` as parameters; `DEFAULT_DECAY_TAU_SECS` / `DEFAULT_SPACING_REFERENCE_SECS` in `alexandria_engine::heat` are the single home for both defaults, derived into `HeatConfig` and `HeatSettings` and guarded by `test_server_fallback_defaults_match_config_defaults`.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `spacing_halflife_secs` | f64 | `86400.0` | **Currently inert.** Intended as the base half-life for the Ebbinghaus spaced-repetition curve, but `decay.rs:projected_heat` hardcodes `tau = stability * 86400.0` and takes no half-life, and nothing outside the engine crate calls it — the configured value is read only to display in the debug dashboard. Wiring it up or deleting it is the open A2 decision in [docs/performance-and-ability-findings.md](performance-and-ability-findings.md). The direction is also the reverse of the intuitive reading: in `decay.rs:on_access` a *lower* value raises the spacing ratio, which grows stability faster and therefore cools *slower*. |
+| `decay_tau_secs` | f64 | `86400.0` | Base decay time constant, seconds. The effective constant is `stability * decay_tau_secs`, so a memory with stability 2.0 cools twice as slowly. **Lower = cools faster.** This is an e-folding, not a half-life: at stability 1.0 one elapsed day leaves `heat/e`, pinned by `test_decay_tau_scales_the_curve`. |
+| `spacing_reference_secs` | f64 | `86400.0` | The gap between two accesses at which the later one earns **full** stability growth; a shorter gap earns a proportional fraction (a burst of same-second accesses grows stability by almost nothing). **Lower = stability accrues from less widely spaced accesses, so heat cools slower.** |
+
+**What each key actually governs.** `spacing_reference_secs` is the denominator `on_access` grows
+`stability` with, and `retrieve_memories` records an access for every row it returns to the caller, so
+it is live on the request path. `decay_tau_secs` is the time constant the `sweep` job materialises
+with and `appraise` judges coldness by.
+
+Neither affects **ranking**: retrieval still orders by cosine similarity alone, so the heat model
+moves real numbers that no ordering reads yet. Audit finding A2 in
+[performance-and-ability-findings.md](performance-and-ability-findings.md) records that and stays
+open for exactly this reason — [#43](https://github.com/cebarks/alexandria/issues/43) wired the
+input, not the output.
+
+**Removed in this release:** `spacing_halflife_secs`. It named a half-life while being used only as the spacing denominator above, and its documented direction was the reverse of its behaviour — the name is how that happened, which is why neither replacement key uses the word. Because `[heat]` is `#[serde(default)]`, a leftover key in `config.toml` is otherwise **silently ignored**; the server instead warns at boot naming both replacements, and `a_config_using_the_removed_heat_key_is_warned_about` guards that. The old single control is now two, because the value it named had two effects that pull in opposite directions.
 
 ### `[activation]`
 
@@ -110,14 +137,71 @@ Controls spreading activation — when a memory is accessed, its graph neighbors
 
 ### `[cluster]`
 
-Controls automatic cluster assignment, splitting, and merging. Maintenance runs periodically in HTTP mode (controlled by `maintenance_interval_secs`).
+Controls automatic cluster assignment, splitting, and merging. The cadences themselves live in
+`[dreaming]` — this section holds only the thresholds the jobs compare against.
 
 | Key | Type | Default | Description |
 | ----- | ------ | --------- | ------------- |
 | `join_threshold` | f32 | `0.75` | Minimum cosine similarity between a new memory's embedding and a cluster centroid to join that cluster. Below this, a new cluster is created. |
-| `merge_threshold` | f32 | `0.9` | Centroid-to-centroid similarity above which two clusters are merged. |
-| `cohesion_floor` | f32 | `0.6` | Average member-to-centroid similarity below which a cluster is split via k-means(k=2). |
-| `maintenance_interval_secs` | u64 | `300` | Interval between cluster maintenance runs in seconds (default: 5 minutes). Only active in HTTP mode. |
+| `merge_threshold` | f32 | `0.9` | Centroid-to-centroid similarity above which two clusters are merged. Read by the `merge` job. |
+| `cohesion_floor` | f32 | `0.6` | Average member-to-centroid similarity below which a cluster is split via k-means(k=2). Read by the `cluster` job. |
+
+> **Removed:** `cluster.maintenance_interval_secs`. Cluster maintenance is no longer one loop with
+> one cadence — it is two of the five dreaming jobs. A config file still setting it boots, but logs a
+> warning naming `dreaming.cluster_interval_secs`, `dreaming.merge_interval_secs` and
+> `dreaming.enabled`.
+
+### `[dreaming]`
+
+The background housekeeping scheduler: **one loop, five independently-due jobs**. HTTP mode only —
+stdio has no long-lived process to run a clock in, so nothing here applies to a stdio server.
+
+Each job carries its own interval and its own last-run stamp, so one job failing or running long
+affects only itself. A process that was down for three intervals catches up with **one** run of each
+job, not three: a missed tick costs latency, never correctness. The loop sleeps until the soonest
+job is due rather than waking on a fixed tick.
+
+| Job | What it does |
+| ----- | ------------- |
+| `sweep` | Materialises decayed heat so stored values are current, and reads the decay anchor forward. Writes no audit rows: it changes ranking by nothing, since every reader projects heat itself. |
+| `cluster` | Cohesion check → split, using `cluster.cohesion_floor`. |
+| `merge` | Centroid similarity → merge, using `cluster.merge_threshold`. Re-reads the cluster set after each merge, because a merge changes the centroids the next comparison would use. |
+| `collapse` | Finds byte-identical duplicates, keeps one, soft-deletes the rest and links them to the survivor. |
+| `appraise` | Demotes memories that are cold, never accessed **since access recording was armed**, and no more confident than the default. |
+
+| Key | Type | Default | Description |
+| ----- | ------ | --------- | ------------- |
+| `enabled` | bool | `true` | Master switch. `false` means the loop is never spawned, so no job writes anything. |
+| `sweep_interval_secs` | u64 | `3600` | Heat materialisation cadence, seconds. |
+| `cluster_interval_secs` | u64 | `300` | Cohesion-check cadence, seconds. Replaces `cluster.maintenance_interval_secs` for splits. |
+| `merge_interval_secs` | u64 | `300` | Merge cadence, seconds. Split from `cluster` because merge is the expensive half — an operator who wants merges rarer should not pay for it in slower splits. |
+| `collapse_interval_secs` | u64 | `86400` | Duplicate-collapse cadence, seconds. |
+| `appraise_interval_secs` | u64 | `86400` | Demotion cadence, seconds. |
+| `max_rows_per_run` | u64 | `500` | Rows one job may **write** per run. Not a bound on reads: `collapse` reads every live fact to group duplicates, and `appraise` reads every live fact's confidence and store time while paging only this many heat rows. `examined` in the job's trace line is what was read, so `examined: 12000, acted: 3` is a normal collapse. Must be ≥ 1. |
+| `cold_heat_floor` | f64 | `0.05` | Projected heat at or below which a memory counts as cold. **Provisional**: a fraction of the `1.0` a fresh access writes, not a number derived from retrieval measurements. |
+| `demote_confidence_ceiling` | f64 | `0.5` | Stored confidence at or below which a cold, never-accessed memory is demotable. Defaults to the confidence `store_memory` writes when the caller supplies none, so the rule reaches only memories nobody asserted more strongly AND nobody retrieved while recording was armed. Must be above `0.2`, the value demoted memories are written at. **Provisional**, as above. |
+
+**Reach of the rule.** `Appraise` judges only memories stored at or after the boot that armed access
+recording (`system_config::access_recording_armed_at`, stamped on first boot). Every older memory
+reads as `access_count = 0` because nothing wrote that field before this release, so trusting the
+count would walk an existing corpus down to `0.2` at 500 rows a day, oldest anchors first — the rows
+most likely to have been used hardest. The cost of refusing is that pre-arming memories are exempt
+permanently, which is the honest price of not demoting on a number nobody recorded.
+
+Every interval must be ≥ 1 second: the engine treats a zero interval as "due on every tick", which
+would turn a daily pass into a hot loop, so the server refuses to start on one and names the key.
+
+There are no `ALEXANDRIA_DREAMING_*` environment overrides, and the gap is deliberate rather than an
+oversight: these are cadences tuned in a file and applied at restart, and a partial set of env vars
+(enabled but not the intervals, say) invites exactly the "why is there no env var for this" question
+a complete set would answer. `dreaming` is not the only section in that position — `[heat]`,
+`[activation]`, `[cluster]` and `[retrieve]` have no environment overrides either, so the table below
+is the complete list of what the server reads from the environment, not an excerpt of a scheme that
+covers every section.
+
+Job runs are logged at `debug` with `examined` and `acted` counts. `cluster`, `merge`, `collapse` and
+`appraise` each write a row to `maintenance_log` — visible at `/debug/maintenance` — and `sweep`
+deliberately does not.
 
 ### `[retrieve]`
 

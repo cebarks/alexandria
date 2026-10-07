@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue, ToSql};
@@ -6,14 +7,44 @@ use tracing::warn;
 
 use crate::models::{Cluster, Fact};
 use crate::record_id_to_string;
+use crate::repos::maintenance_repo::AuditContext;
 
 pub struct ClusterRepo<'a> {
     db: &'a Surreal<Any>,
+    /// Attribution for the audit rows this repo writes. Carried on the repo rather than passed per
+    /// call because it is a property of the writer: one scheduler tick has one `run_id`, and a call
+    /// site that forgot to pass it would produce an unattributable row instead of failing to compile.
+    audit: Option<AuditContext>,
 }
 
 impl<'a> ClusterRepo<'a> {
+    /// Unattributed: `maintenance_log` rows get NONE for run_id/job/actor, as every row written
+    /// before v008 does.
     pub fn new(db: &'a Surreal<Any>) -> Self {
-        Self { db }
+        Self { db, audit: None }
+    }
+
+    /// Attribute the split and merge rows this repo writes to one run of one job.
+    pub fn with_audit(db: &'a Surreal<Any>, audit: AuditContext) -> Self {
+        Self {
+            db,
+            audit: Some(audit),
+        }
+    }
+
+    /// The three attribution binds for a `CREATE maintenance_log`, `None` when the repo is
+    /// unattributed. A split moves
+    /// members between clusters, which is the most destructive thing any job does, so its row is the
+    /// one an operator most needs to be able to tie back to a run.
+    fn audit_binds(&self) -> (Option<String>, Option<String>, Option<String>) {
+        match &self.audit {
+            Some(audit) => (
+                Some(audit.run_id.clone()),
+                Some(audit.job.clone()),
+                Some(audit.actor.clone()),
+            ),
+            None => (None, None, None),
+        }
     }
 
     pub async fn create(&self, label: Option<&str>, centroid: &[f32]) -> Result<String> {
@@ -50,13 +81,43 @@ impl<'a> ClusterRepo<'a> {
     }
 
     pub async fn get_members(&self, cluster_id: &str) -> Result<Vec<Fact>> {
+        // The filter belongs here and not in the callers: every consumer of this method computes
+        // something about the cluster as a whole (`check_cohesion` over member embeddings,
+        // `check_merge` over centroids, `execute_merge` moving edges), so a row nobody can retrieve
+        // silently changes all three verdicts. See `test_get_members_excludes_deleted_and_quarantined`.
         let mut response = self
             .db
-            .query("SELECT * FROM type::record($cluster_id)->contains_memory->fact")
+            .query(
+                "SELECT * FROM type::record($cluster_id)->contains_memory->\
+                 (fact WHERE deleted = false AND quarantined_at = NONE)",
+            )
             .bind(("cluster_id", cluster_id.to_string()))
             .await?;
         let members: Vec<Fact> = response.take(0)?;
         Ok(members)
+    }
+
+    /// Every fact id with an edge into this cluster, live or not.
+    ///
+    /// The move steps need exactly what [`Self::get_members`] deliberately hides: a quarantined or
+    /// soft-deleted member is still a member, and this repo's `delete` drops
+    /// `contains_memory WHERE in = $id` with no fact predicate, so anything not moved here is deleted
+    /// with the source cluster. Ids only — a move needs no embeddings.
+    pub async fn get_member_ids(&self, cluster_id: &str) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize, SurrealValue)]
+        struct EdgeRow {
+            out: RecordId,
+        }
+        let mut response = self
+            .db
+            .query("SELECT out FROM type::record($cluster_id)->contains_memory")
+            .bind(("cluster_id", cluster_id.to_string()))
+            .await?;
+        let rows: Vec<EdgeRow> = response.take(0)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| record_id_to_string(&row.out))
+            .collect())
     }
 
     /// Remove a single fact from this cluster (delete the contains_memory edge).
@@ -162,16 +223,65 @@ impl<'a> ClusterRepo<'a> {
             }
         }
 
+        // Everyone the live list accounted for, so the pass below can tell a member it moved from a
+        // member the caller could not see.
+        let moved: HashSet<String> = group_a
+            .iter()
+            .chain(group_b.iter())
+            .filter_map(|&idx| members.get(idx))
+            .filter_map(|fact| fact.id.as_ref())
+            .map(record_id_to_string)
+            .collect();
+
+        // Hidden members follow the larger half. They cannot be routed by k-means — the split's
+        // verdict is computed over live members precisely so a row nobody can retrieve cannot move it
+        // — and dropping their edge is the permanent loss this method used to cause: after a release
+        // a quarantined memory has no cluster, `cluster_for_fact` is None, and the cluster-driven
+        // paths in `recall` never reach it again. Choosing the larger child is a decision made in the
+        // open; ties go to the first.
+        let hidden_target = if group_b.len() > group_a.len() {
+            &cid_b
+        } else {
+            &cid_a
+        };
+        let mut hidden_moved: i64 = 0;
+        for fid in self
+            .get_member_ids(cluster_id)
+            .await?
+            .iter()
+            .filter(|id| !moved.contains(id.as_str()))
+        {
+            if let Err(e) = self.add_member(hidden_target, fid).await {
+                warn!("Split: failed to carry hidden member {fid} into {hidden_target}: {e}");
+                continue;
+            }
+            if let Err(e) = self.remove_member(cluster_id, fid).await {
+                warn!("Split: failed to remove hidden member {fid} from the split cluster: {e}");
+            }
+            hidden_moved += 1;
+        }
+
         // Delete the old cluster (now empty)
         self.delete(cluster_id).await?;
 
-        // Log the split
-        let members_moved = (group_a.len() + group_b.len()) as i64;
-        if let Err(e) = self.db
-            .query("CREATE maintenance_log SET action = 'split', source_id = $source, target_ids = $targets, members_moved = $count")
+        // Log the split. Counted from the edge writes, not from the group sizes: the groups only
+        // know about the members the caller could see, and under-reporting a move is how a
+        // reconciliation against this row comes out wrong.
+        let members_moved = (group_a.len() + group_b.len()) as i64 + hidden_moved;
+        let (run_id, job, actor) = self.audit_binds();
+        if let Err(e) = self
+            .db
+            .query(
+                "CREATE maintenance_log SET action = 'split', source_id = $source, \
+                 target_ids = $targets, members_moved = $count, \
+                 run_id = $run_id, job = $job, actor = $actor",
+            )
             .bind(("source", cluster_id.to_string()))
             .bind(("targets", vec![cid_a.clone(), cid_b.clone()]))
             .bind(("count", members_moved))
+            .bind(("run_id", run_id))
+            .bind(("job", job))
+            .bind(("actor", actor))
             .await
         {
             warn!("Failed to log split: {e}");
@@ -188,15 +298,12 @@ impl<'a> ClusterRepo<'a> {
         remove_id: &str,
         merged_centroid: &[f32],
     ) -> Result<()> {
-        let removed_members = self.get_members(remove_id).await?;
-
-        // Add to target first, then remove from source (avoids orphaning on failure)
-        for fact in &removed_members {
-            let fid = fact
-                .id
-                .as_ref()
-                .map(record_id_to_string)
-                .unwrap_or_default();
+        // Ids, not `get_members`: every edge has to be carried, including the hidden rows the live
+        // filter excludes, because `delete` below drops them all. The centroid the caller passes is
+        // still a function of live members only — moving a hidden row does not let it decide a
+        // verdict.
+        let mut members_moved: i64 = 0;
+        for fid in self.get_member_ids(remove_id).await? {
             if let Err(e) = self.add_member(keep_id, &fid).await {
                 warn!("Merge: failed to add {fid} to kept cluster {keep_id}: {e}");
                 continue;
@@ -204,19 +311,27 @@ impl<'a> ClusterRepo<'a> {
             if let Err(e) = self.remove_member(remove_id, &fid).await {
                 warn!("Merge: failed to remove {fid} from removed cluster {remove_id}: {e}");
             }
+            members_moved += 1;
         }
-
-        let members_moved = removed_members.len() as i64;
 
         self.update_centroid(keep_id, merged_centroid).await?;
         self.delete(remove_id).await?;
 
         // Log the merge
-        if let Err(e) = self.db
-            .query("CREATE maintenance_log SET action = 'merge', source_id = $source, target_ids = $targets, members_moved = $count")
+        let (run_id, job, actor) = self.audit_binds();
+        if let Err(e) = self
+            .db
+            .query(
+                "CREATE maintenance_log SET action = 'merge', source_id = $source, \
+                 target_ids = $targets, members_moved = $count, \
+                 run_id = $run_id, job = $job, actor = $actor",
+            )
             .bind(("source", remove_id.to_string()))
             .bind(("targets", vec![keep_id.to_string()]))
             .bind(("count", members_moved))
+            .bind(("run_id", run_id))
+            .bind(("job", job))
+            .bind(("actor", actor))
             .await
         {
             warn!("Failed to log merge: {e}");
@@ -225,31 +340,58 @@ impl<'a> ClusterRepo<'a> {
         Ok(())
     }
 
-    /// List all clusters along with their live member counts.
-    /// List maintenance log entries, newest first.
+    /// The WHERE fragment for the maintenance log pages, shared by the list and the count.
+    ///
+    /// One builder for both because the bug this prevents is on the record: `MemoryRepo::count` once
+    /// duplicated `list`'s clause line-for-line while its doc claimed they matched, and the result was
+    /// a debug page whose "N entries" disagreed with the rows under it. A filtered page whose pager
+    /// total came from the unfiltered count is the same defect with a parameter in it.
+    fn maintenance_filter_clause(run: Option<&str>) -> String {
+        match run {
+            // `run_id = $run` cannot be reached by a NULL-style trap: the filter is only emitted when
+            // the caller asked for a run, and an unattributed row simply never matches a run id.
+            Some(_) => "WHERE run_id = $run".to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// List maintenance log entries, newest first, optionally narrowed to one scheduler tick.
+    ///
+    /// `run` is the unit README describes a pass being selected or reversed by, so the page needs it
+    /// to be more than a column you can eyeball: a collapse tick that soft-deleted 40 rows is 40 rows
+    /// to review, and on a busy store they are not near the top of an unfiltered list.
     pub async fn list_maintenance_logs(
         &self,
         limit: usize,
         offset: usize,
+        run: Option<&str>,
     ) -> Result<Vec<crate::models::MaintenanceLog>> {
-        let mut response = self
+        let clause = Self::maintenance_filter_clause(run);
+        let sql = format!(
+            "SELECT * FROM maintenance_log {clause} ORDER BY created_at DESC LIMIT $limit START $offset"
+        );
+        let mut query = self
             .db
-            .query(
-                "SELECT * FROM maintenance_log ORDER BY created_at DESC LIMIT $limit START $offset",
-            )
+            .query(sql)
             .bind(("limit", limit as i64))
-            .bind(("offset", offset as i64))
-            .await?;
+            .bind(("offset", offset as i64));
+        if let Some(run) = run {
+            query = query.bind(("run", run.to_string()));
+        }
+        let mut response = query.await?;
         let logs: Vec<crate::models::MaintenanceLog> = response.take(0)?;
         Ok(logs)
     }
 
-    /// Count total maintenance log entries.
-    pub async fn count_maintenance_logs(&self) -> Result<usize> {
-        let mut response = self
-            .db
-            .query("SELECT count() as total FROM maintenance_log GROUP ALL")
-            .await?;
+    /// Count maintenance log entries, under the same filter as [`Self::list_maintenance_logs`].
+    pub async fn count_maintenance_logs(&self, run: Option<&str>) -> Result<usize> {
+        let clause = Self::maintenance_filter_clause(run);
+        let sql = format!("SELECT count() as total FROM maintenance_log {clause} GROUP ALL");
+        let mut query = self.db.query(sql);
+        if let Some(run) = run {
+            query = query.bind(("run", run.to_string()));
+        }
+        let mut response = query.await?;
         #[derive(serde::Deserialize, SurrealValue)]
         struct CountRow {
             total: i64,
@@ -440,5 +582,255 @@ mod tests {
             .find(|(c, _)| c.label.as_deref() == Some("cluster two"))
             .unwrap();
         assert_eq!(*count2, 0);
+    }
+
+    /// The pin `SessionRepo::get_memories` got in 33e17c9 and the cluster path never did.
+    ///
+    /// A soft-deleted or quarantined member must not count toward `list_with_counts`, must not feed
+    /// `check_cohesion`'s member embeddings, and must not be able to move a merge verdict — which
+    /// became actively wrong rather than merely untidy the moment `Collapse` started soft-deleting
+    /// duplicates, since a cluster of ten near-identical rows would keep behaving like a ten-member
+    /// cluster after nine are collapsed. Quarantined rows are the same defect one rung earlier on the
+    /// ladder.
+    ///
+    /// Filtering the *verdicts* is this method's job; filtering the *moves* is not, and must not
+    /// become it — see `test_hidden_members_survive_a_split_and_a_merge`.
+    /// The run filter exists because a tick that collapses 40 duplicates writes 40 rows, and on a busy
+    /// store they are nowhere near the top of a newest-first list. Asserted against both queries at
+    /// once: the page renders `total` from the count and the rows from the list, and the defect this
+    /// repo already documents for `MemoryRepo::count` is precisely those two disagreeing.
+    #[tokio::test]
+    async fn maintenance_logs_can_be_filtered_to_one_run() {
+        use crate::models::maintenance::{action, disposition, job};
+        use crate::repos::{LogEntry, MaintenanceRepo};
+
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let clusters = ClusterRepo::new(db.inner());
+        let alpha = MaintenanceRepo::with_audit(
+            db.inner(),
+            AuditContext::dreaming("run-alpha", job::COLLAPSE),
+        );
+        let beta = MaintenanceRepo::with_audit(
+            db.inner(),
+            AuditContext::dreaming("run-beta", job::COLLAPSE),
+        );
+
+        for (audit, source) in [(&alpha, "fact:a1"), (&alpha, "fact:a2"), (&beta, "fact:b1")] {
+            audit
+                .record(&LogEntry {
+                    action: action::COLLAPSE.to_string(),
+                    source_id: source.to_string(),
+                    target_ids: vec!["fact:survivor".to_string()],
+                    members_moved: 0,
+                    disposition: Some(disposition::SOFT_DELETE.to_string()),
+                    previous_value: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Positive control: unfiltered, everything is present and the count matches the rows.
+        assert_eq!(
+            clusters
+                .list_maintenance_logs(10, 0, None)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(clusters.count_maintenance_logs(None).await.unwrap(), 3);
+
+        let filtered = clusters
+            .list_maintenance_logs(10, 0, Some("run-alpha"))
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered.len(),
+            2,
+            "the filter must select the whole tick, not one row of it"
+        );
+        assert!(
+            filtered
+                .iter()
+                .all(|row| row.run_id.as_deref() == Some("run-alpha")),
+            "every returned row must belong to the run asked for"
+        );
+        assert_eq!(
+            clusters
+                .count_maintenance_logs(Some("run-alpha"))
+                .await
+                .unwrap(),
+            filtered.len(),
+            "the pager's total must come from the same clause as its rows"
+        );
+
+        // A run nobody wrote is empty rather than an error.
+        assert!(
+            clusters
+                .list_maintenance_logs(10, 0, Some("run-missing"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unknown run must read as no rows, not as every row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_members_excludes_deleted_and_quarantined() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let clusters = ClusterRepo::new(db.inner());
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+
+        let cid = clusters.create(Some("mixed"), &[0.1, 0.2]).await.unwrap();
+        let keep = memory
+            .create_fact("kept", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let gone = memory
+            .create_fact("deleted", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let secret = memory
+            .create_fact("quarantined", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        for id in [&keep, &gone, &secret] {
+            clusters.add_member(&cid, id).await.unwrap();
+        }
+
+        // Positive control first: without this, every assertion below could be satisfied by a
+        // method that returns nothing at all.
+        let all = clusters.get_members(&cid).await.unwrap();
+        assert_eq!(
+            all.len(),
+            3,
+            "fixture control: all three are members to begin with"
+        );
+
+        memory.soft_delete_fact(&gone).await.unwrap();
+        db.inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", secret.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let members = clusters.get_members(&cid).await.unwrap();
+        let contents: Vec<&str> = members.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["kept"],
+            "a soft-deleted and a quarantined member must both drop out, leaving the live row"
+        );
+    }
+
+    /// The other half of the same change, and the half that could silently eat data.
+    ///
+    /// `get_members` filters, so every caller that iterates it sees only live rows — but `delete`
+    /// drops `contains_memory WHERE in = $id` with no fact predicate at all. Before the moves were
+    /// switched to `get_member_ids`, that meant a hidden member's edge was destroyed on every split
+    /// and merge while its fact stayed live-and-recoverable: after a release, `cluster_for_fact`
+    /// returns None and the cluster-driven paths in `recall` can never reach it again. Quarantine is
+    /// documented as the reversible rung, so losing its placement is not a cosmetic consequence.
+    #[tokio::test]
+    async fn test_hidden_members_survive_a_split_and_a_merge() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let clusters = ClusterRepo::new(db.inner());
+        let memory = crate::repos::MemoryRepo::new(db.inner());
+
+        // --- merge: the hidden row follows the live one into the kept cluster ---
+        let source = clusters.create(Some("source"), &[0.1, 0.2]).await.unwrap();
+        let kept = clusters.create(Some("kept"), &[0.1, 0.2]).await.unwrap();
+        let live = memory
+            .create_fact("live", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let quarantined = memory
+            .create_fact("quarantined", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        for id in [&live, &quarantined] {
+            clusters.add_member(&source, id).await.unwrap();
+        }
+        db.inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", quarantined.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        clusters
+            .execute_merge(&kept, &source, &[0.1, 0.2])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            memory
+                .cluster_for_fact(&quarantined)
+                .await
+                .unwrap()
+                .map(|c| c.id.as_ref().map(record_id_to_string).unwrap_or_default()),
+            Some(kept.clone()),
+            "a quarantined member keeps its cluster through a merge, so releasing it does not orphan it"
+        );
+        // Positive control on the same code path: the live row moved too, so the assertion above is
+        // not being satisfied by a move step that carries nobody.
+        assert_eq!(
+            memory.cluster_for_fact(&live).await.unwrap().map(|c| c
+                .id
+                .as_ref()
+                .map(record_id_to_string)
+                .unwrap_or_default()),
+            Some(kept),
+            "the live member moved to the kept cluster as well"
+        );
+
+        // --- split: hidden members follow the larger half, they are not deleted with the source ---
+        let splitting = clusters
+            .create(Some("splitting"), &[0.3, 0.4])
+            .await
+            .unwrap();
+        let left = memory
+            .create_fact("left", 0.5, &[0.3, 0.4], &[])
+            .await
+            .unwrap();
+        let hidden = memory
+            .create_fact("hidden", 0.5, &[0.3, 0.4], &[])
+            .await
+            .unwrap();
+        clusters.add_member(&splitting, &left).await.unwrap();
+        clusters.add_member(&splitting, &hidden).await.unwrap();
+        db.inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", hidden.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let members = clusters.get_members(&splitting).await.unwrap();
+        let (child_a, child_b) = clusters
+            .execute_split(&splitting, &members, &[0], &[], &[0.5, 0.6], &[0.7, 0.8])
+            .await
+            .unwrap();
+
+        assert!(
+            memory.cluster_for_fact(&hidden).await.unwrap().is_some(),
+            "the hidden member still belongs to a cluster after its old one was split away"
+        );
+        assert_eq!(
+            memory.cluster_for_fact(&hidden).await.unwrap().map(|c| c
+                .id
+                .as_ref()
+                .map(record_id_to_string)
+                .unwrap_or_default()),
+            Some(child_a.clone()),
+            "and it went to the larger half (ties to the first), not to a cluster chosen by accident"
+        );
+        assert_ne!(child_a, child_b, "the two children are distinct clusters");
     }
 }

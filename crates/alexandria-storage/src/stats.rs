@@ -34,7 +34,12 @@ async fn count_table(db: &Surreal<Any>, table: &str, where_clause: &str) -> Resu
 /// Gather aggregate counts across all core tables.
 pub async fn gather(db: &Surreal<Any>) -> Result<Stats> {
     Ok(Stats {
-        fact_count: count_table(db, "fact", "WHERE deleted = false").await?,
+        fact_count: count_table(
+            db,
+            "fact",
+            "WHERE deleted = false AND quarantined_at = NONE",
+        )
+        .await?,
         deleted_fact_count: count_table(db, "fact", "WHERE deleted = true").await?,
         cluster_count: count_table(db, "cluster", "").await?,
         edge_count: count_table(db, "memory_edge", "").await?,

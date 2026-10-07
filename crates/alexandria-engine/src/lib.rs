@@ -1,4 +1,5 @@
 pub mod clusters;
+pub mod dreaming;
 pub mod heat;
 pub mod import;
 pub mod recall;

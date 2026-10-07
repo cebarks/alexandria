@@ -11,7 +11,7 @@ pub struct HeatColumns {
 impl HeatColumns {
     /// Compute projected heat for all entries at the given timestamp.
     /// Returns a Vec of projected heat values in the same order.
-    pub fn projected_heat_bulk(&self, now: u64) -> Vec<f64> {
+    pub fn projected_heat_bulk(&self, now: u64, decay_tau: f64) -> Vec<f64> {
         let len = self.heat.len();
         let mut result = Vec::with_capacity(len);
 
@@ -20,9 +20,10 @@ impl HeatColumns {
                 heat: self.heat[i],
                 stability: self.stability[i],
                 last_touched: self.last_touched[i],
-                access_count: 0, // not needed for projection
+                access_count: 0,     // not needed for projection
+                last_accessed_at: 0, // likewise: projection reads the decay anchor only
             };
-            result.push(projected_heat(&state, now));
+            result.push(projected_heat(&state, now, decay_tau));
         }
 
         result

@@ -100,6 +100,44 @@ fn encode_query_value(s: &str) -> String {
     out
 }
 
+/// The live-filter state carried through every href on this page.
+///
+/// A struct rather than more positional parameters. `include_deleted` and `include_quarantined` are
+/// two bools a caller could transpose with nothing but a silent behaviour change, and *every* href on
+/// the page has to carry both or the sort and pagination links would quietly drop the operator back
+/// to the default view mid-inspection. `MemoryRepo::count` had a third positional bool for the same
+/// reason and lost it in the same refactor.
+#[derive(Debug, Clone, Copy, Default)]
+struct Filters<'a> {
+    search: Option<&'a str>,
+    tag: Option<&'a str>,
+    include_deleted: bool,
+    include_quarantined: bool,
+}
+
+impl<'a> Filters<'a> {
+    /// The repo query for one page. Built from the same value that builds the hrefs, so the filter an
+    /// operator sees reflected in a link cannot differ from the one that produced the rows.
+    fn query(
+        &self,
+        sort: FactSort,
+        dir: SortDir,
+        limit: usize,
+        offset: usize,
+    ) -> FactListQuery<'a> {
+        FactListQuery {
+            search: self.search,
+            tag: self.tag,
+            include_deleted: self.include_deleted,
+            include_quarantined: self.include_quarantined,
+            sort,
+            dir,
+            limit,
+            offset,
+        }
+    }
+}
+
 /// Build a URL back to the memories list with the given params.
 ///
 /// `sort` / `dir` are emitted only when they differ from [`DEFAULT_SORT`] / [`DEFAULT_DIR`], which
@@ -107,23 +145,24 @@ fn encode_query_value(s: &str) -> String {
 /// sorted page's Prev/Next hop preserves the sort, which is the entire point of sorting server-side
 /// (a sorted table whose "next page" reverts to newest-first is worse than an unsorted one).
 fn memories_url(
-    search: Option<&str>,
-    tag: Option<&str>,
-    include_deleted: bool,
+    filters: Filters<'_>,
     sort: FactSort,
     dir: SortDir,
     limit: usize,
     offset: usize,
 ) -> String {
     let mut parts = vec![format!("limit={limit}"), format!("offset={offset}")];
-    if let Some(s) = search {
+    if let Some(s) = filters.search {
         parts.push(format!("search={}", encode_query_value(s)));
     }
-    if let Some(t) = tag {
+    if let Some(t) = filters.tag {
         parts.push(format!("tag={}", encode_query_value(t)));
     }
-    if include_deleted {
+    if filters.include_deleted {
         parts.push("include_deleted=true".to_string());
+    }
+    if filters.include_quarantined {
+        parts.push("include_quarantined=true".to_string());
     }
     if sort != DEFAULT_SORT {
         parts.push(format!("sort={}", sort_key(sort)));
@@ -158,9 +197,7 @@ struct SortLinks {
 /// to behave (newest first). Offsets deliberately do not survive a sort change — page 2 of a
 /// different ordering would show arbitrary rows.
 fn sort_link(
-    search: Option<&str>,
-    tag: Option<&str>,
-    include_deleted: bool,
+    filters: Filters<'_>,
     limit: usize,
     column: FactSort,
     active: FactSort,
@@ -174,7 +211,7 @@ fn sort_link(
     } else {
         SortDir::Desc
     };
-    memories_url(search, tag, include_deleted, column, target, limit, 0)
+    memories_url(filters, column, target, limit, 0)
 }
 
 /// One row of the memories table, flattened out of `Fact` so the template never has to deal
@@ -186,7 +223,14 @@ struct MemoryRow {
     tags: Vec<String>,
     confidence: String,
     created: String,
-    deleted: bool,
+    /// Set when the row is on the middle rung of the ladder. Rendered as a badge, so an operator
+    /// looking at a quarantined memory can see that retrieval will not surface it, rather than
+    /// wondering why it never comes back from a query.
+    quarantined: bool,
+    /// `"quarantined"`, `"deleted"` or `""`. Computed here rather than chosen in the template
+    /// because the precedence is a decision: a fact can be both, and "hidden from retrieval" is the
+    /// more surprising of the two.
+    row_class: &'static str,
 }
 
 /// `prev_href` / `next_href` / `summary` feed `templates/_pagination.html`'s `pager` macro,
@@ -201,6 +245,7 @@ struct MemoriesTemplate {
     search: String,
     tag: String,
     include_deleted: bool,
+    include_quarantined: bool,
     rows: Vec<MemoryRow>,
     prev_href: String,
     next_href: String,
@@ -226,6 +271,10 @@ pub async fn list(
         .get("include_deleted")
         .map(|v| v == "true")
         .unwrap_or(false);
+    let include_quarantined = params
+        .get("include_quarantined")
+        .map(|v| v == "true")
+        .unwrap_or(false);
     let limit: usize = params
         .get("limit")
         .and_then(|v| v.parse().ok())
@@ -242,23 +291,24 @@ pub async fn list(
     let dir = parse_dir(params.get("dir"));
 
     let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
-    let rows = match repo
-        .list(FactListQuery {
-            search,
-            tag,
-            include_deleted,
-            sort,
-            dir,
-            limit,
-            offset,
-        })
-        .await
-    {
+    // One filter value feeds the page, its total, and every href on it, so the count above the
+    // table cannot disagree with the rows under it and a sort or pagination hop cannot drop the
+    // operator's view. Quarantine is opt-in and read-only: this page is the operator view #43
+    // promises for a memory that retrieval will no longer surface, which is why the checkbox exists
+    // and why nothing here can write.
+    let filters = Filters {
+        search,
+        tag,
+        include_deleted,
+        include_quarantined,
+    };
+    let filter = filters.query(sort, dir, limit, offset);
+    let rows = match repo.list(&filter).await {
         Ok(r) => r,
         Err(e) => return error_page("memories", &e.to_string()),
     };
 
-    let total = match repo.count(search, tag, include_deleted).await {
+    let total = match repo.count(&filter).await {
         Ok(n) => n,
         Err(_) => rows.len(), // graceful fallback
     };
@@ -280,6 +330,13 @@ pub async fn list(
             // Shared timestamp rendering: `html::format_dt` is the only format the debug UI
             // prints, and `—` the only marker it prints for "never".
             let created = html::format_dt(fact.created_at);
+            let row_class = if fact.quarantined_at.is_some() {
+                "quarantined"
+            } else if fact.deleted {
+                "deleted"
+            } else {
+                ""
+            };
 
             MemoryRow {
                 id: fact
@@ -291,8 +348,8 @@ pub async fn list(
                 tags: fact.tags.clone(),
                 confidence: format!("{:.2}", fact.confidence),
                 created,
-                // Deleted rows get a CSS class for dimming
-                deleted: fact.deleted,
+                quarantined: fact.quarantined_at.is_some(),
+                row_class,
             }
         })
         .collect();
@@ -302,28 +359,12 @@ pub async fn list(
     let summary = format!("Showing {showing_from}\u{2013}{showing_to} of {total} memories");
 
     let prev_href = if offset > 0 {
-        memories_url(
-            search,
-            tag,
-            include_deleted,
-            sort,
-            dir,
-            limit,
-            offset.saturating_sub(limit),
-        )
+        memories_url(filters, sort, dir, limit, offset.saturating_sub(limit))
     } else {
         String::new()
     };
     let next_href = if offset + rows.len() < total {
-        memories_url(
-            search,
-            tag,
-            include_deleted,
-            sort,
-            dir,
-            limit,
-            offset + limit,
-        )
+        memories_url(filters, sort, dir, limit, offset + limit)
     } else {
         String::new()
     };
@@ -331,43 +372,11 @@ pub async fn list(
     // Built after the page's own sort is known, and from the same `memories_url`, so the headers
     // and the pager can never disagree about what the current sort is.
     let sorts = SortLinks {
-        id: sort_link(search, tag, include_deleted, limit, FactSort::Id, sort, dir),
-        content: sort_link(
-            search,
-            tag,
-            include_deleted,
-            limit,
-            FactSort::Content,
-            sort,
-            dir,
-        ),
-        tags: sort_link(
-            search,
-            tag,
-            include_deleted,
-            limit,
-            FactSort::TagCount,
-            sort,
-            dir,
-        ),
-        confidence: sort_link(
-            search,
-            tag,
-            include_deleted,
-            limit,
-            FactSort::Confidence,
-            sort,
-            dir,
-        ),
-        created: sort_link(
-            search,
-            tag,
-            include_deleted,
-            limit,
-            FactSort::CreatedAt,
-            sort,
-            dir,
-        ),
+        id: sort_link(filters, limit, FactSort::Id, sort, dir),
+        content: sort_link(filters, limit, FactSort::Content, sort, dir),
+        tags: sort_link(filters, limit, FactSort::TagCount, sort, dir),
+        confidence: sort_link(filters, limit, FactSort::Confidence, sort, dir),
+        created: sort_link(filters, limit, FactSort::CreatedAt, sort, dir),
         active: sort_key(sort),
         dir: dir_key(dir),
     };
@@ -377,6 +386,7 @@ pub async fn list(
         search: search.unwrap_or_default().to_string(),
         tag: tag.unwrap_or_default().to_string(),
         include_deleted,
+        include_quarantined,
         rows: rows_view,
         prev_href,
         next_href,
@@ -415,6 +425,9 @@ struct MemoryDetailTemplate {
     nav: &'static str,
     id: String,
     deleted: bool,
+    quarantined: bool,
+    /// Formatted `quarantined_at`, or the same "never" marker `created_at` uses.
+    quarantined_at: String,
     content: String,
     tags: Vec<String>,
     confidence: String,
@@ -483,12 +496,16 @@ pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<Strin
         .collect();
 
     let created_at = html::format_dt(fact.created_at);
+    let quarantined = fact.quarantined_at.is_some();
+    let quarantined_at = html::format_dt(fact.quarantined_at);
 
     page(MemoryDetailTemplate {
         nav: "memories",
         id,
         // Deleted badge is shown prominently next to the heading.
         deleted: fact.deleted,
+        quarantined,
+        quarantined_at,
         content: fact.content,
         tags: fact.tags,
         confidence: format!("{:.2}", fact.confidence),
@@ -1022,8 +1039,9 @@ mod tests {
     // ---- column sorting: the handler's `?sort=`/`?dir=`, the encoder, the headers ----
 
     use super::{
-        FactListQuery, FactSort, MemoriesTemplate, MemoryDetailTemplate, MemoryRow, SortDir,
-        SortLinks, dir_key, encode_query_value, parse_dir, parse_sort, sort_key, sort_link,
+        FactListQuery, FactSort, Filters, MemoriesTemplate, MemoryDetailTemplate, MemoryRow,
+        SortDir, SortLinks, dir_key, encode_query_value, parse_dir, parse_sort, sort_key,
+        sort_link,
     };
     use askama::Template;
 
@@ -1251,7 +1269,7 @@ mod tests {
         // there, with their content and confidence unchanged.
         let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
         let left = repo
-            .list(FactListQuery {
+            .list(&FactListQuery {
                 include_deleted: true,
                 ..Default::default()
             })
@@ -1499,9 +1517,12 @@ mod tests {
         // Direct over the builder, so the "a sort change returns to page 1" rule is pinned even
         // where no page happens to expose it.
         let link = sort_link(
-            Some("hello world"),
-            None,
-            true,
+            Filters {
+                search: Some("hello world"),
+                tag: None,
+                include_deleted: true,
+                include_quarantined: false,
+            },
             20,
             FactSort::Confidence,
             FactSort::Confidence,
@@ -1513,17 +1534,21 @@ mod tests {
             "the active column flips to descending and the offset resets"
         );
         let other = sort_link(
-            None,
-            Some("a&b"),
-            false,
+            Filters {
+                search: None,
+                tag: Some("a&b"),
+                include_deleted: false,
+                include_quarantined: true,
+            },
             20,
             FactSort::TagCount,
             FactSort::Id,
             SortDir::Desc,
         );
         assert_eq!(
-            other, "/debug/memories?limit=20&offset=0&tag=a%26b&sort=tags",
-            "an inactive column sorts descending; the default direction is not spelled out"
+            other, "/debug/memories?limit=20&offset=0&tag=a%26b&include_quarantined=true&sort=tags",
+            "an inactive column sorts descending; the default direction is not spelled out, and the \
+             quarantine filter rides along so a sort hop cannot drop it"
         );
     }
 
@@ -1587,6 +1612,8 @@ mod tests {
             tags: vec![],
             confidence: "0.50".into(),
             created_at: html::format_dt(Some(html::example_dt())),
+            quarantined: false,
+            quarantined_at: html::format_dt(None),
             heat: None,
             cluster: None,
             edges: vec![],
@@ -1604,13 +1631,15 @@ mod tests {
             search: String::new(),
             tag: String::new(),
             include_deleted: false,
+            include_quarantined: false,
             rows: vec![MemoryRow {
                 id: "fact:abc".into(),
                 preview: "a preview".into(),
                 tags: vec!["t".into()],
                 confidence: "0.50".into(),
                 created: "2026-09-11 09:00 UTC".into(),
-                deleted: false,
+                quarantined: false,
+                row_class: "",
             }],
             prev_href: String::new(),
             next_href: String::new(),
@@ -1704,7 +1733,7 @@ mod tests {
             std::sync::Arc::new(db),
             std::sync::Arc::new(super::super::test_support::StubEmbedding),
             0.75,
-            86400.0,
+            crate::server::HeatSettings::default(),
         );
         let app = crate::debug::router(server);
         let response = app
@@ -1756,6 +1785,156 @@ mod tests {
         assert!(
             !html.contains("<p>No memories"),
             "the retired bare-paragraph empty shape must not come back; got: {html}"
+        );
+    }
+
+    /// Put a fact on the middle rung of the ladder. Raw SQL because nothing in the product writes
+    /// `quarantined_at` yet — #29's secret scanning is the first producer — so the operator view
+    /// has to be testable against a state the rest of the code cannot currently create.
+    async fn quarantine(server: &crate::AlexandriaServer, id: &str) {
+        server
+            .db
+            .inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", id.to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    async fn memories_page(server: crate::AlexandriaServer, uri: &str) -> String {
+        let app = crate::debug::router(server);
+        body_of(&app, uri).await
+    }
+
+    /// The operator view #43 promises: a quarantined memory is invisible by default, because the
+    /// default page should match what an agent can retrieve, and visible on request, because a
+    /// reversible state nobody can look at is indistinguishable from a deletion.
+    #[tokio::test]
+    async fn test_memories_list_hides_quarantine_until_asked() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        repo.create_fact("an ordinary memory", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let hidden = repo
+            .create_fact("a quarantined secret", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        quarantine(&server, &hidden).await;
+
+        let default_page = memories_page(server.clone(), "/debug/memories").await;
+        assert!(
+            default_page.contains("an ordinary memory"),
+            "the live row is on the default page"
+        );
+        assert!(
+            !default_page.contains("a quarantined secret"),
+            "quarantine is hidden by default, matching what retrieval can see"
+        );
+
+        let asked = memories_page(server.clone(), "/debug/memories?include_quarantined=true").await;
+        assert!(
+            asked.contains("a quarantined secret"),
+            "and shown when the operator asks for it"
+        );
+        assert!(
+            asked.contains(r#"class="quarantined""#),
+            "the row is marked, not merely listed"
+        );
+        assert!(
+            asked.contains("badge-quarantined"),
+            "with a badge that says what the marking means"
+        );
+    }
+
+    /// The filter has to survive a sort or pagination hop. Every href on the page is built from the
+    /// same `Filters` value that built the query, so this is the assertion that would catch a link
+    /// silently dropping the operator back to the default view mid-inspection.
+    #[tokio::test]
+    async fn test_quarantine_filter_survives_the_href_builders() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        for i in 0..3 {
+            repo.create_fact(&format!("row {i}"), 0.5, &[0.1, 0.2], &[])
+                .await
+                .unwrap();
+        }
+
+        let page = memories_page(
+            server.clone(),
+            "/debug/memories?include_quarantined=true&limit=2&sort=content&dir=asc",
+        )
+        .await;
+        assert!(
+            page.contains("include_quarantined=true"),
+            "a sort or pager href must carry the quarantine filter"
+        );
+        assert!(
+            page.contains("Next"),
+            "the page is paginated, so there is a hop to survive"
+        );
+        assert!(
+            page.contains(r#"name="include_quarantined" value="true" checked"#),
+            "the checkbox reflects the active filter, so a form submission keeps it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_shows_quarantine_state() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let id = repo
+            .create_fact("quarantined detail", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        quarantine(&server, &id).await;
+
+        let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
+        let page = memories_page(server.clone(), &uri).await;
+        assert!(
+            page.contains("Quarantined — hidden from retrieval"),
+            "the detail page must say the row is unreachable, not only show a timestamp"
+        );
+        assert!(
+            page.contains("excluded from every retrieval path"),
+            "and what that means"
+        );
+        // The detail page stays reachable for a quarantined row on purpose: an explicit-id read is
+        // not a retrieval path, and a view that answered 404 would leave the state inspectable only
+        // through raw SQL.
+        assert!(
+            !page.contains("Memory not found"),
+            "a quarantined memory is not a missing one"
+        );
+    }
+
+    /// Quarantine wins the row styling when a fact is both, because "hidden from retrieval" is the
+    /// more surprising of the two and the one an operator needs to notice.
+    #[tokio::test]
+    async fn test_quarantined_and_deleted_row_is_marked_quarantined() {
+        let server = super::super::test_support::test_server().await;
+        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+        let id = repo
+            .create_fact("both states", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        repo.soft_delete_fact(&id).await.unwrap();
+        quarantine(&server, &id).await;
+
+        let page = memories_page(
+            server.clone(),
+            "/debug/memories?include_deleted=true&include_quarantined=true",
+        )
+        .await;
+        assert!(
+            page.contains(r#"class="quarantined""#),
+            "quarantine takes precedence over deleted"
+        );
+        assert!(
+            !page.contains(r#"class="deleted""#),
+            "and the row does not carry both classes"
         );
     }
 }

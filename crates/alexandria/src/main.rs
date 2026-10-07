@@ -1,11 +1,11 @@
 mod bench;
 mod config;
+mod dreaming;
 
 use std::sync::Arc;
 
 use alexandria_mcp::AlexandriaServer;
 use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
-use alexandria_storage::record_id_to_string;
 use alexandria_storage::{Database, schema, system_config};
 use config::Config;
 use rmcp::ServiceExt;
@@ -68,6 +68,14 @@ async fn main() -> anyhow::Result<()> {
     // 2. Connect to SurrealDB (persistent or in-memory based on config)
     let db = Database::connect(&config.database.data_dir).await?;
     schema::migrate(db.inner()).await?;
+
+    // 2b. Record the instant this build started counting retrievals, before any job can run.
+    // `Appraise` refuses to demote a memory older than this stamp: on a store that predates access
+    // recording every `access_count` is zero because nothing wrote it, so without the stamp the first
+    // pass reads the whole legacy corpus as unused. Stored once, never rewritten — same shape as the
+    // embedding-model lock beside it.
+    let armed_at = system_config::arm_access_recording(db.inner()).await?;
+    tracing::info!("Access recording armed at {armed_at}");
 
     // 3. Check embedding model safety, then load
     tracing::info!("Loading embedding model: {}", config.embedding.model);
@@ -140,7 +148,10 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(db),
         Arc::new(embedding),
         config.cluster.join_threshold,
-        config.heat.spacing_halflife_secs,
+        alexandria_mcp::server::HeatSettings {
+            decay_tau_secs: config.heat.decay_tau_secs,
+            spacing_reference_secs: config.heat.spacing_reference_secs,
+        },
     )
     .with_activation_config(activation_config)
     .with_activation_top_n(config.activation.top_n)
@@ -237,150 +248,23 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
         http_config = http_config.with_allowed_origins(config.server.allowed_origins.clone());
     }
 
-    // Spawn cluster maintenance background task
-    let maintenance_db = server.db.clone();
-    let cohesion_floor = config.cluster.cohesion_floor;
-    let merge_threshold = config.cluster.merge_threshold;
-    let maintenance_interval_secs = config.cluster.maintenance_interval_secs;
-    let maintenance_cancel = cancel.clone();
-    tokio::spawn(async move {
-        use alexandria_engine::clusters::maintenance::{check_cohesion, check_merge};
-        use alexandria_storage::repos::ClusterRepo;
-
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(maintenance_interval_secs));
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {},
-                _ = maintenance_cancel.cancelled() => break,
-            }
-            tracing::debug!("Running cluster maintenance...");
-            let cluster_repo = ClusterRepo::new(maintenance_db.inner());
-
-            // Load all clusters with members for cohesion check
-            let mut response = match maintenance_db.inner().query("SELECT * FROM cluster").await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Maintenance: {e}");
-                    continue;
-                }
-            };
-            let clusters: Vec<alexandria_storage::models::Cluster> = match response.take(0) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("Maintenance: {e}");
-                    continue;
-                }
-            };
-
-            for cluster in &clusters {
-                let cid = cluster
-                    .id
-                    .as_ref()
-                    .map(record_id_to_string)
-                    .unwrap_or_default();
-                let members = match cluster_repo.get_members(&cid).await {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let member_embeddings: Vec<Vec<f32>> =
-                    members.iter().map(|f| f.embedding.clone()).collect();
-
-                let action =
-                    check_cohesion(&cid, &cluster.centroid, &member_embeddings, cohesion_floor);
-                if let alexandria_engine::clusters::maintenance::MaintenanceAction::Split {
-                    cluster_id,
-                    group_a,
-                    group_b,
-                    centroid_a,
-                    centroid_b,
-                } = action
-                {
-                    tracing::info!(
-                        "Splitting cluster {cluster_id} ({} / {} members)",
-                        group_a.len(),
-                        group_b.len()
-                    );
-                    match cluster_repo
-                        .execute_split(&cid, &members, &group_a, &group_b, &centroid_a, &centroid_b)
-                        .await
-                    {
-                        Ok((cid_a, cid_b)) => {
-                            tracing::info!("Split complete: {cluster_id} -> {cid_a}, {cid_b}");
-                        }
-                        Err(e) => tracing::warn!("Split failed for {cluster_id}: {e}"),
-                    }
-                }
-            }
-
-            // Merge phase: re-query after each merge so we always work with fresh data.
-            // Loop until no more merges are found in a full pass.
-            loop {
-                let merge_clusters: Vec<alexandria_storage::models::Cluster> = match maintenance_db
-                    .inner()
-                    .query("SELECT * FROM cluster")
-                    .await
-                    .and_then(|mut r| r.take(0))
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("Maintenance merge query: {e}");
-                        break;
-                    }
-                };
-                let mut infos: Vec<(String, Vec<f32>, usize)> = Vec::new();
-                for c in &merge_clusters {
-                    let id = c.id.as_ref().map(record_id_to_string).unwrap_or_default();
-                    let count = cluster_repo
-                        .get_members(&id)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    infos.push((id, c.centroid.clone(), count));
-                }
-
-                let mut merged_one = false;
-                'scan: for i in 0..infos.len() {
-                    for j in (i + 1)..infos.len() {
-                        let result = check_merge(
-                            &infos[i].0,
-                            &infos[i].1,
-                            infos[i].2,
-                            &infos[j].0,
-                            &infos[j].1,
-                            infos[j].2,
-                            merge_threshold,
-                        );
-                        if let alexandria_engine::clusters::maintenance::MergeCheck::Merge {
-                            keep_id,
-                            remove_id,
-                            merged_centroid,
-                        } = result
-                        {
-                            tracing::info!("Merging cluster {remove_id} into {keep_id}");
-                            match cluster_repo
-                                .execute_merge(&keep_id, &remove_id, &merged_centroid)
-                                .await
-                            {
-                                Ok(()) => {
-                                    tracing::info!("Merge complete: {remove_id} -> {keep_id}");
-                                    merged_one = true;
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Merge failed ({remove_id} -> {keep_id}): {e}")
-                                }
-                            }
-                            // Re-query fresh data before looking for more merges
-                            break 'scan;
-                        }
-                    }
-                }
-                if !merged_one {
-                    break;
-                }
-            }
-        }
-    });
+    // Spawn the dreaming scheduler: one loop, five independently-due jobs (#43). It replaces the
+    // inline cluster-maintenance spawn that used to live here, which had a single interval for two
+    // distinct phases and no way to add a third job without retiming the first two.
+    //
+    // `liveness` is shared with the dashboard below because a scheduler that quietly stopped is
+    // otherwise indistinguishable from one that is idle: `summary()` renders the *configured*
+    // cadences, which say the same thing about a healthy loop and about one that panicked itself out.
+    let liveness = dreaming::shared_liveness(&config.dreaming);
+    if config.dreaming.enabled {
+        // The supervisor's own handle is what gets dropped here, deliberately: it exits on `cancel`,
+        // which is the HTTP service's own token, so the loop stops when serving stops. Watching it
+        // would mean awaiting the server's lifetime from inside the server.
+        let _dreaming =
+            dreaming::Jobs::spawn(server.db.clone(), config, cancel.clone(), liveness.clone());
+    } else {
+        tracing::info!("dreaming scheduler disabled by [dreaming] enabled = false");
+    }
 
     // Clone `server` for the debug UI router BEFORE it's moved into the MCP service factory
     // closure below — StreamableHttpService::new takes ownership of `server` via `move`.
@@ -394,7 +278,11 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
         bind_port: config.server.port,
         data_dir: config.database.data_dir.display().to_string(),
         cluster_merge_threshold: config.cluster.merge_threshold,
-        maintenance_interval_secs: config.cluster.maintenance_interval_secs,
+        dreaming_summary: dreaming::summary(&config.dreaming),
+        // Only when the scheduler is enabled: `None` renders the dashboard's existing
+        // "not running" state rather than inventing a fourth one, and a disabled loop has no
+        // heartbeat to report.
+        dreaming_liveness: config.dreaming.enabled.then(|| Arc::clone(&liveness)),
         // The same list `/mcp` is configured with above, so the debug UI and the MCP endpoint
         // cannot disagree about what a legitimate Host is.
         allowed_hosts: config.server.allowed_hosts.clone(),

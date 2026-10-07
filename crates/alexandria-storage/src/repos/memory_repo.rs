@@ -3,7 +3,7 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue, ToSql};
 
-use crate::models::{Fact, RawRecord};
+use crate::models::{CollapseCandidate, Fact, LiveConfidence, RawRecord};
 use crate::record_id_to_string;
 
 /// A sortable column for [`MemoryRepo::list`].
@@ -100,7 +100,9 @@ fn knn_sql(k: usize, indexed: bool) -> String {
     } else {
         "COSINE".to_string()
     };
-    format!("SELECT * FROM fact WHERE deleted = false AND embedding <|{k},{arg}|> $q")
+    format!(
+        "SELECT * FROM fact WHERE deleted = false AND quarantined_at = NONE AND embedding <|{k},{arg}|> $q"
+    )
 }
 
 /// Everything [`MemoryRepo::list`] takes, as one value.
@@ -116,6 +118,11 @@ pub struct FactListQuery<'a> {
     /// Keep only facts carrying this tag.
     pub tag: Option<&'a str>,
     pub include_deleted: bool,
+    /// Keep quarantined facts. `false` everywhere except an operator view that exists to inspect
+    /// quarantine; on the pinned engine an absent `option<datetime>` reads as `NONE` and both
+    /// `IS NOT NULL` and `!= NULL` are satisfied by `NONE`, so the live filter can only be written
+    /// `quarantined_at = NONE` — see `quarantine_none_predicate_pins_the_trap`.
+    pub include_quarantined: bool,
     pub sort: FactSort,
     pub dir: SortDir,
     pub limit: usize,
@@ -130,6 +137,7 @@ impl Default for FactListQuery<'_> {
             search: None,
             tag: None,
             include_deleted: false,
+            include_quarantined: false,
             sort: FactSort::CreatedAt,
             dir: SortDir::Desc,
             limit: DEFAULT_FACT_LIST_LIMIT,
@@ -315,29 +323,18 @@ impl<'a> MemoryRepo<'a> {
     /// Behaviour-preserving defaults for the debug UI's current view: `FactSort::CreatedAt` with
     /// `SortDir::Desc` is what this query hardcoded before column sorting existed — see
     /// [`FactListQuery::default`].
-    pub async fn list(
-        &self,
-        FactListQuery {
-            search,
-            tag,
-            include_deleted,
-            sort,
-            dir,
-            limit,
-            offset,
-        }: FactListQuery<'_>,
-    ) -> Result<Vec<Fact>> {
-        let query = Self::list_query(search, tag, include_deleted, sort, dir);
+    pub async fn list(&self, query: &FactListQuery<'_>) -> Result<Vec<Fact>> {
+        let sql = Self::list_query(query);
 
         let mut q = self
             .db
-            .query(&query)
-            .bind(("limit", limit as i64))
-            .bind(("offset", offset as i64));
-        if let Some(s) = search {
+            .query(&sql)
+            .bind(("limit", query.limit as i64))
+            .bind(("offset", query.offset as i64));
+        if let Some(s) = query.search {
             q = q.bind(("search", s.to_string()));
         }
-        if let Some(t) = tag {
+        if let Some(t) = query.tag {
             q = q.bind(("tag", t.to_string()));
         }
 
@@ -352,70 +349,61 @@ impl<'a> MemoryRepo<'a> {
     /// Everything interpolated here is a literal chosen by this module: the WHERE fragments are
     /// fixed strings selected by `Option::is_some` (their *values* stay bound), and the ORDER BY
     /// clause comes from the closed [`FactSort::order_clause`] allowlist.
-    fn list_query(
-        search: Option<&str>,
-        tag: Option<&str>,
-        include_deleted: bool,
-        sort: FactSort,
-        dir: SortDir,
-    ) -> String {
-        let mut conditions = Vec::new();
-        if !include_deleted {
-            conditions.push("deleted = false".to_string());
-        }
-        if search.is_some() {
-            conditions
-                .push("string::lowercase(content) CONTAINS string::lowercase($search)".to_string());
-        }
-        if tag.is_some() {
-            conditions.push("$tag IN tags".to_string());
-        }
-
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
+    fn list_query(query: &FactListQuery<'_>) -> String {
+        let where_clause = Self::fact_filter_clause(query);
 
         format!(
             "SELECT *{} FROM fact {where_clause} ORDER BY {} LIMIT $limit START $offset",
-            sort.projection(),
-            sort.order_clause(dir),
+            query.sort.projection(),
+            query.sort.order_clause(query.dir),
         )
     }
 
-    /// Count facts matching the same filters as `list` (ignoring limit/offset).
-    pub async fn count(
-        &self,
-        search: Option<&str>,
-        tag: Option<&str>,
-        include_deleted: bool,
-    ) -> Result<usize> {
+    /// The WHERE fragment shared by [`Self::list`], [`Self::count`] and [`Self::top_tags`].
+    ///
+    /// One builder for every live-fact scan, because `count` used to duplicate `list`'s condition
+    /// assembly line-for-line while its doc comment claimed they matched. A predicate added to one
+    /// copy and not the other makes the debug UI's "N facts" disagree with the rows under it, which
+    /// is precisely the drift the quarantine filter must not land in.
+    ///
+    /// Called with the default query by the scans that have no filters to carry — `top_tags`,
+    /// `collapse_candidates`, `live_confidences` — which is the whole point: those three want
+    /// "every live fact" and must not have to re-spell what live means each time.
+    fn fact_filter_clause(query: &FactListQuery<'_>) -> String {
         let mut conditions = Vec::new();
-        if !include_deleted {
+        if !query.include_deleted {
             conditions.push("deleted = false".to_string());
         }
-        if search.is_some() {
+        if !query.include_quarantined {
+            conditions.push("quarantined_at = NONE".to_string());
+        }
+        if query.search.is_some() {
             conditions
                 .push("string::lowercase(content) CONTAINS string::lowercase($search)".to_string());
         }
-        if tag.is_some() {
+        if query.tag.is_some() {
             conditions.push("$tag IN tags".to_string());
         }
 
-        let where_clause = if conditions.is_empty() {
+        if conditions.is_empty() {
             String::new()
         } else {
             format!("WHERE {}", conditions.join(" AND "))
-        };
+        }
+    }
 
-        let query = format!("SELECT count() FROM fact {where_clause} GROUP ALL");
+    /// Count facts matching the same filters as [`Self::list`] — literally the same builder, so the
+    /// total above a paged table cannot disagree with the rows under it. `sort`, `dir`, `limit` and
+    /// `offset` are ignored.
+    pub async fn count(&self, query: &FactListQuery<'_>) -> Result<usize> {
+        let where_clause = Self::fact_filter_clause(query);
+        let sql = format!("SELECT count() FROM fact {where_clause} GROUP ALL");
 
-        let mut q = self.db.query(&query);
-        if let Some(s) = search {
+        let mut q = self.db.query(&sql);
+        if let Some(s) = query.search {
             q = q.bind(("search", s.to_string()));
         }
-        if let Some(t) = tag {
+        if let Some(t) = query.tag {
             q = q.bind(("tag", t.to_string()));
         }
 
@@ -449,13 +437,16 @@ impl<'a> MemoryRepo<'a> {
             tags: Vec<String>,
         }
 
-        let mut response = self
-            .db
-            .query(
-                "SELECT array::flatten(array::group(tags)) AS tags \
-                 FROM fact WHERE deleted = false GROUP ALL",
-            )
-            .await?;
+        // The live predicate comes from the same builder as `list` and `count`, not from a copy of
+        // its text: this query is the one place in the file that used to spell `deleted = false AND
+        // quarantined_at = NONE` by hand, so a fourth condition added to the builder would have
+        // quietly kept `top_tags` counting facts the list page cannot show.
+        let filter = FactListQuery::default();
+        let where_clause = Self::fact_filter_clause(&filter);
+        let sql = format!(
+            "SELECT array::flatten(array::group(tags)) AS tags FROM fact {where_clause} GROUP ALL"
+        );
+        let mut response = self.db.query(&sql).await?;
         let row: Option<TagRow> = response.take(0)?;
 
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -482,6 +473,39 @@ impl<'a> MemoryRepo<'a> {
 
     /// Every fact, deleted ones included, as (id, content). Used by the embedding
     /// migration, which must re-embed lineage snapshots too so they stay comparable.
+    /// Live facts projected to the columns the `Collapse` job needs.
+    ///
+    /// Not `all_ids_and_content`, which deliberately includes soft-deleted rows because
+    /// `migrate-embeddings` has to re-embed those too: a collapse pass over deleted rows would
+    /// re-delete what `delete_memory` already removed and log it as work. The WHERE clause comes
+    /// from `fact_filter_clause` rather than being written out again here, so this read cannot drift
+    /// away from the one `list` and `count` use — which is the bug that motivated sharing it.
+    /// Live facts' ids, confidences and store times, for the `Appraise` job.
+    ///
+    /// A projection for the same reason as `collapse_candidates`: demotion reads one number per
+    /// memory and must not pay for embeddings or content to get it. The WHERE clause comes from
+    /// `fact_filter_clause`, so this read cannot drift away from the one `list` and `count` use —
+    /// and reading confidence fresh matters because it is the very value demotion writes.
+    /// `created_at` is read for the same reason it is read by collapse: whether a memory predates
+    /// access recording decides whether appraise may touch it at all.
+    pub async fn live_confidences(&self) -> Result<Vec<LiveConfidence>> {
+        let filter = FactListQuery::default();
+        let where_clause = Self::fact_filter_clause(&filter);
+        let sql = format!("SELECT id, confidence, created_at FROM fact {where_clause}");
+
+        let mut response = self.db.query(&sql).await?;
+        Ok(response.take(0)?)
+    }
+
+    pub async fn collapse_candidates(&self) -> Result<Vec<CollapseCandidate>> {
+        let filter = FactListQuery::default();
+        let where_clause = Self::fact_filter_clause(&filter);
+        let sql = format!("SELECT id, content, confidence, created_at FROM fact {where_clause}");
+
+        let mut response = self.db.query(&sql).await?;
+        Ok(response.take(0)?)
+    }
+
     pub async fn all_ids_and_content(&self) -> Result<Vec<(String, String)>> {
         #[derive(serde::Deserialize, SurrealValue)]
         struct Row {
@@ -549,7 +573,7 @@ mod tests {
 
         // Default: excludes deleted
         let all = repo
-            .list(FactListQuery {
+            .list(&FactListQuery {
                 limit: 10,
                 ..Default::default()
             })
@@ -559,7 +583,7 @@ mod tests {
 
         // include_deleted = true picks up all 3
         let with_deleted = repo
-            .list(FactListQuery {
+            .list(&FactListQuery {
                 include_deleted: true,
                 limit: 10,
                 ..Default::default()
@@ -570,7 +594,7 @@ mod tests {
 
         // search filters by content substring
         let searched = repo
-            .list(FactListQuery {
+            .list(&FactListQuery {
                 search: Some("alpha"),
                 limit: 10,
                 ..Default::default()
@@ -582,7 +606,7 @@ mod tests {
 
         // tag filters
         let tagged = repo
-            .list(FactListQuery {
+            .list(&FactListQuery {
                 tag: Some("tag2"),
                 limit: 10,
                 ..Default::default()
@@ -593,19 +617,19 @@ mod tests {
         assert_eq!(tagged[0].content, "beta content");
 
         // count matches list length for same filters
-        let count = repo.count(None, None, false).await.unwrap();
+        let count = repo.count(&FactListQuery::default()).await.unwrap();
         assert_eq!(count, 2);
 
         // limit/offset paginate
         let page1 = repo
-            .list(FactListQuery {
+            .list(&FactListQuery {
                 limit: 1,
                 ..Default::default()
             })
             .await
             .unwrap();
         let page2 = repo
-            .list(FactListQuery {
+            .list(&FactListQuery {
                 limit: 1,
                 offset: 1,
                 ..Default::default()
@@ -902,7 +926,7 @@ mod tests {
     }
 
     async fn sorted_contents(repo: &MemoryRepo<'_>, sort: FactSort, dir: SortDir) -> Vec<String> {
-        repo.list(FactListQuery {
+        repo.list(&FactListQuery {
             sort,
             dir,
             limit: 100,
@@ -916,7 +940,7 @@ mod tests {
     }
 
     async fn sorted_ids(repo: &MemoryRepo<'_>, sort: FactSort, dir: SortDir) -> Vec<String> {
-        repo.list(FactListQuery {
+        repo.list(&FactListQuery {
             sort,
             dir,
             limit: 100,
@@ -1035,7 +1059,7 @@ mod tests {
         let legacy: Vec<Fact> = response.take(0).unwrap();
 
         let current = repo
-            .list(FactListQuery {
+            .list(&FactListQuery {
                 limit: 100,
                 ..Default::default()
             })
@@ -1093,7 +1117,7 @@ mod tests {
         let mut offset = 0;
         loop {
             let page = repo
-                .list(FactListQuery {
+                .list(&FactListQuery {
                     sort: FactSort::Confidence,
                     limit: PAGE,
                     offset,
@@ -1214,20 +1238,20 @@ mod tests {
 
         // A hostile filter value cannot change the query text at all, because values are bound and
         // never interpolated — the built string is byte-identical to the benign one.
-        let benign = MemoryRepo::list_query(
-            Some("alpha"),
-            Some("tag1"),
-            false,
-            FactSort::Content,
-            SortDir::Asc,
-        );
-        let hostile = MemoryRepo::list_query(
-            Some("a'; DROP TABLE fact; --"),
-            Some("tag1, id DESC"),
-            false,
-            FactSort::Content,
-            SortDir::Asc,
-        );
+        let benign = MemoryRepo::list_query(&FactListQuery {
+            search: Some("alpha"),
+            tag: Some("tag1"),
+            sort: FactSort::Content,
+            dir: SortDir::Asc,
+            ..Default::default()
+        });
+        let hostile = MemoryRepo::list_query(&FactListQuery {
+            search: Some("a'; DROP TABLE fact; --"),
+            tag: Some("tag1, id DESC"),
+            sort: FactSort::Content,
+            dir: SortDir::Asc,
+            ..Default::default()
+        });
         assert_eq!(benign, hostile);
         assert!(!benign.contains(';'));
     }
@@ -1255,17 +1279,17 @@ mod tests {
         create_at(&repo, db.inner(), "alpha untagged", 0.5, &[], 4).await;
         create_at(&repo, db.inner(), "zulu", 0.5, &["keep"], 5).await;
 
-        let sql = MemoryRepo::list_query(
-            Some("alp"),
-            Some("keep"),
-            false,
-            FactSort::TagCount,
-            SortDir::Desc,
-        );
+        let sql = MemoryRepo::list_query(&FactListQuery {
+            search: Some("alp"),
+            tag: Some("keep"),
+            sort: FactSort::TagCount,
+            dir: SortDir::Desc,
+            ..Default::default()
+        });
         println!("LIST QUERY sort=TagCount dir=Desc search+tag: {sql}");
 
         let rows = repo
-            .list(FactListQuery {
+            .list(&FactListQuery {
                 search: Some("alp"),
                 tag: Some("keep"),
                 sort: FactSort::TagCount,
@@ -1278,7 +1302,13 @@ mod tests {
             vec!["alpha three", "alpha two", "alpha one"]
         );
         assert_eq!(
-            repo.count(Some("alp"), Some("keep"), false).await.unwrap(),
+            repo.count(&FactListQuery {
+                search: Some("alp"),
+                tag: Some("keep"),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
             rows.len(),
             "count() must agree with the filtered list"
         );
@@ -1385,5 +1415,161 @@ mod tests {
                 "a null created_at must not affect other sorts"
             );
         }
+    }
+
+    /// Point a fact at the middle rung of the ladder, through raw SQL: nothing writes
+    /// `quarantined_at` yet (secret-scanning, #29, is the first real producer), so the tests that
+    /// depend on the read paths have to set it themselves.
+    async fn quarantine(db: &Surreal<Any>, fact_id: &str) {
+        db.query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", fact_id.to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    /// Quarantine must be invisible to every live read path, and `count` cannot disagree with
+    /// `list` because both now build their WHERE clause from the same `fact_filter_clause`.
+    #[tokio::test]
+    async fn quarantine_is_hidden_from_list_count_and_knn() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let live = repo.create_fact("live", 0.5, &[0.1], &[]).await.unwrap();
+        let secret = repo.create_fact("secret", 0.5, &[0.1], &[]).await.unwrap();
+        quarantine(db.inner(), &secret).await;
+
+        let rows = repo.list(&FactListQuery::default()).await.unwrap();
+        assert_eq!(rows.len(), 1, "list must hide quarantine");
+        assert_eq!(rows[0].content, "live");
+
+        assert_eq!(
+            repo.count(&FactListQuery::default()).await.unwrap(),
+            1,
+            "count must agree with the rows list returns"
+        );
+
+        let shown = repo
+            .list(&FactListQuery {
+                include_quarantined: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            shown.len(),
+            2,
+            "an operator view must still be able to reach it — that is the whole point of the              middle rung being reversible rather than deleted"
+        );
+
+        // Both kNN spellings: brute force and the indexed form, since `retrieve_memories` picks
+        // between them at boot depending on whether the HNSW define succeeded.
+        //
+        // The index has to be defined for the second assertion to mean anything. On 3.3 `<|k,ef|>`
+        // with no index behind it matches **no rows** (3.2 stripped it to a plain scan), so before the
+        // define this pair of assertions was measuring the brute-force path twice and passing on the
+        // engine it was written against — it failed for the right reason the moment the tree moved to
+        // 3.3. Same trap as `nearest_indexed_without_an_index_returns_no_rows_and_with_one_returns_them`.
+        crate::schema::ensure_vector_index(db.inner(), 1)
+            .await
+            .expect("1-dim HNSW index for this fixture");
+        assert_eq!(
+            repo.nearest(&[0.1_f32], 5).await.unwrap().len(),
+            1,
+            "the brute-force kNN path must hide quarantine"
+        );
+        assert_eq!(
+            repo.nearest_indexed(&[0.1_f32], 5).await.unwrap().len(),
+            1,
+            "and so must the indexed one"
+        );
+
+        let tags = repo.top_tags(10).await.unwrap();
+        assert!(
+            !tags.iter().any(|(tag, _)| tag == "secret-tag"),
+            "tag frequencies must not be fed by quarantined rows: {tags:?}"
+        );
+        let _ = live;
+    }
+
+    /// The one predicate both kNN spellings share must not cost the HNSW index. This is a second
+    /// guard next to `test_nearest_indexed_plan_uses_the_hnsw_index`, because the extra
+    /// `quarantined_at = NONE` is exactly the kind of predicate a planner quietly turns into a scan.
+    #[tokio::test]
+    async fn quarantine_predicate_keeps_the_hnsw_index_plan() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        crate::schema::ensure_vector_index(db.inner(), 1)
+            .await
+            .unwrap();
+
+        let sql = knn_sql(3, true);
+        assert!(
+            sql.contains("quarantined_at = NONE"),
+            "the live filter must be in the indexed query too: {sql}"
+        );
+
+        let mut response = db
+            .inner()
+            .query(format!("EXPLAIN FORMAT JSON {sql}"))
+            .bind(("q", vec![0.9_f32]))
+            .await
+            .unwrap();
+        let plan: surrealdb::types::Value = response.take(0).unwrap();
+        let plan = plan.to_sql().replace(' ', "");
+        assert!(
+            plan.contains("KnnScan") && plan.contains("fact_embedding_hnsw"),
+            "the extra predicate must not drop the plan out of the index: {plan}"
+        );
+    }
+    /// `Collapse` groups live facts only. Reading through `all_ids_and_content` — which keeps
+    /// soft-deleted rows on purpose for `migrate-embeddings` — would have the job re-delete what
+    /// `delete_memory` already removed and log it as work.
+    #[tokio::test]
+    async fn collapse_candidates_read_live_facts_only() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+
+        let live = repo.create_fact("live", 0.5, &[0.1], &[]).await.unwrap();
+        let deleted = repo.create_fact("deleted", 0.5, &[0.1], &[]).await.unwrap();
+        let quarantined = repo
+            .create_fact("quarantined", 0.5, &[0.1], &[])
+            .await
+            .unwrap();
+        repo.soft_delete_fact(&deleted).await.unwrap();
+        db.inner()
+            .query("UPDATE type::record($id) SET quarantined_at = time::now()")
+            .bind(("id", quarantined.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let candidates = repo.collapse_candidates().await.unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| crate::record_id_to_string(&c.id))
+                .collect::<Vec<_>>(),
+            vec![live],
+            "only the live row is a collapse candidate"
+        );
+        assert_eq!(candidates[0].content, "live");
+        assert_eq!(candidates[0].confidence, 0.5);
+        assert!(
+            candidates[0].created_at.is_some(),
+            "created_at is the survivor tiebreak, so the projection has to carry it"
+        );
+
+        // The two reads that look interchangeable must not be: this is the assertion that would have
+        // caught using all_ids_and_content for collapse.
+        assert_eq!(
+            repo.all_ids_and_content().await.unwrap().len(),
+            3,
+            "all_ids_and_content still includes deleted and quarantined rows, as migrate-embeddings needs"
+        );
     }
 }
