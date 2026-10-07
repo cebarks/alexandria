@@ -50,8 +50,10 @@ pub(crate) struct Jobs {
     liveness: SharedLiveness,
     cohesion_floor: f32,
     merge_threshold: f32,
-    /// `[heat] decay_tau_secs`. The sweep is the only job that projects heat, so this is the only
-    /// place outside retrieval that needs the constant.
+    /// `[heat] decay_tau_secs`. The time constant both heat projections use: `sweep` materialises
+    /// with it and `appraise` judges coldness with it, so it is needed by two jobs and by nothing
+    /// outside retrieval. (The comment here used to claim `sweep` was the only job that projects
+    /// heat, which `run_appraise`'s own projection contradicted.)
     decay_tau_secs: f64,
     max_rows_per_run: usize,
     cold_heat_floor: f64,
