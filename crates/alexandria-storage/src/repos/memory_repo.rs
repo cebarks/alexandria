@@ -1349,6 +1349,15 @@ mod tests {
 
         // Both kNN spellings: brute force and the indexed form, since `retrieve_memories` picks
         // between them at boot depending on whether the HNSW define succeeded.
+        //
+        // The index has to be defined for the second assertion to mean anything. On 3.3 `<|k,ef|>`
+        // with no index behind it matches **no rows** (3.2 stripped it to a plain scan), so before the
+        // define this pair of assertions was measuring the brute-force path twice and passing on the
+        // engine it was written against — it failed for the right reason the moment the tree moved to
+        // 3.3. Same trap as `nearest_indexed_without_an_index_returns_no_rows_and_with_one_returns_them`.
+        crate::schema::ensure_vector_index(db.inner(), 1)
+            .await
+            .expect("1-dim HNSW index for this fixture");
         assert_eq!(
             repo.nearest(&[0.1_f32], 5).await.unwrap().len(),
             1,
