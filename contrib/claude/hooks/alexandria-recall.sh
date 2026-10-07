@@ -20,7 +20,7 @@
 #   ALEXANDRIA_MARKER_MAX_AGE_DAYS         default 7; per-session markers idle longer than this are pruned
 #   ALEXANDRIA_HOOK_CHILD                  set by hooks that shell out to `claude -p`; exits at once
 set -uo pipefail
-[ $# -gt 0 ] || input=$(cat)   # before any guard: exiting with stdin unread can SIGPIPE the writer (test.sh pipes jq in)
+[ $# -gt 0 ] || input=$(cat)   # before any guard: exiting with stdin unread can SIGPIPE the writer (alexandria-claude-test.sh pipes jq in)
 [ -z "${ALEXANDRIA_HOOK_CHILD:-}" ] || exit 0
 
 URL="${ALEXANDRIA_URL:-http://127.0.0.1:3000/mcp}"
