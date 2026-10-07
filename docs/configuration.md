@@ -203,6 +203,38 @@ Job runs are logged at `debug` with `examined` and `acted` counts. `cluster`, `m
 `appraise` each write a row to `maintenance_log` — visible at `/debug/maintenance` — and `sweep`
 deliberately does not.
 
+**Running a job on demand: `alexandria dream`.** You do not need to touch this section to make a job
+run now. `alexandria dream --job NAME` (or with no `--job`, all five) runs the same job bodies the
+scheduler runs, once, and prints one `job=… examined=… acted=… skipped=…` line per job — the same
+counters the log line carries, plus `skipped`, which the loop does not log — then the run id and how
+many audit rows were found under it. The old workaround was to set all five `*_interval_secs` to `1`
+(the loader refuses only `0`), restart with the debug log target on, and revert: three mutations of a
+live service to answer one question. Cadences are not consulted and not changed here; `dream` reads
+the *thresholds* — `cluster.cohesion_floor`, `cluster.merge_threshold`, `heat.decay_tau_secs`,
+`dreaming.cold_heat_floor`, `dreaming.demote_confidence_ceiling` and
+`dreaming.max_rows_per_run` — and `--max-rows N` overrides the last of those for
+that invocation only: nothing is written back to `config.toml`. A config with
+`dreaming.enabled = false` still runs the pass (warned, because the operator asked for it by name);
+what that key switches off is the background clock, not the jobs' legitimacy.
+
+> SurrealKV is single-writer, so `alexandria dream` refuses while the service holds the data dir: one
+> line naming the directory, exit status non-zero, and no job examined or wrote anything. Stop the
+> service first, or set `ALEXANDRIA_DATA_DIR` to a copy of the directory and run it against that. It
+> loads no embedding model and needs no HNSW index, so it starts in milliseconds.
+
+Rows written by such a pass carry `run-cli-<epoch>-<pid>` in `maintenance_log.run_id`, and the command
+prints that id on its last line, so `/debug/maintenance?run=<id>` shows exactly what one invocation
+did. `actor` stays `system:dreaming` — it genuinely is the dreaming jobs, and the run id is what
+records that an operator rather than the clock pulled the trigger. The pid is the second component
+rather than a tick counter because one process runs exactly one pass, while two back-to-back
+invocations can land in the same second (`for j in sweep collapse; do alexandria dream --job $j; done`)
+— the lock excludes concurrent openers, not sequential ones.
+
+`alexandria dream` does **not** arm access recording; that is a boot step, and a stamp written by a
+one-shot CLI would mean something false. So `appraise` on a store that has never booted this build
+demotes nothing and logs why, which is the fail-closed gate above working rather than the command
+failing.
+
 ### `[retrieve]`
 
 Controls server-side filtering of `retrieve_memories` results.

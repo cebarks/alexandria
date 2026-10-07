@@ -44,9 +44,10 @@ pub(crate) fn tick_run_id(now: u64, tick: u64) -> String {
 /// v008 puts **no `ASSERT`** on `maintenance_log.run_id` — it is a plain `option<string>`, so the
 /// only constraints are uniqueness per pass and readability (the pinned engine accepts a
 /// `run-cli-…` row and returns it through the same `?run=` filter `/debug/maintenance` applies —
-/// `a_pass_prints_one_line_per_job_and_ends_with_its_run_id`). The `cli` component is the provenance an operator needs;
-/// `actor` stays `system:dreaming`, because the code path genuinely is the dreaming jobs — the
-/// difference is who pulled the trigger, and that is what the run id is for.
+/// `a_pass_prints_one_line_per_job_and_ends_with_its_run_id`). The `cli` component is the
+/// provenance an operator needs; `actor` stays `system:dreaming`, because the code path genuinely
+/// is the dreaming jobs — the difference is who pulled the trigger, and that is what the run id is
+/// for.
 ///
 /// The pid, not a tick counter: a CLI process runs exactly one pass, so a per-process counter would
 /// always read `1` and say nothing, while two invocations landing in the same epoch second are
