@@ -63,7 +63,7 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   have broken on the missing `mold`, and the Docker build already overrides `rustflags` via
   `RUSTFLAGS`, so neither `target-cpu` nor mold applied there). Dev boxes wanting it keep
   `-C target-cpu=native` + mold in `~/.cargo/config.toml`. Windows `target-cpu` verification is
-  moot. Repo keeps `rust-version = "1.98"` + edition 2024 as the only compiler floor statement.
+  moot. Repo keeps `rust-version = "1.99"` + edition 2024 as the only compiler floor statement.
 
 ## Dependencies
 
