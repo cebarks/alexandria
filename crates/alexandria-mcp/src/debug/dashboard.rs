@@ -104,6 +104,12 @@ fn context_rows(ctx: Option<&DebugContext>) -> Vec<ConfigRow> {
             "dreaming",
             or_unavailable(ctx.map(|c| c.dreaming_summary.clone())),
         ),
+        // The cadence row above answers "what is configured". It cannot answer "is it running", and
+        // it says the same thing about a healthy loop and a loop that panicked itself out — which is
+        // the failure this row exists to make visible. Two rows rather than one string, because the
+        // two facts change at different times and an operator reading a merged sentence cannot tell
+        // which half moved.
+        row_str("dreaming (actual)", dreaming_state_row(ctx)),
         row_str(
             "embedding.model (config file)",
             or_unavailable(ctx.map(|c| &c.embedding_model)),
@@ -116,6 +122,82 @@ fn context_rows(ctx: Option<&DebugContext>) -> Vec<ConfigRow> {
 }
 
 /// A missing answer renders as [`UNAVAILABLE`], never as a zero or an empty cell.
+/// The scheduler's live state, or the reason there is none to report.
+///
+/// The `None` cases are deliberately different strings: no context means "this process cannot tell
+/// you" (stdio or a test router), while a context with no `dreaming_liveness` means the operator
+/// turned the scheduler off — reporting the former as the latter would be a lie in the UI.
+fn dreaming_state_row(ctx: Option<&DebugContext>) -> String {
+    use alexandria_engine::dreaming::SchedulerState;
+
+    let Some(ctx) = ctx else {
+        return UNAVAILABLE.to_string();
+    };
+    let Some(liveness) = &ctx.dreaming_liveness else {
+        return "not running ([dreaming] enabled = false)".to_string();
+    };
+    match liveness.state(unix_now()) {
+        SchedulerState::NotStarted => "started, no tick yet".to_string(),
+        SchedulerState::Running {
+            since_last_tick,
+            restarts,
+        } => {
+            let restarts = restarts_note(restarts);
+            format!(
+                "awake, last wake {} ago{restarts}",
+                for_humans(since_last_tick)
+            )
+        }
+        SchedulerState::Quiet {
+            since_last_tick,
+            restarts,
+            silence_limit_secs,
+        } => {
+            let restarts = restarts_note(restarts);
+            format!(
+                "QUIET for {} (limit {}) — the loop is not waking on schedule{restarts}",
+                for_humans(since_last_tick),
+                for_humans(silence_limit_secs)
+            )
+        }
+        SchedulerState::GivenUp { panics, restarts } => {
+            format!(
+                "STOPPED — supervisor gave up after {panics} panics ({restarts} restarts); no \
+                 background housekeeping is running"
+            )
+        }
+    }
+}
+
+/// Nothing when the loop never died; a count when it has been restarted.
+fn restarts_note(restarts: u32) -> String {
+    match restarts {
+        0 => String::new(),
+        1 => " (1 restart)".to_string(),
+        n => format!(" ({n} restarts)"),
+    }
+}
+
+/// Seconds as an operator would say them. Not a duration library: the panel needs `4m`, not
+/// `240s`, and one place formats it so two rows cannot disagree.
+fn for_humans(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// Wall clock in whole seconds, supplied here rather than inside the engine so `Liveness` stays
+/// clock-free and its transitions remain testable without sleeping.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn or_unavailable(value: Option<impl std::fmt::Display>) -> String {
     match value {
         Some(value) => value.to_string(),
@@ -416,7 +498,7 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    use super::UNAVAILABLE;
+    use super::{UNAVAILABLE, context_rows, unix_now};
 
     async fn render(app: axum::Router) -> String {
         let response = app
@@ -531,10 +613,13 @@ mod tests {
 
     /// The only coverage of the populated path, so it carries the weight of proving the
     /// plumbing exists at all. Values are distinctive: none of them is a default.
-    #[tokio::test]
-    async fn test_dashboard_with_context_shows_bind_and_transport() {
-        let server = super::super::test_support::test_server().await;
-        let ctx = super::DebugContext {
+    /// The populated context, with values distinctive enough that none of them could be a default.
+    ///
+    /// Shared by the two tests that need a context: `dreaming (actual)` is asserted across all four
+    /// scheduler states, so it needs one with everything else already present, and spelling the
+    /// struct out twice is how the two copies drift.
+    fn base_debug_context() -> super::super::DebugContext {
+        super::super::DebugContext {
             embedding_model: "org/configured-model-v9".to_string(),
             embedding_device: "cuda-device-7".to_string(),
             transport: "http-transport-x".to_string(),
@@ -543,10 +628,17 @@ mod tests {
             data_dir: "/tmp/data-dir-9".to_string(),
             cluster_merge_threshold: 0.875,
             dreaming_summary: "on - sweep 3600s".to_string(),
-            // Host checking is off for this test: `render` below issues a bare `Request::builder()`
+            dreaming_liveness: None,
+            // Host checking is off for these tests: `render` below issues a bare `Request::builder()`
             // GET with no Host header, which an armed check would (correctly) refuse.
             allowed_hosts: vec![],
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_with_context_shows_bind_and_transport() {
+        let server = super::super::test_support::test_server().await;
+        let ctx = base_debug_context();
         let html = render(crate::debug::router_with_context(server, Some(ctx))).await;
 
         assert_eq!(config_value(&html, "server.transport"), "http-transport-x");
@@ -570,6 +662,95 @@ mod tests {
             !html.contains(UNAVAILABLE),
             "a row leaked unavailability: {html}"
         );
+    }
+
+    /// The row exists so a stopped scheduler cannot hide behind a configured cadence, and the states
+    /// must be told apart by a reader — the failure mode is not "the panel is wrong", it is "the panel
+    /// says the same thing about four different situations".
+    ///
+    /// Asserted through `context_rows` rather than rendered HTML: the labels are static, so the router
+    /// would add a template dependency without adding coverage. Each case stamps its own tick time
+    /// relative to `unix_now()` because `state()` reads the wall clock itself — a `Quiet` case has to
+    /// be *created* by a past stamp, not by a different input shape.
+    #[test]
+    fn the_dreaming_state_row_distinguishes_every_scheduler_state() {
+        use alexandria_engine::dreaming::Liveness;
+        use std::sync::Arc;
+
+        let row = |liveness: Option<Arc<Liveness>>| {
+            context_rows(Some(&debug_context_with_liveness(liveness)))
+                .into_iter()
+                .find(|r| r.label == "dreaming (actual)")
+                .expect("the row must exist")
+                .value
+        };
+
+        // A live loop: ticked one second ago, well inside the 600s limit this Liveness carries.
+        let live = Arc::new(Liveness::new(600));
+        live.note_start(unix_now().saturating_sub(1));
+        live.note_tick(unix_now().saturating_sub(1));
+        let running = row(Some(live.clone()));
+        assert!(
+            running.starts_with("awake, last wake ") && !running.contains("QUIET"),
+            "a healthy loop must read as healthy: {running}"
+        );
+
+        // The same type, stamped past the limit. This is the only difference between the two rows, so
+        // if they render alike the state machine is being ignored at render time.
+        live.note_tick(unix_now().saturating_sub(5_000));
+        let quiet = row(Some(live));
+        assert!(
+            quiet.contains("QUIET for") && quiet.contains("not waking on schedule"),
+            "silence past the limit must be called out, not left as 'awake': {quiet}"
+        );
+        assert_ne!(running, quiet, "the two must not collapse into one string");
+
+        let stopped = Arc::new(Liveness::new(600));
+        stopped.note_start(0);
+        stopped.note_restart(Some("sweep panicked".to_string()));
+        stopped.note_give_up(4);
+        let given_up = row(Some(stopped));
+        assert!(
+            given_up.starts_with("STOPPED")
+                && given_up.contains("4 panics")
+                && given_up.contains("no background housekeeping is running"),
+            "a scheduler that gave up must say so and say what it means: {given_up}"
+        );
+
+        let fresh = Arc::new(Liveness::new(600));
+        let not_started = row(Some(fresh));
+        assert_eq!(not_started, "started, no tick yet");
+
+        // Disabled is its own answer, and must not be confused with either silence or ignorance.
+        let disabled = row(None);
+        assert!(
+            disabled.contains("enabled = false"),
+            "turned off must read as turned off: {disabled}"
+        );
+        assert_ne!(
+            disabled, UNAVAILABLE,
+            "a context present is not a context missing"
+        );
+        assert_ne!(disabled, not_started, "off is not the same as booting");
+
+        // And with no context at all, the row degrades to the shared marker like its neighbours.
+        let blind = context_rows(None)
+            .into_iter()
+            .find(|r| r.label == "dreaming (actual)")
+            .expect("row")
+            .value;
+        assert_eq!(blind, UNAVAILABLE);
+    }
+
+    /// One `DebugContext` per test, with only the liveness handle varying.
+    fn debug_context_with_liveness(
+        liveness: Option<std::sync::Arc<alexandria_engine::dreaming::Liveness>>,
+    ) -> super::super::DebugContext {
+        let ctx = base_debug_context();
+        super::super::DebugContext {
+            dreaming_liveness: liveness,
+            ..ctx
+        }
     }
 
     #[tokio::test]

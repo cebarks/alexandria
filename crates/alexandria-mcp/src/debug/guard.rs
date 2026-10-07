@@ -238,6 +238,7 @@ mod tests {
             data_dir: ":memory:".to_string(),
             cluster_merge_threshold: 0.7,
             dreaming_summary: String::new(),
+            dreaming_liveness: None,
             allowed_hosts: allowed_hosts.iter().map(|h| (*h).to_string()).collect(),
         }
     }

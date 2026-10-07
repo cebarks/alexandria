@@ -16,6 +16,7 @@ use alexandria_engine::clusters::maintenance::{
     MaintenanceAction, MergeCheck, check_cohesion, check_merge,
 };
 use alexandria_engine::dreaming::collapse::{Candidate, UNKNOWN_CREATED_AT, duplicate_groups};
+use alexandria_engine::dreaming::liveness::{Liveness, SharedLiveness};
 use alexandria_engine::dreaming::{DEMOTED_CONFIDENCE, Intervals, Job, JobReport, should_demote};
 use alexandria_engine::heat::{HeatColumns, HeatState as EngineHeatState, projected_heat};
 use alexandria_storage::models::LiveConfidence;
@@ -44,6 +45,9 @@ pub(crate) fn now_secs() -> u64 {
 pub(crate) struct Jobs {
     db: Arc<Database>,
     intervals: Intervals,
+    /// Published so the dashboard can tell a stopped loop from an idle one. Owned by `Jobs` because
+    /// the silence limit is derived from the intervals, and shared with `DebugContext` by `Arc`.
+    liveness: SharedLiveness,
     cohesion_floor: f32,
     merge_threshold: f32,
     /// `[heat] decay_tau_secs`. The sweep is the only job that projects heat, so this is the only
@@ -56,9 +60,14 @@ pub(crate) struct Jobs {
 
 impl Jobs {
     pub(crate) fn new(db: Arc<Database>, config: &Config) -> Self {
+        let intervals = config.dreaming.intervals();
         Self {
             db,
-            intervals: config.dreaming.intervals(),
+            // Derived from the cadences rather than fixed: a loop that wakes late is not a dead one,
+            // and nothing is legitimately due sooner than the shortest interval. Doubled, so one
+            // overrun is not reported as a stalled scheduler.
+            liveness: Arc::new(Liveness::new(silence_limit_secs(intervals))),
+            intervals,
             cohesion_floor: config.cluster.cohesion_floor,
             merge_threshold: config.cluster.merge_threshold,
             decay_tau_secs: config.heat.decay_tau_secs,
@@ -88,18 +97,57 @@ impl Jobs {
         db: Arc<Database>,
         config: &Config,
         cancel: CancellationToken,
+        liveness: SharedLiveness,
     ) -> JoinHandle<()> {
-        let jobs = Arc::new(Jobs::new(db, config));
+        let mut jobs = Jobs::new(db, config);
+        // The caller's handle replaces the one `new` derived, so the dashboard and the loop observe
+        // the same counters. Replacing rather than borrowing keeps `Jobs::new` unchanged for the job
+        // tests, which have no supervisor and no dashboard.
+        jobs.liveness = liveness;
+        let jobs = Arc::new(jobs);
         // The closure needs its own handle to the token for each attempt, and `supervise` needs one
         // to watch — `CancellationToken` is cloneable precisely for this, each clone observing the
         // same cancellation without the loop having to own it.
         let watch = cancel.clone();
+        let reported = Arc::clone(&jobs.liveness);
         tokio::spawn(supervise(
             move || run(Arc::clone(&jobs), cancel.clone()),
             watch,
             Duration::from_secs(30),
+            reported,
         ))
     }
+}
+
+/// The shared heartbeat for one process: created by `main.rs`, written by the loop and its
+/// supervisor, read by the dashboard.
+///
+/// The silence limit comes from the same [`silence_limit_secs`] that `Jobs::new` derives, so the
+/// writer and the reader cannot disagree about what "quiet" means while looking at the same struct.
+pub(crate) fn shared_liveness(dreaming: &crate::config::DreamingConfig) -> SharedLiveness {
+    Arc::new(Liveness::new(silence_limit_secs(dreaming.intervals())))
+}
+
+/// How long the loop may legitimately stay asleep before the dashboard calls it quiet.
+///
+/// Twice the shortest interval: the loop sleeps until the soonest job is due, so nothing is
+/// legitimately silent longer than that, and the doubling tolerates one overrun without reporting a
+/// healthy loop as stalled.
+fn silence_limit_secs(intervals: Intervals) -> u64 {
+    intervals.shortest_secs().saturating_mul(2)
+}
+
+/// The panic payload, if the aborted task left one worth showing an operator.
+///
+/// A `JoinError` carries `Box<dyn Any>`, and the two shapes that reach here from application code are
+/// `&str` (a literal like `panic!("boom")`) and `String` (a formatted panic). Anything else is not
+/// worth guessing at, so it reports `None` — the log line still carries the `JoinError`'s own text.
+fn panic_message(error: tokio::task::JoinError) -> Option<String> {
+    let payload = error.into_panic();
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        return Some((*text).to_string());
+    }
+    payload.downcast_ref::<String>().cloned()
 }
 
 /// The restart policy, kept separate from the work so the give-up branch is testable without a job
@@ -117,6 +165,7 @@ pub(crate) async fn supervise<F, Fut>(
     mut start: F,
     cancel: CancellationToken,
     base_backoff: Duration,
+    liveness: SharedLiveness,
 ) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -139,6 +188,7 @@ pub(crate) async fn supervise<F, Fut>(
         failures += 1;
 
         if failures > MAX_CONSECUTIVE_FAILURES {
+            liveness.note_give_up(failures);
             tracing::error!(
                 "dreaming scheduler has panicked {failures} times in a row; giving up. Background \
                  housekeeping (split, merge, sweep, collapse, appraise) is STOPPED for the life of \
@@ -148,9 +198,13 @@ pub(crate) async fn supervise<F, Fut>(
         }
 
         let backoff = base_backoff * failures;
+        // Captured before `error` is consumed for its payload: the `JoinError`'s own text names the
+        // task that died, which is the part that survives a payload this code cannot downcast.
+        let died = error.to_string();
+        liveness.note_restart(panic_message(error));
         tracing::error!(
-            "dreaming scheduler panicked; restarting ({failures}/{MAX_CONSECUTIVE_FAILURES}) in \
-             {backoff:?}: {error}"
+            "dreaming scheduler panicked ({died}); restarting ({failures}/{MAX_CONSECUTIVE_FAILURES}) \
+             in {backoff:?}"
         );
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
@@ -605,6 +659,10 @@ pub(crate) fn summary(config: &crate::config::DreamingConfig) -> String {
 pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
     let mut schedule = jobs.intervals.initial_schedule(now_secs());
     let mut tick: u64 = 0;
+    // Claim the loop's existence before the first sleep. Without this a loop that starts, sleeps for
+    // an hour (sweep's cadence) and is read during that sleep would report `NotStarted`, which is a
+    // different statement than the truth.
+    jobs.liveness.note_start(now_secs());
     tracing::info!(
         "dreaming scheduler started: sweep {}s, cluster {}s, merge {}s, collapse {}s, appraise {}s",
         jobs.intervals.sweep_secs,
@@ -622,6 +680,11 @@ pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
         }
 
         let now = now_secs();
+        // Stamp **every** wake, including one where nothing was due. `due.is_empty()` continues
+        // below, and a heartbeat written only after a real tick would go quiet for exactly the
+        // periods where the scheduler is healthy but idle — which is the failure this field exists
+        // to distinguish from a dead loop.
+        jobs.liveness.note_tick(now);
         let due = schedule.due(now);
         if due.is_empty() {
             continue;
@@ -658,6 +721,7 @@ pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use alexandria_engine::dreaming::SchedulerState;
     use alexandria_storage::Database;
 
     /// An embedded database with the schema applied and nothing in it: the state every first boot
@@ -812,6 +876,41 @@ mod tests {
     /// unattributed `ClusterRepo::new`. A typo in the new `run_id`/`job`/`actor` binds would have
     /// produced unattributed rows with only a warn to show for it — which is precisely the silent
     /// breakage the audit trail exists to catch.
+    /// The heartbeat is only useful if the loop actually writes it, and it must be written on a wake
+    /// where nothing was due — otherwise the field goes quiet precisely during the idle periods that
+    /// are normal for a 1-hour sweep cadence, and "quiet" stops meaning anything.
+    #[tokio::test]
+    async fn the_loop_stamps_the_heartbeat_even_when_nothing_is_due() {
+        let db = migrated_db().await;
+        let jobs = Jobs::new(db, &Config::default());
+        let liveness = Arc::new(Liveness::new(600));
+        // Same field `spawn` sets, and the same reason: a dashboard reading a different `Liveness`
+        // than the loop writes would report `NotStarted` forever.
+        let jobs = Jobs {
+            liveness: Arc::clone(&liveness),
+            ..jobs
+        };
+
+        assert_eq!(liveness.state(now_secs()), SchedulerState::NotStarted);
+
+        let cancel = CancellationToken::new();
+        let loop_handle = tokio::spawn(run(Arc::new(jobs), cancel.clone()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(10), loop_handle)
+            .await
+            .expect("cancelled loop must end")
+            .expect("must not panic on the way out");
+
+        assert!(
+            !matches!(liveness.state(now_secs()), SchedulerState::NotStarted),
+            "entering the loop must be observable, not just the completion of a tick"
+        );
+        if let SchedulerState::GivenUp { .. } = liveness.state(now_secs()) {
+            panic!("a clean cancelled run must not report itself as stopped");
+        }
+    }
+
     #[tokio::test]
     async fn a_split_attributes_its_audit_row_to_the_tick_that_wrote_it() {
         let db = migrated_db().await;
@@ -847,7 +946,7 @@ mod tests {
         );
 
         let logs = ClusterRepo::new(db.inner())
-            .list_maintenance_logs(10, 0)
+            .list_maintenance_logs(10, 0, None)
             .await
             .unwrap();
         let split = logs
@@ -893,7 +992,7 @@ mod tests {
         );
 
         let logs = ClusterRepo::new(db.inner())
-            .list_maintenance_logs(10, 0)
+            .list_maintenance_logs(10, 0, None)
             .await
             .unwrap();
         let merge = logs
@@ -956,6 +1055,7 @@ mod tests {
         let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let cancel = CancellationToken::new();
         let counter = Arc::clone(&attempts);
+        let liveness = Arc::new(Liveness::new(600));
 
         supervise(
             move || {
@@ -968,6 +1068,7 @@ mod tests {
             },
             cancel,
             Duration::from_millis(1),
+            Arc::clone(&liveness),
         )
         .await;
 
@@ -975,6 +1076,23 @@ mod tests {
         assert_eq!(
             seen, 4,
             "three restarts after the first failure, then it stops trying — not forever"
+        );
+        // The give-up has to be visible to a reader who never looks at a log file, because the
+        // dashboard's cadence row says the same thing either way. `restarts` counts the restarts it
+        // did (3), `panics` the failures it saw (4) — the last one is the one it stopped on.
+        assert_eq!(
+            liveness.state(0),
+            SchedulerState::GivenUp {
+                panics: 4,
+                restarts: 3
+            },
+            "a scheduler that gave up must report itself as stopped"
+        );
+        assert!(
+            liveness
+                .last_panic()
+                .is_some_and(|m| m.contains("on purpose")),
+            "the payload should survive for display"
         );
     }
 
@@ -996,6 +1114,9 @@ mod tests {
             },
             cancel,
             Duration::from_millis(1),
+            // A heartbeat the loop never got to write: a clean exit must not be reported as a
+            // stopped scheduler, which is the difference between `NotStarted` and `GivenUp`.
+            Arc::new(Liveness::new(600)),
         )
         .await;
 
@@ -1126,7 +1247,7 @@ mod tests {
         );
 
         let logs = ClusterRepo::new(db.inner())
-            .list_maintenance_logs(10, 0)
+            .list_maintenance_logs(10, 0, None)
             .await
             .unwrap();
         assert_eq!(logs.len(), 1, "and it wrote no second audit row");
@@ -1157,7 +1278,7 @@ mod tests {
         );
 
         let logs = ClusterRepo::new(db.inner())
-            .list_maintenance_logs(10, 0)
+            .list_maintenance_logs(10, 0, None)
             .await
             .unwrap();
         assert_eq!(logs.len(), 2, "one audit row per collapsed fact");
@@ -1289,7 +1410,7 @@ mod tests {
         );
 
         let logs = ClusterRepo::new(db.inner())
-            .list_maintenance_logs(10, 0)
+            .list_maintenance_logs(10, 0, None)
             .await
             .unwrap();
         assert_eq!(logs.len(), 1);
@@ -1391,7 +1512,7 @@ mod tests {
             "nothing was lowered"
         );
         let logs = ClusterRepo::new(db.inner())
-            .list_maintenance_logs(10, 0)
+            .list_maintenance_logs(10, 0, None)
             .await
             .unwrap();
         assert!(logs.is_empty(), "and nothing was logged");
@@ -1458,7 +1579,7 @@ mod tests {
         );
 
         let logs = ClusterRepo::new(db.inner())
-            .list_maintenance_logs(10, 0)
+            .list_maintenance_logs(10, 0, None)
             .await
             .unwrap();
         assert_eq!(logs.len(), 1, "and wrote no second audit row");

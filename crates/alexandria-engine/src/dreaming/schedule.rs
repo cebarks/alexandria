@@ -82,6 +82,26 @@ impl Default for Intervals {
 }
 
 impl Intervals {
+    /// The soonest any job can come due.
+    ///
+    /// The loop sleeps until the *soonest* job is due, so nothing legitimately keeps it quiet longer
+    /// than this. It is the basis for the dashboard's silence limit rather than a guessed constant,
+    /// because an all-hour configuration and a 5-minute cluster cadence are not the same statement
+    /// about health.
+    #[must_use]
+    pub fn shortest_secs(&self) -> u64 {
+        [
+            self.sweep_secs,
+            self.cluster_secs,
+            self.merge_secs,
+            self.collapse_secs,
+            self.appraise_secs,
+        ]
+        .into_iter()
+        .min()
+        .unwrap_or(0)
+    }
+
     pub fn interval_for(&self, job: Job) -> u64 {
         match job {
             Job::Sweep => self.sweep_secs,

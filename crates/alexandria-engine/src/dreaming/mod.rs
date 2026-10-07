@@ -8,6 +8,7 @@
 
 pub mod appraise;
 pub mod collapse;
+pub mod liveness;
 pub mod schedule;
 
 pub use collapse::{Candidate, DuplicateGroup, UNKNOWN_CREATED_AT, duplicate_groups};
@@ -16,6 +17,8 @@ pub use appraise::{
     DEFAULT_COLD_HEAT_FLOOR, DEFAULT_DEMOTE_CONFIDENCE_CEILING, DEMOTED_CONFIDENCE, is_cold,
     should_demote,
 };
+
+pub use liveness::{Liveness, SchedulerState};
 
 pub use schedule::{
     ALL_JOBS, DEFAULT_APPRAISE_INTERVAL_SECS, DEFAULT_CLUSTER_INTERVAL_SECS,

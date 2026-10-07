@@ -251,10 +251,17 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
     // Spawn the dreaming scheduler: one loop, five independently-due jobs (#43). It replaces the
     // inline cluster-maintenance spawn that used to live here, which had a single interval for two
     // distinct phases and no way to add a third job without retiming the first two.
+    //
+    // `liveness` is shared with the dashboard below because a scheduler that quietly stopped is
+    // otherwise indistinguishable from one that is idle: `summary()` renders the *configured*
+    // cadences, which say the same thing about a healthy loop and about one that panicked itself out.
+    let liveness = dreaming::shared_liveness(&config.dreaming);
     if config.dreaming.enabled {
-        // The handle is deliberately dropped: the task is detached and exits on `cancel`, which is
-        // the HTTP service's own token, so the loop stops when serving stops.
-        let _dreaming = dreaming::Jobs::spawn(server.db.clone(), config, cancel.clone());
+        // The supervisor's own handle is what gets dropped here, deliberately: it exits on `cancel`,
+        // which is the HTTP service's own token, so the loop stops when serving stops. Watching it
+        // would mean awaiting the server's lifetime from inside the server.
+        let _dreaming =
+            dreaming::Jobs::spawn(server.db.clone(), config, cancel.clone(), liveness.clone());
     } else {
         tracing::info!("dreaming scheduler disabled by [dreaming] enabled = false");
     }
@@ -272,6 +279,10 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
         data_dir: config.database.data_dir.display().to_string(),
         cluster_merge_threshold: config.cluster.merge_threshold,
         dreaming_summary: dreaming::summary(&config.dreaming),
+        // Only when the scheduler is enabled: `None` renders the dashboard's existing
+        // "not running" state rather than inventing a fourth one, and a disabled loop has no
+        // heartbeat to report.
+        dreaming_liveness: config.dreaming.enabled.then(|| Arc::clone(&liveness)),
         // The same list `/mcp` is configured with above, so the debug UI and the MCP endpoint
         // cannot disagree about what a legitimate Host is.
         allowed_hosts: config.server.allowed_hosts.clone(),
