@@ -75,6 +75,26 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   reaches us via `surrealdb-core -> jsonwebtoken`; nothing here uses RSA. No patched release exists
   (0.10 is still a release candidate). Drop the ignore once `cargo deny` stops needing it, i.e.
   when surrealdb picks up a `jsonwebtoken` built on `rsa` 0.10.
+- [-] **`RUSTSEC-2026-0194` and `-0195` (`quick-xml` 0.39.4) are ignored in `deny.toml`.** They
+  reach us via `surrealdb-core` 3.3 -> `object_store` 0.13, whose cloud backends surrealdb-core
+  compiles in unconditionally; Alexandria never configures object storage. Both are fixed in
+  `quick-xml` 0.41, which `object_store` 0.13 cannot take. Drop the ignores once surrealdb moves
+  to an `object_store` that can.
+- [ ] **SurrealDB 3.3 compiles in `lindera` (a CJK morphological analyser plus its dictionaries) and
+  nothing in this workspace uses it.** No `DEFINE ANALYZER`, `SEARCH` or BM25 appears anywhere in
+  `crates/` or the migrations, so the `surrealdb-idx -> lindera -> lindera-dictionary -> {crawdad,
+  daachorse}` chain is unused surface in the binary — and it is the only route by which those licences
+  reach us, which is why they matter to `cargo deny` even though no code path reads them. It is a
+  transitive of `surrealdb-idx` and cannot be dropped from our manifest: revisit if SurrealDB makes the
+  analyser optional, or when build time or binary size becomes the complaint.
+- [ ] **The `GROUP BY` over an unnested array-field claim is still dated 3.2.4, not re-run on the pin.**
+  `MemoryRepo::top_tags` flattens in SQL because grouping over a value unnested out of an array field
+  collapsed to a single `NONE` group. The shipped flattened form is pinned by
+  `test_top_tags_counts_live_facts_and_caps`, so the behaviour we rely on is covered either way; what
+  is unverified is whether the workaround is still *needed*. Re-check on the pinned engine and, if the
+  naive grouping now works, delete the flatten and the comment that justifies it — the parse-level half
+  of that sweep is already re-checked by
+  `test_the_pinned_engine_still_rejects_the_constructs_the_workarounds_avoid`.
 
 ## Pi extension
 

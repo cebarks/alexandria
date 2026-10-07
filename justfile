@@ -13,13 +13,13 @@ fmt:
 fmt-fix:
     cargo fmt --all
 
-# Lint with clippy (warnings as errors, matches CI)
+# Lint with clippy (warnings as errors, matches CI; --locked keeps the engine pin from drifting)
 lint:
-    RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets --all-features
+    RUSTFLAGS="-Dwarnings" cargo clippy --locked --workspace --all-targets --all-features
 
-# Run all Rust tests
+# Run all Rust tests (--locked: Cargo.lock is a reviewed artifact here, not a resolution to redo)
 test:
-    cargo test --workspace --all-features
+    cargo test --locked --workspace --all-features
 
 # Type-check and test the pi companion (node:test over tsx, hermetic)
 ext-test:
@@ -35,11 +35,11 @@ test-all: test ext-test
 
 # Fast type-check
 check:
-    cargo check --workspace --all-features
+    cargo check --locked --workspace --all-features
 
 # Run the server
 run:
-    cargo run --all-features
+    cargo run --locked --all-features
 
 # Clean build artifacts
 clean:

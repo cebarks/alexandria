@@ -34,11 +34,14 @@ impl FactSort {
             Self::Confidence => "confidence",
             Self::Content => "content",
             Self::Id => "id",
-            // SurrealDB 3.2 will not parse `ORDER BY array::len(tags)` ("Unexpected token `::`,
+            // SurrealDB will not parse `ORDER BY array::len(tags)` ("Unexpected token `::`,
             // expected Eof" — ORDER BY takes a field path, not an expression), so the count is
             // projected under an alias and ordered by that name. Same computed-field trick as
             // [`MemoryRepo::all_ids_and_content`], which projects `created_at` only so ORDER BY
             // has it. The alias is not a `Fact` field, and serde drops unknown fields on read.
+            // Re-checked on the pinned engine by
+            // `test_the_pinned_engine_still_rejects_the_constructs_the_workarounds_avoid` — if that
+            // test starts failing, this alias and its projection are dead complexity.
             Self::TagCount => "tag_count",
         }
     }
@@ -209,8 +212,8 @@ impl<'a> MemoryRepo<'a> {
     }
 
     /// Same as `nearest`, served from the HNSW index. Only valid once
-    /// `schema::ensure_vector_index` has succeeded: without the index the planner strips
-    /// `<|k,ef|>` to a plain scan.
+    /// `schema::ensure_vector_index` has succeeded: without the index `<|k,ef|>` matches
+    /// no rows.
     pub async fn nearest_indexed(&self, query: &[f32], k: usize) -> Result<Vec<Fact>> {
         self.knn(knn_sql(k, true), query).await
     }
@@ -303,7 +306,8 @@ impl<'a> MemoryRepo<'a> {
     /// `test_list_confidence_tiebreak_pages_without_gaps` for what that costs the tests.)
     ///
     /// `created_at` is nullable in the Rust model (`Option<DateTime<Utc>>`). Checked against
-    /// SurrealDB 3.2: `ORDER BY ... NULLS LAST` and `ORDER BY type::coalesce(...)` both fail to
+    /// the pinned engine (3.3.0, and true on 3.2.4 before it): `ORDER BY ... NULLS LAST` and
+    /// `ORDER BY type::coalesce(...)` both fail to
     /// parse in an ORDER BY, so there is nothing to fix here — nulls sort smaller than any
     /// datetime, i.e. first ascending and last descending, and the row is never dropped. Pinned by
     /// `test_list_sorts_null_created_at_without_dropping_the_row`.
@@ -431,10 +435,13 @@ impl<'a> MemoryRepo<'a> {
     /// a distinct-tag sweep it will not render. Ties break on the tag name so the same page
     /// renders the same order twice.
     ///
-    /// SurrealDB 3.2 cannot group by a value unnested out of an array field — `GROUP BY` over
+    /// SurrealDB cannot group by a value unnested out of an array field — `GROUP BY` over
     /// a subquery's array column, and `$value` in that position, both collapse to one `NONE`
     /// group — so the flatten happens in SQL (one row, `array::group` then `array::flatten`)
     /// and only the tally happens here. That keeps the read to the `tags` column; content and
+    /// Last verified that way on 3.2.4, and not re-run since: the flattened form is what this
+    /// function ships and `test_top_tags_counts_live_facts_and_caps` pins its output, so the
+    /// workaround is exercised either way and only the *reason* for it is dated.
     /// embeddings are never pulled.
     pub async fn top_tags(&self, limit: usize) -> Result<Vec<(String, usize)>> {
         #[derive(serde::Deserialize, SurrealValue)]
@@ -679,6 +686,57 @@ mod tests {
         let brute = plan(false).await;
         assert!(brute.contains("KnnTopK"), "{brute}");
         assert!(!brute.contains("KnnScan"), "{brute}");
+    }
+
+    /// On 3.3, `<|k,ef|>` with no index behind it **matches no rows** — the planner evaluates the KNN
+    /// condition per row as false. 3.2 stripped it to a plain scan, so the same mistake returned
+    /// unranked rows. That turns the one guard on this path (`AlexandriaServer::vector_index`, set from
+    /// a successful define) from "worst case the ranking is unindex" into "worst case the agent is
+    /// handed an empty result and a successful tool call", which no test pinned.
+    ///
+    /// Asserted as behaviour rather than as a plan, because the failure mode is the row count an
+    /// agent sees. The positive control is the same call after the index is defined: if both returned
+    /// zero rows the fixture would be broken and this test would pass for nothing.
+    #[tokio::test]
+    async fn nearest_indexed_without_an_index_returns_no_rows_and_with_one_returns_them() {
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+
+        let repo = MemoryRepo::new(db.inner());
+        let id = repo
+            .create_fact("indexed target", 0.5, &[0.9, 0.1], &["x".to_string()])
+            .await
+            .unwrap();
+        repo.create_fact("other", 0.5, &[0.1, 0.9], &[])
+            .await
+            .unwrap();
+        let query = vec![0.9f32, 0.1];
+
+        let unindexed = repo
+            .nearest_indexed(&query, 3)
+            .await
+            .expect("a missing index is not a query error");
+        assert!(
+            unindexed.is_empty(),
+            "`<|k,ef|>` without an index must match nothing on the pinned engine — this is the \
+             behaviour that makes `vector_index` load-bearing, and if it changes the guard's failure \
+             mode changes with it (a silent empty retrieval vs an unranked one)"
+        );
+
+        crate::schema::ensure_vector_index(db.inner(), 2)
+            .await
+            .unwrap();
+        let indexed = repo.nearest_indexed(&query, 3).await.unwrap();
+        assert!(
+            !indexed.is_empty(),
+            "positive control: the same call finds rows once the index exists, so the assertion \
+             above measured the index and not a fixture that cannot match anything"
+        );
+        assert_eq!(
+            record_id_to_string(indexed[0].id.as_ref().unwrap()),
+            id,
+            "and the nearest neighbour is the row that shares the query's direction"
+        );
     }
 
     #[tokio::test]
@@ -1231,9 +1289,68 @@ mod tests {
     /// `fact.created_at` ships as `TYPE datetime DEFAULT time::now()`, which cannot hold a null —
     /// but `Fact.created_at` is an `Option` and a row that predates or bypasses the default has to
     /// survive the ORDER BY. So this test overwrites the field on *its own* in-memory database to
-    /// reach that state; no migration is involved. Checked on SurrealDB 3.2: `NULLS LAST` and
+    /// reach that state; no migration is involved. Checked on the pinned engine: `NULLS LAST` and
     /// `type::coalesce` do not parse inside ORDER BY, and nulls sort smaller than any datetime —
     /// first ascending, last descending. That is the placement we accept, and assert.
+    /// Two workarounds in this file exist because the engine refused to parse or evaluate a more
+    /// direct query. AGENTS.md's gotchas list claims each was verified against the pinned engine, so
+    /// the parse-level one is re-checked here rather than asserted from a comment: a note naming a
+    /// version the manifest can no longer resolve is indistinguishable from a stale one, and the only
+    /// way to know whether the workaround is still load-bearing is to ask the engine that runs it.
+    ///
+    /// The `GROUP BY` half is *behaviour*, not a parse error, and is left to its own shipped test
+    /// (`test_top_tags_counts_live_facts_and_caps`) rather than to a reconstruction of the naive form.
+    #[tokio::test]
+    async fn test_the_pinned_engine_still_rejects_the_constructs_the_workarounds_avoid() {
+        /// Whether the engine accepts `sql` at all. A rejection surfaces either as an `Err` from the
+        /// awaited query or as a failed statement inside the response, so both paths count as a
+        /// rejection and neither is trusted alone.
+        async fn accepted(db: &Surreal<Any>, sql: &str) -> bool {
+            match db.query(sql.to_string()).await {
+                Ok(response) => response.check().is_ok(),
+                Err(_) => false,
+            }
+        }
+
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let repo = MemoryRepo::new(db.inner());
+        let embedding = [0.1_f32, 0.2];
+        repo.create_fact(
+            "one",
+            0.5,
+            &embedding,
+            &["alpha".to_string(), "shared".to_string()],
+        )
+        .await
+        .unwrap();
+        repo.create_fact("two", 0.5, &embedding, &["shared".to_string()])
+            .await
+            .unwrap();
+
+        // `FactSort::TagCount` projects `array::len(tags) AS tag_count` and sorts on the alias.
+        assert!(
+            !accepted(
+                db.inner(),
+                "SELECT id FROM fact ORDER BY array::len(tags) LIMIT 1"
+            )
+            .await,
+            "`ORDER BY array::len(tags)` now parses, so the alias projection in `FactSort::TagCount` \
+             is dead complexity — delete it and the comment that justifies it"
+        );
+        // Positive control: the form the code actually ships must still be accepted, or the
+        // assertion above would be proving that the database is broken rather than that the
+        // workaround is needed.
+        assert!(
+            accepted(
+                db.inner(),
+                "SELECT id, array::len(tags) AS tag_count FROM fact ORDER BY tag_count LIMIT 1"
+            )
+            .await,
+            "the aliased form `FactSort::TagCount` relies on must parse"
+        );
+    }
+
     #[tokio::test]
     async fn test_list_sorts_null_created_at_without_dropping_the_row() {
         let db = Database::connect_embedded().await.unwrap();

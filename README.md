@@ -202,6 +202,19 @@ especially when `host = "0.0.0.0"`.
 
 ## Deployment
 
+**Upgrading from a build on SurrealDB 3.2 is one-way: stop the server and copy the data dir
+first** (`$XDG_DATA_HOME/alexandria/data` by default, `/data/db` in the container). A 3.3 build
+opens a 3.2 store, but ordinary use soon writes data 3.2 cannot read. Listing a cluster or session
+with 64 or more members makes 3.3 rewrite that table's definition, and every `store_memory` lists
+every cluster. How close that leaves a given deployment depends on its largest cluster, so check
+yours before upgrading — `/debug/clusters` prints the member count per cluster. Measured on a
+1897-memory store: 1474 clusters ranging from 1 to 51 members, median 1, 1277 of them singletons,
+so nothing is at the threshold yet; `merge` is the job that grows the top of that distribution
+toward 64. Writes to the vector index leave entries 3.2 cannot decode. A 3.2 build started on
+the result still boots, then fails cluster queries and vector search, or returns empty member lists
+with no error. Restoring the copy is the only way back, as SurrealDB's own
+[upgrade notes](https://github.com/surrealdb/surrealdb/blob/v3.3.0/doc/UPGRADING.md) say.
+
 ### As a systemd user service (recommended)
 
 ```ini
@@ -371,7 +384,7 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | [docs/prompt-path-stall-attribution.md](docs/prompt-path-stall-attribution.md) | 2026-09-22 investigation record: prompt-path stall attribution, the measured cold-handshake fault, and why the worker isolation it proposed was dropped. Carries a STATUS banner naming what shipped |
 | [crates/alexandria-mcp/assets/README.md](crates/alexandria-mcp/assets/README.md) | Vendored debug-UI assets, checksums, how to re-vendor |
 | [TODO-misc.md](TODO-misc.md) | Unprioritised backlog, grouped by area |
-| [AGENTS.md](AGENTS.md) | Working notes for humans and agents on this codebase — SurrealDB 3.2 gotchas, crate boundaries, task runner |
+| [AGENTS.md](AGENTS.md) | Working notes for humans and agents on this codebase — SurrealDB 3.3 gotchas, crate boundaries, task runner |
 
 ## Architecture
 

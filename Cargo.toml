@@ -43,7 +43,13 @@ tokio = { version = "1", default-features = false, features = [
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # Embedded-only: add "protocol-ws" and "rustls" if SurrealDB is ever not on localhost.
-surrealdb = { version = "3.2", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
+# Pinned exactly rather than "3.3", because a SurrealDB minor is a storage-format decision and not a
+# dependency bump: 3.3 rewrites table definitions (the graph fold) and HNSW pending-queue entries at
+# revisions a 3.2 build cannot decode, and the store cannot be rolled back once that has happened.
+# `^3.3` would let `cargo update` walk the engine to 3.4 with no manifest edit, no review, and no
+# re-read of the README upgrade note — while the dev recipes are not lock-resolved either (see
+# justfile `--locked`). Bumping this line is the deliberate act the pin exists to force.
+surrealdb = { version = "=3.3.0", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
 rmcp = { version = "3.1", default-features = false, features = [
   "server",
   "transport-io",
