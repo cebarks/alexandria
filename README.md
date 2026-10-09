@@ -8,7 +8,7 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 - **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool. Heat is recorded on retrieval but is not yet a ranking input — retrieval still ranks by cosine similarity (see [`A2`](docs/performance-and-ability-findings.md#a2-the-heat-model-is-inert)).
 - **Spreading activation** — Accessing a memory warms its graph neighbors. Heat propagates along edges with configurable decay.
 - **Graph edges** — Memories link via `derived_from` and `extracted_from` edges. `relates_to`, `supports` and `contradicts` exist in the schema but nothing in production writes them yet; auto-linking them is planned v0.3 work
-- **Hierarchical clustering** — Automatic cluster assignment on store, plus a background housekeeping scheduler that splits, merges, collapses byte-identical duplicates and lowers the confidence of memories that have gone cold without ever being retrieved, all with a queryable audit log
+- **Hierarchical clustering** — Automatic cluster assignment on store, plus a background housekeeping scheduler that splits, merges, collapses byte-identical duplicates and lowers the confidence of memories that have gone cold without ever being retrieved, all with a queryable audit log that one `alexandria dream` pass can be reviewed (or run on demand) against
 - **Progressive recall** — Two-phase retrieval: broad cluster matching first, then scope-narrowing within a cluster
 - **Session memory** — Group memories by conversation, search within a session, and close it out with a summary
 - **Document import** — Chunk by heading, paragraph, or fixed size with batch tracking and `extracted_from` lineage
@@ -48,7 +48,7 @@ First run downloads the embedding model from HuggingFace Hub (~80MB).
 
 ## Command Line
 
-`alexandria` with no arguments starts the server. The two subcommands are maintenance tools
+`alexandria` with no arguments starts the server. The three subcommands are maintenance tools
 that run once and exit.
 
 | Command | What it does |
@@ -56,13 +56,18 @@ that run once and exit.
 | `alexandria` | Start the server on the configured transport. |
 | `alexandria migrate-embeddings [--force]` | Re-embed the whole corpus with the model and `max_tokens` in `config.toml`. Needed after a deliberate model change or after raising `max_tokens`; `--force` re-embeds even when nothing changed — see [docs/configuration.md](docs/configuration.md). |
 | `alexandria bench-retrieval` | Measure how well the configured model separates a correct answer from the rest of the corpus, and print the score distributions and the limit × threshold grid that the `retrieve.min_similarity` floor and the client recall defaults are judged against — see [docs/minilm-test-data.md](docs/minilm-test-data.md). |
+| `alexandria dream [--job NAME]... [--max-rows N]` | Run one or more of the five housekeeping jobs **once, now**, and print what each did (`job=… examined=… acted=… skipped=…`) plus the run id its audit rows carry, so `/debug/maintenance?run=<id>` shows exactly what that pass changed. With no `--job` it runs all five. The way to answer "why did my corpus change" or "run the collapse now" without editing `[dreaming]` cadences and restarting the service — see [docs/configuration.md](docs/configuration.md). |
 | `alexandria --help` | Print the same list. |
 
-Both subcommands open the data dir directly and SurrealKV is single-writer, so the server has
-to be stopped first. `bench-retrieval` can instead run against a copy of the data dir via
+All three subcommands open the data dir directly and SurrealKV is single-writer, so the server
+has to be stopped first; `alexandria dream` says so in one line and runs nothing at all rather
+than starting half a pass, and `dream --help` states the constraint too. `bench-retrieval` can
+instead run against a copy of the data dir via
 `ALEXANDRIA_DATA_DIR`, which keeps the server down only for a `cp`. It is not read-only: like
 server boot it checks the embedding-model lock (refusing on a mismatch) and defines the HNSW
-index if it is missing.
+index if it is missing. `alexandria dream` needs neither the model nor the index — it reads the
+stored vectors, heat and confidence — and `--max-rows N` overrides `dreaming.max_rows_per_run`
+for that invocation only, without touching the config file.
 
 ## MCP Tools
 
@@ -179,7 +184,9 @@ Tester's non-dry `retrieve` run performs spreading activation, so it writes heat
   writes: cluster splits and merges (source, resulting clusters, members moved), duplicate collapses
   and cold-memory demotions, each carrying the `run_id` of the tick that wrote it, the job that ran,
   the disposition and — for a demotion — the confidence it replaced. `?run=` narrows the whole page
-  to one tick, which is how a pass gets reviewed as a unit or reversed as one; the filter is carried
+  to one run, which is how a pass gets reviewed as a unit or reversed as one; the run ids written by
+  `alexandria dream` start `run-cli-`, so a manual pass is separable from a scheduler tick in that
+  same filter. The filter is carried
   across pagination, and the form is a GET to the same route (the panel stays read-only). The only way to audit *why* the corpus changed since you last
   looked. The heat sweep deliberately writes nothing here: it changes ranking by nothing, so an audit
   trail for it would be hundreds of rows an hour recording that nothing happened.

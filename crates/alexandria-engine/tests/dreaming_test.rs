@@ -200,6 +200,48 @@ fn job_names_match_the_audit_allowlist() {
     );
 }
 
+/// `alexandria dream --job` accepts these and nothing else, and its refusal message is built by
+/// listing them, so both halves of the CLI's vocabulary come from one source.
+#[test]
+fn a_job_name_round_trips_through_the_spelling_an_operator_types() {
+    for job in ALL_JOBS {
+        assert_eq!(Job::from_name(job.as_str()), Some(job), "{}", job.as_str());
+    }
+
+    // Exact match only: `maintenance_log.job` carries these bytes, so an accept-and-lowercase path
+    // would let a command line name a spelling the audit log never shows.
+    for not_a_job in [
+        "SWEEP", "Sweep", " sweep", "sweep ", "", "all", "dream", "sweeps",
+    ] {
+        assert_eq!(
+            Job::from_name(not_a_job),
+            None,
+            "`{not_a_job}` is not a job name"
+        );
+    }
+}
+
+/// The line `alexandria dream` prints per job, in the field order the scheduler logs them. Pinned
+/// here because the engine owns the counters, so this is the one place that shape is a value a
+/// reader can check.
+#[test]
+fn a_report_renders_as_the_three_counters_in_the_logged_order() {
+    let mut report = alexandria_engine::dreaming::JobReport::new(Job::Appraise);
+    report.examined = 12;
+    report.acted = 3;
+    assert_eq!(
+        report.summary_line(),
+        "job=appraise examined=12 acted=3 skipped=0",
+        "skipped is rendered even at zero, so the line has one shape whatever the job did"
+    );
+
+    report.skipped = 9;
+    assert_eq!(
+        report.summary_line(),
+        "job=appraise examined=12 acted=3 skipped=9"
+    );
+}
+
 #[test]
 fn every_job_has_an_interval_and_reports_start_empty() {
     let intervals = Intervals::default();
