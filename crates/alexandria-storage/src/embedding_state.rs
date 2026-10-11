@@ -118,6 +118,30 @@ pub async fn read_target_journal(db: &Surreal<Any>) -> Result<Option<ReembedJour
         .transpose()
 }
 
+/// Validate owned lifecycle keys before provisioning or changing target vectors.
+/// This is read-only; later transitions still CAS the complete snapshot.
+pub async fn validate_target_ownership(db: &Surreal<Any>, expected: &ReembedJournal) -> Result<()> {
+    expected.validate()?;
+    let seen = LockSnapshot::load(db).await?;
+    let stored = decode_journal(
+        seen.journal
+            .as_deref()
+            .context("Target has no migration journal")?,
+    )?;
+    ensure!(
+        &stored == expected,
+        "Migration journal is stale or owned by another run"
+    );
+    embedding_validation::read_target_baseline(db, expected).await?;
+    if expected.phase == MigrationPhase::Complete {
+        ensure_ready(db).await?;
+        seen.source_matches(&expected.target_space, false)?;
+    } else {
+        seen.source_matches(&expected.source_space, true)?;
+    }
+    Ok(())
+}
+
 /// A corrupt/pending journal is never ignored, even if old compatibility keys were repaired.
 pub(crate) async fn ensure_ready(db: &Surreal<Any>) -> Result<()> {
     if let Some(journal) = read_target_journal(db).await? {
@@ -260,7 +284,8 @@ pub async fn checkpoint_target_reembed(db: &Surreal<Any>, journal: &ReembedJourn
     Ok(())
 }
 
-async fn require_hnsw_plan(db: &Surreal<Any>, dimensions: usize) -> Result<()> {
+/// Read-only proof used by publication and reconstructed completion reports.
+pub async fn verify_target_index(db: &Surreal<Any>, dimensions: usize) -> Result<()> {
     let mut result = db.query("INFO FOR TABLE fact STRUCTURE").await?;
     let info: Option<serde_json::Value> = result.take(0)?;
     let info = info.context("Missing fact table information")?;
@@ -329,7 +354,7 @@ pub async fn publish_target_space(
     seen.source_matches(&expected.source_space, true)?;
     embedding_validation::read_target_baseline(db, expected).await?;
     embedding_validation::validate_target_data(db, expected).await?;
-    require_hnsw_plan(db, space.dimensions()).await?;
+    verify_target_index(db, space.dimensions()).await?;
     let mut complete = expected.clone();
     complete.phase = MigrationPhase::Complete;
     let sql = format!("{GUARDED_TRANSACTION}

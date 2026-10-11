@@ -1,6 +1,7 @@
 mod bench;
 mod config;
 mod dreaming;
+mod embedding_migration;
 
 use std::sync::Arc;
 
@@ -23,15 +24,33 @@ const MAX_PRACTICAL_ESCALATION_HOURS: u64 = 24 * 365 * 10;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
-    const USAGE: &str =
-        "Usage: alexandria [migrate-embeddings [--force] | bench-retrieval | --help]";
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("migrate-embeddings") {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
+
+    const USAGE: &str = "Usage: alexandria [migrate-embeddings [--force] [--output-data-dir PATH [--resume]] | bench-retrieval | --help]\nGranite requires --output-data-dir; legacy no-output mode remains in-place. Cutover/rollback is manual: change model and data_dir together, never automatically swap or delete stores.";
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [] => {}
         ["migrate-embeddings"] => return migrate_embeddings(false).await,
         ["migrate-embeddings", "--force"] => return migrate_embeddings(true).await,
+        ["migrate-embeddings", ..] => {
+            let arguments = embedding_migration::parse_migration_args(&args[1..])?;
+            let config = Config::load()?;
+            let report = embedding_migration::migrate_to_copy(&config, arguments).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            eprintln!(
+                "Cutover is manual: set model={}, max_tokens={} and data_dir={} together. Preserve the original model/directory together for rollback; no service was restarted or source deleted.",
+                report.target_space.model(),
+                report.target_space.max_tokens(),
+                report.output_path.display()
+            );
+            return Ok(());
+        }
         ["bench-retrieval"] => return bench::run().await,
         ["--help"] | ["-h"] => {
             println!("{USAGE}");
@@ -67,6 +86,18 @@ async fn main() -> anyhow::Result<()> {
 
     // 2. Connect to SurrealDB (persistent or in-memory based on config)
     let db = Database::connect(&config.database.data_dir).await?;
+    system_config::check_boot_embedding_metadata(
+        db.inner(),
+        &config.embedding.model,
+        config.embedding.max_tokens,
+    )
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "Refused startup for data_dir={}: {error:#}",
+            config.database.data_dir.display()
+        )
+    })?;
     schema::migrate(db.inner()).await?;
 
     // 2b. Record the instant this build started counting retrievals, before any job can run.
@@ -74,13 +105,15 @@ async fn main() -> anyhow::Result<()> {
     // recording every `access_count` is zero because nothing wrote it, so without the stamp the first
     // pass reads the whole legacy corpus as unused. Stored once, never rewritten — same shape as the
     // embedding-model lock beside it.
-    let armed_at = system_config::arm_access_recording(db.inner()).await?;
-    tracing::info!("Access recording armed at {armed_at}");
+    // Arm only after the provider's full identity passes, so a refused boot
+    // cannot invalidate an incomplete target's original metadata baseline.
 
     // 3. Load a ready provider and check its space before index creation/serving.
     tracing::info!("Loading embedding model: {}", config.embedding.model);
     let loaded = load_provider((&config.embedding).into()).await?;
     system_config::check_embedding_space(db.inner(), &loaded.space).await?;
+    let armed_at = system_config::arm_access_recording(db.inner()).await?;
+    tracing::info!("Access recording armed at {armed_at}");
     let embedding = loaded.provider;
     let dims = embedding.dimensions();
     // A failed define must not stop boot: the brute-force KNN form returns the same rows, and
@@ -183,13 +216,14 @@ async fn migrate_embeddings(force: bool) -> anyhow::Result<()> {
     let config = Config::load()?;
     anyhow::ensure!(
         config.embedding.model != alexandria_storage::models::embedding::GRANITE_MODEL_ID,
-        "Granite requires a separate offline migrated copy; the legacy in-place CLI is not supported"
+        "Granite requires a separate offline migrated copy: pass --output-data-dir PATH [--resume]; --force alone does not enable the legacy in-place CLI"
     );
+    let db = Database::connect(&config.database.data_dir).await?;
+    system_config::legacy_reembed_source(db.inner()).await?;
     tracing::info!("Loading embedding model: {}", config.embedding.model);
     let loaded = load_provider((&config.embedding).into()).await?;
     let max_tokens = loaded.effective_max_tokens;
     let embedding = loaded.provider;
-    let db = Database::connect(&config.database.data_dir).await?;
     schema::migrate(db.inner()).await?;
     match reembed(
         &db,

@@ -10,7 +10,7 @@
 
 use alexandria_pipeline::embedding::{EmbeddingProvider, LoadedEmbedding};
 use alexandria_storage::embedding_state::{
-    checkpoint_target_reembed, publish_target_space, read_target_journal,
+    checkpoint_target_reembed, publish_target_space, read_target_journal, validate_target_ownership,
 };
 use alexandria_storage::embedding_validation::{
     checked_target_centroid, read_target_baseline, validate_target_data, validate_target_facts,
@@ -59,6 +59,7 @@ pub async fn reembed_target(
         read_target_journal(db.inner()).await?.as_ref() == Some(&journal),
         "Migration journal is stale or owned by another run"
     );
+    validate_target_ownership(db.inner(), &journal).await?;
     let baseline = read_target_baseline(db.inner(), &journal).await?;
     if journal.phase == MigrationPhase::Complete {
         system_config::check_embedding_space(db.inner(), &loaded.space).await?;
@@ -195,6 +196,7 @@ pub async fn reembed(
         new_model != alexandria_storage::models::embedding::GRANITE_MODEL_ID,
         "Granite requires a separate offline migrated copy; the legacy in-place helper is not supported"
     );
+    let source_space = system_config::legacy_reembed_source(db.inner()).await?;
     let memories = MemoryRepo::new(db.inner());
     match system_config::get_config(db.inner(), "embedding_model").await? {
         None => {
@@ -300,9 +302,12 @@ pub async fn reembed(
     }
 
     // 3. Lock last.
-    system_config::set_config(db.inner(), "embedding_model", new_model).await?;
-    system_config::set_config(db.inner(), "embedding_dimensions", &dims.to_string()).await?;
-    system_config::set_config(db.inner(), "embedding_max_tokens", &max_tokens.to_string()).await?;
+    let target = alexandria_storage::models::embedding::EmbeddingSpace::Legacy {
+        model: new_model.into(),
+        dimensions: dims,
+        max_tokens,
+    };
+    system_config::publish_legacy_reembed_space(db.inner(), &source_space, &target).await?;
 
     Ok(ReembedOutcome::Done {
         facts: total,

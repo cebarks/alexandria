@@ -81,6 +81,58 @@ pub async fn stored_max_tokens(db: &Surreal<Any>) -> Result<usize> {
         .unwrap_or(PRE_LOCK_MAX_TOKENS))
 }
 
+/// Read-only startup admission before schema/heat writes or provider I/O. Fresh
+/// databases may have no config table; pending/corrupt journals never get there.
+/// The ready provider still checks the full identity before index creation.
+pub async fn check_boot_embedding_metadata(
+    db: &Surreal<Any>,
+    model: &str,
+    max_tokens: usize,
+) -> Result<()> {
+    let mut response = db.query("INFO FOR DB STRUCTURE").await?;
+    let info: Option<serde_json::Value> = response.take(0)?;
+    let info = info.ok_or_else(|| anyhow::anyhow!("Missing database table inventory"))?;
+    let tables = info["tables"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Invalid database table inventory"))?;
+    let contains = |name: &str| tables.iter().any(|table| table["name"] == name);
+    let stored = if contains("system_config") {
+        stored_embedding_space(db).await?
+    } else {
+        None
+    };
+    if let Some(space) = stored {
+        anyhow::ensure!(
+            space.model() == model && space.max_tokens() == max_tokens,
+            "Database is locked to model={} at {} tokens; requested model={model} at {max_tokens}. Choose the matching model/max_tokens and original directory together, or migrate-embeddings --output-data-dir PATH into a separate offline copy; never relabel this store",
+            space.model(),
+            space.max_tokens()
+        );
+    } else if model == GRANITE_MODEL_ID {
+        let facts = if contains("fact") {
+            MemoryRepo::new(db)
+                .count(&FactListQuery {
+                    include_deleted: true,
+                    include_quarantined: true,
+                    ..Default::default()
+                })
+                .await?
+        } else {
+            0
+        };
+        let centroids = if contains("cluster") {
+            !crate::repos::ClusterRepo::new(db).list().await?.is_empty()
+        } else {
+            false
+        };
+        anyhow::ensure!(
+            facts == 0 && !centroids,
+            "Existing facts/centroids have no verified embedding identity. Resolve the original model first, then use migrate-embeddings --output-data-dir PATH; do not relabel them Granite"
+        );
+    }
+    Ok(())
+}
+
 /// Read the stored vector space without inventing legacy provenance.
 pub async fn stored_embedding_space(db: &Surreal<Any>) -> Result<Option<EmbeddingSpace>> {
     crate::embedding_state::ensure_ready(db).await?;
@@ -164,6 +216,81 @@ pub async fn check_embedding_space(db: &Surreal<Any>, requested: &EmbeddingSpace
         "Existing centroids have no verified embedding identity; use a separate offline migrated copy"
     );
     stamp_embedding_space(db, requested).await
+}
+
+/// Admission for the old in-place command. Owned copies use their journal;
+/// Granite sources and targets never pass through this legacy path.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LegacyReembedSource {
+    model: Option<String>,
+    dimensions: Option<String>,
+    max_tokens: Option<String>,
+    space: Option<String>,
+}
+
+pub async fn legacy_reembed_source(db: &Surreal<Any>) -> Result<LegacyReembedSource> {
+    let mut response = db.query("INFO FOR DB STRUCTURE").await?;
+    let info: Option<serde_json::Value> = response.take(0)?;
+    let info = info.ok_or_else(|| anyhow::anyhow!("Missing database table inventory"))?;
+    let tables = info["tables"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Invalid database table inventory"))?;
+    if !tables.iter().any(|table| table["name"] == "system_config") {
+        return Ok(LegacyReembedSource {
+            model: None,
+            dimensions: None,
+            max_tokens: None,
+            space: None,
+        });
+    }
+    anyhow::ensure!(
+        crate::embedding_state::read_target_journal(db)
+            .await?
+            .is_none(),
+        "An owned migration target cannot use the legacy in-place command; use --resume or a new --output-data-dir"
+    );
+    let source = LegacyReembedSource {
+        model: get_config(db, "embedding_model").await?,
+        dimensions: get_config(db, "embedding_dimensions").await?,
+        max_tokens: get_config(db, "embedding_max_tokens").await?,
+        space: get_config(db, "embedding_space").await?,
+    };
+    anyhow::ensure!(
+        source.model.as_deref() != Some(GRANITE_MODEL_ID),
+        "Granite source requires a separate offline copy with --output-data-dir"
+    );
+    if source.space.is_some() {
+        anyhow::ensure!(
+            matches!(
+                stored_embedding_space(db).await?,
+                Some(EmbeddingSpace::Legacy { .. })
+            ),
+            "Legacy migration requires a verified legacy identity"
+        );
+    }
+    // Older model-only locks can be repaired by this explicit legacy operation.
+    // Preserve their raw keys for the final comparison; never invent dimensions.
+    Ok(source)
+}
+
+/// The legacy caller must hold exclusive writer access and has already rewritten
+/// its vectors. Preserve a coherent full identity as well as compatibility keys.
+/// This makes metadata publication atomic, not the preceding legacy vector pass.
+pub async fn publish_legacy_reembed_space(
+    db: &Surreal<Any>,
+    source: &LegacyReembedSource,
+    target: &EmbeddingSpace,
+) -> Result<()> {
+    target.validate()?;
+    anyhow::ensure!(
+        matches!(target, EmbeddingSpace::Legacy { .. }),
+        "Legacy publication cannot label Granite"
+    );
+    anyhow::ensure!(
+        &legacy_reembed_source(db).await? == source,
+        "Legacy migration source identity changed"
+    );
+    stamp_embedding_space(db, target).await
 }
 
 async fn stamp_embedding_space(db: &Surreal<Any>, space: &EmbeddingSpace) -> Result<()> {

@@ -3,6 +3,76 @@ use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{Database, system_config};
 
+#[tokio::test]
+async fn legacy_reembed_keeps_an_existing_full_legacy_identity_coherent() {
+    use alexandria_storage::models::embedding::EmbeddingSpace;
+    let (db, _, _, _, _) = seed().await;
+    let source = system_config::stored_embedding_space(db.inner())
+        .await
+        .unwrap()
+        .unwrap();
+    system_config::set_config(
+        db.inner(),
+        "embedding_max_tokens",
+        &source.max_tokens().to_string(),
+    )
+    .await
+    .unwrap();
+    system_config::set_config(
+        db.inner(),
+        "embedding_space",
+        &serde_json::to_string(&source).unwrap(),
+    )
+    .await
+    .unwrap();
+    reembed(&db, &ModelB, 2, MAX_TOKENS, false).await.unwrap();
+    assert_eq!(
+        system_config::stored_embedding_space(db.inner())
+            .await
+            .unwrap(),
+        Some(EmbeddingSpace::Legacy {
+            model: "b".into(),
+            dimensions: 3,
+            max_tokens: MAX_TOKENS
+        })
+    );
+}
+
+#[tokio::test]
+async fn legacy_reembed_cannot_overwrite_an_owned_pending_target() {
+    use alexandria_storage::models::embedding::{EmbeddingSpace, MigrationPhase, ReembedJournal};
+    let (db, id, _, _, _) = seed().await;
+    let journal = ReembedJournal {
+        run_id: "legacy-refusal".into(),
+        source_manifest_sha256: "a".repeat(64),
+        source_space: system_config::stored_embedding_space(db.inner())
+            .await
+            .unwrap()
+            .unwrap(),
+        target_space: EmbeddingSpace::Legacy {
+            model: "b".into(),
+            dimensions: 3,
+            max_tokens: MAX_TOKENS,
+        },
+        phase: MigrationPhase::Facts,
+        last_fact_id: None,
+        reembedded_count: 0,
+    };
+    alexandria_storage::embedding_state::begin_target_reembed(db.inner(), &journal)
+        .await
+        .unwrap();
+    assert!(reembed(&db, &ModelB, 2, MAX_TOKENS, true).await.is_err());
+    assert_eq!(
+        MemoryRepo::new(db.inner())
+            .get_fact(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .embedding,
+        vec![0.6, 0.8]
+    );
+}
+
 /// The limit the fake provider is said to truncate at; above the 128 a lock without the key means.
 const MAX_TOKENS: usize = 256;
 

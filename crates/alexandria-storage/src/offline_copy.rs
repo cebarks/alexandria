@@ -175,6 +175,59 @@ impl OfflineStoreGuard {
     }
 }
 
+/// Read-only path/receipt admission before provider provisioning or engine opens.
+/// Fresh outputs must be absent/empty; resume admits only an existing target with
+/// a regular validated receipt and LOCK. The caller must still verify its journal.
+pub fn preflight_migration_paths(source: &Path, output: &Path, resume: bool) -> Result<PathBuf> {
+    ensure!(
+        source != Path::new(":memory:"),
+        "Source must be a persistent offline store"
+    );
+    let source = source
+        .canonicalize()
+        .context("Resolve existing source store")?;
+    ensure!(source.is_dir(), "Source store must be a directory");
+    let output = resolve_destination(output)?;
+    ensure!(
+        !output.starts_with(&source) && !source.starts_with(&output),
+        "Source and output directories must not overlap"
+    );
+    if resume {
+        ensure!(
+            output.is_dir(),
+            "Resume requires an existing target directory"
+        );
+        ensure!(
+            fs::symlink_metadata(output.join("LOCK"))?
+                .file_type()
+                .is_file(),
+            "Target LOCK must be regular, non-symlink"
+        );
+        read_source_manifest(&output)?;
+    } else {
+        require_empty_or_missing(&output)?;
+        require_missing(&source_manifest_path(&output)?)?;
+    }
+    Ok(output)
+}
+
+/// Read the original receipt, not checksums of the now-recovered target files.
+pub fn read_source_manifest(output: &Path) -> Result<SourceManifest> {
+    let path = source_manifest_path(output)?;
+    ensure!(
+        fs::symlink_metadata(&path)
+            .context("Missing source manifest for owned resume")?
+            .file_type()
+            .is_file(),
+        "Source manifest must be regular, non-symlink"
+    );
+    let manifest: SourceManifest =
+        serde_json::from_reader(std::io::BufReader::new(File::open(path)?))
+            .context("Malformed source manifest")?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
 /// Sidecar next to the data directory; retain it with unfinished targets for resume.
 pub fn source_manifest_path(destination: &Path) -> Result<PathBuf> {
     let destination = resolve_destination(destination)?;

@@ -54,6 +54,11 @@ pub struct ArtifactManifest {
 }
 
 impl ArtifactManifest {
+    /// Immutable descriptor for admission/reporting without reading model bytes.
+    pub fn compiled() -> Result<Self> {
+        Self::parse_json(include_str!("artifact-manifest.json"))
+    }
+
     pub fn parse_json(json: &str) -> Result<Self> {
         let manifest: Self = serde_json::from_str(json)?;
         ensure!(
@@ -114,7 +119,7 @@ pub struct ResolvedArtifacts {
 /// Resolve only the compiled, checksum-pinned manifest. Local directories supply
 /// bytes, not replacement provenance. Unpublished cache misses fail without a URL.
 pub async fn resolve_artifacts(local_override: Option<&Path>) -> Result<ResolvedArtifacts> {
-    let manifest = ArtifactManifest::parse_json(include_str!("artifact-manifest.json"))?;
+    let manifest = ArtifactManifest::compiled()?;
     let (weights_path, tokenizer_path) = if let Some(directory) = local_override {
         ensure!(
             !tokio::fs::try_exists(directory.join("BUILD_INCOMPLETE")).await?,

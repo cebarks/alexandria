@@ -52,7 +52,7 @@ The exact model ID `ibm-granite/granite-embedding-311m-multilingual-r2` selects 
 
 MiniLM remains the installation default. The checksum-pinned Granite pack is **not published yet**: opt-in startup requires verified local artifacts or an already verified cache. A local directory supplies bytes, not replacement checksums. Publication is gated by tokenizer licensing review as well as release approval; the Gemma3-derived tokenizer is not covered by the weights' Apache-2.0 license alone.
 
-Existing databases cannot be relabelled Granite. The legacy in-place migration command refuses Granite; the separate-target offline migration is still pending. Do not change live model/path settings or reuse MiniLM cutoff calibration as proof of Granite quality. See [embedding configuration](docs/configuration.md#embedding) and the [artifact curator](tools/granite-artifact/README.md).
+Existing databases cannot be relabelled Granite. Stop the source server, configure the target model/budget while keeping the source data path, then use `alexandria migrate-embeddings --output-data-dir /path/to/new-target`. `--resume` continues an owned target or reports a completed one without loading weights. The original source is retained; model, budget and data path cutover (and paired rollback) remain manual. The legacy in-place command refuses Granite and owned migration targets. Do not change live model/path settings or reuse MiniLM cutoff calibration as proof of Granite quality. See [embedding configuration](docs/configuration.md#embedding) and the [artifact curator](tools/granite-artifact/README.md).
 
 ## Command Line
 
@@ -63,11 +63,15 @@ that run once and exit.
 | --- | --- |
 | `alexandria` | Start the server on the configured transport. |
 | `alexandria migrate-embeddings [--force]` | Legacy-only: re-embed the whole corpus with the model and `max_tokens` in `config.toml`. Granite requires a separate offline target and is refused by this command. Needed after a deliberate model change or after raising `max_tokens`; `--force` re-embeds even when nothing changed — see [docs/configuration.md](docs/configuration.md). |
+| `alexandria migrate-embeddings --output-data-dir PATH [--resume] [--force]` | Copy a stopped persistent source into a separate, nonoverlapping target, then rewrite and verify it. Logs go to stderr and the completed JSON report to stdout. Resume requires the original adjacent receipt and matching journal/configuration; `--force` does not bypass ownership or replay a completed target. No automatic cutover, deletion, swap or restart. |
 | `alexandria bench-retrieval` | Measure how well the configured model separates a correct answer from the rest of the corpus, and print the score distributions and the limit × threshold grid that the `retrieve.min_similarity` floor and the client recall defaults are judged against — see [docs/minilm-test-data.md](docs/minilm-test-data.md). |
 | `alexandria --help` | Print the same list. |
 
-Both subcommands open the data dir directly and SurrealKV is single-writer, so the server has
-to be stopped first. `bench-retrieval` can instead run against a copy of the data dir via
+The legacy in-place command and benchmark open the data dir directly, and SurrealKV is
+single-writer, so the server has to be stopped first. The separate-target migration instead
+locks the existing source `LOCK` read-only and never opens its storage engine; it opens only
+the copied target. Initial source-lock interoperability is admitted on Linux only. Keep the
+adjacent source-manifest receipt with the target, especially while it is unfinished. `bench-retrieval` can instead run against a copy of the data dir via
 `ALEXANDRIA_DATA_DIR`, which keeps the server down only for a `cp`. It is not read-only: like
 server boot it checks the embedding-model lock (refusing on a mismatch) and defines the HNSW
 index if it is missing.
