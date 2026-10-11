@@ -1,4 +1,4 @@
-//! Re-embed every fact and cluster centroid with a new model or token limit, then move
+//! Legacy-only re-embedding of every fact and centroid with a new model/limit, then move
 //! the lock.
 //! Not transactional: a failure mid-way leaves the lock on the old model and limit. While
 //! config still names the new ones the server refuses to boot; rerun the migration to
@@ -23,6 +23,7 @@ pub enum ReembedOutcome {
     },
 }
 
+/// Granite is refused before any read/write; it requires a separate offline target.
 /// `batch_size` is facts per `embed()` call and the progress-log granularity. It does not
 /// bound memory: the corpus is preloaded and Candle embeds one text per forward pass.
 /// Must be at least 1; `Config::load` rejects 0 before this is reached.
@@ -39,6 +40,10 @@ pub async fn reembed(
     force: bool,
 ) -> anyhow::Result<ReembedOutcome> {
     let new_model = provider.model_id();
+    anyhow::ensure!(
+        new_model != alexandria_storage::models::embedding::GRANITE_MODEL_ID,
+        "Granite requires a separate offline migrated copy; the legacy in-place helper is not supported"
+    );
     let memories = MemoryRepo::new(db.inner());
     match system_config::get_config(db.inner(), "embedding_model").await? {
         None => {

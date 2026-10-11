@@ -10,6 +10,7 @@ use alexandria_engine::heat::DEFAULT_DECAY_TAU_SECS;
 use alexandria_engine::heat::DEFAULT_SPACING_REFERENCE_SECS;
 use alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS;
 use alexandria_engine::search::DEFAULT_MIN_SIMILARITY;
+use alexandria_pipeline::embedding::{ProviderOptions, default_max_tokens, validate_max_tokens};
 use serde::Deserialize;
 
 /// Top-level configuration for Alexandria.
@@ -103,9 +104,7 @@ impl From<RawEmbeddingConfig> for EmbeddingConfig {
         let defaults = Self::default();
         let model = raw.model.unwrap_or(defaults.model);
         Self {
-            max_tokens: raw
-                .max_tokens
-                .unwrap_or_else(|| embedding_default_tokens(&model)),
+            max_tokens: raw.max_tokens.unwrap_or_else(|| default_max_tokens(&model)),
             model,
             device: raw.device.unwrap_or(defaults.device),
             batch_size: raw.batch_size.unwrap_or(defaults.batch_size),
@@ -115,11 +114,14 @@ impl From<RawEmbeddingConfig> for EmbeddingConfig {
     }
 }
 
-fn embedding_default_tokens(model: &str) -> usize {
-    if model == alexandria_storage::models::embedding::GRANITE_MODEL_ID {
-        8192
-    } else {
-        alexandria_pipeline::embedding::DEFAULT_MAX_TOKENS
+impl From<&EmbeddingConfig> for ProviderOptions {
+    fn from(config: &EmbeddingConfig) -> Self {
+        Self {
+            model: config.model.clone(),
+            device: config.device.clone(),
+            max_tokens: config.max_tokens,
+            artifact_dir: config.artifact_dir.clone(),
+        }
     }
 }
 
@@ -502,7 +504,7 @@ impl Config {
         config.embedding.max_tokens = config
             .embedding
             .specified_max_tokens
-            .unwrap_or_else(|| embedding_default_tokens(&config.embedding.model));
+            .unwrap_or_else(|| default_max_tokens(&config.embedding.model));
         if let Some(tz) = env("ALEXANDRIA_REMINDERS_TIMEZONE") {
             config.reminders.timezone = tz;
         }
@@ -515,16 +517,7 @@ impl Config {
             (1..=4096).contains(&config.embedding.batch_size),
             "embedding.batch_size must be between 1 and 4096"
         );
-        let (minimum, maximum) =
-            if config.embedding.model == alexandria_storage::models::embedding::GRANITE_MODEL_ID {
-                (2, 8192)
-            } else {
-                (3, 512)
-            };
-        anyhow::ensure!(
-            (minimum..=maximum).contains(&config.embedding.max_tokens),
-            "embedding.max_tokens must be between {minimum} and {maximum}"
-        );
+        validate_max_tokens(&config.embedding.model, config.embedding.max_tokens)?;
         // The scheduler's own arithmetic treats a zero interval as "due on every tick", so a typo
         // here would turn a daily pass into a hot loop that never sleeps. Refusing to start says
         // which key is wrong instead of burning a core.

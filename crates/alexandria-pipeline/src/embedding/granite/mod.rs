@@ -19,6 +19,20 @@ pub enum GraniteDevice {
     Rocm { index: usize },
 }
 
+impl GraniteDevice {
+    pub(crate) fn check_compiled(self) -> Result<()> {
+        ensure!(
+            !matches!(self, Self::Rocm { .. }) || cfg!(feature = "granite-rocm"),
+            "Requested ROCm backend is not compiled; enable granite-rocm"
+        );
+        ensure!(
+            !matches!(self, Self::Vulkan { .. }) || cfg!(feature = "granite-vulkan"),
+            "Requested Vulkan backend is not compiled; enable granite-vulkan"
+        );
+        Ok(())
+    }
+}
+
 /// Checksum-verified artifacts and effective text budget (2..=8192).
 /// GPU requests require their Cargo feature and an available matching device.
 pub struct GraniteOptions {
@@ -44,15 +58,7 @@ impl GraniteProvider {
             (2..=8192).contains(&options.max_tokens),
             "Granite token budget must be 2..=8192"
         );
-        ensure!(
-            !matches!(options.device, GraniteDevice::Rocm { .. }) || cfg!(feature = "granite-rocm"),
-            "Requested ROCm backend is not compiled; enable granite-rocm"
-        );
-        ensure!(
-            !matches!(options.device, GraniteDevice::Vulkan { .. })
-                || cfg!(feature = "granite-vulkan"),
-            "Requested Vulkan backend is not compiled; enable granite-vulkan"
-        );
+        options.device.check_compiled()?;
         let alexandria_storage::models::embedding::EmbeddingSpace::GraniteV1(space) =
             &mut options.artifacts.space
         else {

@@ -47,6 +47,10 @@ pub struct CandleProvider {
 
 impl CandleProvider {
     pub async fn new(model_id: &str, device_str: &str, max_tokens: usize) -> Result<Self> {
+        anyhow::ensure!(
+            device_str == "cpu",
+            "Legacy Candle supports only cpu; requested {device_str}"
+        );
         // Cache first, network only on a miss (see hub.rs).
         let required = async |file: &str| {
             hub::fetch(model_id, file)
@@ -135,7 +139,7 @@ impl CandleProvider {
     ) -> Result<(BertModel, Tokenizer, Device, usize)> {
         let device = match device_str {
             "cpu" => Device::Cpu,
-            _ => Device::Cpu, // fallback to CPU
+            _ => anyhow::bail!("Legacy Candle supports only cpu; requested {device_str}"),
         };
 
         let config_str = std::fs::read_to_string(config_path)?;
@@ -257,8 +261,7 @@ impl EmbeddingProvider for CandleProvider {
         &self.model_id
     }
 
-    // ponytail: a second tokenization of text `embed` already tokenized, well under a
-    // millisecond. Return it from `embed` instead if the store path ever shows up in a profile.
+    // The MCP store path offloads this independent count to the blocking pool.
     fn overflow(&self, text: &str) -> Option<usize> {
         let encoding = self.tokenizer.encode(text, true).ok()?;
         (!encoding.get_overflowing().is_empty()).then(|| self.full_len(&encoding))
@@ -267,7 +270,21 @@ impl EmbeddingProvider for CandleProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::cls_pooling_from_json;
+    use super::{CandleProvider, cls_pooling_from_json};
+
+    #[test]
+    fn unsupported_legacy_device_errors_before_model_io() {
+        let missing = std::path::Path::new("missing-model-fixture");
+        let error = CandleProvider::load_model(missing, missing, missing, "rocm:0", 256)
+            .err()
+            .expect("unsupported device must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("Legacy Candle supports only cpu"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn cls_true_when_flag_set() {

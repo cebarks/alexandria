@@ -67,6 +67,68 @@ async fn seed() -> (Database, String, String, String, String) {
     (db, live1, live2, gone, cid)
 }
 
+struct GraniteProbe;
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for GraniteProbe {
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|_| {
+                let mut vector = vec![0.0; 768];
+                vector[0] = 1.0;
+                vector
+            })
+            .collect())
+    }
+    fn dimensions(&self) -> usize {
+        768
+    }
+    fn model_id(&self) -> &str {
+        alexandria_storage::models::embedding::GRANITE_MODEL_ID
+    }
+}
+
+#[tokio::test]
+async fn legacy_in_place_reembed_refuses_granite_before_any_vector_or_lock_write() {
+    let (db, live1, _, _, cid) = seed().await;
+    let error = reembed(&db, &GraniteProbe, 2, 8192, true)
+        .await
+        .expect_err("Granite requires a separate offline target");
+    assert!(error.to_string().contains("separate offline"));
+    assert_eq!(
+        MemoryRepo::new(db.inner())
+            .get_fact(&live1)
+            .await
+            .unwrap()
+            .unwrap()
+            .embedding,
+        vec![0.6, 0.8]
+    );
+    assert_eq!(
+        ClusterRepo::new(db.inner())
+            .get(&cid)
+            .await
+            .unwrap()
+            .unwrap()
+            .centroid,
+        vec![0.7, 0.7]
+    );
+    assert_eq!(
+        system_config::get_config(db.inner(), "embedding_model")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("a")
+    );
+    assert_eq!(
+        system_config::get_config(db.inner(), "embedding_max_tokens")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
 #[tokio::test]
 async fn reembed_rewrites_facts_centroids_and_lock() {
     let (db, live1, live2, gone, cid) = seed().await;

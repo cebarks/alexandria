@@ -44,7 +44,15 @@ EOF
 alexandria
 ```
 
-First run downloads the embedding model from HuggingFace Hub (~80MB).
+First run with the default MiniLM configuration downloads the embedding model from HuggingFace Hub (~80MB).
+
+### Native Granite (opt-in, release-gated)
+
+The exact model ID `ibm-granite/granite-embedding-311m-multilingual-r2` selects native Rust Burn inference: 768D FP32, CLS pooling, and a default/cap of 8192 tokens. CPU is the default; explicit `rocm[:index]` or `vulkan[:index]` needs the corresponding binary Cargo feature (`granite-rocm` or `granite-vulkan`). A missing backend/device fails startup rather than falling back. Serving uses exact input lengths and a bounded serial worker.
+
+MiniLM remains the installation default. The checksum-pinned Granite pack is **not published yet**: opt-in startup requires verified local artifacts or an already verified cache. A local directory supplies bytes, not replacement checksums. Publication is gated by tokenizer licensing review as well as release approval; the Gemma3-derived tokenizer is not covered by the weights' Apache-2.0 license alone.
+
+Existing databases cannot be relabelled Granite. The legacy in-place migration command refuses Granite; the separate-target offline migration is still pending. Do not change live model/path settings or reuse MiniLM cutoff calibration as proof of Granite quality. See [embedding configuration](docs/configuration.md#embedding) and the [artifact curator](tools/granite-artifact/README.md).
 
 ## Command Line
 
@@ -54,7 +62,7 @@ that run once and exit.
 | Command | What it does |
 | --- | --- |
 | `alexandria` | Start the server on the configured transport. |
-| `alexandria migrate-embeddings [--force]` | Re-embed the whole corpus with the model and `max_tokens` in `config.toml`. Needed after a deliberate model change or after raising `max_tokens`; `--force` re-embeds even when nothing changed — see [docs/configuration.md](docs/configuration.md). |
+| `alexandria migrate-embeddings [--force]` | Legacy-only: re-embed the whole corpus with the model and `max_tokens` in `config.toml`. Granite requires a separate offline target and is refused by this command. Needed after a deliberate model change or after raising `max_tokens`; `--force` re-embeds even when nothing changed — see [docs/configuration.md](docs/configuration.md). |
 | `alexandria bench-retrieval` | Measure how well the configured model separates a correct answer from the rest of the corpus, and print the score distributions and the limit × threshold grid that the `retrieve.min_similarity` floor and the client recall defaults are judged against — see [docs/minilm-test-data.md](docs/minilm-test-data.md). |
 | `alexandria --help` | Print the same list. |
 
@@ -403,7 +411,7 @@ crates/
 ├── alexandria/          # Binary — config loading, transport setup, main loop, dreaming scheduler
 ├── alexandria-mcp/      # MCP tool handlers + debug web UI (askama templates, vendored assets)
 ├── alexandria-engine/   # Core algorithms — clustering, heat, recall, import, activation
-├── alexandria-pipeline/ # Embedding providers (candle)
+├── alexandria-pipeline/ # Embedding providers (legacy Candle + native Granite/Burn)
 └── alexandria-storage/  # SurrealDB connection, models, repos, schema migrations
 
 contrib/pi/              # Optional client-side pi integrations (skill + extension), not shipped

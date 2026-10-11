@@ -5,7 +5,7 @@ mod dreaming;
 use std::sync::Arc;
 
 use alexandria_mcp::AlexandriaServer;
-use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
+use alexandria_pipeline::embedding::load_provider;
 use alexandria_storage::{Database, schema, system_config};
 use config::Config;
 use rmcp::ServiceExt;
@@ -77,23 +77,12 @@ async fn main() -> anyhow::Result<()> {
     let armed_at = system_config::arm_access_recording(db.inner()).await?;
     tracing::info!("Access recording armed at {armed_at}");
 
-    // 3. Check embedding model safety, then load
+    // 3. Load a ready provider and check its space before index creation/serving.
     tracing::info!("Loading embedding model: {}", config.embedding.model);
-    let embedding = CandleProvider::new(
-        &config.embedding.model,
-        &config.embedding.device,
-        config.embedding.max_tokens,
-    )
-    .await?;
+    let loaded = load_provider((&config.embedding).into()).await?;
+    system_config::check_embedding_space(db.inner(), &loaded.space).await?;
+    let embedding = loaded.provider;
     let dims = embedding.dimensions();
-    // The provider's limit, not config's: the lock records what the vectors were made with.
-    system_config::check_embedding_model(
-        db.inner(),
-        &config.embedding.model,
-        dims,
-        embedding.max_tokens(),
-    )
-    .await?;
     // A failed define must not stop boot: the brute-force KNN form returns the same rows, and
     // the backfill aborts on any row of another dimension — which is exactly the state a
     // reverted, half-finished `migrate-embeddings` leaves behind.
@@ -146,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
 
     let server = AlexandriaServer::new(
         Arc::new(db),
-        Arc::new(embedding),
+        embedding,
         config.cluster.join_threshold,
         alexandria_mcp::server::HeatSettings {
             decay_tau_secs: config.heat.decay_tau_secs,
@@ -181,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `alexandria migrate-embeddings`: re-embed everything with the model in config and
+/// Legacy-only `alexandria migrate-embeddings`: re-embed with the model in config and
 /// move the lock. Run with the server stopped; the data dir is single-writer. `--force`
 /// re-embeds even when the lock already matches config.
 async fn migrate_embeddings(force: bool) -> anyhow::Result<()> {
@@ -192,21 +181,19 @@ async fn migrate_embeddings(force: bool) -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION")
     );
     let config = Config::load()?;
+    anyhow::ensure!(
+        config.embedding.model != alexandria_storage::models::embedding::GRANITE_MODEL_ID,
+        "Granite requires a separate offline migrated copy; the legacy in-place CLI is not supported"
+    );
+    tracing::info!("Loading embedding model: {}", config.embedding.model);
+    let loaded = load_provider((&config.embedding).into()).await?;
+    let max_tokens = loaded.effective_max_tokens;
+    let embedding = loaded.provider;
     let db = Database::connect(&config.database.data_dir).await?;
     schema::migrate(db.inner()).await?;
-
-    tracing::info!("Loading embedding model: {}", config.embedding.model);
-    let embedding = CandleProvider::new(
-        &config.embedding.model,
-        &config.embedding.device,
-        config.embedding.max_tokens,
-    )
-    .await?;
-
-    let max_tokens = embedding.max_tokens();
     match reembed(
         &db,
-        &embedding,
+        embedding.as_ref(),
         config.embedding.batch_size,
         max_tokens,
         force,

@@ -12,7 +12,7 @@
 //! embedded with — only the questions are embedded here.
 
 use alexandria_engine::search::cosine_similarity;
-use alexandria_pipeline::embedding::{CandleProvider, EmbeddingProvider};
+use alexandria_pipeline::embedding::{LoadedEmbedding, load_provider};
 use alexandria_storage::repos::{FactListQuery, MemoryRepo};
 use alexandria_storage::{Database, record_id_to_string, schema, system_config};
 use chrono::{DateTime, Utc};
@@ -575,14 +575,10 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     tracing::info!("Loading embedding model: {}", config.embedding.model);
-    let provider = CandleProvider::new(
-        &config.embedding.model,
-        &config.embedding.device,
-        config.embedding.max_tokens,
-    )
-    .await?;
+    let loaded = load_provider((&config.embedding).into()).await?;
     let questions: Vec<&str> = QUESTIONS.iter().map(|(q, _)| *q).collect();
-    let qvecs = provider.embed(&questions).await?;
+    let qvecs = checked_question_embeddings(&db, &loaded, &questions).await?;
+    let provider = loaded.provider;
 
     let live: Vec<(String, Vec<f32>)> = all
         .iter()
@@ -597,15 +593,7 @@ pub async fn run() -> anyhow::Result<()> {
         QUESTIONS.len()
     );
     report("Live corpus", &live_metrics, provider.model_id());
-    // Same order as server boot: the define is permanent DDL with the configured model's
-    // dimension, so refuse before it if that is not the model the corpus is locked to.
-    system_config::check_embedding_model(
-        db.inner(),
-        &config.embedding.model,
-        provider.dimensions(),
-        provider.max_tokens(),
-    )
-    .await?;
+    // The space was checked before embedding/scoring; only now define the index.
     schema::ensure_vector_index(db.inner(), provider.dimensions()).await?;
     report_hnsw_overlap(&MemoryRepo::new(db.inner()), &live, &qvecs).await?;
 
@@ -626,9 +614,92 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn checked_question_embeddings(
+    db: &Database,
+    loaded: &LoadedEmbedding,
+    questions: &[&str],
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    system_config::check_embedding_space(db.inner(), &loaded.space).await?;
+    loaded.provider.embed(questions).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alexandria_pipeline::embedding::EmbeddingProvider;
+
+    struct QueryProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for QueryProbe {
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "query-model"
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_benchmark_space_refuses_before_query_embedding() {
+        let db = Database::connect_embedded().await.unwrap();
+        schema::migrate(db.inner()).await.unwrap();
+        system_config::check_embedding_model(db.inner(), "stored-model", 2, 256)
+            .await
+            .unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loaded = LoadedEmbedding {
+            provider: std::sync::Arc::new(QueryProbe(calls.clone())),
+            space: alexandria_storage::models::embedding::EmbeddingSpace::Legacy {
+                model: "query-model".into(),
+                dimensions: 2,
+                max_tokens: 256,
+            },
+            effective_max_tokens: 256,
+        };
+        let error = checked_question_embeddings(&db, &loaded, &["query"])
+            .await
+            .expect_err("space mismatch must refuse");
+        assert!(error.to_string().contains("Embedding space mismatch"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            system_config::get_config(db.inner(), "embedding_model")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("stored-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_benchmark_space_embeds_the_labelled_queries() {
+        let db = Database::connect_embedded().await.unwrap();
+        schema::migrate(db.inner()).await.unwrap();
+        system_config::check_embedding_model(db.inner(), "query-model", 2, 256)
+            .await
+            .unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loaded = LoadedEmbedding {
+            provider: std::sync::Arc::new(QueryProbe(calls.clone())),
+            space: alexandria_storage::models::embedding::EmbeddingSpace::Legacy {
+                model: "query-model".into(),
+                dimensions: 2,
+                max_tokens: 256,
+            },
+            effective_max_tokens: 256,
+        };
+        assert_eq!(
+            checked_question_embeddings(&db, &loaded, &["one", "two"])
+                .await
+                .unwrap(),
+            vec![vec![1.0, 0.0], vec![1.0, 0.0]]
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn percentile_interpolates_between_neighbours() {
