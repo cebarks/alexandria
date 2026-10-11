@@ -75,6 +75,10 @@ better abstention at the same numeric threshold. Raising a floor can trade false
 lost valid results; an answerability/reranking mechanism would be a separate design decision,
 not something this migration silently introduces.
 
+The score-scale caveat also applies to cluster join/merge/cohesion thresholds: the old model's
+absolute cosine settings are not established Granite settings. Preserving existing memberships
+during migration does not calibrate future clustering or background maintenance.
+
 The recommendation from this pilot is to **keep the current defaults unchanged** and obtain a
 larger, independently reviewed, representative relevance/unanswerable set before proposing
 paired cutoff changes. With only four negatives, even observing zero false accepts has a
@@ -146,6 +150,21 @@ Evaluation timings are optimized-debug integration-test measurements: initializa
 artifact verification and readiness, and per-row embedding time includes the worker path.
 They are not release-build throughput, isolated forward-pass timings, or end-to-end MCP
 latency. Cold shapes, persistent caches, feature sets and concurrent desktop load matter.
+
+## Hardware acceptance limits
+
+The integrated provider passed 8192-token CPU and ROCm checks on the Ryzen 7950X3D / RX 7900 XTX
+workstation, including empty, whitespace and Unicode inputs. This is hardware-specific
+acceptance, not a portable resource bound or a long-document retrieval-quality measurement.
+
+**Vulkan 8192 is not accepted on the tested RADV stack.** The same long input failed requesting
+a 3,221,225,472-byte buffer. A read-only Burn/CubeCL device probe reported a maximum page size
+of 2,147,483,644 bytes. Raw Vulkan's larger storage-range/VRAM figures do not remove the WGPU
+binding-size limit used by this backend. The frozen shorter corpus passed Vulkan, but that does
+not establish maximum-budget capacity. Failure evidence is retained; there is no silent CPU
+fallback, budget reduction or modified attention graph. A different Vulkan implementation or
+attention strategy requires separate investigation and approval. Use the tested CPU/ROCm path
+for the 8K acceptance claim, not a generic assertion that every compiled GPU supports 8K.
 
 ## Release checklist
 

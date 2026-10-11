@@ -214,6 +214,27 @@ intervals catches up with one run per job, not three.
 - No new MCP tools
 - 468 tests
 
+## Implemented, release-gated
+
+### Native Granite and separate offline embedding migration
+
+- Native Burn CPU inference and optional explicit ROCm/Vulkan backends for Granite 311M
+  Multilingual R2; 768D FP32, CLS pooling, configured 2..=8192-token budget, exact lengths,
+  bounded serial worker and representative GPU warmup.
+- Full immutable embedding identities; model/budget mismatches and incomplete owned targets
+  fail before startup mutations or provider loading. Explicit legacy Candle support remains.
+- Linux-verified read-only source locking, streaming separate-target copy with adjacent receipt,
+  original logical metadata baseline, typed paging, durable checkpoints and atomic verified
+  publication. All facts, including hidden rows, are rewritten; source/cutover remain untouched.
+- Public synthetic multi-relevant/unanswerable evaluation and standalone artifact curator gates.
+
+**Not a default-model release:** MiniLM remains default; independent representative calibration,
+Gemma3 tokenizer licensing review, approved artifact publication and operator cutover are still
+open. The small pilot exposes different cosine bands and abstention tradeoffs, not approved new
+thresholds. See [Granite test data](granite-test-data.md) and [configuration](configuration.md).
+32K, structural chunking and multilingual/TypeScript/graph retrieval-quality coverage remain
+outside this implementation's acceptance claims.
+
 ## Planned
 
 ### v0.2.x — Known Gaps From Shipped Work

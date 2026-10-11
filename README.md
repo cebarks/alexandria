@@ -4,7 +4,7 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 
 ## Features
 
-- **Semantic search** — Cosine similarity over local embeddings (all-MiniLM-L6-v2 via candle, pure Rust)
+- **Semantic search** — Cosine similarity over local embeddings (default MiniLM via Candle; opt-in release-gated Granite via Burn, both native Rust)
 - **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool. Heat is recorded on retrieval but is not yet a ranking input — retrieval still ranks by cosine similarity (see [`A2`](docs/performance-and-ability-findings.md#a2-the-heat-model-is-inert)).
 - **Spreading activation** — Accessing a memory warms its graph neighbors. Heat propagates along edges with configurable decay.
 - **Graph edges** — Memories link via `derived_from` and `extracted_from` edges. `relates_to`, `supports` and `contradicts` exist in the schema but nothing in production writes them yet; auto-linking them is planned v0.3 work
@@ -49,6 +49,21 @@ First run with the default MiniLM configuration downloads the embedding model fr
 ### Native Granite (opt-in, release-gated)
 
 The exact model ID `ibm-granite/granite-embedding-311m-multilingual-r2` selects native Rust Burn inference: 768D FP32, CLS pooling, and a default/cap of 8192 tokens. CPU is the default; explicit `rocm[:index]` or `vulkan[:index]` needs the corresponding binary Cargo feature (`granite-rocm` or `granite-vulkan`). A missing backend/device fails startup rather than falling back. Serving uses exact input lengths and a bounded serial worker.
+
+Build the requested backend explicitly; changing `embedding.device` cannot add it to an existing binary:
+
+```sh
+cargo build --release --locked -p alexandria                         # CPU
+cargo build --release --locked -p alexandria --features granite-rocm # ROCm
+cargo build --release --locked -p alexandria --features granite-vulkan # Vulkan
+```
+
+GPU driver/toolchain availability is a separate requirement; the shipped Alpine image builds
+CPU-only and contains neither GPU runtime nor model artifacts. For container CPU opt-in, mount
+the exact verified local artifact directory read-only and set `artifact_dir` to its in-container
+path; ensure the service UID can read it. Granite's XDG artifact cache is separate from `HF_HOME`
+(the MiniLM cache); persist it explicitly if using it. No driver, model or cache is supplied by
+changing a device selector.
 
 MiniLM remains the installation default. The checksum-pinned Granite pack is **not published yet**: opt-in startup requires verified local artifacts or an already verified cache. A local directory supplies bytes, not replacement checksums. Publication is gated by tokenizer licensing review as well as release approval; the Gemma3-derived tokenizer is not covered by the weights' Apache-2.0 license alone.
 
@@ -396,7 +411,8 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | --- | --- |
 | [docs/configuration.md](docs/configuration.md) | Every server and client config key, env overrides, XDG migration |
 | [docs/session-memory.md](docs/session-memory.md) | Session data model, lifecycle, tool semantics, current limitations |
-| [docs/minilm-test-data.md](docs/minilm-test-data.md) | Retrieval measurements for the embedding model: how to rerun `bench-retrieval`, metric definitions, the floor rule and the client threshold sweep |
+| [docs/minilm-test-data.md](docs/minilm-test-data.md) | Historical MiniLM retrieval measurements: how to rerun `bench-retrieval`, metric definitions, the floor rule and the client threshold sweep |
+| [docs/granite-test-data.md](docs/granite-test-data.md) | Granite public multi-relevant/unanswerable pilot, native offline evaluation, model-specific cutoff caveats and release gates |
 | [docs/roadmap.md](docs/roadmap.md) | Shipped milestones, known gaps, planned work |
 | [contrib/pi/README.md](contrib/pi/README.md) | pi skill vs. extension: what each does, install, failure behavior |
 | [contrib/pi/extensions/alexandria/README.md](contrib/pi/extensions/alexandria/README.md) | The pi companion extension in detail: recall/store/reminders, configuration, known gaps |
@@ -439,11 +455,14 @@ set.
 ```bash
 just               # list every recipe
 just ext-install   # ONE TIME per checkout: npm ci --ignore-scripts for the pi companion (node_modules/ is gitignored)
-just test          # cargo test --workspace --all-features
+just test          # cargo test --locked --workspace --all-features (hermetic Granite tests; native runs ignored)
+just test-cpu      # CPU-only workspace tests, including uncompiled-GPU admission guards
+just artifact-ci   # standalone curator fmt/clippy/hermetic tests/cargo-deny, no official model conversion
+just eval-test     # dependency-free Python scorer tests; no inference
 just ext-test      # pi companion: npm run typecheck + npm test (needs ext-install first)
 just lint          # clippy, warnings as errors (matches CI)
 just fmt-fix       # rustfmt
-just ci            # fmt + lint + test + ext-test + cargo-deny + verify-assets, the full pre-push check
+just ci            # both Rust feature sets + curator + scorer + companion + policy/assets gates
 just run           # run the server locally (prefix with RUST_LOG=debug for verbose logs)
 just verify-assets # check crates/alexandria-mcp/assets against SHA256SUMS
 just vendor-assets # re-download those assets and re-verify the checksums
@@ -468,6 +487,10 @@ CI job. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs five jobs �
 `test`, `extension` (displayed as "Pi companion": the extension's typecheck and tests) and `deny` — on
 PRs against any branch and pushes to `main`; it does not call `just ci`, so a new local gate has to be wired
 into the workflow as well. `just verify-assets` runs in the `test` job ahead of `just test`.
+Curator fmt/Clippy/tests/dependency-policy gates run in the corresponding existing jobs; the
+`test` job also runs CPU-only workspace and Python scorer tests. Optional GPU backend compilation
+is not a hardware acceptance pass: native GPU tests require explicitly verified local assets
+and supported hardware. No official Granite model download/conversion runs in ordinary CI.
 
 [`.github/workflows/container.yml`](.github/workflows/container.yml) additionally builds the Docker
 image and boot-tests it — waits on `/debug`, then performs a real MCP `initialize` handshake against
