@@ -28,4 +28,5 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 askama = { workspace = true }
 
 [dev-dependencies]
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }

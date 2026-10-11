@@ -8,10 +8,19 @@
 //! dropped first (it rejects vectors of another dimension); the next server boot
 //! redefines it.
 
-use alexandria_pipeline::embedding::EmbeddingProvider;
+use alexandria_pipeline::embedding::{EmbeddingProvider, LoadedEmbedding};
+use alexandria_storage::embedding_state::{
+    checkpoint_target_reembed, publish_target_space, read_target_journal,
+};
+use alexandria_storage::embedding_validation::{
+    checked_target_centroid, read_target_baseline, validate_target_data, validate_target_facts,
+    validate_target_metadata, validate_unit_embedding,
+};
+use alexandria_storage::models::embedding::{MigrationPhase, ReembedJournal};
 use alexandria_storage::repos::{ClusterRepo, FactListQuery, MemoryRepo};
 use alexandria_storage::{Database, record_id_to_string, system_config};
 use anyhow::ensure;
+use surrealdb::types::ToSql;
 
 #[derive(Debug)]
 pub enum ReembedOutcome {
@@ -21,6 +30,148 @@ pub enum ReembedOutcome {
         facts: usize,
         clusters: usize,
     },
+}
+
+/// Rewrite only an already-owned target. Inference is microbatch1; `progress_batch_size`
+/// bounds content pages and committed write/log groups, not model concurrency.
+/// Replay an uncheckpointed group, rerun centroid work idempotently, then validate
+/// the original metadata, every vector, and the index before atomic publication.
+pub async fn reembed_target(
+    db: &Database,
+    loaded: &LoadedEmbedding,
+    progress_batch_size: usize,
+    mut journal: ReembedJournal,
+) -> anyhow::Result<ReembedOutcome> {
+    journal.validate()?;
+    loaded.space.validate()?;
+    ensure!(
+        progress_batch_size > 0,
+        "Migration progress batch size must be positive"
+    );
+    ensure!(
+        loaded.space == journal.target_space
+            && loaded.provider.model_id() == loaded.space.model()
+            && loaded.provider.dimensions() == loaded.space.dimensions()
+            && loaded.effective_max_tokens == loaded.space.max_tokens(),
+        "Migration loaded provider/owned target identity mismatch"
+    );
+    ensure!(
+        read_target_journal(db.inner()).await?.as_ref() == Some(&journal),
+        "Migration journal is stale or owned by another run"
+    );
+    let baseline = read_target_baseline(db.inner(), &journal).await?;
+    if journal.phase == MigrationPhase::Complete {
+        system_config::check_embedding_space(db.inner(), &loaded.space).await?;
+        return Ok(ReembedOutcome::Skipped(
+            "owned target is already complete".into(),
+        ));
+    }
+    validate_target_metadata(db.inner(), &journal).await?;
+    ensure!(
+        journal.reembedded_count <= baseline.fact_count,
+        "Checkpoint exceeds original fact count"
+    );
+    if journal.phase == MigrationPhase::Facts {
+        alexandria_storage::schema::drop_vector_index(db.inner()).await?;
+        rewrite_target_facts(
+            db,
+            loaded,
+            progress_batch_size,
+            &mut journal,
+            baseline.fact_count,
+        )
+        .await?;
+        journal.phase = MigrationPhase::Centroids;
+        checkpoint_target_reembed(db.inner(), &journal).await?;
+    }
+    if journal.phase == MigrationPhase::Centroids {
+        validate_target_facts(db.inner(), &journal).await?;
+        rewrite_target_centroids(db, &journal).await?;
+        journal.phase = MigrationPhase::Verify;
+        checkpoint_target_reembed(db.inner(), &journal).await?;
+    }
+    validate_target_data(db.inner(), &journal).await?;
+    alexandria_storage::schema::ensure_vector_index(db.inner(), loaded.space.dimensions()).await?;
+    publish_target_space(db.inner(), &journal, &loaded.space).await?;
+    Ok(ReembedOutcome::Done {
+        facts: baseline.fact_count,
+        clusters: baseline.cluster_count,
+    })
+}
+
+async fn rewrite_target_facts(
+    db: &Database,
+    loaded: &LoadedEmbedding,
+    batch_size: usize,
+    journal: &mut ReembedJournal,
+    total: usize,
+) -> anyhow::Result<()> {
+    let memories = MemoryRepo::new(db.inner());
+    loop {
+        let page = memories
+            .reembed_page(journal.last_fact_id.clone(), batch_size)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        for fact in &page {
+            let vectors = loaded.provider.embed(&[fact.content.as_str()]).await?;
+            ensure!(
+                vectors.len() == 1,
+                "Migration provider must return one embedding for one text"
+            );
+            validate_unit_embedding(&vectors[0], loaded.space.dimensions())?;
+            memories
+                .write_reembed_embedding(&fact.id, &vectors[0])
+                .await?;
+        }
+        let mut next = journal.clone();
+        next.last_fact_id = page.last().map(|fact| fact.id.clone());
+        next.reembedded_count = next
+            .reembedded_count
+            .checked_add(page.len())
+            .ok_or_else(|| anyhow::anyhow!("Migration count overflow"))?;
+        ensure!(
+            next.reembedded_count <= total,
+            "Migration corpus grew beyond original baseline"
+        );
+        checkpoint_target_reembed(db.inner(), &next).await?;
+        *journal = next;
+        tracing::info!(
+            "Re-embedded {}/{total} target facts",
+            journal.reembedded_count
+        );
+    }
+    ensure!(
+        journal.reembedded_count == total,
+        "Migration did not cover the original fact count"
+    );
+    Ok(())
+}
+
+async fn rewrite_target_centroids(db: &Database, journal: &ReembedJournal) -> anyhow::Result<()> {
+    let baseline = read_target_baseline(db.inner(), journal).await?;
+    let clusters = ClusterRepo::new(db.inner());
+    let mut rows = clusters.list().await?;
+    rows.sort_by(|left, right| left.id.cmp(&right.id));
+    for cluster in rows {
+        let id = cluster
+            .id
+            .ok_or_else(|| anyhow::anyhow!("Cluster has no ID"))?;
+        let text_id = id.to_sql();
+        let members = clusters.get_members(&text_id).await?;
+        if baseline.empty_cluster_ids.binary_search(&id).is_ok() {
+            ensure!(
+                members.is_empty() && !clusters.has_reembed_references(&id).await?,
+                "Approved empty cluster acquired references"
+            );
+            clusters.delete(&text_id).await?;
+        } else {
+            let centroid = checked_target_centroid(&members, journal.target_space.dimensions())?;
+            clusters.update_centroid(&text_id, &centroid).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Granite is refused before any read/write; it requires a separate offline target.
@@ -113,9 +264,9 @@ pub async fn reembed(
         tracing::info!("Re-embedded {done}/{total} facts");
     }
 
-    // 2. Centroids: plain mean of all members, deleted included, matching how the
-    //    maintenance loop reads members via get_members. Empty clusters are dropped:
-    //    their centroid would keep the old dimension and nothing references them.
+    // 2. Centroids: plain mean of live members, matching get_members/maintenance.
+    // Legacy empty-cluster deletion remains unchanged; owned targets use the
+    // stricter reference/baseline checks in reembed_target above.
     let clusters = ClusterRepo::new(db.inner());
     let dims = provider.dimensions();
     let mut updated = 0;

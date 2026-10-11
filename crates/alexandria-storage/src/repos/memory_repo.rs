@@ -514,6 +514,27 @@ impl<'a> MemoryRepo<'a> {
         Ok(response.take(0)?)
     }
 
+    /// Rewrite only a pre-existing fact's vector, binding its opaque ID directly.
+    /// Migration cannot round-trip IDs through the display-string formatter.
+    pub async fn write_reembed_embedding(&self, id: &RecordId, embedding: &[f32]) -> Result<()> {
+        anyhow::ensure!(
+            id.table.as_str() == "fact" && !id.key.is_range(),
+            "Migration write requires a single fact ID"
+        );
+        let mut response = self
+            .db
+            .query("UPDATE $id SET embedding = $embedding")
+            .bind(("id", id.clone()))
+            .bind(("embedding", embedding.to_vec()))
+            .await?;
+        let updated: Option<Fact> = response.take(0)?;
+        anyhow::ensure!(
+            updated.and_then(|fact| fact.id).as_ref() == Some(id),
+            "Migration fact disappeared during rewrite"
+        );
+        Ok(())
+    }
+
     /// Keyset page over every fact, including deleted and quarantined rows.
     /// Reuse the last committed cursor to replay an uncheckpointed write group.
     /// IDs stay typed bind parameters; content/embedding changes cannot reorder a page.

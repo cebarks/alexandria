@@ -1,7 +1,7 @@
 //! Atomic lifecycle metadata for an owned, separate migration target.
-//! These APIs do not copy/open a source or rewrite vectors. The rewriter validates
-//! corpus/centroid/metadata survival before publication; publication additionally
-//! proves the target HNSW plan and commits readiness with the exact journal.
+//! These APIs do not copy/open a source or rewrite vectors. Publication revalidates
+//! original metadata survival, complete fact/vector coverage and centroid consistency,
+//! proves the target HNSW definition/plan, and commits readiness with the exact journal.
 
 use anyhow::{Context, Result, ensure};
 use surrealdb::{
@@ -11,6 +11,7 @@ use surrealdb::{
 };
 
 use crate::{
+    embedding_validation::{self, BASELINE_KEY},
     models::embedding::{EmbeddingSpace, MigrationPhase, ReembedJournal},
     system_config::{self, PRE_LOCK_MAX_TOKENS},
 };
@@ -22,6 +23,9 @@ const GUARDED_TRANSACTION: &str = "
 BEGIN TRANSACTION;
 IF (SELECT * FROM system_config WHERE key = 'embedding_migration_journal' LIMIT 1)[0].value != $seen.journal {
     THROW 'Migration journal changed';
+};
+IF (SELECT * FROM system_config WHERE key = 'embedding_migration_baseline' LIMIT 1)[0].value != $seen.baseline {
+    THROW 'Migration baseline changed';
 };
 IF (SELECT * FROM system_config WHERE key = 'embedding_model' LIMIT 1)[0].value != $seen.model
     OR (SELECT * FROM system_config WHERE key = 'embedding_dimensions' LIMIT 1)[0].value != $seen.dimensions
@@ -38,16 +42,18 @@ struct LockSnapshot {
     tokens: Option<String>,
     space: Option<String>,
     journal: Option<String>,
+    baseline: Option<String>,
 }
 
 impl LockSnapshot {
     async fn load(db: &Surreal<Any>) -> Result<Self> {
-        let (model, dimensions, tokens, space, journal) = tokio::try_join!(
+        let (model, dimensions, tokens, space, journal, baseline) = tokio::try_join!(
             system_config::get_config(db, "embedding_model"),
             system_config::get_config(db, "embedding_dimensions"),
             system_config::get_config(db, "embedding_max_tokens"),
             system_config::get_config(db, "embedding_space"),
             system_config::get_config(db, JOURNAL_KEY),
+            system_config::get_config(db, BASELINE_KEY),
         )?;
         Ok(Self {
             model,
@@ -55,6 +61,7 @@ impl LockSnapshot {
             tokens,
             space,
             journal,
+            baseline,
         })
     }
 
@@ -118,6 +125,7 @@ pub(crate) async fn ensure_ready(db: &Surreal<Any>) -> Result<()> {
             journal.phase == MigrationPhase::Complete,
             "Embedding migration incomplete; resume the owned separate target, not the source"
         );
+        embedding_validation::read_target_baseline(db, &journal).await?;
         let encoded = system_config::get_config(db, "embedding_space")
             .await?
             .context("Completed migration has no full embedding identity")?;
@@ -161,9 +169,15 @@ pub async fn begin_target_reembed(db: &Surreal<Any>, journal: &ReembedJournal) -
             "Cannot replace an existing migration run"
         );
     }
+    ensure!(
+        seen.journal.is_some() || seen.baseline.is_none(),
+        "Orphan migration baseline cannot be overwritten"
+    );
+    let baseline = embedding_validation::capture_baseline(db, journal).await?;
     let sql = format!(
         "{GUARDED_TRANSACTION}
-        DELETE system_config WHERE key IN ['embedding_model', 'embedding_migration_journal'];
+        DELETE system_config WHERE key IN ['embedding_model', 'embedding_migration_journal', 'embedding_migration_baseline'];
+        CREATE system_config SET key = 'embedding_migration_baseline', value = $baseline;
         CREATE system_config SET key = 'embedding_migration_journal', value = $journal;
         CREATE system_config SET key = 'embedding_model', value = $marker;
         COMMIT TRANSACTION;"
@@ -172,6 +186,7 @@ pub async fn begin_target_reembed(db: &Surreal<Any>, journal: &ReembedJournal) -
         .bind(("seen", seen))
         .bind(("journal", serde_json::to_string(journal)?))
         .bind(("marker", INCOMPLETE_MODEL))
+        .bind(("baseline", serde_json::to_string(&baseline)?))
         .await?
         .check()?;
     Ok(())
@@ -228,6 +243,7 @@ pub async fn checkpoint_target_reembed(db: &Surreal<Any>, journal: &ReembedJourn
             .as_deref()
             .context("Target has no migration journal")?,
     )?;
+    embedding_validation::read_target_baseline(db, &previous).await?;
     check_progress(&previous, journal)?;
     seen.source_matches(&journal.source_space, true)?;
     let sql = format!(
@@ -311,6 +327,8 @@ pub async fn publish_target_space(
         "Publication journal is stale or belongs to another run"
     );
     seen.source_matches(&expected.source_space, true)?;
+    embedding_validation::read_target_baseline(db, expected).await?;
+    embedding_validation::validate_target_data(db, expected).await?;
     require_hnsw_plan(db, space.dimensions()).await?;
     let mut complete = expected.clone();
     complete.phase = MigrationPhase::Complete;

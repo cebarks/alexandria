@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{RecordId, SurrealValue, ToSql};
+use surrealdb::types::{RecordId, RecordIdKeyRange, SurrealValue, ToSql};
 use tracing::warn;
 
 use crate::models::{Cluster, Fact};
@@ -95,6 +95,40 @@ impl<'a> ClusterRepo<'a> {
             .await?;
         let members: Vec<Fact> = response.take(0)?;
         Ok(members)
+    }
+
+    /// Migration may drop only genuinely empty, unreferenced clusters. Inspect
+    /// every table, not a relation-name allowlist: extension relations count too.
+    pub async fn has_reembed_references(&self, id: &RecordId) -> Result<bool> {
+        let mut response = self.db.query("INFO FOR DB STRUCTURE").await?;
+        let info: Option<serde_json::Value> = response.take(0)?;
+        let info = info.ok_or_else(|| anyhow::anyhow!("Missing database table inventory"))?;
+        let tables = info["tables"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Invalid database table inventory"))?;
+        for table in tables {
+            let name = table["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid database table name"))?;
+            let records = RecordId::new(
+                name,
+                RecordIdKeyRange {
+                    start: std::ops::Bound::Unbounded,
+                    end: std::ops::Bound::Unbounded,
+                },
+            );
+            let mut response = self
+                .db
+                .query("SELECT VALUE id FROM $records WHERE in = $id OR out = $id LIMIT 1")
+                .bind(("records", records))
+                .bind(("id", id.clone()))
+                .await?;
+            let references: Vec<RecordId> = response.take(0)?;
+            if !references.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Every fact id with an edge into this cluster, live or not.
