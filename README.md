@@ -54,6 +54,8 @@ MiniLM remains the installation default. The checksum-pinned Granite pack is **n
 
 Existing databases cannot be relabelled Granite. Stop the source server, configure the target model/budget while keeping the source data path, then use `alexandria migrate-embeddings --output-data-dir /path/to/new-target`. `--resume` continues an owned target or reports a completed one without loading weights. The original source is retained; model, budget and data path cutover (and paired rollback) remain manual. The legacy in-place command refuses Granite and owned migration targets. Do not change live model/path settings or reuse MiniLM cutoff calibration as proof of Granite quality. See [embedding configuration](docs/configuration.md#embedding) and the [artifact curator](tools/granite-artifact/README.md).
 
+Granite's cosine scale differs from MiniLM's. In the small public synthetic pilot, retaining a MiniLM-style floor returned results for every unanswerable query; higher floors traded those errors for lost valid passages. This is not sufficient evidence to change defaults. See [Granite test data and release gates](docs/granite-test-data.md) for the multi-relevant pilot, native evaluation procedure and remaining calibration requirements.
+
 ## Command Line
 
 `alexandria` with no arguments starts the server. The two subcommands are maintenance tools

@@ -1,0 +1,45 @@
+{
+  "format_version": 1,
+  "adjudication": {
+    "method": "Author-reviewed content entailment over the complete synthetic fixture, before model evaluation; relevant_ids enumerate all passages answering each query in its group.",
+    "independent": false,
+    "release_calibration": false,
+    "limitations": ["Small synthetic set, not representative production traffic.", "Near-miss unanswerables request details or implementations absent from the complete fixture, even where related terminology exists.", "No TypeScript, graph traversal, graded relevance, or long-document quality evaluation.", "No default or cutoff recommendation is authorized by this pilot."]
+  },
+  "documents": [
+    {"id":"memory/query-clock","group":"memory","text":"Alexandria reminders have no background timer. A pending reminder becomes deliverable when its due time passes, but it is consumed only when a client next calls check_reminders. Without a client there is no delivery; the server reaches nobody by itself."},
+    {"id":"memory/delivery-path","group":"memory","text":"Reminder delivery is query-time consumption by check_reminders, not a scheduled push. Clients call this tool to consume due occurrences. A conditional claim provides best-effort-once delivery; recurring rows advance past now and coalesce missed occurrences."},
+    {"id":"memory/access-clock","group":"memory","text":"heat_state.last_accessed_at is the spacing reference and moves only on an actual record_access. The separate last_touched field anchors the stored heat value. Decay materialization must never change last_accessed_at."},
+    {"id":"memory/sweep-clock","group":"memory","text":"A heat sweep updates decayed heat and last_touched, but leaves last_accessed_at untouched. Otherwise an hourly sweep becomes the spacing reference even when nobody retrieves the memory. Real accesses alone update the access clock."},
+    {"id":"memory/granite-platform","group":"memory","text":"The native Rust Burn Granite provider emits 768-dimensional FP32 vectors using CLS pooling and L2 normalization with FP64 accumulation cast back to FP32. CPU is default; explicit ROCm or Vulkan needs its compiled backend and available device. There is no CPU fallback for a failed GPU request."},
+    {"id":"memory/granite-worker","group":"memory","text":"Granite owns one serial native Rust inference worker, with one active job and one queued job. CPU and GPU share the same 768D FP32 CLS-pooled, L2-normalized embedding space. Inputs have exact sequence lengths; microbatch size is one. Cancelling active work discards delivery rather than interrupting a kernel."},
+    {"id":"memory/migration-copy","group":"memory","text":"A fresh separate-target offline migration never opens the original source storage engine. On Linux it opens the existing root LOCK read-only, takes an exclusive nonblocking lock, and holds it through copying. Missing or live locks fail without creating or writing the lock file."},
+    {"id":"memory/migration-resume","group":"memory","text":"Offline migration reads source identity only from the copied target, never by opening the source engine. The source is protected by its existing read-only LOCK during the original copy. Resume validates the adjacent original source receipt, journal and original non-vector baseline; it does not recapture partially rewritten data."},
+    {"id":"code/due","group":"code","text":"fn is_due(status: &str, next_due_at: i64, now: i64) -> bool {\n    status == \"pending\" && next_due_at <= now\n}"},
+    {"id":"code/claim","group":"code","text":"fn may_claim(status: &str, stored_due_at: i64, seen_due_at: i64) -> bool {\n    status == \"pending\" && stored_due_at == seen_due_at\n}"},
+    {"id":"code/spacing","group":"code","text":"fn spacing_elapsed(now: i64, last_accessed_at: i64) -> i64 {\n    // Real access is the spacing reference, not last_touched.\n    now.saturating_sub(last_accessed_at)\n}"},
+    {"id":"code/materialize","group":"code","text":"fn materialize_clock(now: i64, last_accessed_at: i64) -> (i64, i64) {\n    let last_touched = now;\n    // Preserve the independent real-access timestamp during materialization.\n    (last_touched, last_accessed_at)\n}"},
+    {"id":"code/live","group":"code","text":"fn is_live_fact(deleted: bool, quarantined: bool) -> bool {\n    !deleted && !quarantined\n}"},
+    {"id":"code/show","group":"code","text":"fn should_show_fact(deleted: bool, quarantined: bool) -> bool {\n    // Exclude soft-deleted and quarantined records.\n    !(deleted || quarantined)\n}"},
+    {"id":"code/lock-path","group":"code","text":"fn source_lock_path(source: &std::path::Path) -> std::path::PathBuf {\n    source.join(\"LOCK\")\n}"},
+    {"id":"code/truncate","group":"code","text":"fn right_truncate(ids: &[i64], limit: usize) -> &[i64] {\n    &ids[..ids.len().min(limit)]\n}"}
+  ],
+  "queries": [
+    {"id":"query/memory/delivery","group":"memory","text":"When does an Alexandria reminder actually get consumed and delivered?","relevant_ids":["memory/query-clock","memory/delivery-path"]},
+    {"id":"query/memory/clock","group":"memory","text":"What clock must a heat sweep leave untouched?","relevant_ids":["memory/access-clock","memory/sweep-clock"]},
+    {"id":"query/memory/space","group":"memory","text":"Which embedding pooling, dimensions and precision does the native Granite provider use?","relevant_ids":["memory/granite-platform","memory/granite-worker"]},
+    {"id":"query/memory/source","group":"memory","text":"How does offline migration keep the source storage engine from writing to the original store?","relevant_ids":["memory/migration-copy","memory/migration-resume"]},
+    {"id":"query/memory/sms-sid","group":"memory","text":"What Twilio account SID is configured for reminder SMS?","relevant_ids":[]},
+    {"id":"query/memory/retry-interval","group":"memory","text":"What is the configured migration lock retry interval in milliseconds?","relevant_ids":[]},
+    {"id":"query/memory/nvidia-rate","group":"memory","text":"What is the measured Granite throughput on an NVIDIA RTX 5090?","relevant_ids":[]},
+    {"id":"query/memory/pack-hash","group":"memory","text":"What is the SHA-256 of the published Granite release pack?","relevant_ids":[]},
+    {"id":"query/code/due","group":"code","text":"Where does the reminder due predicate require both pending status and an elapsed due time?","relevant_ids":["code/due"]},
+    {"id":"query/code/claim","group":"code","text":"Which guard checks that a pending reminder's stored due time equals the occurrence being consumed?","relevant_ids":["code/claim"]},
+    {"id":"query/code/live","group":"code","text":"Which helpers exclude soft-deleted and quarantined facts?","relevant_ids":["code/live","code/show"]},
+    {"id":"query/code/spacing","group":"code","text":"Where is last_accessed_at used or preserved separately from last_touched?","relevant_ids":["code/spacing","code/materialize"]},
+    {"id":"query/code/sms","group":"code","text":"Which function sends reminder SMS through Twilio?","relevant_ids":[]},
+    {"id":"query/code/cuda","group":"code","text":"Where is the CUDA kernel launching flash attention for Granite?","relevant_ids":[]},
+    {"id":"query/code/postgres","group":"code","text":"Which function creates a PostgreSQL connection pool and manages its SQL transactions?","relevant_ids":[]},
+    {"id":"query/code/pack-hash","group":"code","text":"Which function returns the release pack's compiled SHA-256?","relevant_ids":[]}
+  ]
+}
