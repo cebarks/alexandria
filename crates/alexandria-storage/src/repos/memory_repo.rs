@@ -1,7 +1,7 @@
 use anyhow::Result;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{RecordId, SurrealValue, ToSql};
+use surrealdb::types::{RecordId, RecordIdKeyRange, SurrealValue, ToSql};
 
 use crate::models::{CollapseCandidate, Fact, LiveConfidence, RawRecord};
 use crate::record_id_to_string;
@@ -91,6 +91,7 @@ pub const DEFAULT_FACT_LIST_LIMIT: usize = 50;
 // ponytail: fixed search breadth, the value SurrealDB's own HNSW tests use. Must stay above the
 // largest `k` a caller asks for; make it a config key if recall ever measures short.
 const HNSW_EF: usize = 150;
+const REEMBED_PAGE_SQL: &str = "SELECT id, content FROM $records ORDER BY id ASC LIMIT $limit";
 
 /// The numeric-ef form is the only one the planner serves from the HNSW index; a distance name
 /// in that slot means brute force.
@@ -144,6 +145,13 @@ impl Default for FactListQuery<'_> {
             offset: 0,
         }
     }
+}
+
+/// Content-only migration page. Hidden facts are included; the key is the cursor.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, SurrealValue)]
+pub struct ReembedFact {
+    pub id: RecordId,
+    pub content: String,
 }
 
 pub struct MemoryRepo<'a> {
@@ -506,6 +514,40 @@ impl<'a> MemoryRepo<'a> {
         Ok(response.take(0)?)
     }
 
+    /// Keyset page over every fact, including deleted and quarantined rows.
+    /// Reuse the last committed cursor to replay an uncheckpointed write group.
+    /// IDs stay typed bind parameters; content/embedding changes cannot reorder a page.
+    pub async fn reembed_page(
+        &self,
+        after: Option<RecordId>,
+        limit: usize,
+    ) -> Result<Vec<ReembedFact>> {
+        anyhow::ensure!(limit > 0, "Re-embedding page limit must be positive");
+        if let Some(cursor) = &after {
+            anyhow::ensure!(
+                cursor.table.as_str() == "fact" && !cursor.key.is_range(),
+                "Re-embedding cursor must identify a single fact"
+            );
+        }
+        let limit = i64::try_from(limit)?;
+        let records = RecordId::new(
+            "fact",
+            RecordIdKeyRange {
+                start: after
+                    .map(|cursor| std::ops::Bound::Excluded(cursor.key))
+                    .unwrap_or(std::ops::Bound::Unbounded),
+                end: std::ops::Bound::Unbounded,
+            },
+        );
+        let mut response = self
+            .db
+            .query(REEMBED_PAGE_SQL)
+            .bind(("records", records))
+            .bind(("limit", limit))
+            .await?;
+        Ok(response.take(0)?)
+    }
+
     pub async fn all_ids_and_content(&self) -> Result<Vec<(String, String)>> {
         #[derive(serde::Deserialize, SurrealValue)]
         struct Row {
@@ -531,6 +573,35 @@ impl<'a> MemoryRepo<'a> {
 mod tests {
     use super::*;
     use crate::connection::Database;
+
+    #[tokio::test]
+    async fn reembed_page_plan_seeks_a_bound_record_range_not_a_repeated_table_scan() {
+        use surrealdb::types::RecordIdKeyRange;
+        let db = Database::connect_embedded().await.unwrap();
+        crate::schema::migrate(db.inner()).await.unwrap();
+        let records = RecordId::new(
+            "fact",
+            RecordIdKeyRange {
+                start: std::ops::Bound::Excluded("b".into()),
+                end: std::ops::Bound::Unbounded,
+            },
+        );
+        let mut response = db
+            .inner()
+            .query(format!("EXPLAIN FORMAT JSON {REEMBED_PAGE_SQL}"))
+            .bind(("records", records))
+            .bind(("cursor", RecordId::new("fact", "b")))
+            .bind(("limit", 2i64))
+            .await
+            .unwrap();
+        let plan: surrealdb::types::Value = response.take(0).unwrap();
+        let plan = plan.to_sql();
+        assert!(
+            plan.contains("RecordIdScan") && plan.contains("fact:b>.."),
+            "{plan}"
+        );
+        assert!(!plan.contains("TableScan"), "{plan}");
+    }
 
     #[tokio::test]
     async fn test_create_raw() {

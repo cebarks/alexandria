@@ -10,6 +10,8 @@ pub use cluster_repo::ClusterRepo;
 pub use edge_repo::EdgeRepo;
 pub use heat_repo::{HeatMaterialise, HeatRepo, HeatUpdate};
 pub use maintenance_repo::{AuditContext, LogEntry, MaintenanceRepo};
-pub use memory_repo::{DEFAULT_FACT_LIST_LIMIT, FactListQuery, FactSort, MemoryRepo, SortDir};
+pub use memory_repo::{
+    DEFAULT_FACT_LIST_LIMIT, FactListQuery, FactSort, MemoryRepo, ReembedFact, SortDir,
+};
 pub use reminder_repo::{NewReminder, ReminderRepo};
 pub use session_repo::{SessionRepo, SessionSummary};
