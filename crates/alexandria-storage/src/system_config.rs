@@ -83,6 +83,7 @@ pub async fn stored_max_tokens(db: &Surreal<Any>) -> Result<usize> {
 
 /// Read the stored vector space without inventing legacy provenance.
 pub async fn stored_embedding_space(db: &Surreal<Any>) -> Result<Option<EmbeddingSpace>> {
+    crate::embedding_state::ensure_ready(db).await?;
     if let Some(encoded) = get_config(db, "embedding_space").await? {
         let space: EmbeddingSpace = serde_json::from_str(&encoded)?;
         space.validate()?;
@@ -197,6 +198,7 @@ pub async fn check_embedding_model(
     dimensions: usize,
     max_tokens: usize,
 ) -> Result<()> {
+    crate::embedding_state::ensure_ready(db).await?;
     anyhow::ensure!(
         model != GRANITE_MODEL_ID,
         "Granite requires a complete versioned embedding identity; use check_embedding_space"

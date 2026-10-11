@@ -115,6 +115,64 @@ impl GraniteSpace {
     }
 }
 
+/// Only final publication may enter `Complete`; checkpoints advance the work phases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationPhase {
+    Facts,
+    Centroids,
+    Verify,
+    Complete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReembedJournal {
+    pub run_id: String,
+    pub source_manifest_sha256: String,
+    pub source_space: EmbeddingSpace,
+    pub target_space: EmbeddingSpace,
+    pub phase: MigrationPhase,
+    pub last_fact_id: Option<surrealdb::types::RecordId>,
+    pub reembedded_count: usize,
+}
+
+impl ReembedJournal {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.run_id.trim().is_empty(),
+            "Migration run_id must not be blank"
+        );
+        anyhow::ensure!(
+            lower_hex(&self.source_manifest_sha256, 64),
+            "Invalid source manifest SHA256"
+        );
+        self.source_space.validate()?;
+        self.target_space.validate()?;
+        anyhow::ensure!(
+            self.source_space.model() != "alexandria:embedding-migration-incomplete"
+                && self.target_space.model() != "alexandria:embedding-migration-incomplete",
+            "Migration sentinel is not an embedding space"
+        );
+        anyhow::ensure!(
+            self.source_space.model() != self.target_space.model()
+                || self.target_space.max_tokens() >= self.source_space.max_tokens(),
+            "Migration cannot lower the token limit for the same model"
+        );
+        anyhow::ensure!(
+            self.last_fact_id.is_some() == (self.reembedded_count > 0),
+            "Migration cursor and reembedded_count disagree"
+        );
+        if let Some(cursor) = &self.last_fact_id {
+            anyhow::ensure!(
+                cursor.table.as_str() == "fact",
+                "Migration cursor must identify a fact"
+            );
+        }
+        Ok(())
+    }
+}
+
 fn lower_hex(text: &str, length: usize) -> bool {
     text.len() == length
         && text

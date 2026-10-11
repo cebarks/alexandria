@@ -1,4 +1,5 @@
 mod connection;
+pub mod embedding_state;
 pub mod models;
 pub mod repos;
 pub mod schema;
