@@ -7,7 +7,13 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+granite-vulkan = ["burn/vulkan", "burn/fusion", "burn/autotune"]
+granite-rocm = ["burn/rocm", "burn/fusion", "burn/autotune"]
+
 [dependencies]
+burn = { version = "=0.22.0", default-features = false, features = ["std", "flex", "simd", "rayon"] }
+burn-store = { version = "=0.22.0", default-features = false, features = ["std", "memmap"] }
 alexandria-storage = { path = "../alexandria-storage" }
 alexandria-engine = { path = "../alexandria-engine" }
 serde = { workspace = true }
@@ -15,7 +21,9 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util"] }
+sha2 = { version = "=0.10.9", default-features = false, features = ["std"] }
+dirs = { workspace = true }
 async-trait = { version = "0.1", default-features = false }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }

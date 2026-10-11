@@ -1,3 +1,4 @@
+use crate::models::embedding::{EmbeddingSpace, GRANITE_MODEL_ID};
 use crate::repos::{FactListQuery, MemoryRepo};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -80,8 +81,114 @@ pub async fn stored_max_tokens(db: &Surreal<Any>) -> Result<usize> {
         .unwrap_or(PRE_LOCK_MAX_TOKENS))
 }
 
-/// Check if the configured embedding model matches what's stored in the database.
+/// Read the stored vector space without inventing legacy provenance.
+pub async fn stored_embedding_space(db: &Surreal<Any>) -> Result<Option<EmbeddingSpace>> {
+    if let Some(encoded) = get_config(db, "embedding_space").await? {
+        let space: EmbeddingSpace = serde_json::from_str(&encoded)?;
+        space.validate()?;
+        check_compatible_embedding_keys(db, &space).await?;
+        return Ok(Some(space));
+    }
+    let model = get_config(db, "embedding_model").await?;
+    let dimensions = get_config(db, "embedding_dimensions").await?;
+    let tokens = get_config(db, "embedding_max_tokens").await?;
+    match (model, dimensions) {
+        (None, None) => {
+            anyhow::ensure!(tokens.is_none(), "Incomplete legacy embedding lock");
+            Ok(None)
+        }
+        (Some(model), Some(dimensions)) => {
+            let space = EmbeddingSpace::Legacy {
+                model,
+                dimensions: dimensions.parse()?,
+                max_tokens: match tokens {
+                    Some(tokens) => tokens.parse()?,
+                    None => PRE_LOCK_MAX_TOKENS,
+                },
+            };
+            space.validate()?;
+            Ok(Some(space))
+        }
+        _ => anyhow::bail!("Incomplete legacy embedding lock; offline migration is required"),
+    }
+}
+
+async fn check_compatible_embedding_keys(db: &Surreal<Any>, space: &EmbeddingSpace) -> Result<()> {
+    for (key, expected) in [
+        ("embedding_model", space.model().to_owned()),
+        ("embedding_dimensions", space.dimensions().to_string()),
+        ("embedding_max_tokens", space.max_tokens().to_string()),
+    ] {
+        anyhow::ensure!(
+            get_config(db, key).await?.as_deref() == Some(expected.as_str()),
+            "Stored embedding identity disagrees with compatibility key `{key}`"
+        );
+    }
+    Ok(())
+}
+
+/// Check a complete vector-space identity before any serving/index write.
+pub async fn check_embedding_space(db: &Surreal<Any>, requested: &EmbeddingSpace) -> Result<()> {
+    requested.validate()?;
+    if let Some(stored) = stored_embedding_space(db).await? {
+        anyhow::ensure!(
+            stored == *requested,
+            "Embedding space mismatch; use a separate offline migrated copy"
+        );
+        return Ok(());
+    }
+    if let EmbeddingSpace::Legacy {
+        model,
+        dimensions,
+        max_tokens,
+    } = requested
+    {
+        return check_embedding_model(db, model, *dimensions, *max_tokens).await;
+    }
+    let facts = MemoryRepo::new(db)
+        .count(&FactListQuery {
+            include_deleted: true,
+            include_quarantined: true,
+            ..Default::default()
+        })
+        .await?;
+    anyhow::ensure!(
+        facts == 0,
+        "Existing facts have no verified embedding identity; use a separate offline migrated copy"
+    );
+    let mut clusters = db.query("SELECT * FROM cluster LIMIT 1").await?;
+    let clusters: Vec<crate::models::Cluster> = clusters.take(0)?;
+    anyhow::ensure!(
+        clusters.is_empty(),
+        "Existing centroids have no verified embedding identity; use a separate offline migrated copy"
+    );
+    stamp_embedding_space(db, requested).await
+}
+
+async fn stamp_embedding_space(db: &Surreal<Any>, space: &EmbeddingSpace) -> Result<()> {
+    db.query(
+        "BEGIN TRANSACTION;
+         DELETE system_config WHERE key IN [
+             'embedding_space', 'embedding_model', 'embedding_dimensions', 'embedding_max_tokens'
+         ];
+         CREATE system_config SET key = 'embedding_space', value = $space, updated_at = time::now();
+         CREATE system_config SET key = 'embedding_model', value = $model, updated_at = time::now();
+         CREATE system_config SET key = 'embedding_dimensions', value = $dims, updated_at = time::now();
+         CREATE system_config SET key = 'embedding_max_tokens', value = $tokens, updated_at = time::now();
+         COMMIT TRANSACTION;",
+    )
+    .bind(("space", serde_json::to_string(space)?))
+    .bind(("model", space.model().to_owned()))
+    .bind(("dims", space.dimensions().to_string()))
+    .bind(("tokens", space.max_tokens().to_string()))
+    .await?
+    .check()?;
+    Ok(())
+}
+
+/// Check a legacy embedding model against the database lock.
 /// On first boot, stores the current model info. On subsequent boots, compares.
+/// Granite requires `check_embedding_space`; an existing full identity is never bypassed.
 ///
 /// Returns Ok(()) if safe to proceed, Err with a clear message if mismatched.
 pub async fn check_embedding_model(
@@ -90,6 +197,22 @@ pub async fn check_embedding_model(
     dimensions: usize,
     max_tokens: usize,
 ) -> Result<()> {
+    anyhow::ensure!(
+        model != GRANITE_MODEL_ID,
+        "Granite requires a complete versioned embedding identity; use check_embedding_space"
+    );
+    if get_config(db, "embedding_space").await?.is_some() {
+        let requested = EmbeddingSpace::Legacy {
+            model: model.to_owned(),
+            dimensions,
+            max_tokens,
+        };
+        anyhow::ensure!(
+            stored_embedding_space(db).await?.as_ref() == Some(&requested),
+            "Embedding space mismatch; use a separate offline migrated copy"
+        );
+        return Ok(());
+    }
     let stored_model = get_config(db, "embedding_model").await?;
     let stored_dims = get_config(db, "embedding_dimensions").await?;
 

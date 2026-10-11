@@ -1,4 +1,5 @@
 pub mod candle;
+pub mod granite;
 mod hub;
 pub mod provider;
 

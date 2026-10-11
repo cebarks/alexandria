@@ -72,22 +72,55 @@ pub struct DatabaseConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(from = "RawEmbeddingConfig")]
 pub struct EmbeddingConfig {
     pub model: String,
     pub device: String,
-    /// Facts per `embed()` call during `alexandria migrate-embeddings`, which is also
-    /// how often it writes and logs progress. It does not bound memory: the Candle
-    /// provider runs one forward pass per text whatever the call size. 1..=4096,
-    /// default 32; the server itself embeds one text at a time.
+    /// Write/log group size during migration, 1..=4096 (default32). Both providers
+    /// run one text at a time; this is not a GPU batching or concurrency setting.
     pub batch_size: usize,
-    /// Longest text, in wordpiece tokens including `[CLS]`/`[SEP]`, one embedding sees; the
-    /// rest of a longer text is not searchable. 3..=512, default 256 (what
-    /// sentence-transformers serves this model at, and the only value besides 128 that has
-    /// been measured); above that is experimental. A corpus stamped before this key existed
-    /// is treated as 128 and must be migrated before it will boot at the default. Locked on
-    /// first boot: raising it needs `alexandria migrate-embeddings`, and it is never lowered.
+    /// Effective token budget including special tokens: legacy3..=512/default256,
+    /// Granite2..=8192/default8192. The searchable head ends at this budget. Historical
+    /// legacy corpora without the lock key remain128, not either current default.
     pub max_tokens: usize,
+    /// Optional directory supplying bytes that match the compiled Granite manifest.
+    pub artifact_dir: Option<PathBuf>,
+    specified_max_tokens: Option<usize>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawEmbeddingConfig {
+    model: Option<String>,
+    device: Option<String>,
+    batch_size: Option<usize>,
+    max_tokens: Option<usize>,
+    artifact_dir: Option<PathBuf>,
+}
+
+impl From<RawEmbeddingConfig> for EmbeddingConfig {
+    fn from(raw: RawEmbeddingConfig) -> Self {
+        let defaults = Self::default();
+        let model = raw.model.unwrap_or(defaults.model);
+        Self {
+            max_tokens: raw
+                .max_tokens
+                .unwrap_or_else(|| embedding_default_tokens(&model)),
+            model,
+            device: raw.device.unwrap_or(defaults.device),
+            batch_size: raw.batch_size.unwrap_or(defaults.batch_size),
+            artifact_dir: raw.artifact_dir,
+            specified_max_tokens: raw.max_tokens,
+        }
+    }
+}
+
+fn embedding_default_tokens(model: &str) -> usize {
+    if model == alexandria_storage::models::embedding::GRANITE_MODEL_ID {
+        8192
+    } else {
+        alexandria_pipeline::embedding::DEFAULT_MAX_TOKENS
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -184,6 +217,8 @@ impl Default for EmbeddingConfig {
             device: "cpu".to_string(),
             batch_size: 32,
             max_tokens: alexandria_pipeline::embedding::DEFAULT_MAX_TOKENS,
+            artifact_dir: None,
+            specified_max_tokens: None,
         }
     }
 }
@@ -451,16 +486,23 @@ impl Config {
         if let Some(device) = env("ALEXANDRIA_EMBEDDING_DEVICE") {
             config.embedding.device = device;
         }
+        if let Some(directory) = env("ALEXANDRIA_EMBEDDING_ARTIFACT_DIR") {
+            config.embedding.artifact_dir = Some(PathBuf::from(directory));
+        }
         if let Some(batch) = env("ALEXANDRIA_EMBEDDING_BATCH_SIZE") {
             config.embedding.batch_size = batch.parse().map_err(|e| {
                 anyhow::anyhow!("invalid ALEXANDRIA_EMBEDDING_BATCH_SIZE `{batch}`: {e}")
             })?;
         }
         if let Some(tokens) = env("ALEXANDRIA_EMBEDDING_MAX_TOKENS") {
-            config.embedding.max_tokens = tokens.parse().map_err(|e| {
+            config.embedding.specified_max_tokens = Some(tokens.parse().map_err(|e| {
                 anyhow::anyhow!("invalid ALEXANDRIA_EMBEDDING_MAX_TOKENS `{tokens}`: {e}")
-            })?;
+            })?);
         }
+        config.embedding.max_tokens = config
+            .embedding
+            .specified_max_tokens
+            .unwrap_or_else(|| embedding_default_tokens(&config.embedding.model));
         if let Some(tz) = env("ALEXANDRIA_REMINDERS_TIMEZONE") {
             config.reminders.timezone = tz;
         }
@@ -473,11 +515,15 @@ impl Config {
             (1..=4096).contains(&config.embedding.batch_size),
             "embedding.batch_size must be between 1 and 4096"
         );
-        // 3 is `[CLS]`, one wordpiece, `[SEP]`. 512 is the BERT position table; the provider
-        // checks the loaded model's own table too.
+        let (minimum, maximum) =
+            if config.embedding.model == alexandria_storage::models::embedding::GRANITE_MODEL_ID {
+                (2, 8192)
+            } else {
+                (3, 512)
+            };
         anyhow::ensure!(
-            (3..=512).contains(&config.embedding.max_tokens),
-            "embedding.max_tokens must be between 3 and 512"
+            (minimum..=maximum).contains(&config.embedding.max_tokens),
+            "embedding.max_tokens must be between {minimum} and {maximum}"
         );
         // The scheduler's own arithmetic treats a zero interval as "due on every tick", so a typo
         // here would turn a daily pass into a hot loop that never sleeps. Refusing to start says
@@ -983,6 +1029,115 @@ mod tests {
             err.to_string().contains("ALEXANDRIA_EMBEDDING_BATCH_SIZE"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn granite_artifact_directory_env_overrides_file_without_ambient_env() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "[embedding]\nartifact_dir = '/file/artifacts'\n",
+        )
+        .unwrap();
+        let path = file.path().to_str().unwrap();
+        let from_file = Config::load_from(&env(&[("ALEXANDRIA_CONFIG", path)])).unwrap();
+        assert_eq!(
+            from_file.embedding.artifact_dir,
+            Some(PathBuf::from("/file/artifacts"))
+        );
+        let overridden = Config::load_from(&env(&[
+            ("ALEXANDRIA_CONFIG", path),
+            ("ALEXANDRIA_EMBEDDING_ARTIFACT_DIR", "/env/artifacts"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            overridden.embedding.artifact_dir,
+            Some(PathBuf::from("/env/artifacts"))
+        );
+        assert_eq!(Config::default().embedding.artifact_dir, None);
+    }
+
+    #[test]
+    fn granite_budget_default_follows_the_selected_model() {
+        let granite = alexandria_storage::models::embedding::GRANITE_MODEL_ID;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let selected = Config::load_from(&env(&[
+            ("ALEXANDRIA_CONFIG", path),
+            ("ALEXANDRIA_EMBEDDING_MODEL", granite),
+        ]))
+        .unwrap();
+        assert_eq!(selected.embedding.max_tokens, 8192);
+        assert_eq!(selected.embedding.device, "cpu");
+        let toml = format!("[embedding]\nmodel = {granite:?}\n");
+        assert_eq!(Config::from_toml(&toml).unwrap().embedding.max_tokens, 8192);
+        assert_eq!(Config::default().embedding.max_tokens, 256);
+    }
+
+    #[test]
+    fn granite_budget_respects_explicit_legacy_default_in_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "[embedding]\nmax_tokens = 256\n").unwrap();
+        let config = Config::load_from(&env(&[
+            ("ALEXANDRIA_CONFIG", file.path().to_str().unwrap()),
+            (
+                "ALEXANDRIA_EMBEDDING_MODEL",
+                alexandria_storage::models::embedding::GRANITE_MODEL_ID,
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(
+            config.embedding.max_tokens, 256,
+            "explicit256 is not an omission marker"
+        );
+    }
+
+    #[test]
+    fn granite_file_default_can_be_overridden_by_a_legacy_env_model() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                "[embedding]\nmodel = {:?}\n",
+                alexandria_storage::models::embedding::GRANITE_MODEL_ID
+            ),
+        )
+        .unwrap();
+        let config = Config::load_from(&env(&[
+            ("ALEXANDRIA_CONFIG", file.path().to_str().unwrap()),
+            (
+                "ALEXANDRIA_EMBEDDING_MODEL",
+                "sentence-transformers/all-MiniLM-L6-v2",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(config.embedding.max_tokens, 256);
+    }
+
+    #[test]
+    fn granite_budget_accepts_two_through_8192_and_rejects_outside() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let at = |value: &str| {
+            Config::load_from(&env(&[
+                ("ALEXANDRIA_CONFIG", file.path().to_str().unwrap()),
+                (
+                    "ALEXANDRIA_EMBEDDING_MODEL",
+                    alexandria_storage::models::embedding::GRANITE_MODEL_ID,
+                ),
+                ("ALEXANDRIA_EMBEDDING_MAX_TOKENS", value),
+            ]))
+        };
+        for (value, expected) in [("2", 2), ("16", 16), ("256", 256), ("8192", 8192)] {
+            assert_eq!(at(value).unwrap().embedding.max_tokens, expected);
+        }
+        for value in ["0", "1", "8193"] {
+            assert!(
+                at(value)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("between 2 and 8192")
+            );
+        }
     }
 
     #[test]

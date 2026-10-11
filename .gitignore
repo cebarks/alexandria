@@ -1,5 +1,7 @@
 /target
 Cargo.lock
+!tools/granite-artifact/Cargo.lock
+/tools/granite-artifact/target/
 /.worktrees
 contrib/pi/extensions/*/node_modules
 .pi/
