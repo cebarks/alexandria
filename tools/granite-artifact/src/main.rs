@@ -171,6 +171,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upstream_importer_checksum_names_the_locked_burn_onnx_archive() {
+        let lock = include_str!("../Cargo.lock");
+        let package = lock
+            .split("[[package]]")
+            .find(|block| block.lines().any(|line| line == "name = \"burn-onnx\""))
+            .expect("pinned burn-onnx package must be locked");
+        assert!(package.lines().any(|line| line == "version = \"0.22.0\""));
+        assert!(
+            package
+                .lines()
+                .any(|line| line == format!("checksum = \"{IMPORTER_SHA}\""))
+        );
+    }
+
+    #[test]
     fn huggingface_symlink_keeps_the_model_filename() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

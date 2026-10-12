@@ -19,10 +19,17 @@ Outputs:
 
 - `model.rs`, `model.bpk`, `tokenizer.json`
 - `artifact-manifest.json`: full embedding identity and pinned artifact hashes
-- `provenance.json`: importer crate/lock hashes, settings, and license-file hashes
+- `provenance.json`: pinned upstream `burn-onnx` crate archive checksum, standalone Cargo.lock hash, settings, and license-file hashes
 - `semantic-tensors.json`: tensor names, dtypes, shapes and payload hashes, plus
   producer metadata and typed scalar descriptions
 - `licenses/`: the supplied license/notice packet
+
+`importer_crate_sha256` names the crates.io `burn-onnx` 0.22.0 **archive checksum**, matching
+that package's entry in the standalone `Cargo.lock`. It is not a checksum of this curator's
+`src/main.rs` or source tree. `importer_lock_sha256` hashes the complete standalone lockfile;
+generated-source and pack hashes attest the actual output separately. Recording this curator's
+own source revision/digest would be an additional provenance field, not a reinterpretation of
+the existing upstream checksum.
 
 A failed build leaves `BUILD_INCOMPLETE` in its new output directory. Do not use
 or publish that directory; start a new build in a different directory. The runtime
