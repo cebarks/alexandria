@@ -70,6 +70,12 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    # Both feature sets and the curator coexist on one runner. Keep test semantics,
+    # but omit debug info/incremental artifacts to avoid exhausting its disk.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -86,6 +92,8 @@ jobs:
       # Runs before `just test`: the `immutable` asset cache header is only safe
       # because SHA256SUMS pins bytes to filename, and that link is not checked
       # anywhere else.
+      - name: Runner disk before tests
+        run: df -h .
       - run: just verify-assets
       - run: just cpu-deps
       - run: just test
@@ -93,6 +101,9 @@ jobs:
       # Real inference/conversion requires explicit cached artifacts and is ignored here.
       - run: just artifact-test
       - run: just eval-test
+      - name: Runner disk after tests
+        if: always()
+        run: df -h .
 
   # The pi companion is TypeScript with its own suite, and nothing else in this
   # workflow would notice if it stopped compiling: `just test` is cargo-only. It is

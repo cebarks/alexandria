@@ -501,6 +501,11 @@ Curator fmt/Clippy/tests/dependency-policy gates run in the corresponding existi
 `test` job also runs CPU-only workspace and Python scorer tests. Optional GPU backend compilation
 is not a hardware acceptance pass: native GPU tests require explicitly verified local assets
 and supported hardware. No official Granite model download/conversion runs in ordinary CI.
+The `test` job disables debug info (`CARGO_PROFILE_DEV_DEBUG=0`,
+`CARGO_PROFILE_TEST_DEBUG=0`) and incremental compilation (`CARGO_INCREMENTAL=0`) to
+fit both feature sets and the curator on the hosted runner. Optimization levels,
+debug assertions, overflow checks and test coverage are unchanged; CI backtraces
+have less detail. Local builds retain their normal debug settings.
 
 [`.github/workflows/container.yml`](.github/workflows/container.yml) additionally builds the Docker
 image and boot-tests it — waits on `/debug`, then performs a real MCP `initialize` handshake against

@@ -246,7 +246,13 @@ These will bite you. SurrealDB 3.3 differs from docs and prior versions:
   **not** call `just ci`. Editing the justfile alone therefore changes nothing on GitHub Actions — a
   new gate has to be added to the workflow too. `just verify-assets` runs as its own step in the
   `test` job, before `just test`, because the year-long `immutable` asset cache header is only safe
-  while the filename pins the bytes.
+  while the filename pins the bytes. The `test` job sets `CARGO_PROFILE_DEV_DEBUG=0`,
+  `CARGO_PROFILE_TEST_DEBUG=0` and `CARGO_INCREMENTAL=0` to fit both feature sets and
+  the curator on the hosted runner; optimization levels, debug assertions, overflow
+  checks and coverage stay unchanged, but CI backtraces lose debug-info detail.
+  These are job-only overrides, not local profile changes. The pinned rust-cache
+  action includes these env values in both exact and fallback cache keys, so old
+  debug-info artifacts are not restored under the reduced-footprint settings.
 - `Pi companion` **is** in the ruleset's required list, so a red companion job now blocks the merge.
   It was gated by convention only until the ruleset was edited in the UI, which is why no commit
   authorises the change and `git log` cannot show it — this bullet is the only in-repo record of the
