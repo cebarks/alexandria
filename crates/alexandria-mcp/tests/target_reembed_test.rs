@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use alexandria_mcp::migrate::{ReembedOutcome, reembed_target};
@@ -9,7 +10,7 @@ use alexandria_storage::models::embedding::{
 };
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{Database, schema, system_config};
-use surrealdb::types::{RecordId, ToSql};
+use surrealdb::types::{Array, Object, RecordId, ToSql, Uuid};
 
 fn space() -> EmbeddingSpace {
     EmbeddingSpace::GraniteV1(Box::new(GraniteSpace {
@@ -338,6 +339,108 @@ async fn numeric_ids_survive_typed_vector_writes_and_completed_retry_is_noop() {
         ReembedOutcome::Skipped(_)
     ));
     assert_eq!(provider.calls.lock().unwrap().len(), count);
+}
+
+#[tokio::test]
+async fn mixed_key_checkpoints_resume_without_skipping_or_replaying_committed_facts() {
+    let records = [
+        (RecordId::new("fact", 7), "one"),
+        (RecordId::new("fact", "é:quote'"), "two"),
+        (
+            RecordId::new(
+                "fact",
+                "00000000-0000-4000-8000-000000000001"
+                    .parse::<Uuid>()
+                    .unwrap(),
+            ),
+            "gone",
+        ),
+        (
+            RecordId::new("fact", Array::from(vec![1_i64, 2])),
+            "quarantine",
+        ),
+        (
+            RecordId::new("fact", Object::from(BTreeMap::from([("key", 7_i64)]))),
+            "object",
+        ),
+    ];
+    for failure_index in 2..records.len() {
+        let db = Database::connect_embedded().await.unwrap();
+        schema::migrate(db.inner()).await.unwrap();
+        system_config::check_embedding_space(db.inner(), &journal().source_space)
+            .await
+            .unwrap();
+        for (id, content) in &records {
+            db.inner().query("CREATE $id SET content = $content, embedding = [1.0, 0.0], tags = ['mixed-key'], deleted = $deleted")
+                .bind(("id", id.clone())).bind(("content", *content))
+                .bind(("deleted", *content == "quarantine"))
+                .await.unwrap().check().unwrap();
+        }
+        let current = journal();
+        begin_target_reembed(db.inner(), &current).await.unwrap();
+        let failing = Arc::new(Probe {
+            fail_on: Some(records[failure_index].1.into()),
+            ..Probe::default()
+        });
+        let error = reembed_target(&db, &loaded(failing.clone()), 1, current)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("injected encoder failure"),
+            "{error:#}"
+        );
+        let pending = read_target_journal(db.inner()).await.unwrap().unwrap();
+        assert_eq!(pending.reembedded_count, failure_index);
+        assert_eq!(
+            pending.last_fact_id,
+            Some(records[failure_index - 1].0.clone())
+        );
+        assert_eq!(
+            *failing.calls.lock().unwrap(),
+            records[..=failure_index]
+                .iter()
+                .map(|(_, text)| text.to_string())
+                .collect::<Vec<_>>()
+        );
+        let resumed = Arc::new(Probe::default());
+        assert!(matches!(
+            reembed_target(&db, &loaded(resumed.clone()), 1, pending)
+                .await
+                .unwrap(),
+            ReembedOutcome::Done {
+                facts: 5,
+                clusters: 0
+            }
+        ));
+        assert_eq!(
+            *resumed.calls.lock().unwrap(),
+            records[failure_index..]
+                .iter()
+                .map(|(_, text)| text.to_string())
+                .collect::<Vec<_>>()
+        );
+        for (id, content) in &records {
+            let fact: Option<alexandria_storage::models::Fact> =
+                db.inner().select(id.clone()).await.unwrap();
+            let fact = fact.unwrap();
+            assert_eq!(fact.embedding, vector(content));
+            assert_eq!(fact.tags, ["mixed-key"]);
+            assert_eq!(fact.deleted, *content == "quarantine");
+        }
+        let complete = read_target_journal(db.inner()).await.unwrap().unwrap();
+        assert_eq!(
+            complete.last_fact_id,
+            Some(records.last().unwrap().0.clone())
+        );
+        let retry = Arc::new(Probe::default());
+        assert!(matches!(
+            reembed_target(&db, &loaded(retry.clone()), 1, complete)
+                .await
+                .unwrap(),
+            ReembedOutcome::Skipped(_)
+        ));
+        assert!(retry.calls.lock().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]

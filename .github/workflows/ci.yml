@@ -87,6 +87,7 @@ jobs:
       # because SHA256SUMS pins bytes to filename, and that link is not checked
       # anywhere else.
       - run: just verify-assets
+      - run: just cpu-deps
       - run: just test
       - run: just test-cpu
       # Real inference/conversion requires explicit cached artifacts and is ignored here.

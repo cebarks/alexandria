@@ -166,6 +166,23 @@ fallback, budget reduction or modified attention graph. A different Vulkan imple
 attention strategy requires separate investigation and approval. Use the tested CPU/ROCm path
 for the 8K acceptance claim, not a generic assertion that every compiled GPU supports 8K.
 
+The current 8K implementation acceptance scope is **CPU and ROCm**. Vulkan remains an
+explicitly selected experimental backend for shorter tested inputs; resolving its 8K limit
+is not required for this checkpoint and no lower Vulkan token cap is silently imposed.
+
+## Hermetic regression guards
+
+`just cpu-deps` checks the CPU binary's locked normal/build dependency graph and rejects
+known GPU backend/native-runtime package families. Shared CPU utilities such as
+`cubecl-common` remain allowed. The guard tests command failures and malformed/empty graph
+output; it is not an exhaustive audit of arbitrary future dynamically loaded GPU code.
+This gate runs in both `just ci` and the existing GitHub Tests job.
+
+Target-migration tests also cover mixed numeric, opaque string, UUID, array and object fact
+IDs at progress batch size one, including failure/resume after complex-key checkpoints.
+They check complete vector coverage, preserved metadata and no replay of checkpointed rows,
+without loading model artifacts or running native inference.
+
 ## Release checklist
 
 - Representative independently reviewed memory/code relevance sets, with multiple valid

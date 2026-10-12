@@ -457,12 +457,13 @@ just               # list every recipe
 just ext-install   # ONE TIME per checkout: npm ci --ignore-scripts for the pi companion (node_modules/ is gitignored)
 just test          # cargo test --locked --workspace --all-features (hermetic Granite tests; native runs ignored)
 just test-cpu      # CPU-only workspace tests, including uncompiled-GPU admission guards
+just cpu-deps      # CPU binary graph rejects known GPU backend/native dependencies
 just artifact-ci   # standalone curator fmt/clippy/hermetic tests/cargo-deny, no official model conversion
 just eval-test     # dependency-free Python scorer tests; no inference
 just ext-test      # pi companion: npm run typecheck + npm test (needs ext-install first)
 just lint          # clippy, warnings as errors (matches CI)
 just fmt-fix       # rustfmt
-just ci            # both Rust feature sets + curator + scorer + companion + policy/assets gates
+just ci            # CPU graph + both Rust feature sets + curator/scorer/companion/policy/assets
 just run           # run the server locally (prefix with RUST_LOG=debug for verbose logs)
 just verify-assets # check crates/alexandria-mcp/assets against SHA256SUMS
 just vendor-assets # re-download those assets and re-verify the checksums

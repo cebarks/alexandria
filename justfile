@@ -21,6 +21,11 @@ lint:
 test:
     cargo test --locked --workspace --all-features
 
+# CPU runtime/build graph: known GPU backend/native libraries must stay optional
+cpu-deps:
+    python3 -B -m unittest discover -s tools -p test_cpu_dependencies.py
+    python3 -B tools/check_cpu_dependencies.py
+
 # CPU-only workspace admission guards (no optional GPU backends)
 test-cpu:
     cargo test --locked --workspace --no-default-features
@@ -97,7 +102,7 @@ verify-assets:
     done
 
 # Full CI suite locally — run before pushing
-ci: fmt lint test test-cpu artifact-ci eval-test ext-test deny verify-assets
+ci: fmt lint cpu-deps test test-cpu artifact-ci eval-test ext-test deny verify-assets
 
 # Install git hooks (pre-commit: fmt + clippy)
 install-hooks:
