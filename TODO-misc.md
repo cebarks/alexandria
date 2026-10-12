@@ -126,7 +126,7 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   bash output, so an unrelated call-shape error quoting one is exempted (no such row exists in the
   session corpus); and a *different* server whose rejection text quotes `alexandria_store_memory` is
   exempted. All three die if the fleet ever standardises the server key.
-- [-] **Nothing gates pi's *behavioural* drift, only its types.** `@earendil-works/pi-coding-agent` is
+- [-] **CI does not gate pi's *behavioural* drift, only its types.** `@earendil-works/pi-coding-agent` is
   now exact-pinned, so a bump is a deliberate lockfile edit rather than background float, and CI's
   `npm run typecheck` does catch a bump that breaks the type boundary. What nothing catches is a change
   that compiles and still behaves differently: the `0.87` provider-contract change and the `0.99` MCP
@@ -137,13 +137,12 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   pin-vs-lock disagreement as its own failure, and make "no host pi" a skip rather than an error so it
   can actually live in `ci`. The real gap is a smoke job that loads the extension under the host pi and
   asserts what it registers — see the next-but-one entry.
-- [-] **Seven lockfile entries have no `integrity`.** The `@earendil-works/*` packages inside pi's
-  subtree (`chord`, `pi-agent-core`, `pi-ai`, `pi-codemode`, `pi-mcp`, `pi-telemetry`, `pi-tui`) are
-  pinned by URL and version only, because pi ships `npm-shrinkwrap.json` and its generator drops
-  digests for same-version workspace siblings — `npm` copies that omission forward. These are exactly
-  the `.d.ts` files the `Pick<ExtensionContext, …>` boundary resolves through. Guard: a check that
-  fails if any `package-lock.json` entry lacks `integrity` (same shape as `just verify-assets`), plus
-  the upstream ask. Note the asymmetry: Rust has `cargo-deny` for advisories *and* licences; the npm
+- [-] **Lockfile integrity is not CI-gated.** The seven digest-less `@earendil-works/*`
+  entries inherited from pi's 0.99.1 shrinkwrap were fixed by the 1.1.0 refresh: every
+  current registry entry has `integrity` (verified 2026-10-12). A future update can
+  regress that, so the remaining guard is a check that fails if any registry
+  `package-lock.json` entry lacks `integrity` (same shape as `just verify-assets`).
+  Note the asymmetry: Rust has `cargo-deny` for advisories *and* licences; the npm
   tree has neither, and `deny.toml`'s licence allowlist would reject `BlueOak-1.0.0` and `0BSD` today
   if it were applied — substantively harmless, but it shows npm sits outside the policy.
 
@@ -155,8 +154,8 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   resumed pi session recalls across everything. Pass `ctx.sessionManager.getSessionId()` if
   same-session recall ever matters more than cross-session recall.
 - [-] **`just ext-test` type-checks against whatever `@earendil-works/pi-coding-agent` the lockfile
-  holds.** The lock now pins `0.99.1`, matching the running pi, and the extension's context boundary
-  is declared as `Pick<ExtensionContext, …>` with no casts at the production call sites — so a pi
+  holds.** The lock now pins `1.1.0`, matching the host used for local SDK validation,
+  and the extension's context boundary is declared as `Pick<ExtensionContext, …>` with no casts at the production call sites — so a pi
   rename or removal fails `npm run typecheck` instead of failing at runtime. A typecheck that starts
   failing after a lockfile bump still means upstream changed `ExtensionAPI`, not that our code
   regressed. The remaining gap is pi's *behaviour*, which no typecheck covers: the `0.87` provider

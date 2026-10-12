@@ -214,6 +214,14 @@ project = "alexandria"
 `ALEXANDRIA_AUTO_RECALL` is the original name of the recall toggle and is still the spelling it
 uses; `ALEXANDRIA_REMINDERS` follows the same shape for the reminders feature.
 
+## Development
+
+The type-only Pi SDK dependency is exact-pinned at **1.1.0**. Changing it requires
+`npm ci --ignore-scripts`, the typecheck and tests (`just ext-test`), and a real
+SDK/host behavior check: type compatibility alone cannot prove event or injection
+behavior. Production installs omit this development dependency; CI does not load
+an actual Pi host. Keep lifecycle scripts disabled for every install path.
+
 ## Known gaps
 
 - No unit tests for the extraction prompt or its truncation (the detectors, the transcript

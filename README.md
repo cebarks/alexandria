@@ -507,6 +507,11 @@ fit both feature sets and the curator on the hosted runner. Optimization levels,
 debug assertions, overflow checks and test coverage are unchanged; CI backtraces
 have less detail. Local builds retain their normal debug settings.
 
+During dependency refreshes, retain the resolved SurrealDB and Burn families in
+addition to their exact top-level pins: pinning the SurrealDB SDK alone does not
+freeze its internal engine crates. Engine changes need the deployment/storage-format
+review described below; inference-stack changes need artifact and vector validation.
+
 [`.github/workflows/container.yml`](.github/workflows/container.yml) additionally builds the Docker
 image and boot-tests it — waits on `/debug`, then performs a real MCP `initialize` handshake against
 `/mcp` — but only when a change touches the `Containerfile`, `.dockerignore`, the manifests, or
