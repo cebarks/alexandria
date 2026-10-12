@@ -46,6 +46,23 @@ async fn fixture_child() {
             .create_fact("public one", 0.6, &[1.0, 0.0], &[])
             .await
             .unwrap();
+    } else if mode == "duplicate" {
+        alexandria_storage::repos::MemoryRepo::new(db.inner())
+            .create_fact("public one", 0.6, &[1.0, 0.0], &[])
+            .await
+            .unwrap();
+    } else if mode == "lower-schema-version" {
+        system_config::set_config(db.inner(), "schema_version", "0")
+            .await
+            .unwrap();
+    } else if mode == "corrupt-journal" {
+        system_config::set_config(
+            db.inner(),
+            alexandria_storage::embedding_state::JOURNAL_KEY,
+            "{broken",
+        )
+        .await
+        .unwrap();
     } else if mode == "repair-marker" {
         system_config::set_config(db.inner(), "embedding_model", "public-legacy")
             .await
@@ -57,6 +74,27 @@ async fn fixture_child() {
                 .await
                 .unwrap()
                 .is_some()
+        );
+        println!(
+            "LIVE={}",
+            alexandria_storage::repos::MemoryRepo::new(db.inner())
+                .count(&alexandria_storage::repos::FactListQuery::default())
+                .await
+                .unwrap()
+        );
+        println!(
+            "AUDIT={}",
+            alexandria_storage::repos::ClusterRepo::new(db.inner())
+                .count_maintenance_logs(None)
+                .await
+                .unwrap()
+        );
+        println!(
+            "SCHEMA={}",
+            system_config::get_config(db.inner(), "schema_version")
+                .await
+                .unwrap()
+                .unwrap()
         );
     } else {
         struct Encoder;
@@ -322,8 +360,121 @@ fn embedding_migration_cli_help_describes_copy_resume_and_manual_cutover() {
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
-        text.contains("--output-data-dir") && text.contains("--resume") && text.contains("manual")
+        text.contains("--output-data-dir")
+            && text.contains("--resume")
+            && text.contains("manual")
+            && text.contains("dream")
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dream_refuses_pending_or_corrupt_targets_before_schema_or_job_writes() {
+    for mode in ["pending", "repair-marker", "corrupt-journal"] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fixture_process("seed", &source);
+        fixture_process("duplicate", &source);
+        let guard = alexandria_storage::offline_copy::OfflineStoreGuard::acquire(&source).unwrap();
+        guard.copy_to(&target).unwrap();
+        fixture_process("pending", &target);
+        if mode != "pending" {
+            fixture_process(mode, &target);
+        }
+        fixture_process("lower-schema-version", &target);
+        let output = command(root.path(), &target, &["dream", "--job", "collapse"]);
+        assert!(
+            !output.status.success(),
+            "{mode}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("job=collapse"));
+        let inspected = fixture_process("inspect", &target);
+        let text = String::from_utf8(inspected.stdout).unwrap();
+        assert!(
+            text.contains("LIVE=2")
+                && text.contains("AUDIT=0")
+                && text.contains("SCHEMA=0")
+                && text.contains("ARMED=false"),
+            "{mode}: {text}"
+        );
+        assert!(!root.path().join("cache").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dream_uses_ready_legacy_or_granite_vectors_without_model_or_config_identity_matching() {
+    for mode in ["legacy", "complete"] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fixture_process("seed", &source);
+        fixture_process("duplicate", &source);
+        let target = root.path().join("target");
+        let path = if mode == "complete" {
+            let guard =
+                alexandria_storage::offline_copy::OfflineStoreGuard::acquire(&source).unwrap();
+            guard.copy_to(&target).unwrap();
+            fixture_process("complete", &target);
+            &target
+        } else {
+            &source
+        };
+        let output = command(root.path(), path, &["dream", "--job", "collapse"]);
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("job=collapse examined=2 acted=1 skipped=0")
+        );
+        let inspected = fixture_process("inspect", path);
+        let text = String::from_utf8(inspected.stdout).unwrap();
+        assert!(
+            text.contains("LIVE=1") && text.contains("AUDIT=1") && text.contains("ARMED=false"),
+            "{mode}: {text}"
+        );
+        assert!(!root.path().join("cache").exists());
+    }
+}
+
+#[test]
+fn dream_accepts_a_fresh_store_without_identity_or_artifact_provisioning() {
+    let root = tempfile::tempdir().unwrap();
+    let fresh = root.path().join("fresh-source");
+    let output = command(root.path(), &fresh, &["dream", "--job", "collapse"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("job=collapse examined=0 acted=0 skipped=0")
+    );
+    assert!(!root.path().join("cache").exists());
+    let inspected = fixture_process("inspect", &fresh);
+    assert!(String::from_utf8_lossy(&inspected.stdout).contains("ARMED=false"));
+}
+
+#[test]
+fn dream_help_routes_without_opening_a_store_or_loading_a_model() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing-source");
+    let output = command(root.path(), &missing, &["dream", "--help"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("alexandria dream")
+            && text.contains("--max-rows")
+            && text.contains("single-writer")
+    );
+    assert!(!missing.exists());
+    assert!(!root.path().join("cache").exists());
 }
 
 #[test]

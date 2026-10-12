@@ -1,5 +1,6 @@
 mod bench;
 mod config;
+mod dream;
 mod dreaming;
 mod embedding_migration;
 
@@ -33,7 +34,11 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt::init();
     }
 
-    const USAGE: &str = "Usage: alexandria [migrate-embeddings [--force] [--output-data-dir PATH [--resume]] | bench-retrieval | --help]\nGranite requires --output-data-dir; legacy no-output mode remains in-place. Cutover/rollback is manual: change model and data_dir together, never automatically swap or delete stores.";
+    const USAGE: &str = "Usage: alexandria [migrate-embeddings [--force] [--output-data-dir PATH [--resume]] | bench-retrieval | dream [--job NAME]... [--max-rows N] | --help]\nGranite requires --output-data-dir; legacy no-output mode remains in-place. Cutover/rollback is manual: change model and data_dir together, never automatically swap or delete stores.";
+    if args.first().is_some_and(|first| first == "dream") {
+        let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+        return dream::run(&rest).await;
+    }
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [] => {}
         ["migrate-embeddings"] => return migrate_embeddings(false).await,

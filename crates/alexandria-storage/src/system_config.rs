@@ -133,8 +133,18 @@ pub async fn check_boot_embedding_metadata(
     Ok(())
 }
 
-/// Read the stored vector space without inventing legacy provenance.
+/// Read the stored vector space without inventing legacy provenance. A fresh store
+/// with no identity table returns None without bootstrapping schema.
 pub async fn stored_embedding_space(db: &Surreal<Any>) -> Result<Option<EmbeddingSpace>> {
+    let mut response = db.query("INFO FOR DB STRUCTURE").await?;
+    let info: Option<serde_json::Value> = response.take(0)?;
+    let info = info.ok_or_else(|| anyhow::anyhow!("Missing database table inventory"))?;
+    let tables = info["tables"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Invalid database table inventory"))?;
+    if !tables.iter().any(|table| table["name"] == "system_config") {
+        return Ok(None);
+    }
     crate::embedding_state::ensure_ready(db).await?;
     if let Some(encoded) = get_config(db, "embedding_space").await? {
         let space: EmbeddingSpace = serde_json::from_str(&encoded)?;

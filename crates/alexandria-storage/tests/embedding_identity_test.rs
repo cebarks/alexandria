@@ -18,6 +18,35 @@ fn granite() -> EmbeddingSpace {
 }
 
 #[tokio::test]
+async fn missing_identity_table_returns_none_without_defining_schema() {
+    let db = Database::connect_embedded().await.unwrap();
+    let before: Option<serde_json::Value> = db
+        .inner()
+        .query("INFO FOR DB STRUCTURE")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert!(
+        system_config::stored_embedding_space(db.inner())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let after: Option<serde_json::Value> = db
+        .inner()
+        .query("INFO FOR DB STRUCTURE")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "reading an absent identity must not bootstrap tables"
+    );
+}
+
+#[tokio::test]
 async fn fresh_granite_store_stamps_full_and_compatible_identity() {
     let db = Database::connect_embedded().await.unwrap();
     schema::migrate(db.inner()).await.unwrap();

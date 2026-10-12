@@ -46,6 +46,16 @@ impl Job {
         }
     }
 
+    /// The inverse of [`Job::as_str`]: the name an operator types on the command line.
+    ///
+    /// Exact match, lower-case only. Deliberately not `to_lowercase()`ed first, because the names
+    /// written into `maintenance_log.job` are byte-exact and a CLI that accepted `SWEEP` would be
+    /// accepting a spelling the audit log does not use.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        ALL_JOBS.into_iter().find(|job| job.as_str() == name)
+    }
+
     /// Whether the job runs on the first tick after boot, or waits a full interval.
     ///
     /// `Cluster` and `Merge` run immediately because that is the behaviour being preserved: the
@@ -232,5 +242,24 @@ impl JobReport {
             acted: 0,
             skipped: 0,
         }
+    }
+
+    /// The three counters as one `key=value` line, in the field order the scheduler logs them.
+    ///
+    /// The loop renders its own report through `tracing::debug!` with the same field names, and is
+    /// deliberately left alone: structured fields are what the journal carries, and changing that
+    /// line is a scheduler behaviour change with nothing to show for it. This is the stdout twin of
+    /// it, for `alexandria dream`, which has no log level to be run at. `skipped` is included
+    /// always rather than only when non-zero, because `examined: N, acted: 0` is exactly the case
+    /// where the third counter is the answer, and a line whose fields come and go cannot be grepped.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        format!(
+            "job={} examined={} acted={} skipped={}",
+            self.job.as_str(),
+            self.examined,
+            self.acted,
+            self.skipped
+        )
     }
 }
