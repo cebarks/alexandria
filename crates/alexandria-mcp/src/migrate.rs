@@ -160,7 +160,7 @@ async fn rewrite_target_centroids(db: &Database, journal: &ReembedJournal) -> an
             .id
             .ok_or_else(|| anyhow::anyhow!("Cluster has no ID"))?;
         let text_id = id.to_sql();
-        let members = clusters.get_members(&text_id).await?;
+        let members = clusters.get_reembed_members(&id).await?;
         if baseline.empty_cluster_ids.binary_search(&id).is_ok() {
             ensure!(
                 members.is_empty() && !clusters.has_reembed_references(&id).await?,

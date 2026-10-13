@@ -160,6 +160,94 @@ async fn blocked(db: &Database) {
 }
 
 #[tokio::test]
+async fn deleted_only_centroid_and_memberships_survive_partial_rewrite_resume() {
+    let db = Database::connect_embedded().await.unwrap();
+    seed(&db).await;
+    db.inner().query("CREATE fact:archived_second SET content = 'old second', confidence = 0.6, embedding = [0.0, 1.0], deleted = true; CREATE cluster:archived SET label = 'archived', centroid = [0.5, 0.5]")
+        .await.unwrap().check().unwrap();
+    let clusters = ClusterRepo::new(db.inner());
+    clusters
+        .add_member("cluster:archived", "fact:c")
+        .await
+        .unwrap();
+    clusters
+        .add_member("cluster:archived", "fact:archived_second")
+        .await
+        .unwrap();
+    let before = clusters.get_member_ids("cluster:archived").await.unwrap();
+    let current = journal();
+    begin_target_reembed(db.inner(), &current).await.unwrap();
+    let failing = Arc::new(Probe {
+        fail_on: Some("gone".into()),
+        ..Probe::default()
+    });
+    assert!(
+        reembed_target(&db, &loaded(failing), 1, current)
+            .await
+            .is_err()
+    );
+    let partial = read_target_journal(db.inner()).await.unwrap().unwrap();
+    assert_eq!(partial.phase, MigrationPhase::Facts);
+    assert_eq!(
+        clusters.get_member_ids("cluster:archived").await.unwrap(),
+        before
+    );
+    let retry = Arc::new(Probe::default());
+    reembed_target(&db, &loaded(retry.clone()), 1, partial)
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.calls.lock().unwrap().as_slice(),
+        ["gone", "quarantine"]
+    );
+    let archived = clusters.get("cluster:archived").await.unwrap().unwrap();
+    let mut expected = vec![0.0; 768];
+    expected[2] = 0.5;
+    expected[4] = 0.5;
+    assert_eq!(archived.centroid, expected);
+    assert!(
+        clusters
+            .get_members("cluster:archived")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        clusters.get_member_ids("cluster:archived").await.unwrap(),
+        before
+    );
+    assert!(
+        MemoryRepo::new(db.inner())
+            .get_fact("fact:c")
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+    assert!(
+        MemoryRepo::new(db.inner())
+            .get_fact("fact:archived_second")
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+    let complete = read_target_journal(db.inner()).await.unwrap().unwrap();
+    assert_eq!(complete.phase, MigrationPhase::Complete);
+    validate_target_metadata(db.inner(), &complete)
+        .await
+        .unwrap();
+    let no_inference = Arc::new(Probe::default());
+    assert!(matches!(
+        reembed_target(&db, &loaded(no_inference.clone()), 1, complete)
+            .await
+            .unwrap(),
+        ReembedOutcome::Skipped(_)
+    ));
+    assert!(no_inference.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn rewrites_every_fact_preserves_metadata_recomputes_live_centroids_and_builds_index() {
     let (db, current) = fixture().await;
     let probe = Arc::new(Probe::default());

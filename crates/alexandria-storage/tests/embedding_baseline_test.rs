@@ -7,6 +7,7 @@ use alexandria_storage::embedding_validation::{
 use alexandria_storage::models::embedding::{EmbeddingSpace, MigrationPhase, ReembedJournal};
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{Database, schema, system_config};
+use surrealdb::types::ToSql;
 
 fn journal() -> ReembedJournal {
     ReembedJournal {
@@ -164,30 +165,162 @@ async fn malformed_or_missing_baseline_refuses_checkpoints() {
 }
 
 #[tokio::test]
-async fn hidden_only_cluster_refuses_begin_without_deleting_memberships() {
+async fn deleted_only_cluster_preserves_baseline_and_memberships() {
     let (db, id, _) = fixture().await;
     MemoryRepo::new(db.inner())
         .soft_delete_fact(&id)
         .await
         .unwrap();
-    let before = ClusterRepo::new(db.inner()).list().await.unwrap().len();
-    assert!(begin_target_reembed(db.inner(), &journal()).await.is_err());
+    let clusters = ClusterRepo::new(db.inner());
+    let retained = clusters
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|cluster| cluster.label.as_deref() == Some("populated"))
+        .unwrap()
+        .id
+        .unwrap();
+    let before = clusters.get_member_ids(&retained.to_sql()).await.unwrap();
+    begin_target_reembed(db.inner(), &journal()).await.unwrap();
+    let baseline = read_target_baseline(db.inner(), &journal()).await.unwrap();
+    assert_eq!(baseline.cluster_count, 1);
+    assert!(!baseline.empty_cluster_ids.contains(&retained));
+    assert!(
+        clusters
+            .get_members(&retained.to_sql())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
-        ClusterRepo::new(db.inner()).list().await.unwrap().len(),
+        clusters.get_member_ids(&retained.to_sql()).await.unwrap(),
         before
     );
+    validate_target_metadata(db.inner(), &journal())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deleted_only_fallback_refuses_quarantine_missing_and_other_references() {
+    for scenario in [
+        "quarantined",
+        "deleted_quarantined",
+        "missing",
+        "hierarchy",
+        "extension",
+        "incoming_membership",
+    ] {
+        let (db, fact, _) = fixture().await;
+        let clusters = ClusterRepo::new(db.inner());
+        let id = clusters
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|cluster| cluster.label.as_deref() == Some("populated"))
+            .unwrap()
+            .id
+            .unwrap();
+        if scenario != "quarantined" {
+            MemoryRepo::new(db.inner())
+                .soft_delete_fact(&fact)
+                .await
+                .unwrap();
+        }
+        let sql = match scenario {
+            "quarantined" | "deleted_quarantined" => {
+                "UPDATE type::record($fact) SET quarantined_at = time::now()"
+            }
+            "missing" => "RELATE $cluster->contains_memory->fact:missing",
+            "hierarchy" => {
+                "CREATE cluster:parent SET centroid = [1.0, 0.0]; RELATE cluster:parent->contains_cluster->$cluster"
+            }
+            "extension" => {
+                "DEFINE TABLE extension_reference TYPE RELATION; RELATE $cluster->extension_reference->fact:other"
+            }
+            "incoming_membership" => {
+                "DEFINE TABLE OVERWRITE contains_memory SCHEMAFULL TYPE RELATION; RELATE fact:other->contains_memory->$cluster"
+            }
+            _ => unreachable!(),
+        };
+        db.inner()
+            .query(sql)
+            .bind(("cluster", id.clone()))
+            .bind(("fact", fact.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let before = clusters.get_member_ids(&id.to_sql()).await.unwrap();
+        assert!(
+            begin_target_reembed(db.inner(), &journal()).await.is_err(),
+            "{scenario}"
+        );
+        assert_eq!(
+            clusters.get_member_ids(&id.to_sql()).await.unwrap(),
+            before,
+            "{scenario}"
+        );
+        assert!(
+            system_config::get_config(db.inner(), BASELINE_KEY)
+                .await
+                .unwrap()
+                .is_none(),
+            "{scenario}"
+        );
+        assert!(
+            system_config::get_config(db.inner(), "embedding_migration_journal")
+                .await
+                .unwrap()
+                .is_none(),
+            "{scenario}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleted_only_migration_population_keeps_typed_numeric_and_opaque_ids() {
+    use surrealdb::types::RecordId;
+    let (db, fact, _) = fixture().await;
+    MemoryRepo::new(db.inner())
+        .soft_delete_fact(&fact)
+        .await
+        .unwrap();
+    let clusters = ClusterRepo::new(db.inner());
+    let cluster = clusters
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|cluster| cluster.label.as_deref() == Some("populated"))
+        .unwrap()
+        .id
+        .unwrap();
+    let expected = [
+        RecordId::new("fact", 7_i64),
+        RecordId::new("fact", "é:quote'"),
+    ];
+    for id in &expected {
+        db.inner().query("CREATE $id SET content = 'typed archived', embedding = [1.0, 0.0], deleted = true; RELATE $cluster->contains_memory->$id")
+            .bind(("id", id.clone())).bind(("cluster", cluster.clone()))
+            .await.unwrap().check().unwrap();
+    }
+    begin_target_reembed(db.inner(), &journal()).await.unwrap();
+    let members = clusters.get_reembed_members(&cluster).await.unwrap();
+    assert_eq!(members.len(), 3);
     assert!(
-        system_config::get_config(db.inner(), BASELINE_KEY)
-            .await
-            .unwrap()
-            .is_none()
+        expected
+            .iter()
+            .all(|id| members.iter().any(|fact| fact.id.as_ref() == Some(id)))
     );
-    assert_eq!(
-        system_config::get_config(db.inner(), "embedding_model")
+    assert!(
+        clusters
+            .get_members(&cluster.to_sql())
             .await
             .unwrap()
-            .as_deref(),
-        Some("before")
+            .is_empty()
     );
 }
 

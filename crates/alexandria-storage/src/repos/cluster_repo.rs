@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use std::collections::HashSet;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
@@ -97,9 +97,61 @@ impl<'a> ClusterRepo<'a> {
         Ok(members)
     }
 
+    /// Owned migration population: live members first, otherwise only retained
+    /// deleted members with no quarantine, missing targets or other references.
+    /// This is deliberately separate from live retrieval/maintenance semantics.
+    pub async fn get_reembed_members(&self, id: &RecordId) -> Result<Vec<Fact>> {
+        let live = self.get_members(&id.to_sql()).await?;
+        if !live.is_empty() {
+            return Ok(live);
+        }
+        ensure!(
+            !self.reembed_references(id, true).await?,
+            "Cluster {id:?} has zero visible members but retains non-membership references"
+        );
+        let mut response = self
+            .db
+            .query("SELECT VALUE out FROM contains_memory WHERE in = $id")
+            .bind(("id", id.clone()))
+            .await?;
+        let mut ids: Vec<RecordId> = response.take(0)?;
+        ids.sort();
+        ids.dedup();
+        ensure!(
+            ids.iter().all(|id| id.table.as_str() == "fact"),
+            "Migration membership must target a fact"
+        );
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut response = self
+            .db
+            .query("SELECT * FROM $members ORDER BY id ASC")
+            .bind(("members", ids.clone()))
+            .await?;
+        let members: Vec<Fact> = response.take(0)?;
+        let mut actual: Vec<RecordId> = members.iter().filter_map(|fact| fact.id.clone()).collect();
+        actual.sort();
+        ensure!(
+            actual == ids,
+            "Migration cluster has missing membership targets"
+        );
+        ensure!(
+            members
+                .iter()
+                .all(|fact| fact.deleted && fact.quarantined_at.is_none()),
+            "Migration fallback requires only deleted, non-quarantined members"
+        );
+        Ok(members)
+    }
+
     /// Migration may drop only genuinely empty, unreferenced clusters. Inspect
     /// every table, not a relation-name allowlist: extension relations count too.
     pub async fn has_reembed_references(&self, id: &RecordId) -> Result<bool> {
+        self.reembed_references(id, false).await
+    }
+
+    async fn reembed_references(&self, id: &RecordId, allow_memberships: bool) -> Result<bool> {
         let mut response = self.db.query("INFO FOR DB STRUCTURE").await?;
         let info: Option<serde_json::Value> = response.take(0)?;
         let info = info.ok_or_else(|| anyhow::anyhow!("Missing database table inventory"))?;
@@ -117,9 +169,14 @@ impl<'a> ClusterRepo<'a> {
                     end: std::ops::Bound::Unbounded,
                 },
             );
+            let sql = if allow_memberships && name == "contains_memory" {
+                "SELECT VALUE id FROM $records WHERE out = $id LIMIT 1"
+            } else {
+                "SELECT VALUE id FROM $records WHERE in = $id OR out = $id LIMIT 1"
+            };
             let mut response = self
                 .db
-                .query("SELECT VALUE id FROM $records WHERE in = $id OR out = $id LIMIT 1")
+                .query(sql)
                 .bind(("records", records))
                 .bind(("id", id.clone()))
                 .await?;

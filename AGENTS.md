@@ -60,6 +60,7 @@ These will bite you. SurrealDB 3.3 differs from docs and prior versions:
   because it rejects vectors of any other dimension; the next boot redefines it.
 - Cluster `member_count` is queried live (not cached) — `load_cluster_infos()` calls `get_members()` per cluster, so it is one query per cluster. Fine at current scale, the first thing to revisit if cluster counts grow.
 - The dashboard's cluster-health rollup costs **~2 queries per cluster per render** (`get_members` + the stored centroid from `list_with_counts`), and is flagged `TODO(debt)` in code. Same revisit trigger as above.
+- **Owned migration preserves deleted-only clusters**, via `ClusterRepo::get_reembed_members`: prefer live members; with no live members, allow only existing deleted/non-quarantined fact targets and outgoing `contains_memory` edges, rejecting every other incoming/outgoing reference. Baseline admission, centroid rewrite and final verification share this population; do not change normal `get_members` to include hidden facts. Only truly empty/unreferenced clusters are removed.
 - `update_memory` with content change: creates a soft-deleted snapshot of old content, then links via `derived_from` edge. The old version is hidden from search but preserved for lineage.
 - `import_document` creates a `raw` table record for the full document, then `extracted_from` edges from each chunk to it.
 - Spreading activation fires on the top N results of `retrieve_memories` (configurable via `activation.top_n`, default 3) — it's a side effect, not part of the ranking.

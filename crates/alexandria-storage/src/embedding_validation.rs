@@ -95,7 +95,7 @@ pub(crate) async fn capture_baseline(
     let mut empty_cluster_ids = Vec::new();
     for cluster in clusters.list().await? {
         let id = cluster.id.context("Cluster has no record ID")?;
-        if clusters.get_members(&id.to_sql()).await?.is_empty() {
+        if clusters.get_reembed_members(&id).await?.is_empty() {
             ensure!(
                 !clusters.has_reembed_references(&id).await?,
                 "Cluster {id:?} has zero visible members but retains references; resolve it explicitly before migration"
@@ -154,7 +154,7 @@ pub fn validate_unit_embedding(vector: &[f32], dimensions: usize) -> Result<()> 
     Ok(())
 }
 
-/// Plain member mean, matching current live-population semantics. Shape checks
+/// Plain migration-population mean: live members, or eligible deleted-only members. Shape checks
 /// precede accumulation, so a short member cannot be silently zip-truncated.
 pub fn checked_target_centroid(members: &[Fact], dimensions: usize) -> Result<Vec<f32>> {
     ensure!(
@@ -238,7 +238,7 @@ pub async fn validate_target_data(db: &Surreal<Any>, journal: &ReembedJournal) -
             baseline.empty_cluster_ids.binary_search(&id).is_err(),
             "Approved empty cluster still exists"
         );
-        let members = clusters.get_members(&id.to_sql()).await?;
+        let members = clusters.get_reembed_members(&id).await?;
         let expected = checked_target_centroid(&members, journal.target_space.dimensions())?;
         ensure!(
             cluster.centroid.len() == expected.len()
