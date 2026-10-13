@@ -1,5 +1,8 @@
 /target
 Cargo.lock
+!tools/granite-artifact/Cargo.lock
+/tools/granite-artifact/target/
+/tools/granite-evaluation/__pycache__/
 /.worktrees
 contrib/pi/extensions/*/node_modules
 .pi/

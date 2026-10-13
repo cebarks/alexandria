@@ -3,6 +3,76 @@ use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{Database, system_config};
 
+#[tokio::test]
+async fn legacy_reembed_keeps_an_existing_full_legacy_identity_coherent() {
+    use alexandria_storage::models::embedding::EmbeddingSpace;
+    let (db, _, _, _, _) = seed().await;
+    let source = system_config::stored_embedding_space(db.inner())
+        .await
+        .unwrap()
+        .unwrap();
+    system_config::set_config(
+        db.inner(),
+        "embedding_max_tokens",
+        &source.max_tokens().to_string(),
+    )
+    .await
+    .unwrap();
+    system_config::set_config(
+        db.inner(),
+        "embedding_space",
+        &serde_json::to_string(&source).unwrap(),
+    )
+    .await
+    .unwrap();
+    reembed(&db, &ModelB, 2, MAX_TOKENS, false).await.unwrap();
+    assert_eq!(
+        system_config::stored_embedding_space(db.inner())
+            .await
+            .unwrap(),
+        Some(EmbeddingSpace::Legacy {
+            model: "b".into(),
+            dimensions: 3,
+            max_tokens: MAX_TOKENS
+        })
+    );
+}
+
+#[tokio::test]
+async fn legacy_reembed_cannot_overwrite_an_owned_pending_target() {
+    use alexandria_storage::models::embedding::{EmbeddingSpace, MigrationPhase, ReembedJournal};
+    let (db, id, _, _, _) = seed().await;
+    let journal = ReembedJournal {
+        run_id: "legacy-refusal".into(),
+        source_manifest_sha256: "a".repeat(64),
+        source_space: system_config::stored_embedding_space(db.inner())
+            .await
+            .unwrap()
+            .unwrap(),
+        target_space: EmbeddingSpace::Legacy {
+            model: "b".into(),
+            dimensions: 3,
+            max_tokens: MAX_TOKENS,
+        },
+        phase: MigrationPhase::Facts,
+        last_fact_id: None,
+        reembedded_count: 0,
+    };
+    alexandria_storage::embedding_state::begin_target_reembed(db.inner(), &journal)
+        .await
+        .unwrap();
+    assert!(reembed(&db, &ModelB, 2, MAX_TOKENS, true).await.is_err());
+    assert_eq!(
+        MemoryRepo::new(db.inner())
+            .get_fact(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .embedding,
+        vec![0.6, 0.8]
+    );
+}
+
 /// The limit the fake provider is said to truncate at; above the 128 a lock without the key means.
 const MAX_TOKENS: usize = 256;
 
@@ -65,6 +135,68 @@ async fn seed() -> (Database, String, String, String, String) {
         .await
         .unwrap();
     (db, live1, live2, gone, cid)
+}
+
+struct GraniteProbe;
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for GraniteProbe {
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|_| {
+                let mut vector = vec![0.0; 768];
+                vector[0] = 1.0;
+                vector
+            })
+            .collect())
+    }
+    fn dimensions(&self) -> usize {
+        768
+    }
+    fn model_id(&self) -> &str {
+        alexandria_storage::models::embedding::GRANITE_MODEL_ID
+    }
+}
+
+#[tokio::test]
+async fn legacy_in_place_reembed_refuses_granite_before_any_vector_or_lock_write() {
+    let (db, live1, _, _, cid) = seed().await;
+    let error = reembed(&db, &GraniteProbe, 2, 8192, true)
+        .await
+        .expect_err("Granite requires a separate offline target");
+    assert!(error.to_string().contains("separate offline"));
+    assert_eq!(
+        MemoryRepo::new(db.inner())
+            .get_fact(&live1)
+            .await
+            .unwrap()
+            .unwrap()
+            .embedding,
+        vec![0.6, 0.8]
+    );
+    assert_eq!(
+        ClusterRepo::new(db.inner())
+            .get(&cid)
+            .await
+            .unwrap()
+            .unwrap()
+            .centroid,
+        vec![0.7, 0.7]
+    );
+    assert_eq!(
+        system_config::get_config(db.inner(), "embedding_model")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("a")
+    );
+    assert_eq!(
+        system_config::get_config(db.inner(), "embedding_max_tokens")
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]

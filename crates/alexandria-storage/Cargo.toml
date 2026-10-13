@@ -16,6 +16,7 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+sha2 = { version = "=0.10.9", default-features = false, features = ["std"] }
 tokio = { workspace = true }
 
 [dev-dependencies]

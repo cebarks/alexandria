@@ -21,6 +21,34 @@ lint:
 test:
     cargo test --locked --workspace --all-features
 
+# CPU runtime/build graph: known GPU backend/native libraries must stay optional
+cpu-deps:
+    python3 -B -m unittest discover -s tools -p test_cpu_dependencies.py
+    python3 -B tools/check_cpu_dependencies.py
+
+# CPU-only workspace admission guards (no optional GPU backends)
+test-cpu:
+    cargo test --locked --workspace --no-default-features
+
+# Standalone curator gates: no official model download/conversion or inference
+artifact-fmt:
+    cargo fmt --manifest-path tools/granite-artifact/Cargo.toml -- --check
+
+artifact-lint:
+    cargo clippy --locked --manifest-path tools/granite-artifact/Cargo.toml --all-targets -- -D warnings
+
+artifact-test:
+    cargo test --locked --manifest-path tools/granite-artifact/Cargo.toml
+
+artifact-deny:
+    cargo deny --manifest-path tools/granite-artifact/Cargo.toml --config deny.toml check
+
+artifact-ci: artifact-fmt artifact-lint artifact-test artifact-deny
+
+# Dependency-free evaluator tests; Python performs no inference
+eval-test:
+    python3 -m unittest discover -s tools/granite-evaluation
+
 # Type-check and test the pi companion (node:test over tsx, hermetic)
 ext-test:
     cd contrib/pi/extensions/alexandria && npm run typecheck && npm test
@@ -74,7 +102,7 @@ verify-assets:
     done
 
 # Full CI suite locally — run before pushing
-ci: fmt lint test ext-test deny verify-assets
+ci: fmt lint cpu-deps test test-cpu artifact-ci eval-test ext-test deny verify-assets
 
 # Install git hooks (pre-commit: fmt + clippy)
 install-hooks:

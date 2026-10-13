@@ -7,6 +7,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+granite-vulkan = ["alexandria-pipeline/granite-vulkan"]
+granite-rocm = ["alexandria-pipeline/granite-rocm"]
+
 [dependencies]
 alexandria-storage = { path = "../alexandria-storage" }
 alexandria-engine = { path = "../alexandria-engine" }
@@ -18,6 +22,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
 rmcp = { workspace = true }
 dirs = { workspace = true }
 toml = { workspace = true }

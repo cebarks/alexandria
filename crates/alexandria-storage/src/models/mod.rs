@@ -1,5 +1,6 @@
 pub mod cluster;
 pub mod edge;
+pub mod embedding;
 pub mod heat;
 pub mod maintenance;
 pub mod memory;

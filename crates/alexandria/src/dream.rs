@@ -18,15 +18,16 @@
 //!   never booted this build, `appraise` demotes nothing and says why. That is the correct output,
 //!   not a gap to route around.
 //! - **Load the embedding model.** None of the five jobs embeds anything — they read stored vectors,
-//!   stored heat and stored confidence — so the command neither needs the ~80MB model nor touches the
-//!   embedding lock.
+//!   stored heat and stored confidence — so the command needs no model artifacts. It reads the stored
+//!   embedding identity/readiness before any schema or job write, without stamping a lock or matching
+//!   the configured model.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use alexandria_engine::dreaming::{ALL_JOBS, Job, JobReport};
 use alexandria_storage::repos::ClusterRepo;
-use alexandria_storage::{Database, schema};
+use alexandria_storage::{Database, schema, system_config};
 use anyhow::anyhow;
 
 use crate::config::Config;
@@ -304,6 +305,8 @@ pub(crate) async fn pass(request: &Request, mut config: Config) -> anyhow::Resul
     // First, and therefore before anything is examined or written: if the store is held, this is the
     // point the command stops.
     let db = Arc::new(open_store(&config.database.data_dir).await?);
+    // Jobs use stored vectors: validate readiness without provisioning or relabelling a provider.
+    let _ = system_config::stored_embedding_space(db.inner()).await?;
     schema::migrate(db.inner()).await?;
 
     let run_id = dreaming::cli_run_id(dreaming::now_secs());

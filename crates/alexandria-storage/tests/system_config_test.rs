@@ -1,5 +1,98 @@
 use alexandria_storage::{Database, schema, system_config};
 
+const GRANITE_MODEL: &str = "ibm-granite/granite-embedding-311m-multilingual-r2";
+
+#[tokio::test]
+async fn boot_metadata_admits_fresh_database_without_defining_or_stamping_tables() {
+    let db = Database::connect_embedded().await.unwrap();
+    system_config::check_boot_embedding_metadata(db.inner(), GRANITE_MODEL, 8192)
+        .await
+        .unwrap();
+    let mut response = db.inner().query("INFO FOR DB STRUCTURE").await.unwrap();
+    let info: Option<serde_json::Value> = response.take(0).unwrap();
+    assert!(info.unwrap()["tables"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn boot_metadata_accepts_locked_legacy_rollback_without_relabelling_source() {
+    let db = Database::connect_embedded().await.unwrap();
+    schema::migrate(db.inner()).await.unwrap();
+    system_config::check_embedding_model(db.inner(), "legacy", 384, 128)
+        .await
+        .unwrap();
+    system_config::check_boot_embedding_metadata(db.inner(), "legacy", 128)
+        .await
+        .unwrap();
+    assert!(
+        system_config::check_boot_embedding_metadata(db.inner(), GRANITE_MODEL, 8192)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        system_config::get_config(db.inner(), "embedding_model")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("legacy")
+    );
+    assert!(
+        system_config::access_recording_armed_at(db.inner())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn unlocked_nonempty_store_cannot_be_granite() {
+    let db = Database::connect_embedded().await.unwrap();
+    schema::migrate(db.inner()).await.unwrap();
+    alexandria_storage::repos::MemoryRepo::new(db.inner())
+        .create_fact("legacy fact", 1.0, &[0.1_f32; 384], &[])
+        .await
+        .unwrap();
+
+    assert!(
+        system_config::check_boot_embedding_metadata(db.inner(), GRANITE_MODEL, 8192)
+            .await
+            .is_err()
+    );
+    let result = system_config::check_embedding_model(db.inner(), GRANITE_MODEL, 768, 128).await;
+    assert!(
+        result.is_err(),
+        "an unrecognized corpus must not become Granite"
+    );
+    assert_eq!(
+        system_config::get_config(db.inner(), "embedding_model")
+            .await
+            .unwrap(),
+        None,
+        "a refused boot must not relabel the source vectors"
+    );
+}
+
+#[tokio::test]
+async fn partial_legacy_lock_cannot_be_relabelled_granite() {
+    let db = Database::connect_embedded().await.unwrap();
+    schema::migrate(db.inner()).await.unwrap();
+    system_config::set_config(db.inner(), "embedding_model", "legacy-model")
+        .await
+        .unwrap();
+
+    let result = system_config::check_embedding_model(db.inner(), GRANITE_MODEL, 768, 128).await;
+    assert!(
+        result.is_err(),
+        "a partial old lock must not be overwritten"
+    );
+    assert_eq!(
+        system_config::get_config(db.inner(), "embedding_model")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("legacy-model")
+    );
+}
+
 #[tokio::test]
 async fn test_first_boot_stores_embedding_config() {
     let db = Database::connect_embedded().await.unwrap();

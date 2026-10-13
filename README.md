@@ -4,7 +4,7 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 
 ## Features
 
-- **Semantic search** — Cosine similarity over local embeddings (all-MiniLM-L6-v2 via candle, pure Rust)
+- **Semantic search** — Cosine similarity over local embeddings (default MiniLM via Candle; opt-in release-gated Granite via Burn, both native Rust)
 - **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool. Heat is recorded on retrieval but is not yet a ranking input — retrieval still ranks by cosine similarity (see [`A2`](docs/performance-and-ability-findings.md#a2-the-heat-model-is-inert)).
 - **Spreading activation** — Accessing a memory warms its graph neighbors. Heat propagates along edges with configurable decay.
 - **Graph edges** — Memories link via `derived_from` and `extracted_from` edges. `relates_to`, `supports` and `contradicts` exist in the schema but nothing in production writes them yet; auto-linking them is planned v0.3 work
@@ -44,7 +44,32 @@ EOF
 alexandria
 ```
 
-First run downloads the embedding model from HuggingFace Hub (~80MB).
+First run with the default MiniLM configuration downloads the embedding model from HuggingFace Hub (~80MB).
+
+### Native Granite (opt-in, release-gated)
+
+The exact model ID `ibm-granite/granite-embedding-311m-multilingual-r2` selects native Rust Burn inference: 768D FP32, CLS pooling, and a default/cap of 8192 tokens. CPU is the default; explicit `rocm[:index]` or `vulkan[:index]` needs the corresponding binary Cargo feature (`granite-rocm` or `granite-vulkan`). A missing backend/device fails startup rather than falling back. Serving uses exact input lengths and a bounded serial worker.
+
+Build the requested backend explicitly; changing `embedding.device` cannot add it to an existing binary:
+
+```sh
+cargo build --release --locked -p alexandria                         # CPU
+cargo build --release --locked -p alexandria --features granite-rocm # ROCm
+cargo build --release --locked -p alexandria --features granite-vulkan # Vulkan
+```
+
+GPU driver/toolchain availability is a separate requirement; the shipped Alpine image builds
+CPU-only and contains neither GPU runtime nor model artifacts. For container CPU opt-in, mount
+the exact verified local artifact directory read-only and set `artifact_dir` to its in-container
+path; ensure the service UID can read it. Granite's XDG artifact cache is separate from `HF_HOME`
+(the MiniLM cache); persist it explicitly if using it. No driver, model or cache is supplied by
+changing a device selector.
+
+MiniLM remains the installation default. The checksum-pinned Granite pack is **not published yet**: opt-in startup requires verified local artifacts or an already verified cache. A local directory supplies bytes, not replacement checksums. Publication is gated by tokenizer licensing review as well as release approval; the Gemma3-derived tokenizer is not covered by the weights' Apache-2.0 license alone.
+
+Existing databases cannot be relabelled Granite. Stop the source server, configure the target model/budget while keeping the source data path, then use `alexandria migrate-embeddings --output-data-dir /path/to/new-target`. `--resume` continues an owned target or reports a completed one without loading weights. The original source is retained; model, budget and data path cutover (and paired rollback) remain manual. The legacy in-place command refuses Granite and owned migration targets. Do not change live model/path settings or reuse MiniLM cutoff calibration as proof of Granite quality. See [embedding configuration](docs/configuration.md#embedding) and the [artifact curator](tools/granite-artifact/README.md).
+
+Granite's cosine scale differs from MiniLM's. In the small public synthetic pilot, retaining a MiniLM-style floor returned results for every unanswerable query; higher floors traded those errors for lost valid passages. This is not sufficient evidence to change defaults. See [Granite test data and release gates](docs/granite-test-data.md) for the multi-relevant pilot, native evaluation procedure and remaining calibration requirements.
 
 ## Command Line
 
@@ -54,19 +79,25 @@ that run once and exit.
 | Command | What it does |
 | --- | --- |
 | `alexandria` | Start the server on the configured transport. |
-| `alexandria migrate-embeddings [--force]` | Re-embed the whole corpus with the model and `max_tokens` in `config.toml`. Needed after a deliberate model change or after raising `max_tokens`; `--force` re-embeds even when nothing changed — see [docs/configuration.md](docs/configuration.md). |
+| `alexandria migrate-embeddings [--force]` | Legacy-only: re-embed the whole corpus with the model and `max_tokens` in `config.toml`. Granite requires a separate offline target and is refused by this command. Needed after a deliberate model change or after raising `max_tokens`; `--force` re-embeds even when nothing changed — see [docs/configuration.md](docs/configuration.md). |
+| `alexandria migrate-embeddings --output-data-dir PATH [--resume] [--force]` | Copy a stopped persistent source into a separate, nonoverlapping target, then rewrite and verify it. Logs go to stderr and the completed JSON report to stdout. Resume requires the original adjacent receipt and matching journal/configuration; `--force` does not bypass ownership or replay a completed target. No automatic cutover, deletion, swap or restart. |
 | `alexandria bench-retrieval` | Measure how well the configured model separates a correct answer from the rest of the corpus, and print the score distributions and the limit × threshold grid that the `retrieve.min_similarity` floor and the client recall defaults are judged against — see [docs/minilm-test-data.md](docs/minilm-test-data.md). |
 | `alexandria dream [--job NAME]... [--max-rows N]` | Run one or more of the five housekeeping jobs **once, now**, and print what each did (`job=… examined=… acted=… skipped=…`) plus the run id its audit rows carry, so `/debug/maintenance?run=<id>` shows exactly what that pass changed. With no `--job` it runs all five. The way to answer "why did my corpus change" or "run the collapse now" without editing `[dreaming]` cadences and restarting the service — see [docs/configuration.md](docs/configuration.md). |
 | `alexandria --help` | Print the same list. |
 
-All three subcommands open the data dir directly and SurrealKV is single-writer, so the server
-has to be stopped first; `alexandria dream` says so in one line and runs nothing at all rather
-than starting half a pass, and `dream --help` states the constraint too. `bench-retrieval` can
-instead run against a copy of the data dir via
+The legacy in-place command, benchmark and `dream` open the data dir directly, and SurrealKV
+is single-writer, so the server has to be stopped first. `alexandria dream` refuses a held
+store before any job runs; `dream --help` states the constraint too. The separate-target
+migration instead locks the existing source `LOCK` read-only and never opens its storage
+engine; it opens only the copied target. Initial source-lock interoperability is admitted on
+Linux only. Keep the adjacent source-manifest receipt with the target, especially while it is
+unfinished. `bench-retrieval` can instead run against a copy of the data dir via
 `ALEXANDRIA_DATA_DIR`, which keeps the server down only for a `cp`. It is not read-only: like
 server boot it checks the embedding-model lock (refusing on a mismatch) and defines the HNSW
 index if it is missing. `alexandria dream` needs neither the model nor the index — it reads the
-stored vectors, heat and confidence — and `--max-rows N` overrides `dreaming.max_rows_per_run`
+stored vectors, heat and confidence. It validates stored embedding readiness/identity before
+schema or job writes and refuses unfinished or corrupt migration targets, without loading a
+provider or requiring the configured model to match. `--max-rows N` overrides `dreaming.max_rows_per_run`
 for that invocation only, without touching the config file.
 
 ## MCP Tools
@@ -389,7 +420,8 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | --- | --- |
 | [docs/configuration.md](docs/configuration.md) | Every server and client config key, env overrides, XDG migration |
 | [docs/session-memory.md](docs/session-memory.md) | Session data model, lifecycle, tool semantics, current limitations |
-| [docs/minilm-test-data.md](docs/minilm-test-data.md) | Retrieval measurements for the embedding model: how to rerun `bench-retrieval`, metric definitions, the floor rule and the client threshold sweep |
+| [docs/minilm-test-data.md](docs/minilm-test-data.md) | Historical MiniLM retrieval measurements: how to rerun `bench-retrieval`, metric definitions, the floor rule and the client threshold sweep |
+| [docs/granite-test-data.md](docs/granite-test-data.md) | Granite public multi-relevant/unanswerable pilot, native offline evaluation, model-specific cutoff caveats and release gates |
 | [docs/roadmap.md](docs/roadmap.md) | Shipped milestones, known gaps, planned work |
 | [contrib/pi/README.md](contrib/pi/README.md) | pi skill vs. extension: what each does, install, failure behavior |
 | [contrib/pi/extensions/alexandria/README.md](contrib/pi/extensions/alexandria/README.md) | The pi companion extension in detail: recall/store/reminders, configuration, known gaps |
@@ -410,7 +442,7 @@ crates/
 ├── alexandria/          # Binary — config loading, transport setup, main loop, dreaming scheduler
 ├── alexandria-mcp/      # MCP tool handlers + debug web UI (askama templates, vendored assets)
 ├── alexandria-engine/   # Core algorithms — clustering, heat, recall, import, activation
-├── alexandria-pipeline/ # Embedding providers (candle)
+├── alexandria-pipeline/ # Embedding providers (legacy Candle + native Granite/Burn)
 └── alexandria-storage/  # SurrealDB connection, models, repos, schema migrations
 
 contrib/pi/              # Optional client-side pi integrations (skill + extension), not shipped
@@ -432,11 +464,15 @@ set.
 ```bash
 just               # list every recipe
 just ext-install   # ONE TIME per checkout: npm ci --ignore-scripts for the pi companion (node_modules/ is gitignored)
-just test          # cargo test --workspace --all-features
+just test          # cargo test --locked --workspace --all-features (hermetic Granite tests; native runs ignored)
+just test-cpu      # CPU-only workspace tests, including uncompiled-GPU admission guards
+just cpu-deps      # CPU binary graph rejects known GPU backend/native dependencies
+just artifact-ci   # standalone curator fmt/clippy/hermetic tests/cargo-deny, no official model conversion
+just eval-test     # dependency-free Python scorer tests; no inference
 just ext-test      # pi companion: npm run typecheck + npm test (needs ext-install first)
 just lint          # clippy, warnings as errors (matches CI)
 just fmt-fix       # rustfmt
-just ci            # fmt + lint + test + ext-test + cargo-deny + verify-assets, the full pre-push check
+just ci            # CPU graph + both Rust feature sets + curator/scorer/companion/policy/assets
 just run           # run the server locally (prefix with RUST_LOG=debug for verbose logs)
 just verify-assets # check crates/alexandria-mcp/assets against SHA256SUMS
 just vendor-assets # re-download those assets and re-verify the checksums
@@ -461,6 +497,20 @@ CI job. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs five jobs �
 `test`, `extension` (displayed as "Pi companion": the extension's typecheck and tests) and `deny` — on
 PRs against any branch and pushes to `main`; it does not call `just ci`, so a new local gate has to be wired
 into the workflow as well. `just verify-assets` runs in the `test` job ahead of `just test`.
+Curator fmt/Clippy/tests/dependency-policy gates run in the corresponding existing jobs; the
+`test` job also runs CPU-only workspace and Python scorer tests. Optional GPU backend compilation
+is not a hardware acceptance pass: native GPU tests require explicitly verified local assets
+and supported hardware. No official Granite model download/conversion runs in ordinary CI.
+The `test` job disables debug info (`CARGO_PROFILE_DEV_DEBUG=0`,
+`CARGO_PROFILE_TEST_DEBUG=0`) and incremental compilation (`CARGO_INCREMENTAL=0`) to
+fit both feature sets and the curator on the hosted runner. Optimization levels,
+debug assertions, overflow checks and test coverage are unchanged; CI backtraces
+have less detail. Local builds retain their normal debug settings.
+
+During dependency refreshes, retain the resolved SurrealDB and Burn families in
+addition to their exact top-level pins: pinning the SurrealDB SDK alone does not
+freeze its internal engine crates. Engine changes need the deployment/storage-format
+review described below; inference-stack changes need artifact and vector validation.
 
 [`.github/workflows/container.yml`](.github/workflows/container.yml) additionally builds the Docker
 image and boot-tests it — waits on `/debug`, then performs a real MCP `initialize` handshake against

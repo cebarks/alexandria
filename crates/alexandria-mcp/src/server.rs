@@ -279,7 +279,18 @@ impl AlexandriaServer {
     ) -> CallToolResult {
         // Asked before the store because the id does not exist until after it, and the id is
         // what makes the warning actionable.
-        let overflow = self.embedding.overflow(&params.content);
+        let embedding = Arc::clone(&self.embedding);
+        let content = params.content.clone();
+        let overflow = match tokio::task::spawn_blocking(move || embedding.overflow(&content)).await
+        {
+            Ok(overflow) => overflow,
+            Err(error) => {
+                return CallToolResult::structured_error(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Embedding overflow counting failed: {error}")
+                }));
+            }
+        };
         match self.do_store_memory(params).await {
             Ok(id) => {
                 let mut body = serde_json::json!({ "status": "ok", "id": id });
@@ -1963,6 +1974,7 @@ mod error_message_tests {
 #[cfg(test)]
 mod get_info_tests {
     use super::*;
+    use alexandria_storage::repos::FactListQuery;
     use rmcp::ServerHandler;
 
     struct StubEmbedding;
@@ -2921,6 +2933,161 @@ mod get_info_tests {
         assert_eq!(long["truncated"], true);
         assert_eq!(long["tokens"], 24);
         assert!(store("short").await.get("truncated").is_none());
+    }
+
+    struct OverflowProbe {
+        caller: std::thread::ThreadId,
+        off_thread: Arc<std::sync::atomic::AtomicBool>,
+        panic_counting: bool,
+        fail_embedding: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for OverflowProbe {
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            if self.fail_embedding {
+                anyhow::bail!("Tokenization failed: invalid input");
+            }
+            StubEmbedding.embed(texts).await
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "overflow-probe"
+        }
+        fn overflow(&self, text: &str) -> Option<usize> {
+            self.off_thread.store(
+                std::thread::current().id() != self.caller,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            assert!(!self.panic_counting, "overflow tokenizer failed");
+            (text.len() > 10).then_some(text.len())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_memory_counts_overflow_off_the_async_executor() {
+        let db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let off_thread = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(OverflowProbe {
+                caller: std::thread::current().id(),
+                off_thread: off_thread.clone(),
+                panic_counting: false,
+                fail_embedding: false,
+            }),
+            0.75,
+            HeatSettings::default(),
+        );
+        let result = server
+            .store_memory(Parameters(StoreMemoryParams {
+                content: "well past ten characters".into(),
+                tags: None,
+                session_id: None,
+                agent_id: None,
+                model: None,
+            }))
+            .await;
+        check_structured("overflow offload", &result);
+        assert!(off_thread.load(std::sync::atomic::Ordering::SeqCst));
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["truncated"], true);
+        assert_eq!(body["tokens"], 24);
+    }
+
+    #[tokio::test]
+    async fn store_memory_counting_panic_is_a_structured_error_without_a_fact() {
+        let db = Arc::new(Database::connect_embedded().await.unwrap());
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(
+            db.clone(),
+            Arc::new(OverflowProbe {
+                caller: std::thread::current().id(),
+                off_thread: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                panic_counting: true,
+                fail_embedding: false,
+            }),
+            0.75,
+            HeatSettings::default(),
+        );
+        let result = server
+            .store_memory(Parameters(StoreMemoryParams {
+                content: "must not be written".into(),
+                tags: None,
+                session_id: None,
+                agent_id: None,
+                model: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["status"], "error");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("overflow counting")
+        );
+        assert!(body.get("truncated").is_none());
+        assert_eq!(
+            MemoryRepo::new(db.inner())
+                .count(&FactListQuery::default())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn store_memory_tokenization_error_is_not_reported_as_successful_truncation() {
+        let db = Arc::new(Database::connect_embedded().await.unwrap());
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let server = AlexandriaServer::new(
+            db.clone(),
+            Arc::new(OverflowProbe {
+                caller: std::thread::current().id(),
+                off_thread: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                panic_counting: false,
+                fail_embedding: true,
+            }),
+            0.75,
+            HeatSettings::default(),
+        );
+        let result = server
+            .store_memory(Parameters(StoreMemoryParams {
+                content: "will fail tokenization".into(),
+                tags: None,
+                session_id: None,
+                agent_id: None,
+                model: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["status"], "error");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("Tokenization failed")
+        );
+        assert!(body.get("truncated").is_none());
+        assert_eq!(
+            MemoryRepo::new(db.inner())
+                .count(&FactListQuery::default())
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
