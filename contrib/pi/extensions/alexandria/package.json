@@ -8,8 +8,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/client": "^2.0.0",
-    "smol-toml": "^1.8.0"
+    "@modelcontextprotocol/client": "^2.0.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.1.0",

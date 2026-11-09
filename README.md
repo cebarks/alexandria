@@ -410,7 +410,7 @@ Legacy `~/.alexandria/config.toml` is used as a fallback when the XDG config fil
 
 Reminder delivery is configured by the `[reminders]` section: `timezone` (IANA name, empty = system-local) governs naive datetime input and pattern/cron evaluation, and `escalation_hours` controls overdue escalation to global delivery.
 
-The Pi companion extension (recall / store / reminders) has its own config at `$XDG_CONFIG_HOME/alexandria/client.toml`.
+The Pi companion extension (recall / store / reminders) has its own JSON config at `$XDG_CONFIG_HOME/alexandria/client.json`. Its `/alexandria` command configures auto-recall inside Pi. The companion no longer reads the former `client.toml`; existing client configuration must be converted manually. Server configuration remains TOML.
 
 See [docs/configuration.md](docs/configuration.md) for all options, client config reference, and migration instructions.
 

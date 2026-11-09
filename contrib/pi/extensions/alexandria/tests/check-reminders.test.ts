@@ -15,7 +15,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 process.env.ALEXANDRIA_CLIENT_CONFIG ??=
-  "/tmp/alexandria-tests-absent-client.toml";
+  "/tmp/alexandria-tests-absent-client.json";
 
 const { checkReminders, formatDueBlock, MAX_RENDERED_REMINDERS } =
   await import("../src/reminders.js");

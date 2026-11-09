@@ -12,7 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { basename, join } from "node:path";
 import {
-	absentClientToml,
+	absentClientJson,
 	extensionRoot,
 	gitToplevel,
 	inDir,
@@ -22,7 +22,7 @@ import {
 // Deliberately padded: the server matches a target exactly, so an override that
 // reached it with whitespace would silently degrade project delivery. Both cases
 // below are arranged so a git probe could not produce this string.
-process.env.ALEXANDRIA_CLIENT_CONFIG = absentClientToml;
+process.env.ALEXANDRIA_CLIENT_CONFIG = absentClientJson;
 process.env.ALEXANDRIA_REMINDERS_PROJECT = "  alexandria  ";
 
 const { getProjectHint, __resetProjectHint } = await import(

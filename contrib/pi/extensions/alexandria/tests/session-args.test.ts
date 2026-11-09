@@ -36,7 +36,7 @@ test("omits model when none is set", () => {
 
 // store_memory failures come back as a normal tool result flagged isError whose text block is
 // {"status":"error","message":...} (rmcp's structured_error), not as a thrown MCP error.
-process.env.ALEXANDRIA_CLIENT_CONFIG ??= "/tmp/alexandria-tests-absent-client.toml";
+process.env.ALEXANDRIA_CLIENT_CONFIG ??= "/tmp/alexandria-tests-absent-client.json";
 const { toolErrorMessage } = await import("../src/mcp-client.js");
 
 test("a result is a failure only when the server flags it", () => {

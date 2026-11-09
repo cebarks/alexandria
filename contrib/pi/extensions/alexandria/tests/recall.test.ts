@@ -6,10 +6,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { join } from "node:path";
+import { writeFileSync } from "node:fs";
+import { makeScratchDir } from "./helpers.js";
 
-process.env.ALEXANDRIA_CLIENT_CONFIG ??= "/tmp/alexandria-tests-absent-client.toml";
+process.env.ALEXANDRIA_CLIENT_CONFIG ??= "/tmp/alexandria-tests-absent-client.json";
 
 const { formatMemoriesBlock, retrieveMemories } = await import("../src/recall.js");
+const { createRecallSettingsStore } = await import("../src/config.js");
 type CallTool = import("../src/mcp-client.js").CallTool;
 
 const callWith = (payload: unknown): CallTool => async () => ({
@@ -59,6 +63,31 @@ test("a payload problem comes back as an error, not as silence", async () => {
 		content: [{ type: "text", text: "index unavailable" }],
 	}));
 	assert.match(errored.error ?? "", /index unavailable/);
+});
+
+test("a pending recall uses its original limit and threshold after settings change", async () => {
+	const dir = await makeScratchDir("alexandria-recall-snapshot-");
+	const path = join(dir, "client.json");
+	writeFileSync(path, JSON.stringify({ recall: { enabled: true, limit: 3, min_similarity: 0.8 } }));
+	const store = createRecallSettingsStore(path, {});
+	let release!: () => void;
+	const wait = new Promise<void>((resolve) => { release = resolve; });
+	const limits: unknown[] = [];
+	const call: CallTool = async (_name, args) => {
+		limits.push(args.limit);
+		await wait;
+		return { content: [{ type: "text", text: JSON.stringify({ results: [
+			{ id: "fact:high", content: "high", similarity: 0.9 },
+			{ id: "fact:mid", content: "mid", similarity: 0.6 },
+		] }) }] };
+	};
+	const pending = retrieveMemories("q", call, undefined, store.get().effective);
+	store.save("limit", 8);
+	store.save("minSimilarity", 0.5);
+	release();
+	assert.deepEqual((await pending).items.map((item) => item.id), ["fact:high"]);
+	assert.deepEqual((await retrieveMemories("q", call, undefined, store.get().effective)).items.map((item) => item.id), ["fact:high", "fact:mid"]);
+	assert.deepEqual(limits, [3, 8]);
 });
 
 test("a usable result set still filters by the configured floor", async () => {

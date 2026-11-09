@@ -328,40 +328,67 @@ can only be set via the TOML file.
 
 ## Client Configuration
 
-The Pi companion extension (recall / store / reminders) loads its own config from
-`$XDG_CONFIG_HOME/alexandria/client.toml`. It is a separate file with separate keys — the server
-never reads it and the extension never reads `config.toml`.
+The Pi companion extension (recall / store / reminders) loads its own JSON config from
+`$XDG_CONFIG_HOME/alexandria/client.json`. It is a separate file with separate keys — the server
+never reads it and the extension never reads `config.toml`. When `XDG_CONFIG_HOME` is unset, the
+client uses `~/.config` on Linux or `~/Library/Application Support` on macOS.
 
-Precedence: defaults → `client.toml` → `ALEXANDRIA_CLIENT_CONFIG` env var (path to alt TOML) → individual `ALEXANDRIA_*` env vars.
+The file is selected by `ALEXANDRIA_CLIENT_CONFIG`, if set, or by the default path. Precedence is
+built-in defaults → selected JSON file → individual `ALEXANDRIA_*` env vars. Blank env overrides
+are treated as unset; invalid numeric overrides fall back to the file/default. An unreadable or
+invalid JSON file warns and falls back to defaults at startup.
+
+**Breaking change:** The companion no longer reads `client.toml`. Convert any existing client file
+manually to JSON, preserving its keys, and point `ALEXANDRIA_CLIENT_CONFIG` to the JSON file if set.
+There is no automatic migration or TOML fallback. This does not change the server's TOML config.
+
+In Pi, `/alexandria` edits the enabled state, limit, and minimum similarity through an interactive
+menu. It saves to the selected file and changes subsequent prompts in that process; other running Pi
+processes need a reload. A valid environment override remains authoritative and the menu shows both
+the effective and saved values. The menu rejects invalid inputs and refuses to overwrite invalid or unreadable JSON, a read-only
+file, a hard-linked file, duplicate object keys, or numbers that would lose precision. It updates the
+target of a symlink and preserves unrelated JSON values. It also refuses group/world-writable
+non-sticky ancestor directories. Menu saves require no external filesystem metadata tools. They are
+supported on Linux and macOS; Windows menu writes are currently refused because the directory
+ownership check is not available there. The macOS path has not yet been tested on a real Mac.
+
+The same-directory replacement preserves the ordinary Unix mode bits, but it creates a new inode:
+ownership, ACLs, extended attributes, special mode bits, and inode flags are **not** preserved.
+Effective access can therefore change even when the displayed mode bits are the same. If those
+attributes matter for your config, edit the JSON manually instead. Before rename, the temporary file
+uses the original mode but can have a different group; if it is group-writable, a member of that group
+who can access it may alter the staged JSON, even if they could not write the original file. Use an
+owner-only config mode or directory when that risk matters.
+
+The lock serializes **companion writers only**. The writer checks for other changes before rename,
+but an editor that ignores the lock can still save between that check and the rename; do not edit the
+file externally while a menu save is in progress. A crash can leave `<config>.lock`; check that no
+other writer is active before removing it. The same-directory rename persists across ordinary Pi
+restarts but does not call `fsync`, so sudden-power-loss durability is not guaranteed. Other JSON
+formatting may be normalized when saved.
 
 ### Full Example
 
-```toml
-[server]
-url = "http://127.0.0.1:3000/mcp"
-
-[recall]
-enabled = true
-limit = 10
-min_similarity = 0.45
-
-[store]
-enabled = true
-extract_model = "vertex/claude-haiku-4-5"
-extract_timeout_ms = 5000
-
-[reminders]
-enabled = true
-project = "alexandria"
+```json
+{
+  "server": { "url": "http://127.0.0.1:3000/mcp" },
+  "recall": { "enabled": true, "limit": 10, "min_similarity": 0.45 },
+  "store": {
+    "enabled": true,
+    "extract_model": "vertex/claude-haiku-4-5",
+    "extract_timeout_ms": 5000
+  },
+  "reminders": { "enabled": true, "project": "alexandria" }
+}
 ```
 
-### `[server]`
+### `server`
 
 | Key | Type | Default | Env Override | Description |
 |-----|------|---------|-------------|-------------|
 | `url` | string | `"http://127.0.0.1:3000/mcp"` | `ALEXANDRIA_URL` | Alexandria MCP server endpoint URL. |
 
-### `[recall]`
+### `recall`
 
 | Key | Type | Default | Env Override | Description |
 | ----- | ------ | --------- | ------------- | ------------- |
@@ -369,7 +396,7 @@ project = "alexandria"
 | `limit` | number | `10` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. It is not merely a cap — a target ranked below it cannot be surfaced by any threshold, so it is a recall lever in its own right, and the stronger of the two. A judgement call on a small hand-authored question set, not a measurement — the questions were written against facts already in the corpus and none lacks a target (see [docs/minilm-test-data.md](minilm-test-data.md), "Limitations"). What the 2026-09-09 limit × threshold grid on an 880-fact corpus showed ("Result limit"): delivery saturates at `10`, because the worst of the 12 benchmark target ranks is 9, so `15` and `20` add non-target memories and no hits. Was `5` until that pass, which hid 3 of the 11 targets that cleared the then-default threshold on score. Lowering it below `3` also silently narrows spreading activation (`activation.top_n`). |
 | `min_similarity` | number | `0.45` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. A judgement call read off the same grid, with the same caveats; the grid counts how many of 12 known targets a threshold actually delivers *through* `limit`. **Read it together with `limit` — the two are not independent.** At `limit = 10`: `0.45` delivers 8/12 at ~1.0 non-targets per prompt, `0.35` delivers 11/12 at ~4.7, `0.50` delivers 7/12 at ~0.5, and the old `0.58` Pi default delivers only 4/12 — it assumed genuine matches score 0.6+ and drops two thirds of real hits. `0.40` was dominated on that 12-question grid (same 8 delivered as `0.45`, roughly double the noise); with the 20-question set it delivers 16/20 at ~3.0 against `0.45`'s 14/20 at ~1.65, a genuine trade that the strict-dominance rule used to pick the pair does not take. `0.45` is chosen as the frontier pick: paired with `limit = 10` it delivers what the previous `5`/`0.35` pair did at a third of the injection. Note that `0.45` is only on the frontier *because* the limit is 10 — at `limit = 5` it was dominated by `0.50`, so do not lower one without revisiting the other. It is not free: the weakest target scores 0.338 and falls below it. |
 
-### `[store]`
+### `store`
 
 | Key | Type | Default | Env Override | Description |
 | ----- | ------ | --------- | ------------- | ------------- |
@@ -377,7 +404,7 @@ project = "alexandria"
 | `extract_model` | string | `"vertex/claude-haiku-4-5"` | `ALEXANDRIA_EXTRACT_MODEL` | Model for session-end LLM extraction. Falls back to session model if unavailable. |
 | `extract_timeout_ms` | number | `5000` | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | Timeout for the extraction LLM call in milliseconds. |
 
-### `[reminders]`
+### `reminders`
 
 Client-side delivery keys. The server-side `[reminders]` section above configures how
 schedules are interpreted; this section only says whether the extension asks for due reminders, and
