@@ -315,17 +315,23 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
     };
     let debug_router = alexandria_mcp::debug::router_with_context(server.clone(), Some(debug_ctx));
 
+    // Grab the handle before `server` moves into the MCP factory below. `/health` is a
+    // machine contract for supervisors (systemd watchdogs, container healthchecks,
+    // agent memory-status panels) — see `alexandria_mcp::health`.
+    let health_db = Arc::clone(&server.db);
+
     let service: StreamableHttpService<AlexandriaServer, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(server.clone()), Default::default(), http_config);
 
     let router = axum::Router::new()
         .nest_service("/mcp", service)
+        .merge(alexandria_mcp::health::router(health_db))
         .merge(debug_router);
     let bind_addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
     tracing::info!(
-        "Alexandria ready, serving HTTP on http://{bind_addr}/mcp (debug UI at http://{bind_addr}/debug)"
+        "Alexandria ready, serving HTTP on http://{bind_addr}/mcp (debug UI at http://{bind_addr}/debug, health at http://{bind_addr}/health)"
     );
 
     axum::serve(listener, router)
