@@ -34,9 +34,10 @@ These will bite you. SurrealDB 3.3 differs from docs and prior versions:
 - **storage** owns all DB access — no raw SurrealDB queries outside this crate. Two exceptions survive, both maintained elsewhere; don't add a third: the `alexandria-mcp` `provenance` create in `do_store_memory`, and the binary's dreaming scheduler in `crates/alexandria/src/dreaming.rs`, whose `all_clusters` helper reads `cluster` with raw SQL once per cluster run and again per merge drain iteration
 - **engine** is pure algorithms — no DB, no async (except test helpers). Takes data in, returns results.
 - **pipeline** owns embedding — unchanged `EmbeddingProvider` trait, legacy CPU Candle and native Granite/Burn behind the shared `load_provider` factory. The binary forwards optional `granite-rocm`/`granite-vulkan` features; a device selector does not compile a backend. The model lives on one named worker thread, not in the MCP server.
-- **mcp** wires tools to engine+storage. It is not the only crate that sees both — the binary depends on engine *and* storage, and `main.rs:serve_http`'s maintenance task combines them — but it is the only one whose *purpose* is joining them. Also owns the debug web UI (`alexandria-mcp/src/debug/`), which is Axum handlers over the same repos, plus `crates/alexandria-mcp/templates/` (askama, compiled at build time) and `crates/alexandria-mcp/assets/` (vendored third-party JS, `include_bytes!`). Both are **compile-time contracts**: a missing template or asset file is a build error, not a runtime 404.
+- **mcp** wires tools to engine+storage. It is not the only crate that sees both — the binary depends on engine *and* storage, and `main.rs:serve_http`'s maintenance task combines them — but it is the only one whose *purpose* is joining them. Also owns the debug web UI (`alexandria-mcp/src/debug/`), which is Axum handlers over the same repos, plus `crates/alexandria-mcp/templates/` (askama, compiled at build time) and `crates/alexandria-mcp/assets/` (vendored third-party JS, `include_bytes!`). Both are **compile-time contracts**: a missing template or asset file is a build error, not a runtime 404. It also owns the top-level `/health` liveness endpoint (`health.rs`): plain JSON, no templates, 200 only when `Database::ping` round-trips, merged into the binary's router next to the MCP service.
 - **alexandria** (binary) is config + transport + startup + the background cluster-maintenance task
 - **contrib/pi** is client-side only — TypeScript, never compiled into or imported by the Rust server
+- **contrib/hermes** is client-side only — Python, never compiled into or imported by the Rust server
 
 ## Non-Obvious Patterns
 
@@ -242,8 +243,9 @@ These will bite you. SurrealDB 3.3 differs from docs and prior versions:
   deliberately. A PR base change emits only `edited`, which is *not* a default `pull_request`
   activity type, so retargeting alone starts nothing; `gh pr close` then `gh pr reopen` fires
   `reopened` and does.
-- `.github/workflows/ci.yml` is **five separate jobs** (`fmt`, `clippy`, `test`, `extension`,
-  `deny` — `extension` is the job displayed as `Pi companion`) and does
+- `.github/workflows/ci.yml` is **six separate jobs** (`fmt`, `clippy`, `test`, `extension`,
+  `hermes-companion`, `deny` — `extension` is the job displayed as `Pi companion`,
+  `hermes-companion` as `Hermes companion`) and does
   **not** call `just ci`. Editing the justfile alone therefore changes nothing on GitHub Actions — a
   new gate has to be added to the workflow too. `just verify-assets` runs as its own step in the
   `test` job, before `just test`, because the year-long `immutable` asset cache header is only safe
@@ -287,6 +289,7 @@ These will bite you. SurrealDB 3.3 differs from docs and prior versions:
 - `contrib/pi/skills/alexandria-memory/SKILL.md` — the pi client-side skill (`mcp__alexandria__<tool>`
   names, as pi's built-in MCP exposes them since 0.99)
 - `contrib/claude/README.md` — the Claude Code skill and hooks
+- `contrib/hermes/README.md` — the Hermes Agent memory-provider companion: install, config, hook mapping, tests
 - `contrib/claude/skills/alexandria-memory/SKILL.md` — the Claude Code skill, using the same
   `mcp__alexandria__<tool>` names. Must stay at content parity with the pi copy: since pi 0.99's
   built-in MCP the two clients spell the tools identically, so the remaining differences are

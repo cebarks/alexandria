@@ -63,6 +63,15 @@ pair is a total order. Ordering by `ended_at` alone left the ties unspecified, a
 UI pages with `LIMIT`/`START` that is a correctness bug, not a cosmetic one — page 2 could repeat a
 session page 1 showed while silently dropping another.
 
+**The id is the client's to choose.** `session_id` is an opaque string — the server never parses it
+and imposes no format; it is stored as `session.external_id` (UNIQUE) and everything groups around
+it. The convention the client companions follow: *one id per conversation, stable for the
+conversation's whole life, unique across everything sharing the store.* Hermes passes its own
+session UUID; the pi companion passes the session id from pi's event bus. Ids like `s1` from the
+example above are fine only for a single-client store: the store is shared by every connected agent,
+so an id two clients both pick becomes one merged session — namespace your ids (prefix with the
+client name, or use UUIDs) when more than one agent connects.
+
 ## Tools
 
 | Tool | Session behavior |
