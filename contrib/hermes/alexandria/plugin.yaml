@@ -1,0 +1,9 @@
+name: alexandria
+version: 0.1.0
+description: "Alexandria — semantic long-term memory via a local Alexandria MCP server (SurrealDB-backed), with heuristic capture and session-end LLM extraction."
+external_dependencies:
+  - name: alexandria
+    check: "curl -sf -m 2 http://127.0.0.1:3000/health -o /dev/null"
+    install: "cargo install --git https://github.com/cebarks/alexandria -p alexandria  # crate name per README (cargo build -p alexandria); or build the Containerfile"
+config_keys:
+  - memory.alexandria

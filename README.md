@@ -121,6 +121,10 @@ for that invocation only, without touching the config file.
 Tool and parameter descriptions are written directively ("call this proactively when…") because
 that measurably changes how often client LLMs reach for them unprompted.
 
+**The tool names and parameter shapes above are the server's public API surface.** The client
+companions in `contrib/` bind to them, so a rename or a shape change is a breaking change: it needs
+a changelog entry and coordination with the companions in the same PR, not a quiet rename.
+
 ### Session memory
 
 Passing `session_id` to `store_memory` groups memories under a caller-chosen handle, and the session
@@ -174,10 +178,16 @@ three levels:
    recall and much denser capture; recall, store, and reminders each toggle independently. The Claude
    Code equivalent is the set of `UserPromptSubmit`, `PreToolUse`, and `Stop` hooks at
    [`contrib/claude/hooks/`](contrib/claude/hooks/).
+4. **Hermes Agent memory provider** — [`contrib/hermes/`](contrib/hermes/) integrates with Hermes'
+   external-memory-provider slot for automatic cross-session recall, heuristic capture,
+   session-end extraction, and native memory/reminder tools. The recommended configuration
+   disables Hermes' built-in curated stores so Alexandria is the only active long-term memory
+   backend; conversation history stays Hermes-owned. Coexistence is also supported, without
+   copying or synchronizing native memory entries into Alexandria.
 
-Items 2 and 3 are client-side integrations, not part of the MCP server itself — see
-[`contrib/pi/README.md`](contrib/pi/README.md) and [`contrib/claude/README.md`](contrib/claude/README.md)
-for what they are and how to install them.
+Items 2–4 are client-side integrations, not part of the MCP server itself — see
+[`contrib/pi/README.md`](contrib/pi/README.md), [`contrib/claude/README.md`](contrib/claude/README.md),
+and [`contrib/hermes/README.md`](contrib/hermes/README.md) for what they are and how to install them.
 
 ## Debug Web UI
 
@@ -262,6 +272,16 @@ toward 64. Writes to the vector index leave entries 3.2 cannot decode. A 3.2 bui
 the result still boots, then fails cluster queries and vector search, or returns empty member lists
 with no error. Restoring the copy is the only way back, as SurrealDB's own
 [upgrade notes](https://github.com/surrealdb/surrealdb/blob/v3.3.0/doc/UPGRADING.md) say.
+
+### Health check
+
+`GET /health` answers `200 {"status":"ok","version":"…"}` when a trivial query round-trips through
+the engine at request time within a one-second deadline, and
+`503 {"status":"unavailable","error":"…"}` when the probe fails or times out — a wedged or closed
+store is never reported healthy from process state alone. No auth (the server has
+none anywhere) and nothing sensitive in the body. It exists for supervisors: systemd watchdogs,
+container healthchecks, and agent memory-status panels (the Hermes companion's `plugin.yaml` probes
+it during setup).
 
 ### As a systemd user service (recommended)
 
