@@ -45,15 +45,29 @@ mod tests {
     /// Builds the real debug router once per test. Going through
     /// `crate::debug::router` (rather than a hand-routed `Router`) is what makes
     /// these tests fail if the `/debug/assets/{name}` route is ever dropped.
+    /// The **secured** build: assets are the one surface that is public in every build, and the reason
+    /// this fixture goes through the authenticated router at all is to prove that — a public allowlist
+    /// that only works when the boundary is off would be an accident rather than a rule.
     async fn build_router() -> Router {
         let server = super::super::test_support::test_server().await;
-        crate::debug::router(server)
+        super::super::test_support::authenticated_on_server(server)
+            .await
+            .router_only()
     }
 
     async fn get(app: &Router, uri: &str) -> (u16, Vec<u8>, HeaderMap) {
         let resp = app
             .clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    // Every request carries a `Host`, as every browser request does: the secured build
+                    // checks it on the public surface too, because a rebound name is exactly what a
+                    // no-`Host` request looks like to a server that does not check.
+                    .header(axum::http::header::HOST, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let status = resp.status().as_u16();

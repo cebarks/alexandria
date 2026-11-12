@@ -23,6 +23,17 @@ design and meant for a trusted network boundary (README, "Debug Web UI" and "Dep
 are ranked by what an attacker gains *within* that posture, not by whether the posture itself should
 change.
 
+> **The posture this section describes no longer holds for `/debug`.** The audit predates the
+> multi-user work; the debug UI is now authenticated per account, owner-scoped on every read, CSRF-bound
+> on every mutation, and fail-closed when no boundary is armed. **S1** and **S4** are closed by that
+> change rather than mitigated by configuration: the `Host` check is armed by `server.allowed_hosts`
+> against a mandatory `server.public_origin`, and the Query Tester's heat write now needs the caller's
+> own session plus its CSRF pair, so a cross-site form cannot reach it. **S2**, **S3**, **S5** and **S6**
+> are untouched by it — provenance, asset integrity, parameter clamping and model-integrity remain as
+> written, and S3 in particular is *sharper* now, since a script injected through the asset path reads
+> an authenticated session rather than a trust-the-network store. Read the findings below as the audit's
+> record; the live contract is "Debug Web UI" and "Guards, and what they are for" in the README.
+
 | ID | Finding | Severity |
 |---|---|---|
 | [S1](#s1-dns-rebinding-protection-is-disabled-by-default) | DNS-rebinding protection is disabled by default | Medium |
@@ -37,7 +48,8 @@ change.
 ### The documented posture
 
 - No authentication on `/mcp` or `/debug`. Any process that can reach the port can read, write,
-  update, and soft-delete every memory and session.
+  update, and soft-delete every memory and session. *(As audited; `/mcp` now takes a bearer credential
+  and `/debug` an account session — see the note above the findings table.)*
 - Default bind is `127.0.0.1:3000`; the Docker image binds `0.0.0.0:3000` and the README says to
   publish it only behind a reverse proxy or on a trusted network.
 - Session `external_id` is client-chosen and any client can read any session. Consistent with the

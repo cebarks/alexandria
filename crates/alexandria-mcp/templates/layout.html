@@ -26,6 +26,15 @@ tr.deleted td:first-child { text-decoration: none; }
 .pagination a { margin: 0 4px; }
 .badge-deleted { background: #3d1a1a; color: #f85149; border: 1px solid #6e2020; padding: 2px 10px; border-radius: 12px; font-size: 13px; margin-left: 8px; }
 .badge-quarantined { background: #3d2e00; color: #d29922; border: 1px solid #6e5320; padding: 2px 10px; border-radius: 12px; font-size: 13px; margin-left: 8px; }
+/* One-time secrets and the state notes around them. The secret box is the only place a value that
+   leaves the process once is rendered, and it is escaped like every other interpolation in this
+   template: there is no raw-output filter here to remember to omit. */
+.secret { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 12px; font-family: ui-monospace, monospace; word-break: break-all; font-size: 13px; }
+.warning { color: #d29922; border-left: 3px solid #6e5320; padding-left: 10px; font-size: 14px; }
+.note { color: #8b949e; font-size: 13px; }
+section { margin-top: 22px; }
+section h2 { font-size: 16px; margin-bottom: 4px; }
+form.inline-form { display: inline; }
 pre.content-block { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow-y: auto; }
 dl.fact-meta { display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px; margin: 12px 0; }
 dl.fact-meta dt { color: #8b949e; font-weight: 600; }
@@ -74,8 +83,11 @@ tr.dropped td { opacity: 0.55; }
 <a href="/debug/memories" {% if nav == "memories" %}class="active"{% endif %}>Memories</a>
 <a href="/debug/clusters" {% if nav == "clusters" %}class="active"{% endif %}>Clusters</a>
 <a href="/debug/sessions" {% if nav == "sessions" %}class="active"{% endif %}>Sessions</a>
-<a href="/debug/maintenance" {% if nav == "maintenance" %}class="active"{% endif %}>Maintenance Log</a>
+<a href="/debug/collections" {% if nav == "collections" %}class="active"{% endif %}>Collections</a>
+<a href="/debug/operations" {% if nav == "history" %}class="active"{% endif %}>History</a>
 <a href="/debug/query" {% if nav == "query" %}class="active"{% endif %}>Query Tester</a>
+<a href="/debug/account" {% if nav == "account" %}class="active"{% endif %}>Account</a>
+<a href="/debug/admin" {% if nav == "admin" %}class="active"{% endif %}>Accounts &amp; health</a>
 </nav>
 <main>
 {% block body %}{% endblock %}

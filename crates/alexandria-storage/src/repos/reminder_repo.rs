@@ -33,6 +33,12 @@ impl<'a> ReminderRepo<'a> {
         Self { db }
     }
 
+    /// The engine handle, so the account-bound wrapper can build statements against the same store
+    /// without duplicating this repo's schedule parsing. Crate-visible only.
+    pub(crate) fn db(&self) -> &'a Surreal<Any> {
+        self.db
+    }
+
     /// Create a reminder. State fields are initialized here (status = 'pending',
     /// delivered_count = 0); `created_at` comes from the schema default.
     pub async fn create(&self, r: &NewReminder) -> Result<String> {

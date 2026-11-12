@@ -1,0 +1,85 @@
+{% extends "layout.html" %}
+{% block title %}Accounts{% endblock %}
+{% block body %}
+<h1>Accounts and service health</h1>
+<p class="mode-note">Acting as <strong>{{ acting_login }}</strong>. This page manages accounts. It never lists another owner&rsquo;s memories, tags, cluster labels or session summaries — those are private content, and the administrator role is not a memory-reader context.</p>
+{% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}
+{% if let Some(secret) = issued %}
+<section>
+<h2>New recovery link</h2>
+<div class="secret" data-one-time-secret="{{ secret }}">{{ secret }}</div>
+<p class="warning">Copy it now and hand it over out of band. It works once, expires in an hour, and cannot be read back from this server.</p>
+</section>
+{% endif %}
+<section>
+<h2>Accounts <span class="note">({{ total }} total, newest {{ accounts.len() }} shown)</span></h2>
+<table>
+<thead><tr><th>Login</th><th>Status</th><th>Role</th><th>Created</th><th>Record id</th><th></th></tr></thead>
+<tbody>
+{% for row in accounts %}
+<tr>
+<td>{{ row.login }}{% if row.is_self %} <span class="badge">you</span>{% endif %}</td>
+<td>{{ row.status }}</td>
+<td>{{ row.role }}</td>
+<td>{{ row.created }}</td>
+<td><code>{{ row.id }}</code></td>
+<td>
+{% if row.is_self %}
+<span class="note">your own account cannot be suspended from here</span>
+{% else %}
+<form method="post" action="/debug/admin/suspend">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="account" value="{{ row.id }}">
+<button type="submit">Suspend</button>
+</form>
+<form method="post" action="/debug/admin/activate">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="account" value="{{ row.id }}">
+<button type="submit">Restore</button>
+</form>
+<form method="post" action="/debug/admin/recovery">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="account" value="{{ row.id }}">
+<button type="submit">Recovery link</button>
+</form>
+{% endif %}
+</td>
+</tr>
+{% else %}
+<tr><td colspan="6" class="empty">no accounts to show</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<p class="note">Suspending an account stops its reads, writes and scheduled maintenance and ends the sessions and streams it held. Nothing is deleted: a suspended account keeps its corpus, and restoring it does not restore those sessions — the people using them sign in again.</p>
+</section>
+<section>
+<h2>Create an invitation</h2>
+<form method="post" action="/debug/admin/invitations">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Create an invitation</button>
+</form>
+<p class="note">An invitation is one-use, expires in 48 hours, and belongs to your account in the list on your account page — so a leaked one is yours to revoke.</p>
+</section>
+<section>
+<h2>Scheduler health</h2>
+<p class="mode-note">What the background passes did, in aggregate. The audit table has no owner column, so per-record history is not shown to anybody here: counts, verbs and timings only. One owner&rsquo;s own per-record change history is a Task 10 page over the semantic journal, not this one.</p>
+<table>
+<thead><tr><th>Run</th><th>Jobs</th><th>Actions</th><th>Rows written</th><th>Members moved</th><th>First write</th><th>Last write</th></tr></thead>
+<tbody>
+{% for run in runs %}
+<tr>
+<td>{{ run.run }}</td>
+<td>{{ run.jobs }}</td>
+<td>{{ run.actions }}</td>
+<td>{{ run.entries }}</td>
+<td>{{ run.members_moved }}</td>
+<td>{{ run.first_at }}</td>
+<td>{{ run.last_at }}</td>
+</tr>
+{% else %}
+<tr><td colspan="7" class="empty">no maintenance has been recorded yet</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endblock %}

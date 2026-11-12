@@ -3,6 +3,7 @@ use axum::extract::{Path, State};
 use axum::response::Response;
 
 use super::html::{error_page, page, unavailable};
+use super::web::{Boundary, BrowserSession};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
@@ -48,8 +49,16 @@ struct ClusterDetailTemplate {
     member_count: usize,
 }
 
-pub async fn list(State(server): State<AlexandriaServer>) -> Response {
-    let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
+pub(crate) async fn list(
+    State(server): State<AlexandriaServer>,
+    boundary: Boundary,
+    session: BrowserSession,
+) -> Response {
+    let Ok((owner, read)) = boundary.corpus(&session).await else {
+        return forbidden("this page requires an authenticated owner session");
+    };
+    let cluster_repo =
+        alexandria_storage::repos::ScopedClusterRepo::new(server.db.inner(), &owner, &read);
     let clusters = match cluster_repo.list_with_counts().await {
         Ok(c) => c,
         Err(e) => return error_page("clusters", &e.to_string()),
@@ -91,8 +100,6 @@ pub(super) enum Cohesion {
     NeedsSplit,
     /// Too few members for the maintenance task to consider a split at all.
     TooSmall,
-    /// No cluster record, so there is no stored centroid to compare against.
-    NoCentroid,
 }
 
 impl Cohesion {
@@ -103,7 +110,6 @@ impl Cohesion {
             Cohesion::Healthy => "Healthy",
             Cohesion::NeedsSplit => "Needs split (below cohesion floor)",
             Cohesion::TooSmall => "N/A (fewer than 4 members)",
-            Cohesion::NoCentroid => "N/A (no cluster record)",
         }
     }
 }
@@ -144,29 +150,45 @@ pub(super) fn embeddings_of(members: &[alexandria_storage::models::Fact]) -> Vec
     members.iter().map(|f| f.embedding.clone()).collect()
 }
 
-pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<String>) -> Response {
-    let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
+pub(crate) async fn detail(
+    State(server): State<AlexandriaServer>,
+    boundary: Boundary,
+    session: BrowserSession,
+    Path(id): Path<String>,
+) -> Response {
+    let Ok((owner, read)) = boundary.corpus(&session).await else {
+        return forbidden("this page requires an authenticated owner session");
+    };
+    let cluster_repo =
+        alexandria_storage::repos::ScopedClusterRepo::new(server.db.inner(), &owner, &read);
     let cluster = match cluster_repo.get(&id).await {
         Ok(cluster) => cluster,
         Err(e) => return unavailable("clusters", "cluster", e),
+    };
+    // A cluster the caller's population does not contain is a 404, and that includes one that is
+    // genuinely absent: the scoped read cannot tell "deleted" from "someone else's", so neither can the
+    // page — which is the point, because a distinguishable answer would be a probe for foreign ids.
+    //
+    // This replaces the pre-Task 9 rendering, which showed "N/A (no cluster record)" plus whatever
+    // member edges still existed. Those edges carry **fact content**, and `get_members` on a foreign
+    // cluster would have quoted another owner's memories on a page their own account never touched.
+    let Some(cluster) = cluster else {
+        let mut response = error_page("clusters", "Cluster not found.");
+        *response.status_mut() = axum::http::StatusCode::NOT_FOUND;
+        return response;
     };
     let members = match cluster_repo.get_members(&id).await {
         Ok(m) => m,
         Err(e) => return unavailable("clusters", "cluster members", e),
     };
 
-    let cohesion = match &cluster {
-        Some(cluster) => cohesion_of(
-            &id,
-            &cluster.centroid,
-            &embeddings_of(&members),
-            server.cohesion_floor,
-        )
-        .label(),
-        // Members can still exist here: `get_members` traverses edges, which outlive the
-        // record they start from. Reporting a computed verdict would be a guess.
-        None => Cohesion::NoCentroid.label(),
-    }
+    let cohesion = cohesion_of(
+        &id,
+        &cluster.centroid,
+        &embeddings_of(&members),
+        server.cohesion_floor,
+    )
+    .label()
     .to_string();
 
     let member_count = members.len();
@@ -191,8 +213,17 @@ pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<Strin
     })
 }
 
+/// A refusal through the shared layout, for a handler that passed the guard and could not resolve its
+/// caller's population.
+fn forbidden(message: &str) -> Response {
+    let mut response = error_page("clusters", message);
+    *response.status_mut() = axum::http::StatusCode::FORBIDDEN;
+    response
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::HOST_HEADER;
     use askama::Template;
     use axum::body::Body;
     use axum::http::Request;
@@ -203,10 +234,19 @@ mod tests {
 
     /// Renders the cluster detail page for `cid` through the real router.
     async fn detail_html(server: &AlexandriaServer, cid: &str) -> String {
-        let app = crate::debug::router(server.clone());
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/clusters/{}", cid.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -236,11 +276,15 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/clusters")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -319,10 +363,19 @@ mod tests {
             .unwrap();
         cluster_repo.add_member(&c1, &f1).await.unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/clusters/{}", c1.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -366,10 +419,19 @@ mod tests {
             cluster_repo.add_member(&c1, &fact).await.unwrap();
         }
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/clusters/{}", c1.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -397,27 +459,25 @@ mod tests {
 
     /// Storage failure ⇒ `html::UNAVAILABLE_STATUS`, asserted on bytes the handler produced.
     ///
-    /// Forced by handing the handler a database that was never migrated: the first repo call then
-    /// fails for real, with no mock and no change to `alexandria-storage`. The body assertion matters
+    /// Forced by removing the table the read needs, on a store that *is* migrated: the first repo call
+    /// then fails for real, with no mock and no change to `alexandria-storage`. The body assertion matters
     /// as much as the status one — it is what proves this page goes through `html::unavailable`
     /// rather than re-inlining `error_page` plus a `status_mut` (the old `memories.rs` shape), which
     /// would keep the status identical and only change the wording.
     #[tokio::test]
     async fn test_cluster_storage_failure_answers_with_the_one_status() {
-        let db = alexandria_storage::Database::connect_embedded()
-            .await
-            .unwrap();
-        let server = crate::AlexandriaServer::new(
-            std::sync::Arc::new(db),
-            std::sync::Arc::new(super::super::test_support::StubEmbedding),
-            0.75,
-            crate::server::HeatSettings::default(),
-        );
-        let app = crate::debug::router(server);
+        // A migrated store with the one table the read needs removed: the handler's repo call then
+        // fails for real. (The pre-Task 9 injection was an unmigrated database, which the boundary now
+        // refuses before any handler runs — a page cannot be shown to fail on a store that cannot
+        // sign anybody in.)
+        let fixture = super::super::test_support::authenticated_app(true).await;
+        fixture.drop_table("cluster").await;
+        let app = fixture.session_router();
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/clusters/cluster:absent")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -463,6 +523,69 @@ mod tests {
         assert!(
             html.contains("<td colspan=\"2\" class=\"empty\">No members in this cluster.</td>"),
             "the shared empty-state row must stand in for the missing rows; got: {html}"
+        );
+    }
+}
+
+/// Clusters as two owners see them, including the member content the detail page quotes.
+#[cfg(test)]
+mod boundary {
+    use crate::debug::test_support as support;
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn each_owner_sees_their_own_clusters_and_nobody_elses_members() {
+        let server = crate::debug::test_support::test_server().await;
+        let alice = support::authenticated_on_server(server.clone()).await;
+        let bob = alice.second_owner("debug-fixture-second").await;
+
+        let alice_cluster = alice.seed_cluster(Some("alice cluster"), &[0.1, 0.2]).await;
+        let alice_fact = alice.seed_personal("alice member text").await;
+        alice.add_cluster_member(&alice_cluster, &alice_fact).await;
+        let bob_cluster = bob.seed_cluster(Some("bob cluster"), &[0.3, 0.4]).await;
+        let bob_fact = bob.seed_personal("bob member text").await;
+        bob.add_cluster_member(&bob_cluster, &bob_fact).await;
+
+        let (status, page) = alice.get("/debug/clusters").await;
+        assert_eq!(status, StatusCode::OK, "{}", support::clip(&page));
+        assert!(
+            page.contains("alice cluster"),
+            "the owner's cluster is missing"
+        );
+        assert!(
+            !page.contains("bob cluster"),
+            "a second owner's cluster was listed: {}",
+            support::clip(&page)
+        );
+
+        let (own, own_body) = alice
+            .get(&format!(
+                "/debug/clusters/{}",
+                alice_cluster.replace(':', "%3A")
+            ))
+            .await;
+        assert_eq!(own, StatusCode::OK, "{}", support::clip(&own_body));
+        assert!(
+            own_body.contains("alice member text"),
+            "the owner lost their own member"
+        );
+        assert!(
+            !own_body.contains("bob member text"),
+            "a foreign member's content was quoted: {}",
+            support::clip(&own_body)
+        );
+
+        let (foreign, _) = alice
+            .get(&format!(
+                "/debug/clusters/{}",
+                bob_cluster.replace(':', "%3A")
+            ))
+            .await;
+        let (absent, _) = alice.get("/debug/clusters/cluster%3Ano-such").await;
+        assert_eq!(foreign, StatusCode::NOT_FOUND);
+        assert_eq!(
+            absent, foreign,
+            "a foreign cluster is distinguishable from an absent one"
         );
     }
 }

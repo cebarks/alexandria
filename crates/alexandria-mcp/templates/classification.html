@@ -1,0 +1,34 @@
+{% extends "layout.html" %}
+{% block title %}Proposals{% endblock %}
+{% block body %}<h1>Proposals awaiting you</h1>
+<p>What an agent thought your memories belong in, and the decision that is yours alone to make. Nothing here has moved anything: a proposal is a recorded opinion, and approval is the only act that files a memory.</p>
+{% if proposals.is_empty() %}<p>Nothing pending.</p>{% endif %}
+{% if !proposals.is_empty() %}
+<form method="post" action="/debug/classification/decide">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<table>
+<tr><th></th><th>Memory</th><th>Proposed destination</th><th>Reason</th><th>Target state</th></tr>
+{% for row in proposals %}<tr><td><input type="checkbox" name="selected" value="{{ row.id }}:{{ row.revision }}"></td><td>{{ row.memory }}</td><td>{{ row.destination }}</td><td>{{ row.reason }}</td><td>{% if row.quarantined %}<span class="badge">quarantined — stays quarantined if moved</span>{% else %}live{% endif %}</td></tr>
+{% endfor %}</table>
+<p><button type="submit" name="decision" value="approve">Approve selected</button> <button type="submit" name="decision" value="dismiss">Dismiss selected</button></p>
+</form>
+<p>Approval is one transaction per memory, so an entry whose memory changed since the suggestion was formed is refused on its own and named in the answer. It cannot overwrite the move it missed.</p>
+{% endif %}
+{% if !proposals.is_empty() %}<h2>Change one destination</h2>
+<p>A destination is an opinion you can revise without dismissing the proposal. Changing it moves the proposal's own revision, so any approval made against the old destination stops being applicable: the store keeps both judgements and honours only the latest, and that is what keeps a click on a stale row from filing a memory somewhere you stopped asking for.</p>
+<table>
+<tr><th>Proposal</th><th>Now going to</th><th>Change its destination</th></tr>
+{% for row in proposals %}<tr><td><code>{{ row.id }}</code> at revision {{ row.revision }}</td><td>{{ row.destination }}</td>
+<td><form class="inline" method="post" action="/debug/classification/revise">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="id" value="{{ row.id }}">
+<input type="hidden" name="revision" value="{{ row.revision }}">
+<label>New destination <select name="destination"><option value="personal">personal</option><option value="project">project</option><option value="unassigned">unassigned (review)</option></select></label>
+<label>Project <input type="text" name="project" size="30" placeholder="name or id"></label>
+<button type="submit">Change</button>
+</form></td></tr>
+{% endfor %}</table>
+{% if projects.is_empty() %}<p class="muted">You have no projects yet, so a project destination will be refused rather than created.</p>{% endif %}
+{% endif %}
+<p><a class="link" href="/debug/collections">Back to collections</a></p>
+{% endblock %}

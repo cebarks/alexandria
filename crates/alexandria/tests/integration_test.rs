@@ -41,6 +41,9 @@ async fn test_full_flow_store_and_retrieve() {
 
     for content in &auth_memories {
         let params = alexandria_mcp::tools::StoreMemoryParams {
+            scope: None,
+            project: None,
+            context_project: None,
             content: content.to_string(),
             tags: Some(vec!["auth".to_string()]),
             session_id: None,
@@ -53,6 +56,9 @@ async fn test_full_flow_store_and_retrieve() {
 
     for content in &db_memories {
         let params = alexandria_mcp::tools::StoreMemoryParams {
+            scope: None,
+            project: None,
+            context_project: None,
             content: content.to_string(),
             tags: Some(vec!["database".to_string()]),
             session_id: None,
@@ -65,6 +71,8 @@ async fn test_full_flow_store_and_retrieve() {
 
     // Retrieve auth-related memories
     let params = alexandria_mcp::tools::RetrieveMemoriesParams {
+        scope: None,
+        project: None,
         query: "OAuth token expiration".to_string(),
         limit: Some(3),
         session_id: None,
@@ -88,6 +96,9 @@ async fn test_delete_excludes_from_search() {
 
     // Store a memory
     let params = alexandria_mcp::tools::StoreMemoryParams {
+        scope: None,
+        project: None,
+        context_project: None,
         content: "temporary secret key is abc123".to_string(),
         tags: None,
         session_id: None,
@@ -98,6 +109,8 @@ async fn test_delete_excludes_from_search() {
 
     // Verify it appears in retrieve
     let params = alexandria_mcp::tools::RetrieveMemoriesParams {
+        scope: None,
+        project: None,
         query: "secret key".to_string(),
         limit: Some(5),
         session_id: None,
@@ -112,6 +125,8 @@ async fn test_delete_excludes_from_search() {
 
     // Should no longer appear
     let params = alexandria_mcp::tools::RetrieveMemoriesParams {
+        scope: None,
+        project: None,
         query: "secret key".to_string(),
         limit: Some(5),
         session_id: None,
@@ -126,6 +141,8 @@ async fn test_empty_database_retrieve() {
     let (server, _db) = setup().await;
 
     let params = alexandria_mcp::tools::RetrieveMemoriesParams {
+        scope: None,
+        project: None,
         query: "anything".to_string(),
         limit: Some(5),
         session_id: None,
@@ -145,6 +162,9 @@ async fn test_recall_broad_and_focused() {
         "CORS headers must include Access-Control-Allow-Origin",
     ] {
         let params = alexandria_mcp::tools::StoreMemoryParams {
+            scope: None,
+            project: None,
+            context_project: None,
             content: content.to_string(),
             tags: None,
             session_id: None,
@@ -156,6 +176,8 @@ async fn test_recall_broad_and_focused() {
 
     // Broad recall
     let params = alexandria_mcp::tools::RecallParams {
+        scope: None,
+        project: None,
         query: "authentication".to_string(),
         scope_handle: None,
     };
@@ -170,6 +192,9 @@ async fn test_update_memory_content() {
 
     // Store a memory
     let params = alexandria_mcp::tools::StoreMemoryParams {
+        scope: None,
+        project: None,
+        context_project: None,
         content: "Rust is version 1.75".to_string(),
         tags: Some(vec!["rust".to_string()]),
         session_id: None,
@@ -185,7 +210,10 @@ async fn test_update_memory_content() {
         tags: None,
         confidence: None,
     };
-    let result = server.do_update_memory(update_params).await.unwrap();
+    let result = server
+        .do_update_memory_interim(update_params)
+        .await
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["status"], "ok");
     assert_eq!(parsed["content_changed"], true);
@@ -201,6 +229,9 @@ async fn test_update_memory_tags_only() {
     let (server, _db) = setup().await;
 
     let params = alexandria_mcp::tools::StoreMemoryParams {
+        scope: None,
+        project: None,
+        context_project: None,
         content: "SurrealDB is a database".to_string(),
         tags: Some(vec!["db".to_string()]),
         session_id: None,
@@ -216,7 +247,10 @@ async fn test_update_memory_tags_only() {
         tags: Some(vec!["database".to_string(), "surrealdb".to_string()]),
         confidence: None,
     };
-    let result = server.do_update_memory(update_params).await.unwrap();
+    let result = server
+        .do_update_memory_interim(update_params)
+        .await
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["content_changed"], false);
 
@@ -230,6 +264,9 @@ async fn test_import_document_whole() {
     let (server, _db) = setup().await;
 
     let params = alexandria_mcp::tools::ImportDocumentParams {
+        scope: None,
+        project: None,
+        context_project: None,
         content: "This is a complete document about Rust programming.".to_string(),
         mode: Some("whole".to_string()),
         chunk_strategy: None,
@@ -238,7 +275,7 @@ async fn test_import_document_whole() {
         agent_id: None,
         model: None,
     };
-    let result = server.do_import_document(params).await.unwrap();
+    let result = server.do_import_document_interim(params).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["status"], "ok");
     assert_eq!(parsed["count"], 1);
@@ -250,6 +287,9 @@ async fn test_import_document_chunk_by_heading() {
 
     let doc = "# Chapter 1\nFirst chapter content.\n\n# Chapter 2\nSecond chapter.\n\n# Chapter 3\nThird chapter.";
     let params = alexandria_mcp::tools::ImportDocumentParams {
+        scope: None,
+        project: None,
+        context_project: None,
         content: doc.to_string(),
         mode: Some("chunk".to_string()),
         chunk_strategy: Some("heading".to_string()),
@@ -258,7 +298,7 @@ async fn test_import_document_chunk_by_heading() {
         agent_id: None,
         model: None,
     };
-    let result = server.do_import_document(params).await.unwrap();
+    let result = server.do_import_document_interim(params).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["status"], "ok");
     assert_eq!(parsed["count"], 3);
@@ -270,6 +310,9 @@ async fn test_import_document_chunk_by_paragraph() {
 
     let doc = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.\n\nFourth paragraph.";
     let params = alexandria_mcp::tools::ImportDocumentParams {
+        scope: None,
+        project: None,
+        context_project: None,
         content: doc.to_string(),
         mode: Some("chunk".to_string()),
         chunk_strategy: Some("paragraph".to_string()),
@@ -278,7 +321,7 @@ async fn test_import_document_chunk_by_paragraph() {
         agent_id: None,
         model: None,
     };
-    let result = server.do_import_document(params).await.unwrap();
+    let result = server.do_import_document_interim(params).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["status"], "ok");
     assert_eq!(parsed["count"], 4);

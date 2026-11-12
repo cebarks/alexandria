@@ -1313,6 +1313,9 @@ async fn piggyback_lists_due_reminders_without_consuming() {
         .unwrap();
     server
         .do_store_memory(alexandria_mcp::tools::StoreMemoryParams {
+            scope: None,
+            project: None,
+            context_project: None,
             content: "OAuth tokens expire after 7 days".to_string(),
             tags: None,
             session_id: None,
@@ -1325,6 +1328,8 @@ async fn piggyback_lists_due_reminders_without_consuming() {
     let out: serde_json::Value = serde_json::from_str(
         &server
             .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+                scope: None,
+                project: None,
                 query: "token expiration".to_string(),
                 limit: Some(5),
                 session_id: None,
@@ -1356,6 +1361,9 @@ async fn piggyback_recall_broad_lists_due_reminders_without_consuming() {
         .unwrap();
     server
         .do_store_memory(alexandria_mcp::tools::StoreMemoryParams {
+            scope: None,
+            project: None,
+            context_project: None,
             content: "the search index is built with tantivy".to_string(),
             tags: None,
             session_id: None,
@@ -1368,6 +1376,8 @@ async fn piggyback_recall_broad_lists_due_reminders_without_consuming() {
     let out: serde_json::Value = serde_json::from_str(
         &server
             .do_recall(alexandria_mcp::tools::RecallParams {
+                scope: None,
+                project: None,
                 query: "search index".to_string(),
                 scope_handle: None,
             })
@@ -1402,6 +1412,8 @@ async fn piggyback_empty_retrieve_still_lists_due_reminders() {
     // comes from the empty-results early return rather than the ranked path.
     let out = server
         .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+            scope: None,
+            project: None,
             query: "nothing about this at all".to_string(),
             limit: Some(5),
             session_id: None,
@@ -1601,6 +1613,8 @@ async fn piggyback_caps_at_five_oldest_due_first() {
 
     let out = server
         .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+            scope: None,
+            project: None,
             query: "anything".to_string(),
             limit: Some(5),
             session_id: None,
@@ -1767,6 +1781,8 @@ async fn piggyback_sample_is_bounded_ordered_and_hides_undeliverable_rows() {
 
     let out = server
         .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+            scope: None,
+            project: None,
             query: "anything".to_string(),
             limit: Some(3),
             session_id: None,

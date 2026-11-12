@@ -268,6 +268,17 @@ impl<'a> ClusterRepo<'a> {
         centroid_a: &[f32],
         centroid_b: &[f32],
     ) -> Result<(String, String)> {
+        let source = RecordId::parse_simple(cluster_id)?;
+        let supplied = members
+            .iter()
+            .map(|member| member.id.clone())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow::anyhow!("Legacy maintenance requires identified members"))?;
+        ensure!(
+            self.legacy_maintenance_eligible(&[source], &supplied)
+                .await?,
+            "Legacy maintenance is unavailable for owned or unverified data"
+        );
         let cid_a = self.create(None, centroid_a).await?;
         let cid_b = match self.create(None, centroid_b).await {
             Ok(id) => id,
@@ -389,6 +400,14 @@ impl<'a> ClusterRepo<'a> {
         remove_id: &str,
         merged_centroid: &[f32],
     ) -> Result<()> {
+        let targets = [
+            RecordId::parse_simple(keep_id)?,
+            RecordId::parse_simple(remove_id)?,
+        ];
+        ensure!(
+            self.legacy_maintenance_eligible(&targets, &[]).await?,
+            "Legacy maintenance is unavailable for owned or unverified data"
+        );
         // Ids, not `get_members`: every edge has to be carried, including the hidden rows the live
         // filter excludes, because `delete` below drops them all. The centroid the caller passes is
         // still a function of live members only — moving a hidden row does not let it decide a
@@ -491,6 +510,58 @@ impl<'a> ClusterRepo<'a> {
         Ok(row.map(|r| r.total as usize).unwrap_or(0))
     }
 
+    /// Until scoped maintenance replaces the legacy writers, admit only physically unowned
+    /// populations. This is an application gate, not a fence against privileged concurrent SQL.
+    async fn legacy_maintenance_eligible(
+        &self,
+        clusters: &[RecordId],
+        supplied_members: &[RecordId],
+    ) -> Result<bool> {
+        if clusters.is_empty() || clusters.iter().any(|id| id.table.as_str() != "cluster") {
+            return Ok(false);
+        }
+        let mut response = self
+            .db
+            .query("SELECT VALUE out FROM contains_memory WHERE in IN $clusters")
+            .bind(("clusters", clusters.to_vec()))
+            .await?;
+        let mut members: Vec<RecordId> = response.take(0)?;
+        members.extend_from_slice(supplied_members);
+        if members.iter().any(|id| id.table.as_str() != "fact") {
+            return Ok(false);
+        }
+        let mut records: Vec<RecordId> = clusters.iter().cloned().chain(members).collect();
+        records.sort();
+        records.dedup();
+        let expected = records.len();
+        let mut response = self
+            .db
+            .query(
+                "SELECT VALUE id FROM $records WHERE account = NONE AND workspace = NONE \
+             AND scope = NONE AND project = NONE",
+            )
+            .bind(("records", records))
+            .await?;
+        let admitted: Vec<RecordId> = response.take(0)?;
+        Ok(admitted.len() == expected)
+    }
+
+    /// Candidates for legacy split/merge only; hidden retained ownership also excludes a cluster.
+    /// Entry-point rechecks remain necessary because selection is not write authorization.
+    pub async fn legacy_maintenance_clusters(&self) -> Result<Vec<Cluster>> {
+        let mut eligible = Vec::new();
+        for cluster in self.list().await? {
+            if let Some(id) = &cluster.id
+                && self
+                    .legacy_maintenance_eligible(std::slice::from_ref(id), &[])
+                    .await?
+            {
+                eligible.push(cluster);
+            }
+        }
+        Ok(eligible)
+    }
+
     pub async fn list(&self) -> Result<Vec<Cluster>> {
         let mut response = self.db.query("SELECT * FROM cluster").await?;
         Ok(response.take(0)?)
@@ -523,6 +594,10 @@ impl<'a> ClusterRepo<'a> {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+#[path = "cluster_repo/legacy_maintenance_gate_tests.rs"]
+mod legacy_maintenance_gate_tests;
 
 #[cfg(test)]
 mod tests {

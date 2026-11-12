@@ -13,19 +13,25 @@ use axum::response::Response;
 use serde::Deserialize;
 
 use super::html::page;
+use super::web::{Boundary, BrowserSession};
 use crate::AlexandriaServer;
+use crate::scope_service::ReadScope;
 use crate::tools::{RecallParams, RetrieveMemoriesParams};
 
-/// The form. `nav` is the only field: no values are pre-filled, the inputs are static markup
-/// whose `name` attributes are what [`QueryForm`] deserializes.
+/// The form's session proof is serialized as JSON, then attribute-escaped by Askama.
+/// Static input names are what [`QueryForm`] deserializes; the proof travels only in a header.
 #[derive(Template)]
 #[template(path = "query.html")]
 struct QueryTemplate {
     nav: &'static str,
+    csrf_headers: String,
 }
 
-pub async fn form(State(_server): State<AlexandriaServer>) -> Response {
-    page(QueryTemplate { nav: "query" })
+pub async fn form(State(_server): State<AlexandriaServer>, session: BrowserSession) -> Response {
+    page(QueryTemplate {
+        nav: "query",
+        csrf_headers: serde_json::json!({ "X-CSRF-Token": session.csrf() }).to_string(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,12 +318,11 @@ fn activation_note(wet: bool, kept: &[ResultRow], top_n: usize) -> String {
 ///
 /// Two reads, on purpose:
 ///
-/// 1. The kept table is whatever the path the operator selected returns — `do_retrieve_memories`
-///    when not dry (the real tool, heat write included), `do_retrieve_memories_dry` when dry. That
-///    is what "what would this query return" means here: the tool's own answer, not a reconstruction
+/// 1. The kept table is whatever the path the operator selected returns — the tool's own body when
+///    not dry (heat write included) and its dry twin otherwise, both over the caller's own population.
+///    That is what "what would this query return" means here: the tool's answer, not a reconstruction
 ///    the debug layer could get wrong.
-/// 2. The unfiltered window (`do_retrieve_memories_unfiltered`, same ranking code, floor off, no
-///    writes) supplies the rows the floor suppressed, on every run — not just dry ones — so the
+/// 2. The unfiltered window (same ranking code, floor off, no writes) supplies the rows the floor suppressed, on every run — not just dry ones — so the
 ///    kept list and the dropped list describe one ranking.
 ///
 /// Reimplementing activation to avoid read 1 on a wet run would put an unsanctioned second write
@@ -325,6 +330,7 @@ fn activation_note(wet: bool, kept: &[ResultRow], top_n: usize) -> String {
 /// let the two disagree silently. Both are avoided.
 async fn retrieve_fragment(
     server: &AlexandriaServer,
+    scope: &crate::server::RequestScope,
     query: String,
     limit: Option<usize>,
     session_id: Option<String>,
@@ -333,19 +339,27 @@ async fn retrieve_fragment(
     // Built per call rather than moved, because `RetrieveMemoriesParams` is the tool's own params
     // type and does not (and should not) derive `Clone`.
     let params = || RetrieveMemoriesParams {
+        scope: None,
+        project: None,
         query: query.clone(),
         limit,
         session_id: session_id.clone(),
     };
-    let kept = match if dry_run {
-        server.do_retrieve_memories_dry(params()).await
-    } else {
-        server.do_retrieve_memories(params()).await
-    } {
+    let kept = match server
+        .retrieve_scoped(
+            scope,
+            params(),
+            AlexandriaServer::debug_scoped(dry_run, false),
+        )
+        .await
+    {
         Ok(value) => result_rows(value.get("results")),
         Err(e) => return Fragment::error(e.to_string()),
     };
-    let window = match server.do_retrieve_memories_unfiltered(params()).await {
+    let window = match server
+        .retrieve_scoped(scope, params(), AlexandriaServer::debug_scoped(false, true))
+        .await
+    {
         Ok(value) => result_rows(value.get("results")),
         Err(e) => return Fragment::error(e.to_string()),
     };
@@ -379,7 +393,25 @@ async fn retrieve_fragment(
     Fragment::Retrieve { report }
 }
 
-pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryForm>) -> Response {
+pub(crate) async fn run(
+    State(server): State<AlexandriaServer>,
+    boundary: Boundary,
+    session: BrowserSession,
+    Form(form): Form<QueryForm>,
+) -> Response {
+    // The route runs under the caller's own authority. Before Task 9 it reached `retrieve_core`'s
+    // `scope: None` arm, which read every account's rows and — on the non-dry path — warmed them; that
+    // arm now has no caller. Reaching here at all already means the guard verified the CSRF pair,
+    // because this is the debug UI's only sanctioned write.
+    let Ok((owner, read)) = boundary.corpus(&session).await else {
+        return page(QueryResultsTemplate {
+            fragment: Fragment::error(
+                "this route requires an authenticated owner session".to_string(),
+            ),
+            mode_note: None,
+        });
+    };
+    let scope = crate::server::RequestScope::issued_for_debug(owner, read);
     let mode_note = matches!(form.mode.as_str(), "recall").then_some(RECALL_IGNORES_NOTE);
     let fragment = match form.mode.as_str() {
         "retrieve" => {
@@ -408,14 +440,14 @@ pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryF
             // Spreading activation writes heat, so a retrieve run is the one debug route that
             // mutates. The template says so out loud; the checkbox routes around it for an
             // operator who wants an answer that a previous test query did not bias.
-            retrieve_fragment(&server, form.query, limit, session_id, dry_run).await
+            retrieve_fragment(&server, &scope, form.query, limit, session_id, dry_run).await
         }
         // recall mode intentionally ignores all three of the form's retrieve-only fields:
         //   - `limit`: `RecallParams` has no limit field at all;
         //   - `session_id`: recall's `scope_handle` is an opaque handle returned by a previous
         //     broad recall that narrows into one cluster — a different concept from a session id,
         //     so there is nothing honest to map a session onto;
-        //   - `dry_run`: worth stating before anyone adds a branch, because `do_recall` writes
+        //   - `dry_run`: worth stating before anyone adds a branch, because the recall arm writes
         //     nothing at all (no activation, no heat), so there is no side effect left for a dry
         //     run to skip.
         // The form labels all three "(retrieve only)" and, since there is no JavaScript here to
@@ -423,10 +455,15 @@ pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryF
         // see [`RECALL_IGNORES_NOTE`] for why it cannot be conditional.
         "recall" => {
             let params = RecallParams {
+                scope: None,
+                project: None,
                 query: form.query.clone(),
                 scope_handle: None,
             };
-            match server.do_recall(params).await {
+            match server
+                .recall_scoped(&scope, ReadScope::Assigned, &params)
+                .await
+            {
                 Ok(json_str) => Fragment::recall(&json_str),
                 Err(e) => Fragment::error(e.to_string()),
             }
@@ -441,6 +478,7 @@ pub async fn run(State(server): State<AlexandriaServer>, Form(form): Form<QueryF
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::HOST_HEADER;
     use askama::Template;
     use axum::body::Body;
     use axum::http::Request;
@@ -449,13 +487,16 @@ mod tests {
     #[tokio::test]
     async fn test_query_run_retrieve_mode_empty_db() {
         let server = super::super::test_support::test_server().await;
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/debug/query/run")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::from("mode=retrieve&query=test&limit=5"))
                     .unwrap(),
             )
@@ -477,13 +518,16 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/debug/query/run")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::from("mode=retrieve&query=test&limit=5"))
                     .unwrap(),
             )
@@ -500,13 +544,16 @@ mod tests {
     #[tokio::test]
     async fn test_query_run_recall_mode_without_limit() {
         let server = super::super::test_support::test_server().await;
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/debug/query/run")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::from("mode=recall&query=test"))
                     .unwrap(),
             )
@@ -530,6 +577,7 @@ mod tests {
                     .method("POST")
                     .uri("/debug/query/run")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -586,7 +634,9 @@ mod tests {
     async fn test_query_tester_scopes_retrieve_to_session() {
         let server = super::super::test_support::test_server().await;
         seed_two_sessions(&server).await;
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
 
         let scoped = run_form(
             app.clone(),
@@ -629,7 +679,9 @@ mod tests {
     async fn test_query_tester_empty_session_id_is_unscoped() {
         let server = super::super::test_support::test_server().await;
         seed_two_sessions(&server).await;
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
 
         let omitted = run_form(app.clone(), "mode=retrieve&query=project+decision&limit=10").await;
         // A blank `<input type="text">` still posts the key, so the handler receives
@@ -679,6 +731,9 @@ mod tests {
         for i in 0..12 {
             server
                 .do_store_memory(crate::tools::StoreMemoryParams {
+                    scope: None,
+                    project: None,
+                    context_project: None,
                     content: format!("pinned memory number {i}"),
                     tags: None,
                     session_id: None,
@@ -688,7 +743,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
 
         let blank = run_form(app.clone(), "mode=retrieve&query=pinned+memory&limit=").await;
         let junk = run_form(app.clone(), "mode=retrieve&query=pinned+memory&limit=abc").await;
@@ -715,12 +772,33 @@ mod tests {
         );
     }
 
-    /// The two handler tests above post the wire format, so they cannot see the template half of
-    /// the contract: if an input's `name` drifted from a `QueryForm` field the field would simply
-    /// stop being submittable and every handler test would still pass. This renders the form.
+    /// Literal entity text must survive one HTML decode, not become a second escape sequence.
+    #[test]
+    fn query_header_attribute_preserves_json_without_html_injection() {
+        let token = r#"quote" amp& <script>N2_TOKEN_MARK</script> slash\ literal&#34; single'"#;
+        let html = super::QueryTemplate {
+            nav: "query",
+            csrf_headers: serde_json::json!({ "X-CSRF-Token": token }).to_string(),
+        }
+        .render()
+        .unwrap();
+        assert!(!html.contains("<script>N2_TOKEN_MARK"));
+        assert!(html.contains("&#34;X-CSRF-Token&#34;"));
+        assert!(
+            !html.contains("name=\"csrf\""),
+            "the owner chose a header, not an input"
+        );
+        assert_eq!(super::boundary::rendered_query_proof(&html), token);
+    }
+
     #[test]
     fn test_query_form_template_names_every_query_form_field() {
-        let html = super::QueryTemplate { nav: "query" }.render().unwrap();
+        let html = super::QueryTemplate {
+            nav: "query",
+            csrf_headers: serde_json::json!({ "X-CSRF-Token": "template-fixture" }).to_string(),
+        }
+        .render()
+        .unwrap();
 
         assert!(
             html.contains(r#"class="active">Query Tester"#),
@@ -796,6 +874,9 @@ mod tests {
             ids.push(
                 server
                     .do_store_memory(crate::tools::StoreMemoryParams {
+                        scope: None,
+                        project: None,
+                        context_project: None,
                         content: content.to_string(),
                         tags: None,
                         session_id: None,
@@ -839,7 +920,9 @@ mod tests {
             "each seeded memory starts at heat 1.0"
         );
 
-        let app = crate::debug::router(server.clone());
+        let app = super::super::test_support::authenticated_on_server(server.clone())
+            .await
+            .session_router();
         let fragment = run_form(app, "mode=retrieve&query=project+decision&limit=10").await;
         assert!(
             fragment.contains("alpha project decision")
@@ -864,7 +947,9 @@ mod tests {
         let ids = seed_edge_pair(&server).await;
         let before = seeded_heat(&server, &ids).await;
 
-        let app = crate::debug::router(server.clone());
+        let app = super::super::test_support::authenticated_on_server(server.clone())
+            .await
+            .session_router();
         let fragment = run_form(
             app,
             "mode=retrieve&query=project+decision&limit=10&dry_run=true",
@@ -890,6 +975,9 @@ mod tests {
         let server = super::super::test_support::test_server().await;
         server
             .do_store_memory(crate::tools::StoreMemoryParams {
+                scope: None,
+                project: None,
+                context_project: None,
                 content: "a recallable fact".to_string(),
                 tags: None,
                 session_id: None,
@@ -898,7 +986,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let app = crate::debug::router(server.clone());
+        let app = super::super::test_support::authenticated_on_server(server.clone())
+            .await
+            .session_router();
 
         let plain = run_form(app.clone(), "mode=recall&query=recallable+fact").await;
         let dry = run_form(app, "mode=recall&query=recallable+fact&dry_run=true").await;
@@ -923,6 +1013,9 @@ mod tests {
             ids.push(
                 server
                     .do_store_memory(crate::tools::StoreMemoryParams {
+                        scope: None,
+                        project: None,
+                        context_project: None,
                         content: content.to_string(),
                         tags: None,
                         session_id: None,
@@ -946,7 +1039,9 @@ mod tests {
     async fn test_query_tester_shows_floor_and_dropped_rows() {
         let server = super::super::test_support::banded_server().await;
         seed_straddling_pair(&server).await;
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
 
         let fragment = run_form(
             app,
@@ -997,6 +1092,9 @@ mod tests {
         let server = super::super::test_support::banded_server().await;
         server
             .do_store_memory(crate::tools::StoreMemoryParams {
+                scope: None,
+                project: None,
+                context_project: None,
                 content: "a strong match memory".to_string(),
                 tags: None,
                 session_id: None,
@@ -1005,7 +1103,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
 
         let fragment = run_form(
             app,
@@ -1035,7 +1135,9 @@ mod tests {
     async fn test_query_tester_prints_the_measured_score_bands() {
         let server = super::super::test_support::banded_server().await;
         seed_straddling_pair(&server).await;
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
 
         let fragment = run_form(
             app,
@@ -1120,7 +1222,9 @@ mod tests {
     async fn test_query_tester_reports_activation_seeds_on_a_wet_run() {
         let server = super::super::test_support::banded_server().await;
         let (strong_id, weak_id) = seed_straddling_pair(&server).await;
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
 
         let fragment = run_form(app, "mode=retrieve&query=project+decision&limit=10").await;
         assert!(
@@ -1140,7 +1244,9 @@ mod tests {
     async fn test_query_tester_reports_no_activation_on_a_dry_run() {
         let server = super::super::test_support::banded_server().await;
         seed_straddling_pair(&server).await;
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
 
         let fragment = run_form(
             app,
@@ -1172,7 +1278,9 @@ mod tests {
             "each seeded memory starts at heat 1.0"
         );
 
-        let app = crate::debug::router(server.clone());
+        let app = super::super::test_support::authenticated_on_server(server.clone())
+            .await
+            .session_router();
         let fragment = run_form(
             app,
             "mode=retrieve&query=project+decision&limit=10&dry_run=true",
@@ -1199,6 +1307,9 @@ mod tests {
             ids.push(
                 server
                     .do_store_memory(crate::tools::StoreMemoryParams {
+                        scope: None,
+                        project: None,
+                        context_project: None,
                         content: content.to_string(),
                         tags: None,
                         session_id: None,
@@ -1236,6 +1347,8 @@ mod tests {
         let server = super::super::test_support::banded_server().await;
         seed_straddling_pair(&server).await;
         let params = || crate::tools::RetrieveMemoriesParams {
+            scope: None,
+            project: None,
             query: "project decision".to_string(),
             limit: Some(10),
             session_id: None,
@@ -1291,6 +1404,9 @@ mod tests {
         let server = super::super::test_support::test_server().await;
         server
             .do_store_memory(crate::tools::StoreMemoryParams {
+                scope: None,
+                project: None,
+                context_project: None,
                 content: "a recallable fact".to_string(),
                 tags: None,
                 session_id: None,
@@ -1299,7 +1415,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let app = crate::debug::router(server);
+        let app = super::super::test_support::authenticated_on_server(server)
+            .await
+            .session_router();
 
         let defaults = run_form(app.clone(), "mode=recall&query=recallable+fact").await;
         let filled = run_form(
@@ -1323,5 +1441,236 @@ mod tests {
             !retrieve.contains(super::RECALL_IGNORES_NOTE),
             "the recall note must not appear on a retrieve fragment; got: {retrieve}"
         );
+    }
+}
+
+/// The Query Tester is the one debug surface that **writes** — a non-dry run records an access and
+/// warms heat — so its boundary claim has two halves: it must read inside one population, and its write
+/// must land on the caller's own row and nowhere else.
+#[cfg(test)]
+mod boundary {
+    use crate::debug::test_support as support;
+    use alexandria_storage::repos::HeatRepo;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    pub(super) fn rendered_query_proof(html: &str) -> String {
+        let form = html
+            .split("<form")
+            .find(|form| form.contains("hx-post=\"/debug/query/run\""))
+            .expect("the real Query Tester form");
+        let encoded = form
+            .split("hx-headers=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("Query Tester rendered no hx-headers");
+        let mut json = String::new();
+        let mut rest = encoded;
+        while let Some((prefix, entity)) = rest.split_once('&') {
+            json.push_str(prefix);
+            let (entity, tail) = entity.split_once(';').expect("a complete escaped entity");
+            json.push(match entity {
+                "#34" => '"',
+                "#38" => '&',
+                "#39" => '\'',
+                "#60" => '<',
+                "#62" => '>',
+                _ => panic!("unexpected Askama attribute entity"),
+            });
+            rest = tail;
+        }
+        json.push_str(rest);
+        let headers: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&json).expect("the decoded attribute is a JSON object");
+        assert_eq!(headers.len(), 1, "only the per-form CSRF header is added");
+        headers["X-CSRF-Token"]
+            .as_str()
+            .expect("the proof is a JSON string")
+            .to_string()
+    }
+
+    async fn post_query_header(
+        app: &support::AuthenticatedTestApp,
+        proof: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/debug/query/run")
+            .header(support::HOST_HEADER, support::HOST)
+            .header("origin", support::ORIGIN)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", app.session.cookie_header());
+        if let Some(proof) = proof {
+            request = request.header("X-CSRF-Token", proof);
+        }
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(
+                        "mode=retrieve&query=shared+wording&limit=10&session_id=",
+                    ))
+                    .expect("the actual form fields, with no helper-supplied CSRF"),
+            )
+            .await
+            .expect("the router answered");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn rendered_query_htmx_headers_authorize_only_their_session() {
+        let server = support::test_server().await;
+        let alice = support::authenticated_on_server(server).await;
+        let bob = alice.second_owner("debug-query-header-second").await;
+        let alice_fact = alice.seed_personal("shared wording for the tester").await;
+        let bob_fact = bob.seed_personal("shared wording for the tester").await;
+        seed_heat(&alice, &alice_fact, 0.2).await;
+        seed_heat(&bob, &bob_fact, 0.2).await;
+        let before = (
+            heat_of(&alice, &alice_fact).await,
+            heat_of(&bob, &bob_fact).await,
+        );
+        assert!(before.0 < 1.0 && before.1 < 1.0);
+        let (status, page) = alice.get("/debug/query").await;
+        assert_eq!(status, StatusCode::OK);
+        let alice_proof = rendered_query_proof(&page);
+        assert!(
+            alice_proof == alice.session.csrf,
+            "the page must emit its own proof"
+        );
+        let (status, page) = bob.get("/debug/query").await;
+        assert_eq!(status, StatusCode::OK);
+        let bob_proof = rendered_query_proof(&page);
+        assert!(bob_proof == bob.session.csrf && bob_proof != alice_proof);
+
+        for proof in [None, Some(bob_proof.as_str())] {
+            let (status, _) = post_query_header(&alice, proof).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(heat_of(&alice, &alice_fact).await, before.0);
+            assert_eq!(heat_of(&bob, &bob_fact).await, before.1);
+        }
+        let (status, body) = post_query_header(&alice, Some(&alice_proof)).await;
+        assert_eq!(status, StatusCode::OK, "{}", support::clip(&body));
+        assert!(body.contains(&alice_fact) && !body.contains(&bob_fact));
+        assert!((heat_of(&alice, &alice_fact).await - 1.0).abs() < f64::EPSILON);
+        assert_eq!(heat_of(&bob, &bob_fact).await, before.1);
+
+        let (status, body) = post_query_header(&bob, Some(&bob_proof)).await;
+        assert_eq!(status, StatusCode::OK, "{}", support::clip(&body));
+        assert!(body.contains(&bob_fact) && !body.contains(&alice_fact));
+        assert!((heat_of(&bob, &bob_fact).await - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn a_run_returns_one_owners_rows_and_warms_only_them() {
+        let server = crate::debug::test_support::test_server().await;
+        let alice = support::authenticated_on_server(server.clone()).await;
+        let bob = alice.second_owner("debug-fixture-second").await;
+
+        // Both owners seed the same words, so the query matches both rows by content: the only thing
+        // that can keep bob's row out of alice's results is the population predicate.
+        let alice_fact = alice.seed_personal("shared wording for the tester").await;
+        let bob_fact = bob.seed_personal("shared wording for the tester").await;
+
+        // Heat rows are seeded **below** the access reset value, because a recorded access sets heat to
+        // 1.0: seeding 1.0 would make "the access happened" and "nothing happened" read identically —
+        // the false green this fixture's own notes warn about. `create_fact` leaves no heat row at all,
+        // and `record_access` matches zero rows silently without one, so the seed is what makes the pair
+        // of assertions below mean anything.
+        seed_heat(&alice, &alice_fact, 0.2).await;
+        seed_heat(&bob, &bob_fact, 0.2).await;
+        let alice_before = heat_of(&alice, &alice_fact).await;
+        let bob_before = heat_of(&bob, &bob_fact).await;
+        assert!(
+            alice_before < 1.0 && bob_before < 1.0,
+            "the fixture seeded heat at or above the access reset: {alice_before}/{bob_before}"
+        );
+
+        let (status, body) = alice
+            .post(
+                "/debug/query/run",
+                &[
+                    ("mode", "retrieve"),
+                    ("query", "shared+wording"),
+                    ("limit", "10"),
+                    ("dry_run", "false"),
+                ],
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", support::clip(&body));
+        assert!(
+            body.contains(&alice_fact),
+            "the run lost the caller's own row: {}",
+            support::clip(&body)
+        );
+        assert!(
+            !body.contains(&bob_fact),
+            "the run returned another owner's row: {}",
+            support::clip(&body)
+        );
+
+        // The write half: the caller's row moved, the other owner's did not.
+        let alice_after = heat_of(&alice, &alice_fact).await;
+        let bob_after = heat_of(&bob, &bob_fact).await;
+        assert!(
+            (alice_after - 1.0).abs() < f64::EPSILON,
+            "the caller's row was not reset by the access the run recorded: {alice_before} ->             {alice_after}"
+        );
+        assert_eq!(
+            bob_after, bob_before,
+            "a run as alice changed bob's heat: {bob_before} -> {bob_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_writes_nothing() {
+        let server = crate::debug::test_support::test_server().await;
+        let alice = support::authenticated_on_server(server.clone()).await;
+        let fact = alice.seed_personal("dry run marker").await;
+        // Seeded below the reset value for the same reason as the paired case: if the dry run *did*
+        // record an access, the row would jump to 1.0 — which an assertion against a 1.0 seed could
+        // never see.
+        seed_heat(&alice, &fact, 0.2).await;
+        let before = heat_of(&alice, &fact).await;
+
+        let (status, body) = alice
+            .post(
+                "/debug/query/run",
+                &[
+                    ("mode", "retrieve"),
+                    ("query", "dry+run+marker"),
+                    ("limit", "10"),
+                    ("dry_run", "true"),
+                ],
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", support::clip(&body));
+        assert_eq!(
+            heat_of(&alice, &fact).await,
+            before,
+            "the disclosed read-only run wrote heat"
+        );
+    }
+
+    async fn seed_heat(fixture: &support::AuthenticatedTestApp, fact_id: &str, heat: f64) {
+        let repo = HeatRepo::new(fixture.db.inner());
+        if repo.get(fact_id).await.ok().flatten().is_none() {
+            repo.create_for_memory(fact_id, heat)
+                .await
+                .expect("a seeded heat row");
+        }
+    }
+
+    async fn heat_of(fixture: &support::AuthenticatedTestApp, fact_id: &str) -> f64 {
+        HeatRepo::new(fixture.db.inner())
+            .get(fact_id)
+            .await
+            .expect("a heat read")
+            .unwrap_or_else(|| panic!("{fact_id} has no heat row to compare"))
+            .heat
     }
 }

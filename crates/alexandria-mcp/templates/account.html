@@ -1,0 +1,78 @@
+{% extends "layout.html" %}
+{% block title %}Account{% endblock %}
+{% block body %}
+<h1>Account</h1>
+<p class="mode-note">Signed in as <strong>{{ login }}</strong>. This page lists the credentials your account holds. Secrets are shown once when they are minted and cannot be read back afterwards — the store keeps only a digest of each.</p>
+{% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}
+{% if let Some(issued) = issued %}
+<section>
+<h2>New {{ issued.kind }}: {{ issued.label }}</h2>
+<div class="secret" data-one-time-secret="{{ issued.secret }}">{{ issued.secret }}</div>
+<p class="warning">Copy it now. This is the only time this token is shown; if it is lost, issue a new one and revoke this one.</p>
+</section>
+{% endif %}
+<section>
+<h2>Credentials</h2>
+<table>
+<thead><tr><th>Kind</th><th>Name</th><th>Created</th><th>Last used</th><th>Expires</th><th>State</th><th></th></tr></thead>
+<tbody>
+{% for row in credentials %}
+<tr data-credential="{{ row.id }}">
+<td>{{ row.kind }}{% if row.current %} <span class="badge">this device</span>{% endif %}</td>
+<td data-label="{{ row.label }}">{{ row.label }}</td>
+<td>{{ row.created }}</td>
+<td>{{ row.last_used }}</td>
+<td>{{ row.expires }}</td>
+<td>{{ row.state }}</td>
+<td>
+{% if row.state == "active" && !row.current %}
+<form method="post" action="/debug/account/credentials/revoke">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="credential" value="{{ row.id }}">
+<button type="submit">Revoke</button>
+</form>
+{% endif %}
+</td>
+</tr>
+{% else %}
+<tr><td colspan="7" class="empty">no credentials listed</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<p class="note">A browser session row is a sign-in; revoking it signs that device out. An agent token is what a Pi or Claude Code client presents as a bearer token, and the <code>/mcp</code> endpoint accepts only that kind — a browser cookie is never a machine credential, nor the other way round.</p>
+</section>
+<section>
+<h2>Issue an agent token</h2>
+<form method="post" action="/debug/account/tokens">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="name">Name (for example <code>work-laptop</code>)</label>
+<input id="name" name="name" required>
+<button type="submit">Issue</button>
+</form>
+</section>
+<section>
+<h2>Recover this account</h2>
+<form method="post" action="/debug/account/recovery">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Create a recovery link for my account</button>
+</form>
+<p class="note">One-use, expires in an hour, and rotates this account&rsquo;s password when it is claimed — the sessions it held end with it. It appears in the list above as a row of your own account, because a link you minted is yours to revoke. Enrolling a new account is not something an owner can do from this page: an invitation needs the account-management role, and only an administrator can mint one.</p>
+</section>
+{% if is_admin %}
+<section>
+<h2>Administration</h2>
+<p class="note">Your account holds the account-management role. It lets you create invitations, mint recovery links for other accounts, suspend and restore accounts, and read scheduler health — all of that on the &ldquo;Accounts and health&rdquo; page below, never from this one. It does not let anyone read another account&rsquo;s memories, tags, cluster labels or session summaries — and this page&rsquo;s own corpus links are the ordinary owner views.</p>
+<nav>
+<a href="/debug/admin">Accounts and health</a>
+</nav>
+</section>
+{% endif %}
+<section>
+<h2>Sign out</h2>
+<form method="post" action="/debug/logout">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Sign out of this browser</button>
+</form>
+<p class="note">Signing out revokes this session&rsquo;s credential, so the cookie stops working everywhere it was sent, not just in this tab.</p>
+</section>
+{% endblock %}

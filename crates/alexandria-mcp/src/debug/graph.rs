@@ -1,19 +1,21 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use askama::Template;
 use axum::extract::{Path, Query, State};
-use axum::response::{Json, Response};
+use axum::response::Response;
 
+use super::web::{Boundary, BrowserSession};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
+use axum::response::IntoResponse;
 
 /// Node labels are a content snippet this long; record ids move to the tooltip.
 const LABEL_MAX_CHARS: usize = 40;
 /// Hop radius used when `?hops` is absent or unparseable — the radius the page shipped before
 /// the parameter existed, so the default view does not change.
 pub const DEFAULT_HOPS: u32 = 2;
-/// Ceiling on the hop radius. Memory graphs are dense, so `?hops=99` must not turn into an
-/// unbounded traversal of the whole database.
+/// Ceiling on the hop radius, enforced by storage: [`ScopedMemoryRepo::ego`](alexandria_storage::repos::ScopedMemoryRepo::ego)
+/// clamps the same way, so a hand-typed `?hops=99` cannot widen either the walk or the draw.
 const MAX_HOPS: u32 = 3;
 /// Drop everything past `cap` nodes from an already-sorted node list, reporting whether anything
 /// was dropped. Split out because the alternative — testing through `api_graph` — would need a
@@ -107,13 +109,17 @@ fn node_tooltip(id: &str, hop: u32) -> String {
 ///
 /// `?hops` is read out of a free-form map rather than a typed field so a junk value falls through
 /// to [`DEFAULT_HOPS`] instead of failing the request with a 400.
-pub async fn api_graph(
+pub(crate) async fn api_graph(
     State(server): State<AlexandriaServer>,
+    boundary: Boundary,
+    session: BrowserSession,
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Response {
     api_graph_with_radius(
         &server,
+        &boundary,
+        &session,
         &id,
         resolve_hops(query.get("hops").map(String::as_str)),
     )
@@ -122,59 +128,70 @@ pub async fn api_graph(
 
 /// Shared traversal, parameterised by radius. [`api_graph`] and the page's control resolve
 /// `?hops` through the same [`resolve_hops`], so they cannot disagree about what is drawn.
+/// The caller's own neighbourhood, as JSON.
+///
+/// The whole traversal is one storage read now — `ScopedMemoryRepo::ego` — which replaces the
+/// per-node `get_edges_for`/`get_fact` loop this handler used to run (and its `TODO(debt)` note):
+/// the bound node set is admitted by the caller's own population inside the statement, so a foreign
+/// row cannot enter the picture *or* cost a round trip. A root the caller cannot read is a 404 with
+/// no nodes, which is the same answer an absent root gives.
 async fn api_graph_with_radius(
     server: &AlexandriaServer,
+    boundary: &Boundary,
+    session: &BrowserSession,
     id: &str,
     hops: u32,
-) -> Json<serde_json::Value> {
-    let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
-
-    // Collect the node set: the center plus everything within `hops` hops, up to the visit bound.
-    let mut node_ids: HashSet<String> = HashSet::new();
-    let mut hop_of: HashMap<String, u32> = HashMap::new();
-    node_ids.insert(id.to_string());
-    hop_of.insert(id.to_string(), 0);
-    let (neighbors, traversal_truncated) = edge_repo
-        // Bounded here rather than in storage's caller-visible shape: `get_neighbors` stays the
-        // untruncated walk that spreading activation depends on. The `false` on the error path is
-        // not a guess — a traversal that returned `Err` cannot have reported hitting the bound,
-        // and it keeps the page's pre-existing "an unparseable id reads as an empty
-        // neighbourhood" behaviour intact.
-        .get_neighbors_capped(id, hops, GRAPH_VISIT_CAP)
-        .await
-        .unwrap_or((Vec::new(), false));
-    for n in &neighbors {
-        let neighbor_id = record_id_to_string(&n.id);
-        // A node reached by several paths keeps the shortest distance: the BFS reports a node once
-        // per path, so the first `hop` seen is not necessarily the closest.
-        let entry = hop_of.entry(neighbor_id.clone()).or_insert(n.hop);
-        *entry = (*entry).min(n.hop);
-        node_ids.insert(neighbor_id);
+) -> Response {
+    let Ok((owner, read)) = boundary.corpus(session).await else {
+        return plain_forbidden_page();
+    };
+    let memory_repo =
+        alexandria_storage::repos::ScopedMemoryRepo::new(server.db.inner(), &owner, &read);
+    let Ok(centre) = surrealdb::types::RecordId::parse_simple(id) else {
+        return graph_not_found();
+    };
+    let graph = match memory_repo.ego(&centre, hops, GRAPH_VISIT_CAP).await {
+        Ok(graph) => graph,
+        Err(_) => return graph_not_found(),
+    };
+    if graph.nodes.is_empty() {
+        // A root outside the caller's population and one that does not exist are one answer.
+        return graph_not_found();
     }
-
-    // Cap the node set before any per-node work happens, so an oversized ego-graph costs one
-    // traversal rather than hundreds of queries. Ordered by hop then id so the cut is the same
-    // set every time — a HashSet's iteration order would make the dropped half arbitrary.
-    let mut ordered: Vec<(u32, String)> = node_ids
+    // Two bounds, both still the handler's to apply: storage capped what the traversal *visited*, and
+    // this caps what the canvas draws, cut by hop-then-id so the retained set is the same one every
+    // time a `HashSet`'s iteration order is not.
+    let mut ordered: Vec<(u32, String)> = graph
+        .nodes
         .iter()
-        .map(|nid| (hop_of.get(nid).copied().unwrap_or(hops), nid.clone()))
+        .map(|node| {
+            (
+                *graph.hops.get(&format!("{node:?}")).unwrap_or(&hops),
+                record_id_to_string(node),
+            )
+        })
         .collect();
     ordered.sort();
-    let truncated = apply_node_cap(&mut ordered, GRAPH_NODE_CAP);
-    let node_ids: Vec<String> = ordered.into_iter().map(|(_, nid)| nid).collect();
-
-    // TODO(debt): this handler costs one `get_edges_for` plus one `get_fact` per node, so the
-    // round trips here are O(nodes) — bounded now by GRAPH_NODE_CAP but still the first thing to
-    // revisit if graph pages feel slow. A batch-by-ids read in storage would collapse both. (The
-    // traversal above has its own bound, [`GRAPH_VISIT_CAP`]; this loop is the remaining debt.)
-    //
-    // Collect edges among the node set by querying each node's direct edges and
-    // keeping only those whose both endpoints are in `node_ids` (dedup by in/out/type).
-    let mut edges_seen: HashSet<(String, String, String)> = HashSet::new();
-    let mut edges_json = Vec::new();
-    for node_id in &node_ids {
-        let edges = edge_repo.get_edges_for(node_id).await.unwrap_or_default();
-        for e in edges {
+    let capped = apply_node_cap(&mut ordered, GRAPH_NODE_CAP);
+    let truncated = graph.truncated || capped;
+    let node_ids: Vec<String> = ordered.iter().map(|(_, id)| id.clone()).collect();
+    let hop_of: HashMap<String, u32> = ordered.iter().cloned().map(|(hop, id)| (id, hop)).collect();
+    let drawn: std::collections::HashSet<String> = node_ids.iter().cloned().collect();
+    let edges_json: Vec<serde_json::Value> = graph
+        .edges
+        .iter()
+        .filter(|e| {
+            // An edge to a node the draw cap dropped would render as a dangling line in vis-network.
+            e.in_node
+                .as_ref()
+                .map(record_id_to_string)
+                .is_some_and(|id| drawn.contains(&id))
+                && e.out_node
+                    .as_ref()
+                    .map(record_id_to_string)
+                    .is_some_and(|id| drawn.contains(&id))
+        })
+        .map(|e| {
             let from = e
                 .in_node
                 .as_ref()
@@ -185,14 +202,7 @@ async fn api_graph_with_radius(
                 .as_ref()
                 .map(record_id_to_string)
                 .unwrap_or_default();
-            if !node_ids.contains(&from) || !node_ids.contains(&to) {
-                continue;
-            }
-            let key = (from.clone(), to.clone(), e.edge_type.clone());
-            if !edges_seen.insert(key) {
-                continue;
-            }
-            edges_json.push(serde_json::json!({
+            serde_json::json!({
                 "from": from,
                 "to": to,
                 "label": e.edge_type,
@@ -201,11 +211,11 @@ async fn api_graph_with_radius(
                 "strength_band": strength_band(e.strength),
                 "edge_color": edge_style_of(&e.edge_type).0,
                 "edge_dashes": dashes_json(edge_style_of(&e.edge_type).1),
-            }));
-        }
-    }
+            })
+        })
+        .collect();
 
-    let content = load_fact_content(server, &node_ids).await;
+    let content = load_fact_content(&memory_repo, &node_ids).await;
     let nodes_json: Vec<serde_json::Value> = node_ids
         .iter()
         .map(|nid| {
@@ -231,7 +241,7 @@ async fn api_graph_with_radius(
         })
         .collect();
 
-    Json(serde_json::json!({
+    axum::Json(serde_json::json!({
         "nodes": nodes_json,
         "edges": edges_json,
         "centre": id,
@@ -242,12 +252,38 @@ async fn api_graph_with_radius(
         // Distinct from `truncated` on purpose: that one says "the nearest 200 of these nodes are
         // all you get to see", this one says "there were more nodes to find, at all". Only the
         // render cap has a cap to quote, so the notice has to word them differently.
-        "traversal_truncated": traversal_truncated,
+        "traversal_truncated": graph.truncated,
         "visit_cap": GRAPH_VISIT_CAP,
         // Legend data, derived from the same consts that style the canvas.
         "node_types": node_type_legend(),
         "edge_types": edge_type_legend(),
     }))
+    .into_response()
+}
+
+/// The graph API's answer to a root this caller cannot read, and to one that is not there at all: one
+/// status, no body that could distinguish them.
+fn graph_not_found() -> Response {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        r#"{"error":"no such memory in your corpus","nodes":[],"edges":[]}"#,
+    )
+        .into_response()
+}
+
+/// The guard's own refusal, mirrored for a handler that passed it and could not resolve its caller's
+/// population. Unreachable in practice — `corpus` only refuses when the account changed mid-request —
+/// and the point of the 403 is that it never becomes a 200 with somebody else's graph in it.
+fn plain_forbidden_page() -> Response {
+    axum::response::IntoResponse::into_response((
+        axum::http::StatusCode::FORBIDDEN,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        super::web::NO_SESSION,
+    ))
 }
 
 /// How each known node table is drawn: `(table, shape, colour)`.
@@ -328,19 +364,26 @@ fn edge_type_legend() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Content for node labels, one [`MemoryRepo::get_fact`] per fact node.
+/// Content for node labels, one [`ScopedMemoryRepo::get_fact`] per fact node.
 ///
-/// `get_fact` is the only by-id read storage exposes, and `all_ids_and_content()` would load the
-/// entire table to label a few dozen nodes. A failed lookup degrades that one node to its record
-/// id rather than failing the graph: a missing label is cosmetic, a 500 is not.
+/// The **caller's own** repo, not a fresh unscoped one: the walk that produced `node_ids` was already
+/// population-filtered, and re-reading those ids through `MemoryRepo::get_fact` would label nodes with
+/// content the predicate had just excluded — a leak whose only symptom is a string on a canvas, which is
+/// the least visible way to leak. `all_ids_and_content()` was the alternative and is worse still: it
+/// loads the whole table to label a few dozen nodes, and it has no owner predicate at all.
+///
+/// A failed lookup degrades that one node to its record id rather than failing the graph: a missing
+/// label is cosmetic, a 500 is not.
 async fn load_fact_content(
-    server: &AlexandriaServer,
+    fact_repo: &alexandria_storage::repos::ScopedMemoryRepo<'_>,
     node_ids: &[String],
 ) -> HashMap<String, String> {
-    let fact_repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
     let mut content = HashMap::new();
     for node_id in node_ids.iter().filter(|nid| node_table_of(nid) == "fact") {
-        match fact_repo.get_fact(node_id).await {
+        let Ok(handle) = surrealdb::types::RecordId::parse_simple(node_id) else {
+            continue;
+        };
+        match fact_repo.get_fact(&handle).await {
             Ok(Some(fact)) => {
                 content.insert(node_id.clone(), fact.content);
             }
@@ -369,7 +412,7 @@ struct GraphTemplate {
 
 /// The renderer is called by full path because this handler is itself named `page` — a module
 /// level `use super::html::page` would collide with it.
-pub async fn page(
+pub(crate) async fn page(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
@@ -387,6 +430,7 @@ pub async fn page(
 mod tests {
     use std::collections::HashSet;
 
+    use super::super::test_support::HOST_HEADER;
     use super::{
         DEFAULT_HOPS, EDGE_STYLES, GRAPH_NODE_CAP, GRAPH_VISIT_CAP, GraphTemplate, MAX_HOPS,
         NODE_STYLES, UNKNOWN_EDGE_STYLE, UNKNOWN_NODE_STYLE, apply_node_cap, edge_style_of,
@@ -494,10 +538,19 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/api/graph/{}", a.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -512,11 +565,27 @@ mod tests {
         assert_eq!(edges[0]["label"], "relates_to");
     }
 
-    async fn graph_json(server: &AlexandriaServer, centre: &str, query: &str) -> serde_json::Value {
-        let app = crate::debug::router(server.clone());
+    /// The JSON endpoint as an owner sees it.
+    ///
+    /// Takes the **fixture**, not a server: each call signs in as a fresh owner and the adoption layer
+    /// claims unowned rows for whichever owner asked first, so a per-call fixture would make every
+    /// later call in the same test look at an empty corpus — an isolation assertion that passes because
+    /// the fixture was rebuilt rather than because the boundary held.
+    async fn graph_json(
+        fixture: &super::super::test_support::AuthenticatedTestApp,
+        centre: &str,
+        query: &str,
+    ) -> serde_json::Value {
+        let app = fixture.session_router();
         let uri = format!("/debug/api/graph/{}{query}", centre.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -557,7 +626,8 @@ mod tests {
             .await
             .unwrap();
 
-        let json = graph_json(&server, &centre, "").await;
+        let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
+        let json = graph_json(&fixture, &centre, "").await;
 
         let centre_node = node_by_id(&json, &centre);
         assert_ne!(
@@ -624,6 +694,7 @@ mod tests {
             .create_edge(&fact, &other, "relates_to", 1.0)
             .await
             .unwrap();
+        let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
 
         // Table extraction is a pure function over the id, so the id shapes that cannot be
         // stored here (unknown table, no separator) are exercised directly.
@@ -634,30 +705,41 @@ mod tests {
         assert_eq!(node_table_of("no-separator-here"), "");
         assert_eq!(node_table_of(""), "", "an empty id must not panic");
 
-        for (node_id, table) in [
-            ("cluster:legend", "cluster"),
-            ("raw:doc1", "raw"),
-            ("widget:mystery", "widget"),
-            ("malformed-id", ""),
+        /// A **non-fact root** is now a refusal rather than a picture, and that is the boundary, not a
+        /// regression: the scoped ego-graph read admits a root only if the caller's own population
+        /// contains it, so a cluster, raw document, unknown table or malformed string all answer 404 —
+        /// the same answer an absent fact gives, which is what keeps the endpoint from probing.
+        /// The refusal path, same fixture.
+        async fn graph_fetch(
+            fixture: &super::super::test_support::AuthenticatedTestApp,
+            id: &str,
+        ) -> (axum::http::StatusCode, String) {
+            fixture
+                .get(&format!("/debug/api/graph/{}", id.replace(':', "%3A")))
+                .await
+        }
+
+        for node_id in [
+            "cluster:legend",
+            "raw:doc1",
+            "widget:mystery",
+            "malformed-id",
+            "fact:never-stored-here",
         ] {
-            let json = graph_json(&server, node_id, "").await;
-            let node = node_by_id(&json, node_id);
+            let (status, body) = graph_fetch(&fixture, node_id).await;
             assert_eq!(
-                node["label"],
-                serde_json::json!(node_id),
-                "a non-fact node must fall back to its record id"
+                status,
+                axum::http::StatusCode::NOT_FOUND,
+                "a root the caller cannot read returned data: {body}"
             );
-            assert_eq!(node["table"], serde_json::json!(table));
-            assert_eq!(node["hop"], serde_json::json!(0));
             assert!(
-                node["title"].as_str().unwrap().contains(node_id),
-                "the tooltip must still carry the id: got {:?}",
-                node["title"]
+                !body.contains("fact:"),
+                "the refusal leaked a record id: {body}"
             );
         }
 
         // Content labelling and id fallback coexist in one response.
-        let json = graph_json(&server, &fact, "").await;
+        let json = graph_json(&fixture, &fact, "").await;
         assert_eq!(
             node_by_id(&json, &fact)["label"],
             serde_json::json!("the fact content is not its id")
@@ -689,7 +771,8 @@ mod tests {
             .await
             .unwrap();
 
-        let json = graph_json(&server, &a, "").await;
+        let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
+        let json = graph_json(&fixture, &a, "").await;
         let edges = json["edges"].as_array().unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0]["edge_type"], serde_json::json!("derived_from"));
@@ -750,6 +833,11 @@ mod tests {
                 .unwrap();
         }
 
+        // One fixture for the whole loop, deliberately: each iteration would otherwise sign in a new
+        // owner and the adoption layer would already have claimed the seeded rows for the first one,
+        // so every later page would render an empty graph and the radius assertions would pass on
+        // nothing.
+        let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
         for (query, expected) in [
             ("", 2u32),
             ("?hops=1", 1),
@@ -758,7 +846,7 @@ mod tests {
             ("?hops=0", 1),
             ("?hops=abc", 2),
         ] {
-            let json = graph_json(&server, &ids[0], query).await;
+            let json = graph_json(&fixture, &ids[0], query).await;
             assert_eq!(
                 json["hops"],
                 serde_json::json!(expected),
@@ -774,8 +862,8 @@ mod tests {
         }
 
         // The radius actually narrows the view: 1 hop draws strictly fewer nodes than 3.
-        let one = graph_json(&server, &ids[0], "?hops=1").await;
-        let three = graph_json(&server, &ids[0], "?hops=3").await;
+        let one = graph_json(&fixture, &ids[0], "?hops=1").await;
+        let three = graph_json(&fixture, &ids[0], "?hops=3").await;
         assert!(
             one["nodes"].as_array().unwrap().len() < three["nodes"].as_array().unwrap().len(),
             "hops=1 should draw a smaller ego-graph than hops=3"
@@ -888,7 +976,8 @@ mod tests {
             .await
             .unwrap();
 
-        let json = graph_json(&server, &a, "").await;
+        let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
+        let json = graph_json(&fixture, &a, "").await;
         let node = node_by_id(&json, &a);
         assert_eq!(node["shape"], serde_json::json!("dot"));
         assert_eq!(node["color"], serde_json::json!("#58a6ff"));
@@ -961,7 +1050,8 @@ mod tests {
             .create_fact("uncapped small graph", 0.5, &[0.1, 0.2], &[])
             .await
             .unwrap();
-        let json = graph_json(&server, &fact, "").await;
+        let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
+        let json = graph_json(&fixture, &fact, "").await;
         assert_eq!(json["truncated"], serde_json::json!(false));
         assert_eq!(json["node_count"], serde_json::json!(1));
         assert_eq!(json["node_cap"], serde_json::json!(GRAPH_NODE_CAP));
@@ -1001,7 +1091,8 @@ mod tests {
         let server = super::super::test_support::test_server().await;
         let centre = seed_star(&server, GRAPH_NODE_CAP + 50).await;
 
-        let json = graph_json(&server, &centre, "").await;
+        let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
+        let json = graph_json(&fixture, &centre, "").await;
         assert_eq!(json["node_count"], serde_json::json!(GRAPH_NODE_CAP));
         assert_eq!(
             json["truncated"],
@@ -1024,7 +1115,8 @@ mod tests {
         let server = super::super::test_support::test_server().await;
         let centre = seed_star(&server, GRAPH_VISIT_CAP + 1).await;
 
-        let json = graph_json(&server, &centre, "").await;
+        let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
+        let json = graph_json(&fixture, &centre, "").await;
         assert_eq!(
             json["traversal_truncated"],
             serde_json::json!(true),
@@ -1038,5 +1130,77 @@ mod tests {
             "the render cap necessarily bites once the walk has visited {GRAPH_VISIT_CAP} records"
         );
         assert_eq!(json["node_count"], serde_json::json!(GRAPH_NODE_CAP));
+    }
+}
+
+/// The ego-graph endpoint as a second owner sees it. Both halves of the claim are needed: the root must
+/// be invisible, and the walk must not cross into a foreign row through an edge that happens to touch
+/// the caller's own fact.
+#[cfg(test)]
+mod boundary {
+    use crate::debug::test_support as support;
+    use axum::http::StatusCode;
+
+    /// A record id inside a path segment: the engine's own handle spelling, percent-encoded the way a
+    /// browser's form would send it.
+    fn urlencode(id: &str) -> String {
+        id.replace(':', "%3A")
+    }
+
+    #[tokio::test]
+    async fn a_foreign_root_is_the_same_404_as_an_absent_one_and_the_walk_stays_inside() {
+        let server = crate::debug::test_support::test_server().await;
+        let alice = support::authenticated_on_server(server.clone()).await;
+        let bob = alice.second_owner("debug-fixture-second").await;
+
+        let alice_fact = alice.seed_personal("alice graph centre").await;
+        let bob_fact = bob.seed_personal("bob graph centre").await;
+
+        let (own, own_body) = alice
+            .get(&format!(
+                "/debug/api/graph/{}",
+                urlencode(&alice_fact.clone())
+            ))
+            .await;
+        assert_eq!(own, StatusCode::OK, "{}", support::clip(&own_body));
+        let nodes: serde_json::Value = serde_json::from_str(&own_body).expect("graph json");
+        let ids: Vec<&str> = nodes["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            ids.contains(&alice_fact.as_str()),
+            "the caller's own root is missing from their ego-graph: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&bob_fact.as_str()),
+            "a foreign fact was walked into: {ids:?}"
+        );
+
+        let (foreign, foreign_body) = alice
+            .get(&format!("/debug/api/graph/{}", urlencode(&bob_fact)))
+            .await;
+        let (absent, _) = alice.get("/debug/api/graph/fact%3Anever-existed").await;
+        assert_eq!(
+            foreign,
+            StatusCode::NOT_FOUND,
+            "a foreign root returned a graph: {}",
+            support::clip(&foreign_body)
+        );
+        assert_eq!(
+            absent, foreign,
+            "a foreign root is distinguishable from an absent one"
+        );
+        assert!(
+            !foreign_body.contains("bob graph centre"),
+            "the refusal carried the foreign fact's content"
+        );
+        // The endpoint answers as the owner, so an anonymous caller gets the guard's refusal, not JSON.
+        let (anonymous_code, _) = alice
+            .get_anonymous(&format!("/debug/api/graph/{}", urlencode(&alice_fact)))
+            .await;
+        assert_eq!(anonymous_code, StatusCode::FORBIDDEN);
     }
 }

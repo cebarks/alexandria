@@ -1,11 +1,13 @@
 use askama::Template;
 use axum::Extension;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::Response;
 
 use super::DebugContext;
 use super::clusters::{Cohesion, cohesion_of, embeddings_of};
 use super::html::{error_page, page};
+use super::web::{Boundary, BrowserSession};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
@@ -306,8 +308,13 @@ struct BarSection {
 /// Healthy vs needs-split, judged through [`cohesion_of`] from each cluster's **stored**
 /// centroid — the same vector the background maintenance task splits on, so this rollup and
 /// `clusters.rs`' detail page cannot render opposite verdicts for one cluster.
-async fn cluster_health(server: &AlexandriaServer) -> Result<ClusterHealth, anyhow::Error> {
-    let repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
+async fn cluster_health(
+    server: &AlexandriaServer,
+    owner: &alexandria_storage::access::OwnerContext,
+    population: &alexandria_storage::access::ScopedContext,
+) -> Result<ClusterHealth, anyhow::Error> {
+    let repo =
+        alexandria_storage::repos::ScopedClusterRepo::new(server.db.inner(), owner, population);
     let mut section = ClusterHealth::default();
 
     for (cluster, member_count) in repo.list_with_counts().await? {
@@ -340,7 +347,7 @@ async fn cluster_health(server: &AlexandriaServer) -> Result<ClusterHealth, anyh
             // Fewer members than the engine will judge. `NoCentroid` is unreachable here —
             // every row came from a real cluster record — but counting it rather than
             // dropping it keeps the three rows summing to the cluster total.
-            Cohesion::TooSmall | Cohesion::NoCentroid => section.too_few += 1,
+            Cohesion::TooSmall => section.too_few += 1,
         }
     }
     Ok(section)
@@ -351,11 +358,13 @@ async fn cluster_health(server: &AlexandriaServer) -> Result<ClusterHealth, anyh
 /// it. Only the finalized read can fail.
 async fn session_rollup(
     server: &AlexandriaServer,
+    owner: &alexandria_storage::access::OwnerContext,
     total: usize,
 ) -> Result<SessionRollup, anyhow::Error> {
-    let finalized = alexandria_storage::repos::SessionRepo::new(server.db.inner())
-        .count_finalized()
-        .await?;
+    let finalized =
+        alexandria_storage::repos::ScopedSessionRepo::new(server.db.inner(), owner.clone())
+            .count_finalized()
+            .await?;
     Ok(SessionRollup {
         error: String::new(),
         total,
@@ -369,17 +378,29 @@ async fn session_rollup(
 
 /// The ten most-used tags, as bars. The cap is stated in the section heading, because a list of
 /// ten that is presented as complete would be a quiet lie about a database with two thousand.
-async fn tag_bars(server: &AlexandriaServer) -> Result<BarSection, anyhow::Error> {
-    let pairs = alexandria_storage::repos::MemoryRepo::new(server.db.inner())
-        .top_tags(TAG_LIMIT)
-        .await?;
+async fn tag_bars(
+    server: &AlexandriaServer,
+    owner: &alexandria_storage::access::OwnerContext,
+    population: &alexandria_storage::access::ScopedContext,
+) -> Result<BarSection, anyhow::Error> {
+    let pairs =
+        alexandria_storage::repos::ScopedMemoryRepo::new(server.db.inner(), owner, population)
+            .top_tags(TAG_LIMIT)
+            .await?;
     Ok(bars(pairs))
 }
 
-async fn heat_bars(server: &AlexandriaServer) -> Result<BarSection, anyhow::Error> {
-    let counts = alexandria_storage::repos::HeatRepo::new(server.db.inner())
-        .heat_histogram()
-        .await?;
+/// The caller's own heat spread. `heat_state` has no owner column (v009), so the population test runs
+/// through the fact each row belongs to — a store-wide histogram is another account's ranking shape.
+async fn heat_bars(
+    server: &AlexandriaServer,
+    owner: &alexandria_storage::access::OwnerContext,
+    population: &alexandria_storage::access::ScopedContext,
+) -> Result<BarSection, anyhow::Error> {
+    let counts =
+        alexandria_storage::repos::ScopedMemoryRepo::new(server.db.inner(), owner, population)
+            .heat_bands()
+            .await?;
     // Positional against `HEAT_BANDS`, which is documented as being in the histogram's order.
     // `zip` stops at the shorter side on purpose: a band rendering without a count (or vice
     // versa) after one of the two changes is a quieter failure than panicking on a diagnostic
@@ -441,12 +462,34 @@ fn row_str(label: &'static str, value: String) -> ConfigRow {
     ConfigRow { label, value }
 }
 
-pub async fn handler(
+pub(crate) async fn handler(
     State(server): State<AlexandriaServer>,
+    boundary: Boundary,
+    session: BrowserSession,
     Extension(ctx): Extension<Option<DebugContext>>,
 ) -> Response {
-    let stats = match alexandria_storage::stats::gather(server.db.inner()).await {
-        Ok(stats) => stats,
+    // Every number on this page is the caller's own corpus, read through their resolved population.
+    // `stats::gather` counts the store, which is what made the dashboard a cross-account leak rather
+    // than a diagnostic: with two owners on a box, each saw the other's totals, tag names and heat
+    // spread, and a tag bar is somebody's vocabulary.
+    let Ok((owner, read)) = boundary.corpus(&session).await else {
+        let mut response = error_page(
+            "dashboard",
+            "this page requires an authenticated owner session",
+        );
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return response;
+    };
+    let population = &read;
+    let stats = match alexandria_storage::repos::ScopedMemoryRepo::new(
+        server.db.inner(),
+        &owner,
+        population,
+    )
+    .counts()
+    .await
+    {
+        Ok(counts) => counts,
         // The legacy page prefixed the raw error, so the prefix travels with the message.
         Err(e) => return error_page("dashboard", &format!("Failed to load stats: {e}")),
     };
@@ -462,26 +505,39 @@ pub async fn handler(
 
     // Every rollup goes through `degrade`, so one unavailable stat costs the reader one section
     // and nothing else.
-    let (data, error) = degrade("Cluster health", cluster_health(&server).await);
+    let (data, error) = degrade(
+        "Cluster health",
+        cluster_health(&server, &owner, population).await,
+    );
     let cluster_health = ClusterHealth { error, ..data };
+    // The session numbers come from the repo that can resolve them: `session` is account-keyed, and
+    // `counts()` above deliberately says nothing about sessions.
+    let session_total =
+        alexandria_storage::repos::ScopedSessionRepo::new(server.db.inner(), owner.clone())
+            .count()
+            .await
+            .unwrap_or(0);
     let (data, error) = degrade(
         "Sessions",
-        session_rollup(&server, stats.session_count).await,
+        session_rollup(&server, &owner, session_total).await,
     );
     let sessions = SessionRollup { error, ..data };
-    let (data, error) = degrade("Top tags", tag_bars(&server).await);
+    let (data, error) = degrade("Top tags", tag_bars(&server, &owner, population).await);
     let tags = BarSection { error, ..data };
-    let (data, error) = degrade("Heat distribution", heat_bars(&server).await);
+    let (data, error) = degrade(
+        "Heat distribution",
+        heat_bars(&server, &owner, population).await,
+    );
     let heat = BarSection { error, ..data };
 
     page(DashboardTemplate {
         nav: "dashboard",
-        fact_count: stats.fact_count,
-        deleted_fact_count: stats.deleted_fact_count,
-        cluster_count: stats.cluster_count,
-        edge_count: stats.edge_count,
-        raw_count: stats.raw_count,
-        session_count: stats.session_count,
+        fact_count: stats.live_facts,
+        deleted_fact_count: stats.deleted_facts,
+        cluster_count: stats.clusters,
+        edge_count: stats.edges,
+        raw_count: stats.raw_documents,
+        session_count: session_total,
         config_rows,
         schema_note,
         cluster_health,
@@ -494,6 +550,7 @@ pub async fn handler(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::HOST_HEADER;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -505,6 +562,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/debug")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -551,7 +609,12 @@ mod tests {
         let server = super::super::test_support::test_server()
             .await
             .with_retrieve_min_similarity(0.42);
-        let html = render(crate::debug::router(server)).await;
+        let html = render(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+        )
+        .await;
         assert_eq!(
             config_value(&html, "retrieve.min_similarity"),
             "0.42",
@@ -562,7 +625,12 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_shows_embedding_model_and_dimensions() {
         let server = super::super::test_support::test_server().await;
-        let html = render(crate::debug::router(server)).await;
+        let html = render(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+        )
+        .await;
         // The harness stub reports "stub" / 2 dims; both must appear on the loaded rows.
         assert_eq!(config_value(&html, "embedding.model (loaded)"), "stub");
         assert_eq!(
@@ -578,7 +646,12 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_config_panel_unavailable_without_context() {
         let server = super::super::test_support::test_server().await;
-        let html = render(crate::debug::router(server)).await;
+        let html = render(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+        )
+        .await;
         assert!(
             html.contains(UNAVAILABLE),
             "no unavailable wording rendered"
@@ -639,7 +712,12 @@ mod tests {
     async fn test_dashboard_with_context_shows_bind_and_transport() {
         let server = super::super::test_support::test_server().await;
         let ctx = base_debug_context();
-        let html = render(crate::debug::router_with_context(server, Some(ctx))).await;
+        let html = render(
+            super::super::test_support::authenticated_with_context(server, ctx)
+                .await
+                .session_router(),
+        )
+        .await;
 
         assert_eq!(config_value(&html, "server.transport"), "http-transport-x");
         assert_eq!(config_value(&html, "server.host"), "bind-host-9");
@@ -756,7 +834,12 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_shows_schema_versions() {
         let server = super::super::test_support::test_server().await;
-        let html = render(crate::debug::router(server)).await;
+        let html = render(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+        )
+        .await;
         let head = alexandria_storage::schema::LATEST_VERSION.to_string();
         assert_eq!(
             config_value(&html, "schema.version (compiled-in head)"),
@@ -778,7 +861,12 @@ mod tests {
         for id in ["sess-dashboard-7", "sess-dashboard-8"] {
             repo.create(id, None, None).await.unwrap();
         }
-        let html = render(crate::debug::router(server)).await;
+        let html = render(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+        )
+        .await;
         assert!(
             html.contains("<tr><th>Sessions</th><td>2</td></tr>"),
             "Stats::session_count was not surfaced"
@@ -788,11 +876,15 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_returns_200_with_stats() {
         let server = super::super::test_support::test_server().await;
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -868,7 +960,12 @@ mod tests {
             .await
             .unwrap();
 
-        let html = render(crate::debug::router(server)).await;
+        let html = render(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+        )
+        .await;
         for (label, value) in [
             ("Healthy", 2),
             ("Needs split", 1),
@@ -906,7 +1003,12 @@ mod tests {
                 .unwrap();
         }
 
-        let html = render(crate::debug::router(server)).await;
+        let html = render(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+        )
+        .await;
         for (label, value) in [("Total", 5), ("Finalized", 2), ("Idle", 3)] {
             let row = format!("<tr><th>{label}</th><td>{value}</td></tr>");
             assert!(
@@ -938,7 +1040,12 @@ mod tests {
             }
         }
 
-        let html = render(crate::debug::router(server)).await;
+        let html = render(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+        )
+        .await;
         assert!(
             html.contains(&bar_row("alpha-tag-3x", 100, 3)),
             "got: {html}"
@@ -973,7 +1080,12 @@ mod tests {
             heat_repo.create_for_memory(&fact, *heat).await.unwrap();
         }
 
-        let html = render(crate::debug::router(server)).await;
+        let html = render(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+        )
+        .await;
         for (band, width, count) in [
             ("below 1", 50, 1),
             ("1 to 2", 50, 1),
@@ -994,7 +1106,12 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_rollups_render_on_an_empty_database() {
         let server = super::super::test_support::test_server().await;
-        let html = render(crate::debug::router(server)).await;
+        let html = render(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+        )
+        .await;
         for heading in [
             "<h2>Cluster health</h2>",
             "<h2>Sessions</h2>",
@@ -1100,5 +1217,54 @@ mod tests {
         assert!(html.contains(&bar_row("below 1", 100, 3)));
         assert!(html.contains("<h2>Top tags (up to 10)</h2>"));
         assert!(html.contains("Facts (active)"));
+    }
+}
+
+/// The dashboard's rollups are counts of one population. Pre-Task 9 this page read the whole store
+/// through `stats::gather`; the claim here is that the numbers moved, not just that the page renders.
+#[cfg(test)]
+mod boundary {
+    use crate::debug::test_support::{self as support, stat_value};
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn every_rollup_counts_the_caller_not_the_store() {
+        let server = crate::debug::test_support::test_server().await;
+        let alice = support::authenticated_on_server(server.clone()).await;
+        let bob = alice.second_owner("debug-fixture-second").await;
+        for _ in 0..2 {
+            alice.seed_personal("alice row").await;
+        }
+        bob.seed_personal("bob row one").await;
+        bob.seed_personal("bob row two").await;
+        bob.seed_personal("bob row three").await;
+        alice.seed_session("alice-session", None).await;
+        bob.seed_session("bob-session", None).await;
+        bob.seed_cluster(Some("bob cluster"), &[0.5, 0.5]).await;
+
+        let (status, page) = alice.get("/debug").await;
+        assert_eq!(status, StatusCode::OK, "{}", support::clip(&page));
+        assert_eq!(
+            stat_value(&page, "Facts (active)"),
+            Some(2),
+            "the active count is not alice's: {}",
+            support::clip(&page)
+        );
+        assert_eq!(
+            stat_value(&page, "Sessions"),
+            Some(1),
+            "the session count is store-wide: {}",
+            support::clip(&page)
+        );
+        assert_eq!(
+            stat_value(&page, "Clusters"),
+            Some(0),
+            "the cluster count is store-wide: {}",
+            support::clip(&page)
+        );
+        // And the other side of the same pair.
+        let (_, bobs_page) = bob.get("/debug").await;
+        assert_eq!(stat_value(&bobs_page, "Facts (active)"), Some(3));
+        assert_eq!(stat_value(&bobs_page, "Clusters"), Some(1));
     }
 }

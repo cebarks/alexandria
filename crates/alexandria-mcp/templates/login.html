@@ -1,0 +1,26 @@
+{% extends "auth_page.html" %}
+{% block title %}Sign in{% endblock %}
+{% block content %}
+<h1>Alexandria</h1>
+<p class="lede">Sign in to review your own memories, sessions and clusters.</p>
+{% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}
+<form method="post" action="/debug/login">
+<input type="hidden" name="page" value="{{ page }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<div>
+<label for="login">Login</label>
+<input id="login" name="login" autocomplete="username" required>
+</div>
+<div>
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autocomplete="current-password" required>
+</div>
+<button type="submit">Sign in</button>
+</form>
+{% if insecure_development %}<p class="warning">This deployment runs with <code>loopback_development</code> set, so session cookies are sent without the <code>Secure</code> flag. That is a development exception: a published deployment must set an <code>https</code> <code>server.public_origin</code>.</p>{% endif %}
+<nav class="links">
+<a href="/debug/invite">Have an invitation?</a>
+<a href="/debug/recover">Recover a password</a>
+</nav>
+<p class="note">Enrollment is invitation-only. Creating the first account is an operator command, not a page on this server.</p>
+{% endblock %}

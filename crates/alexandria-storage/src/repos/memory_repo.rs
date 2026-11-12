@@ -28,7 +28,7 @@ pub enum FactSort {
 
 impl FactSort {
     /// The ORDER BY expression. A closed set of literals — never interpolated from input.
-    fn order_expr(self) -> &'static str {
+    pub(crate) fn order_expr(self) -> &'static str {
         match self {
             Self::CreatedAt => "created_at",
             Self::Confidence => "confidence",
@@ -47,7 +47,7 @@ impl FactSort {
     }
 
     /// The extra projection [`Self::order_expr`] needs, empty for the plain column sorts.
-    fn projection(self) -> &'static str {
+    pub(crate) fn projection(self) -> &'static str {
         match self {
             Self::TagCount => ", array::len(tags) AS tag_count",
             _ => "",
@@ -55,7 +55,7 @@ impl FactSort {
     }
 
     /// The complete ORDER BY clause, including the tie-break documented on [`MemoryRepo::list`].
-    fn order_clause(self, dir: SortDir) -> String {
+    pub(crate) fn order_clause(self, dir: SortDir) -> String {
         let primary = format!("{} {}", self.order_expr(), dir.sql());
         if self == Self::Id {
             primary
@@ -73,7 +73,7 @@ pub enum SortDir {
 }
 
 impl SortDir {
-    fn sql(self) -> &'static str {
+    pub(crate) fn sql(self) -> &'static str {
         match self {
             Self::Asc => "ASC",
             Self::Desc => "DESC",
@@ -90,7 +90,7 @@ pub const DEFAULT_FACT_LIST_LIMIT: usize = 50;
 
 // ponytail: fixed search breadth, the value SurrealDB's own HNSW tests use. Must stay above the
 // largest `k` a caller asks for; make it a config key if recall ever measures short.
-const HNSW_EF: usize = 150;
+pub(crate) const HNSW_EF: usize = 150;
 const REEMBED_PAGE_SQL: &str = "SELECT id, content FROM $records ORDER BY id ASC LIMIT $limit";
 
 /// The numeric-ef form is the only one the planner serves from the HNSW index; a distance name
@@ -367,6 +367,25 @@ impl<'a> MemoryRepo<'a> {
         )
     }
 
+    /// The filter half of the fact `WHERE` clause, **without** the `WHERE` keyword and without a
+    /// leading population predicate. [`crate::repos::ScopedMemoryRepo::page`] splices its own
+    /// population conjunct in front of this, so the two pages share one spelling of "live" and
+    /// "filtered by search/tag" rather than keeping two copies that can drift.
+    pub(crate) fn filter_tail(query: &FactListQuery<'_>) -> String {
+        let clause = Self::fact_filter_clause(query);
+        let tail = clause.strip_prefix("WHERE ").unwrap_or(&clause).trim();
+        // A page that includes deleted *and* quarantined rows has no filter of its own, and the
+        // callers here splice this into `WHERE <population> AND <tail>` — an empty tail would leave a
+        // dangling `AND`, which is a parse error the debug page would report as a storage failure.
+        // `1 = 1` is the identity for `AND`, so the conjunction stays well-formed for every
+        // combination of the two include flags.
+        if tail.is_empty() {
+            "1 = 1".to_string()
+        } else {
+            tail.to_string()
+        }
+    }
+
     /// The WHERE fragment shared by [`Self::list`], [`Self::count`] and [`Self::top_tags`].
     ///
     /// One builder for every live-fact scan, because `count` used to duplicate `list`'s condition
@@ -377,7 +396,7 @@ impl<'a> MemoryRepo<'a> {
     /// Called with the default query by the scans that have no filters to carry — `top_tags`,
     /// `collapse_candidates`, `live_confidences` — which is the whole point: those three want
     /// "every live fact" and must not have to re-spell what live means each time.
-    fn fact_filter_clause(query: &FactListQuery<'_>) -> String {
+    pub(crate) fn fact_filter_clause(query: &FactListQuery<'_>) -> String {
         let mut conditions = Vec::new();
         if !query.include_deleted {
             conditions.push("deleted = false".to_string());

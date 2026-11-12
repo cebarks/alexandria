@@ -834,6 +834,8 @@ async fn completed_target_query_tester_and_real_retrieval_agree() {
     let server = AlexandriaServer::new(Arc::new(db), provider, 0.8, HeatSettings::default())
         .with_vector_index(true);
     let params = || RetrieveMemoriesParams {
+        scope: None,
+        project: None,
         query: "one".into(),
         limit: Some(1),
         session_id: None,

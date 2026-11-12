@@ -1,6 +1,8 @@
+pub mod access;
 mod connection;
 pub mod embedding_state;
 pub mod embedding_validation;
+pub mod error;
 pub mod models;
 pub mod offline_copy;
 pub mod repos;

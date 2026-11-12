@@ -1,0 +1,22 @@
+{% extends "layout.html" %}
+{% block title %}Operation{% endblock %}
+{% block body %}<h1>Operation: {{ kind }}</h1>
+<p class="note">{{ id }}</p>
+<p><strong>Committed</strong> {{ at }} · <strong>Actor</strong> {{ actor }}</p>
+<p><strong>Effects expected:</strong> {{ expected }}<br><strong>Effects applied:</strong> {{ actual }}</p>
+{% if expected != actual %}<p class="badge">This operation applied a different set of effects than it planned. The difference is how a batch reports the entries it refused.</p>{% endif %}
+
+<p class="note">Expand a snapshot to inspect its exact stored journal values. These typed diagnostic values are not current corpus data or an import format.</p>
+<h2>Before</h2>
+{% if before.is_empty() %}<p>Nothing — this operation created rather than changed.</p>{% endif %}
+<table>
+{% for row in before %}<tr><td>{{ row.kind }}</td><td>{{ row.subject }}</td><td>{% if row.has_content %}{{ row.content }} — {{ row.detail }}{% else %}{{ row.detail }}{% endif %}<details><summary>Exact stored state</summary><pre class="content-block">{{ row.exact }}</pre></details></td></tr>
+{% endfor %}</table>
+
+<h2>After</h2>
+<table>
+{% for row in after %}<tr><td>{{ row.kind }}</td><td>{{ row.subject }}</td><td>{% if row.has_content %}{{ row.content }} — {{ row.detail }}{% else %}{{ row.detail }}{% endif %}<details><summary>Exact stored state</summary><pre class="content-block">{{ row.exact }}</pre></details></td></tr>
+{% endfor %}</table>
+
+<p><a class="link" href="/debug/operations">Back to history</a></p>
+{% endblock %}

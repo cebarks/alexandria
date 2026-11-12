@@ -1,0 +1,89 @@
+{% extends "layout.html" %}
+{% import "_pagination.html" as p %}
+{% block title %}Collections{% endblock %}
+{% block body %}<h1>Collections</h1>
+<p>Personal, project and review partitions of your own memory, and the places an agent has guessed they belong.</p>
+<p><a class="link" href="/debug/collections?partition=personal">Personal</a> · <a class="link" href="/debug/collections?partition=project">Projects</a> · <a class="link" href="/debug/collections?partition=unassigned">Unassigned (review)</a> · <a class="link" href="/debug/collections/archive">Session archive</a></p>
+{% if let Some(note) = note %}<p class="badge">{{ note }}</p>{% endif %}
+{% if let Some(error) = error %}<p class="badge">Not applied: {{ error }}</p>{% endif %}
+
+<h2>Memories — {{ partition }}</h2>
+<p class="muted">One page of the most recent rows; older rows are reachable from <a class="link" href="/debug/memories">Memories</a>.</p>
+<table>
+<tr><th>Content</th><th>Tags</th><th>Confidence</th><th>Created</th><th>State</th><th>Partition</th><th>Rev</th><th></th></tr>
+{% if rows.is_empty() %}<tr><td colspan="8" class="empty">Nothing in this partition yet.</td></tr>{% endif %}
+{% for row in rows %}<tr><td>{{ row.content }}</td><td>{{ row.tags }}</td><td>{{ row.confidence }}</td><td>{{ row.created }}</td><td>{% if row.hidden %}<span class="badge">hidden</span>{% endif %}{% if row.quarantined %}<span class="badge">quarantined</span>{% endif %}{% if !row.hidden %}{% if !row.quarantined %}live{% endif %}{% endif %}</td><td>{{ row.partition }}</td><td class="rev">{{ row.revision }}</td><td><a class="link" href="/debug/memories/{{ row.id|urlencode }}">detail</a></td></tr>
+<tr class="controls"><td colspan="8"><form class="inline" method="post" action="/debug/collections/edit">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="id" value="{{ row.id }}">
+<input type="hidden" name="revision" value="{{ row.revision }}">
+<label>New text <input type="text" name="content" size="40" placeholder="{{ row.content }}"></label>
+<label>Tags <input type="text" name="tags" size="20" placeholder="{{ row.tags }}"></label>
+<label><input type="checkbox" name="clear_tags" value="on"> Remove every tag</label>
+<button type="submit" name="action" value="save">Save</button>
+<button type="submit" name="action" value="delete">Hide</button>
+</form> <form class="inline" method="post" action="/debug/collections/move">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="id" value="{{ row.id }}">
+<input type="hidden" name="revision" value="{{ row.revision }}">
+<label>Move to <select name="destination"><option value="personal" {% if row.partition_word == "personal" %}selected{% endif %}>personal</option><option value="project" {% if row.partition_word == "project" %}selected{% endif %}>project</option><option value="unassigned" {% if row.partition_word == "unassigned" %}selected{% endif %}>unassigned (review)</option></select></label>
+<label>Project <select name="project"><option value="" selected>no project</option>{% for choice in projects %}<option value="{{ choice.handle }}">{{ choice.label }}</option>{% endfor %}</select></label>
+<button type="submit">Move</button>
+</form></td></tr>
+{% endfor %}</table>
+
+{{ p::pager(prev_href = prev_href, next_href = next_href, summary = page_summary) }}
+
+<h3>Correct a memory by id</h3>
+<p>An edit here is the same journaled write the <code>update_memory</code> tool performs: the text, its vector and the hidden before-state commit together, and the history page shows exactly what changed. Leave <em>Tags</em> empty to keep the tags a memory already has — clearing them is the box, not the blank.</p>
+<form method="post" action="/debug/collections/edit">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<p><label>Memory id <input type="text" name="id" size="40" required></label> <label>at revision <input type="text" name="revision" size="6" required></label></p>
+<p><label>New text (leave empty to change only tags)<br><textarea name="content" rows="3" cols="60"></textarea></label></p>
+<p><label>Replacement tags, comma-separated <input type="text" name="tags" size="60"></label> <label><input type="checkbox" name="clear_tags" value="on"> Remove every tag</label></p>
+<p class="muted">The revision above is the number this page read for that row. If the memory changed since, the edit is refused and you are told to reload — it does not overwrite the change you did not see.</p>
+<p><button type="submit" name="action" value="save">Save</button> <button type="submit" name="action" value="delete">Hide this memory</button></p>
+</form>
+
+<h3>Move a memory by id</h3>
+<p>A move keeps the memory's id and re-parents its partition-local cluster membership: the cluster it leaves gets the centre of the members that stay, and it joins (or forms) a cluster of the partition it arrives in. It does not carry the hidden history snapshots, the source documents or the session links with it, and it does not write a quarantine — filing is not hiding.</p>
+<form method="post" action="/debug/collections/move">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<p><label>Memory id <input type="text" name="id" size="40" required></label> <label>at revision <input type="text" name="revision" size="6" required></label></p>
+<p><label>Destination <select name="destination"><option value="personal">personal</option><option value="project">project</option><option value="unassigned">unassigned (review)</option></select></label>
+<label>Project, if destination is project <input type="text" name="project" size="40" placeholder="one of your projects, by name or id"></label></p>
+{% if !projects.is_empty() %}<p class="muted">Your projects:
+{% for choice in projects %}<code>{{ choice.label }}</code> ({{ choice.handle }}) {% endfor %}</p>{% else %}<p class="muted">You have no projects yet, so a project destination will be refused rather than created.</p>{% endif %}
+<p><button type="submit">Move</button></p>
+</form>
+
+<h2>Proposals awaiting you</h2>
+<p>An agent's suggestion is a judgement, not an edit. Nothing moves until you approve it here, and approving is one transaction per memory: an entry that changed since the suggestion was formed is refused on its own and says so, rather than rolling back the ones you were right about.</p>
+{% if let Some(queue_error) = queue_error %}<p class="badge">The queue could not be read: {{ queue_error }}</p>{% endif %}
+<form method="post" action="/debug/classification/decide">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<table>
+<tr><th></th><th>Memory</th><th>Proposed destination</th><th>Reason</th><th>Target state</th></tr>
+{% if queue.is_empty() %}<tr><td colspan="5" class="empty">Nothing pending.</td></tr>{% endif %}
+{% for row in queue %}<tr><td><input type="checkbox" name="selected" value="{{ row.id }}:{{ row.revision }}"></td><td>{{ row.memory }}</td><td>{{ row.destination }}</td><td>{{ row.reason }}</td><td>{% if row.quarantined %}<span class="badge">quarantined — stays quarantined if moved</span>{% else %}live{% endif %}</td></tr>
+{% endfor %}</table>
+{% if !queue.is_empty() %}<p class="muted">Each box you check posts one <code>selected</code> value, and any number of them — one, two, the whole queue — is one decision.</p>
+<p><button type="submit" name="decision" value="approve">Approve selected</button> <button type="submit" name="decision" value="dismiss">Dismiss selected</button></p>{% endif %}
+</form>
+
+{% if !queue.is_empty() %}<h3>Change one destination</h3>
+<p>A destination is an opinion you can revise without dismissing the proposal. Changing it moves the proposal's own revision, so any approval you made against the old destination stops being applicable — the store keeps both judgements and honours only the latest.</p>
+<table>
+<tr><th>Proposal</th><th>Now going to</th><th>Change its destination</th></tr>
+{% for row in queue %}<tr><td><code>{{ row.id }}</code> at revision {{ row.revision }}</td><td>{{ row.destination }}</td>
+<td><form class="inline" method="post" action="/debug/classification/revise">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="id" value="{{ row.id }}">
+<input type="hidden" name="revision" value="{{ row.revision }}">
+<label>New destination <select name="destination"><option value="personal">personal</option><option value="project">project</option><option value="unassigned">unassigned (review)</option></select></label>
+<label>Project <input type="text" name="project" size="30" placeholder="name or id"></label>
+<button type="submit">Change</button>
+</form></td></tr>
+{% endfor %}</table>
+{% endif %}
+{% endblock %}

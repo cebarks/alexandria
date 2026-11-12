@@ -652,13 +652,9 @@ impl Jobs {
     }
 
     async fn all_clusters(&self) -> anyhow::Result<Vec<alexandria_storage::models::Cluster>> {
-        let clusters = self
-            .db
-            .inner()
-            .query("SELECT * FROM cluster")
-            .await?
-            .take(0)?;
-        Ok(clusters)
+        ClusterRepo::new(self.db.inner())
+            .legacy_maintenance_clusters()
+            .await
     }
 }
 
@@ -747,6 +743,10 @@ pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
     }
     tracing::debug!("dreaming scheduler stopped");
 }
+
+#[cfg(test)]
+#[path = "dreaming/legacy_gate_tests.rs"]
+mod legacy_gate_tests;
 
 #[cfg(test)]
 mod tests {

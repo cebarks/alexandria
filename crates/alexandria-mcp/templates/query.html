@@ -18,7 +18,7 @@
    The trim marker on this comment's closing delimiter drops the newline after it, because
    legacy had exactly one newline between `</h1>` and `<form>` and a blank line there renders as
    extra vertical space. -#}
-<form hx-post="/debug/query/run" hx-target="#query-results">
+<form hx-post="/debug/query/run" hx-target="#query-results" hx-headers="{{ csrf_headers }}">
 <label>Mode:
 <select name="mode">
 <option value="retrieve">retrieve_memories</option>

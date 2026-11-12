@@ -7,7 +7,7 @@ Alexandria loads server config with this precedence:
    - `ALEXANDRIA_CONFIG` env var (explicit path override)
    - `$XDG_CONFIG_HOME/alexandria/config.toml` (default: `~/.config/alexandria/config.toml` on Linux, `~/Library/Application Support/alexandria/config.toml` on macOS)
    - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
-3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_EMBEDDING_BATCH_SIZE`, `ALEXANDRIA_EMBEDDING_MAX_TOKENS`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
+3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_SERVER_PUBLIC_ORIGIN`, `ALEXANDRIA_SERVER_LOOPBACK_DEVELOPMENT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_EMBEDDING_BATCH_SIZE`, `ALEXANDRIA_EMBEDDING_MAX_TOKENS`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
 
 ## Full Example
 
@@ -18,6 +18,8 @@ host = "127.0.0.1"            # HTTP bind address (default: "127.0.0.1")
 port = 3000                   # HTTP port (default: 3000)
 allowed_origins = ["*"]       # CORS origins; ["*"] disables validation (default: ["*"])
 allowed_hosts = ["*"]         # Allowed Host headers; ["*"] disables validation (default: ["*"])
+# public_origin = "https://memory.example.com"   # required when transport = "http"
+# loopback_development = false                    # drop `Secure` on cookies, loopback bind only
 sse_keep_alive_secs = 15      # SSE keep-alive interval in seconds (default: 15)
 
 [database]
@@ -71,8 +73,39 @@ escalation_hours = 48              # Project-targeted reminders escalate to glob
 | `host` | string | `"127.0.0.1"` | Bind address for HTTP mode. Use `"0.0.0.0"` to listen on all interfaces. |
 | `port` | u16 | `3000` | Port for HTTP mode. |
 | `allowed_origins` | string[] | `["*"]` | CORS allowed origins. `["*"]` disables origin validation. Set to specific origins (e.g. `["http://localhost:3000"]`) in production. |
-| `allowed_hosts` | string[] | `["*"]` | Allowed HTTP Host header values. `["*"]` disables host validation. |
+| `allowed_hosts` | string[] | `["*"]` | Allowed HTTP Host header values. Under a hosted origin this must contain the request `Host`, with or without its port; `["*"]` is accepted only by the legacy no-boundary debug build, which serves no data. |
+| `public_origin` | string | *none* | **Required when `transport = "http"`.** The `https` origin browsers actually reach, as `scheme://host[:port]` with no path, query, credentials or trailing slash — `https://memory.example.com`, or `https://example.com:8443`. It is the origin the debug UI's cookies are scoped to, the value an `Origin` header is compared against, and the thing the server refuses to guess. `http` is refused except on the loopback exception below. A missing or malformed value stops startup with a message naming the three keys to set. |
+| `loopback_development` | bool | `false` | The one exception to the `https` rule: session cookies are sent without `Secure` so a developer can sign in over plain `http` on `127.0.0.1`/`::1`/`localhost`. Honoured **only** when `host` is a loopback address — setting it with `host = "0.0.0.0"` is a startup error, not a warning, because the flag's whole meaning is "there is nobody between me and the browser". It never turns off the CSRF pair, the `Host` check or authentication. |
 | `sse_keep_alive_secs` | u64 | `15` | SSE keep-alive interval in seconds. Controls how often the server sends keep-alive pings on Streamable HTTP connections. |
+
+#### HTTP origins, hosts and what a proxy may not decide
+
+`transport = "http"` arms the browser boundary, and the three keys above are its whole configuration
+surface. The rules the server applies, and the ones operators most often get wrong:
+
+- **`public_origin` is mandatory, and it is not derived.** The server will not infer it from the bind
+  address, from a `Host` header, or from the absence of either. A wrong guess here is not cosmetic:
+  cookies scoped to an origin the browser did not use are either dropped (nobody can sign in) or sent to
+  a host the operator did not choose (every signed-in page is a cross-origin read for someone else).
+- **`allowed_origins` must contain `public_origin` exactly.** Origin comparison is scheme, host and port
+  together; `https://example.com` and `https://example.com:443` are the same origin and the check knows
+  it, but `http://example.com` is not.
+- **`allowed_hosts` must contain the request `Host`.** Entries match with or without the port. A request
+  with no `Host` header at all is refused once the boundary is armed — including by `curl`, which sends
+  one; the refusal is the DNS-rebinding defence (S1 in `docs/security-findings.md`), and it holds even
+  when the port is bound to loopback.
+- **Forwarded headers are never consulted.** `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-For`
+  and `Forwarded` cannot establish the origin, the host, or the loopback exception, because any client
+  that can reach the port can set all four. TLS terminates at the reverse proxy you configure; the
+  server's view of the origin is the one you wrote in `public_origin`, and nothing a request carries can
+  override it. If the proxy rewrites `Host` instead of passing it through, put the rewritten value in
+  `allowed_hosts` — the boundary checks the header it will actually receive.
+- **`stdio` needs none of this.** There is no browser, no origin and no cookie in stdio mode, so
+  `public_origin` is not read and the boundary is never armed.
+- **A fresh store cannot self-bootstrap over HTTP.** Accounts are created by invitation from an existing
+  administrator, so the first account and the first administrator arrive through the operator command,
+  not through `/debug/login`. An empty store served over HTTP is reachable and correctly says it cannot
+  sign anybody in.
 
 ### `[database]`
 
@@ -186,6 +219,20 @@ Controls automatic cluster assignment, splitting, and merging. The cadences them
 
 The background housekeeping scheduler: **one loop, five independently-due jobs**. HTTP mode only —
 stdio has no long-lived process to run a clock in, so nothing here applies to a stdio server.
+
+**Temporary split/merge boundary on owned data:** the legacy `cluster` and `merge` jobs only
+select clusters whose records and complete physically retained populations have no account,
+workspace, scope, or project markers. Deleted and quarantined members still participate in this
+eligibility check. Missing targets and partial ownership fail closed. Storage rechecks eligibility
+at the split/merge entry points before any child cluster, membership, centroid, deletion, or audit
+write; an earlier candidate selection is not authorization to mutate a now-owned population.
+Eligible unowned maintenance remains enabled. Owned/mixed split and merge are deferred until
+account-scoped maintenance is implemented; changing thresholds does not override this gate.
+
+This is a supported-writer application boundary, not predicate/phantom locking against arbitrary
+privileged database writes or concurrent ownership rewrites. Ownership migration remains offline.
+Other housekeeping jobs are unchanged by this gate; it is not a claim that the complete multi-user
+maintenance rollout is finished.
 
 Each job carries its own interval and its own last-run stamp, so one job failing or running long
 affects only itself. A process that was down for three intervals catches up with **one** run of each
@@ -308,6 +355,8 @@ These env vars override individual config values after the TOML file is loaded:
 | `ALEXANDRIA_SERVER_TRANSPORT` | `server.transport` (`"stdio"` or `"http"`) |
 | `ALEXANDRIA_SERVER_HOST` | `server.host` |
 | `ALEXANDRIA_SERVER_PORT` | `server.port` — a non-numeric value fails startup with an error naming the variable |
+| `ALEXANDRIA_SERVER_PUBLIC_ORIGIN` | `server.public_origin` — the published `https` origin the debug UI is bound to. Required for `transport = "http"` by the validator, whichever way the value arrived |
+| `ALEXANDRIA_SERVER_LOOPBACK_DEVELOPMENT` | `server.loopback_development` (`true`/`1` enable) — the loopback-only `Secure`-cookie exception |
 | `ALEXANDRIA_DATA_DIR` | `database.data_dir` |
 | `ALEXANDRIA_EMBEDDING_MODEL` | `embedding.model` |
 | `ALEXANDRIA_EMBEDDING_DEVICE` | `embedding.device` |

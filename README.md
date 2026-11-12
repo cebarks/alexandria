@@ -8,7 +8,7 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 - **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool. Heat is recorded on retrieval but is not yet a ranking input — retrieval still ranks by cosine similarity (see [`A2`](docs/performance-and-ability-findings.md#a2-the-heat-model-is-inert)).
 - **Spreading activation** — Accessing a memory warms its graph neighbors. Heat propagates along edges with configurable decay.
 - **Graph edges** — Memories link via `derived_from` and `extracted_from` edges. `relates_to`, `supports` and `contradicts` exist in the schema but nothing in production writes them yet; auto-linking them is planned v0.3 work
-- **Hierarchical clustering** — Automatic cluster assignment on store, plus a background housekeeping scheduler that splits, merges, collapses byte-identical duplicates and lowers the confidence of memories that have gone cold without ever being retrieved, all with a queryable audit log that one `alexandria dream` pass can be reviewed (or run on demand) against
+- **Hierarchical clustering** — Automatic cluster assignment on store, plus a background housekeeping scheduler that splits, merges, collapses byte-identical duplicates and lowers the confidence of memories that have gone cold without ever being retrieved, all with a queryable audit log that one `alexandria dream` pass can be reviewed (or run on demand) against. Legacy split/merge currently skips owned or mixed populations pending scoped maintenance ([details](docs/configuration.md#dreaming)).
 - **Progressive recall** — Two-phase retrieval: broad cluster matching first, then scope-narrowing within a cluster
 - **Session memory** — Group memories by conversation, search within a session, and close it out with a summary
 - **Document import** — Chunk by heading, paragraph, or fixed size with batch tracking and `extracted_from` lineage
@@ -104,19 +104,23 @@ for that invocation only, without touching the config file.
 
 | Tool | Description |
 | ------ | ------------- |
-| `store_memory` | Store text with auto-embedding, clustering, and heat initialization; optional `session_id` to group it. Returns `truncated: true` when the text is longer than `embedding.max_tokens`, meaning only its head is searchable |
-| `retrieve_memories` | Semantic similarity search with spreading activation on top results; optional `session_id` to scope |
-| `recall` | Progressive two-phase recall: broad cluster scan → focused scope narrowing |
+| `store_memory` | Store text with auto-embedding, clustering, and heat initialization; optional `session_id` to group it, plus `scope` (`personal`/`project`) with `project`/`context_project` to choose where it lands — a hosted request that names neither is refused before anything is embedded. Returns `truncated: true` when the text is longer than `embedding.max_tokens`, meaning only its head is searchable, and `scope` to confirm where the row went |
+| `retrieve_memories` | Semantic similarity search with spreading activation on top results; optional `session_id` to narrow within the scope, plus `scope` (`auto`/`personal`/`project`/`assigned`) and `project` to choose which partitions are searched. The response reports the selection that actually ran as `scope` — a label, never a partition handle |
+| `recall` | Progressive two-phase recall: broad cluster scan → focused scope narrowing; takes the same `scope`/`project` selection as `retrieve_memories` and applies the same population predicate to cluster members, reporting the selection it ran as `scope` |
 | `update_memory` | Update content/tags/confidence; content changes re-embed and create lineage |
-| `import_document` | Import and chunk documents with `extracted_from` edge tracking |
+| `import_document` | Import and chunk documents with `extracted_from` edge tracking; takes the same `scope`/`project`/`context_project` target, refused before the batch is embedded when a hosted request names none |
 | `delete_memory` | Soft-delete a memory by ID |
-| `get_session` | Return a session's metadata plus every memory stored during it |
-| `list_sessions` | List sessions newest-first with live memory counts; filter by `agent_id`, `tag`, or `finalized` |
+| `get_session` | Return a session's metadata plus the memories stored during it, inside the population selected by `project`; `view: "archive"` is the deliberate whole-session read that also returns the account-private summary and tags |
+| `list_sessions` | List sessions newest-first with live memory counts restricted to the population selected by `project`; filter by `agent_id` or `finalized`, and by `tag` only in `view: "archive"` |
 | `finalize_session` | Close a session with a summary, tags, and `ended_at` |
 | `set_reminder` | Schedule a one-shot (`due_at`) or recurring (named pattern / cron) reminder; response previews the next fire times |
 | `check_reminders` | Deliver due reminders and mark them consumed (global, project-matching, or escalated) |
 | `list_reminders` | List scheduled reminders by status and target project, oldest-due first, paginated |
 | `cancel_reminder` | Soft-cancel a reminder by ID |
+| `resolve_project` | Establish which project the current work belongs to from a sanitized origin remote or a project name/ID, and return the opaque project ID to use as `context_project`; the only tool that can create a project, so no agent guesses a partition into existence |
+| `list_projects` | List the projects you own with live memory counts, paged by opaque cursor (default 20, max 100); never names another workspace's project, not even by existence |
+| `list_unassigned_memories` | Enumerate the Unassigned partition for owner review, paged by cursor; the response says plainly that these rows are review state and are in no recall path, which is the point of the partition |
+| `propose_memory_scope` | Propose where a memory belongs, naming the revision it was read at (1–20 per call). Records a pending proposal and moves nothing: only the owner's decision, made later, changes a memory's scope |
 
 Tool and parameter descriptions are written directively ("call this proactively when…") because
 that measurably changes how often client LLMs reach for them unprompted.
@@ -182,71 +186,154 @@ for what they are and how to install them.
 ## Debug Web UI
 
 When `transport = "http"`, a debug web UI is served alongside the MCP endpoint at
-`http://<host>:<port>/debug`. It is **read-only except for one disclosed exception**: the Query
-Tester's non-dry `retrieve` run performs spreading activation, so it writes heat exactly as a real
-`retrieve_memories` call does. Tick **Dry run** for a strictly read-only probe that writes nothing.
+`http://<host>:<port>/debug`. It is **authenticated**: every page and every JSON endpoint belongs to the
+signed-in account, and shows only that account's own memories, sessions, clusters, graph and query
+results. It is **read-only except for one disclosed exception**: the Query Tester's non-dry `retrieve`
+run performs spreading activation, so it writes heat exactly as a real `retrieve_memories` call does.
+Tick **Dry run** for a strictly read-only probe that writes nothing.
 
-- **Dashboard** (`/debug`) — record counts (facts active/deleted, clusters, edges, raw documents,
-  sessions), the **effective configuration** the server is actually running with (retrieval floor,
-  activation knobs, cluster and heat thresholds, the dreaming scheduler's cadences, live embedding
-  model and dimensions) shown alongside
+### Signing in, and what an account can see
+
+`/debug/login` is the only unauthenticated page that reaches data — and it reaches none. Login,
+invitation redemption and password recovery are the three public pages; each carries a short-lived,
+single-use token issued with the page, so a bookmarked form cannot be replayed, and none of them is a
+session. Signing in sets two cookies: `alexandria_session` (the credential) and `alexandria_csrf`
+(the value every mutation must echo back). Both are `HttpOnly`, `SameSite=Lax`, `Path=/`, and `Secure`
+unless the deployment is running under the explicit loopback-development exception below.
+
+**Every mutation on this server requires the CSRF pair** — the Query Tester's run, sign-out, token
+issue and revoke, invitation creation (administrators) and recovery creation, and suspension. The guard,
+not the handler, is the single authority for that, and it is what the paragraph below used to lean on
+`Sec-Fetch-Site` alone for. An account can also mint and revoke its own agent tokens from
+`/debug/account`, which is the same credential surface the MCP `Authorization` header consumes.
+
+- **Account** (`/debug/account`) — the signed-in account's own credentials: browser sessions and agent
+  tokens by label and creation time, with revoke, plus a recovery link for **this** account's password.
+  A newly minted token's or link's secret is shown **once**, in the response that created it; afterwards
+  the page lists the label and its last-used time, never the value. Creating an invitation is not
+  here — see Admin
+- **Admin** (`/debug/admin`, administrators only) — the account table: status, role, credential and
+  memory counts, and the actions that suspend, activate, invite and reset. An ordinary owner gets
+  `403` here, and the capability that gates it is a type the storage layer only issues after re-reading
+  `account.role`, so a demotion cannot be outrun by a page rendered while the account still had it
+- **Maintenance** (`/debug/maintenance`, administrators only) — the scheduler's **aggregate** health:
+  one row per `run_id` with its jobs, the action verbs it ran and how many rows each touched. No record
+  identities, no stored values and no per-row dispositions — a disposition lives in the audit table, not
+  on this page. See the note under the page list below for why this replaced the per-row audit page
+
+An administrator's own memories, sessions and clusters are read through the same owner-scoped path as
+anybody else's: `AdminCapability` authorizes account management and nothing else, and there is no
+route on this server that lists another account's content.
+
+Two consequences of that boundary are deliberate and worth stating before they surprise anyone:
+
+- **A fresh, empty store cannot create its first account or administrator through the browser.**
+  Enrollment is invitation-only, and an invitation needs an administrator. The operator command that
+  bootstraps the first account is the deployment step that comes next; until it exists, a new store's
+  debug UI is reachable only as the page that says it cannot sign anybody in. Nothing about stdio,
+  loopback, a `Host` header or the absence of accounts grants authority — authority comes from a
+  credential and nothing else.
+- **Owner-facing per-record history is not on this page yet.** The rows the old audit page listed still
+  exist in `maintenance_log`, and the rows written before attribution landed carry no `run_id`, no
+  `job` and no actor; they are counted into an "unattributed" group rather than shown to a browser role
+  as record identities, because revealing which memories the scheduler collapsed is another account's
+  content seen through an operator's page. A per-record history for owners is the next surface, over the
+  operation journal.
+
+### The pages
+
+- **Dashboard** (`/debug`) — the caller's own record counts (facts active/deleted, clusters, edges, raw
+  documents, sessions), the **effective configuration** the server is actually running with (retrieval
+  floor, activation knobs, cluster and heat thresholds, the dreaming scheduler's cadences, live
+  embedding model and dimensions) shown alongside
   what the TOML asked for, rollups for cluster health, sessions finalized/idle, top tags and heat
-  distribution, and the schema version — applied versus compiled-in, with a mismatch called out
-- **Memories** (`/debug/memories`) — paginated, sortable search/filter of facts by content and tag,
-  with **include deleted** and **include quarantined** checkboxes; click through to a detail view
-  showing heat, stability, timestamps, cluster membership, and graph edges. Quarantine is off by
-  default so the page matches what an agent can retrieve, and this is the operator view for a memory
-  on that middle rung — hidden from every retrieval path, still present, still reversible. Nothing
-  in the UI can put a row into quarantine or take it out
-- **Clusters** (`/debug/clusters`) — cluster list with live member counts and depth; drill into
+  distribution, and the schema version — applied versus compiled-in, with a mismatch called out. Every
+  number is the signed-in population's, not the store's: this page used to call `stats::gather`, which
+  counted every account's rows into one operator's summary
+- **Memories** (`/debug/memories`) — paginated, sortable search/filter of **the caller's** facts by
+  content and tag, with **include deleted** and **include quarantined** checkboxes; click through to a
+  detail view showing heat, stability, timestamps, cluster membership, and graph edges. Quarantine is
+  off by default so the page matches what an agent can retrieve, and this is the operator view for a
+  memory on that middle rung — hidden from every retrieval path, still present, still reversible.
+  Nothing in the UI can put a row into quarantine or take it out. A detail id that belongs to somebody
+  else answers `404` exactly as an absent one does, which is the point: a distinguishable answer would
+  be a way to test which record ids exist
+- **Clusters** (`/debug/clusters`) — the caller's clusters with live member counts and depth; drill into
   `/debug/clusters/{id}` for member facts and cohesion. Cohesion is computed from each cluster's stored
   centroid, on the detail page and in the dashboard rollup alike, so the verdict matches what
-  the background maintenance task will actually act on
-- **Sessions** (`/debug/sessions`) — every session with agent, model, derived memory count, start and
-  last-activity times, and a finalized/active badge; `/debug/sessions/{external_id}` shows the
-  summary, tags, and the session's memories. Keyed by the `external_id` you pass to `store_memory(session_id)`
-- **Graph** (`/debug/graph/{id}`) — visualizes a memory's local edge neighborhood: nodes labelled with
-  content snippets rather than raw record ids (full id and hop distance in the tooltip), colour and
-  shape by table, edges styled by `edge_type` with strength banded into width, a legend generated from
-  those same maps, and click-through to the memory detail page. `?hops=1..3` sets the radius, clamped
-  server-side; the view caps at 200 nodes and says so when it truncates rather than rendering a
-  hairball. The backing JSON is at `/debug/api/graph/{id}`
-- **Maintenance log** (`/debug/maintenance`) — paginated history of the background scheduler's
-  writes: cluster splits and merges (source, resulting clusters, members moved), duplicate collapses
-  and cold-memory demotions, each carrying the `run_id` of the tick that wrote it, the job that ran,
-  the disposition and — for a demotion — the confidence it replaced. `?run=` narrows the whole page
-  to one run, which is how a pass gets reviewed as a unit or reversed as one; the run ids written by
-  `alexandria dream` start `run-cli-`, so a manual pass is separable from a scheduler tick in that
-  same filter. The filter is carried
-  across pagination, and the form is a GET to the same route (the panel stays read-only). The only way to audit *why* the corpus changed since you last
-  looked. The heat sweep deliberately writes nothing here: it changes ranking by nothing, so an audit
-  trail for it would be hundreds of rows an hour recording that nothing happened.
+  the background maintenance task will actually act on. A cluster the caller's population does not
+  contain is a `404`, including one whose row is gone but whose edges still carry member facts: those
+  edges hold other people's content, and labelling them would be the leak, not the diagnosis
+- **Sessions** (`/debug/sessions`) — the caller's sessions with agent, model, derived memory count,
+  start and last-activity times, and a finalized/active badge; `/debug/sessions/{external_id}` shows
+  the summary, tags, and the session's memories. Keyed by the `external_id` you pass to
+  `store_memory(session_id)`
+- **Graph** (`/debug/graph/{id}`, JSON at `/debug/api/graph/{id}`) — visualizes **one of the caller's**
+  memories' local edge neighborhood: nodes labelled with content snippets rather than raw record ids
+  (full id and hop distance in the tooltip), colour and shape by table, edges styled by `edge_type`
+  with strength banded into width, a legend generated from those same maps, and click-through to the
+  memory detail page. `?hops=1..3` sets the radius, clamped server-side; the view caps at 200 nodes and
+  says so when it truncates rather than rendering a hairball. Only edges whose **both** ends are inside
+  the caller's population are drawn, and the labels are read back through the same scoped repo that
+  produced the node list — a walk filtered by owner and labels fetched without that filter would put
+  another account's text on the canvas
+- **Maintenance** (`/debug/maintenance`, administrators only) — scheduler health as aggregates: runs
+  and what each did, with no fact, session or cluster identities and no content. This deliberately
+  replaced the pre-Task 9 page that listed every `maintenance_log` row across the whole store, because
+  those rows name records belonging to accounts that were never given an operator role, and the rows
+  written before attribution carries a `NONE` run id that cannot be shown to one owner without showing
+  it to all. An owner asking *why did my memory move* is answered by the operation journal, not here
 - **Query Tester** (`/debug/query`, `POST /debug/query/run`) — run `retrieve_memories`/`recall` live
-  against the real embedding model to sanity-check retrieval quality, with optional `session_id`
-  scoping and a **Dry run** checkbox. Results report the effective `min_similarity` floor, list what
+  against the real embedding model to sanity-check retrieval quality, from inside the signed-in
+  account's own population, with optional `session_id` scoping and a **Dry run** checkbox. Results
+  report the effective `min_similarity` floor, list what
   that floor dropped, whether spreading activation fired and on which top-N, and carry a measured
   score-band legend so a similarity number can be read without a ruler
 
 All browser assets (htmx, vis-network) are **vendored** into the binary and served from
-`/debug/assets/{name}`, so the UI loads nothing from a CDN and works fully air-gapped.
+`/debug/assets/{name}`, so the UI loads nothing from a CDN and works fully air-gapped. The asset
+allowlist is the only public surface besides the three auth pages, and it is a closed `match` over
+literal filenames, so traversal is impossible by construction.
 
-The debug UI has **no authentication** and is intended for a trusted network boundary (same
-posture as the unauthenticated MCP endpoint) — do not expose it on a public interface without
-putting a reverse proxy/auth layer in front of it. That tradeoff is defensible because nothing on
-the page mutates except the one disclosed heat write above; if a mutating route is ever added, this
-paragraph is the thing that has to change first.
+### Guards, and what they are for
 
-Two guards in `debug/guard.rs` narrow that boundary. Every non-`GET` request that arrives with
-`Sec-Fetch-Site: cross-site` or `cross-origin` is refused with `403`, so a hidden auto-submitting
-form on a page you visit cannot drive the Query Tester into writing heat on an attacker-chosen
-query — this check is unconditional and needs no configuration. Separately, **binding to loopback
-is not by itself a security boundary**: DNS rebinding lets a remote page resolve its own domain to
-`127.0.0.1` and then read `/debug/sessions` — session summaries and tags — as same-origin. Setting
-`allowed_hosts` in `[server]` now guards the debug UI as well as `/mcp`, accepting a `Host` either
-with or without its port, and requests with no `Host` at all are refused while it is armed. The
-Host half is opt-in, so the shipped default of `["*"]` behaves exactly as before; prefer setting
-`allowed_hosts` explicitly (for example `["localhost", "127.0.0.1"]`) over leaving the wildcard,
-especially when `host = "0.0.0.0"`.
+The debug UI is no longer a thing you must put a proxy in front of to make it safe to publish, but the
+proxy advice still applies to `/mcp`: an agent token is a bearer credential, and TLS terminates at the
+reverse proxy you configure. What the server enforces itself:
+
+- **Authentication is fail-closed.** `debug::router(server)` and `debug::router_with_context(server,
+  Some(ctx))` — the two builds that used to be "the debug UI, unauthenticated" — now serve the asset
+  allowlist and refuse **every** private route with `403` *before* any handler runs, so a route mounted
+  above the guard, or a router assembled without a boundary, cannot leak. The production build is
+  `router_secured(server, ctx, boundary)`, and `main.rs` is its only caller. A `403` here is a refusal,
+  not an error page: it renders no markup, so a page cannot be probed for which routes exist.
+- **`Host` and `Origin` are checked against the published origin.** Binding to loopback is not by
+  itself a security boundary: DNS rebinding lets a remote page resolve its own domain to `127.0.0.1` and
+  read `/debug/sessions` as same-origin. Under a secured build, `allowed_hosts` must contain the request
+  `Host` and `allowed_origins` must contain `server.public_origin` exactly; a request with no `Host` is
+  refused. The wildcard `["*"]` remains an option only for the legacy no-boundary build, which shows
+  nothing anyway.
+- **CSRF is a session property, not a header heuristic.** `Sec-Fetch-Site` is still read — a
+  cross-site or cross-origin *mutation* is refused outright, and the check is unconditional — but a
+  mutation now also needs the token that matches the caller's own session, in the `csrf` form field or
+  the `X-CSRF-Token` header. `OPTIONS` is not exempt: this router advertises no CORS configuration, so a
+  preflight here is the attack rather than a use case. A direct top-level navigation (`Sec-Fetch-Site:
+  none`) still needs the token too, which is why a cross-site form cannot reach the Query Tester's heat
+  write even with `Lax` cookies present.
+- **Private and auth-page responses carry `no-store`**, so a shared machine's cache cannot hold another
+  account's memory text.
+- **Sessions expire on idle**, and an agent token's revocation is noticed on the next request rather
+  than at some later reconnect, because the guard re-reads the live rows through the same `AuthService`
+  that `/mcp` admits through.
+
+Set `server.public_origin` to the `https` origin the UI is published at. Refusing to start without it —
+rather than booting a browser-facing server on an inferred origin — is the point of the check;
+`server.loopback_development = true` is the one exception, and it is honoured only on a loopback bind.
+`[server] allowed_hosts` and `allowed_origins` must cover that origin, and see
+[docs/configuration.md](docs/configuration.md) for the exact rules and the failure messages. Forwarded
+headers are never consulted: `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-For` and `Forwarded`
+cannot establish the origin, the host, or the loopback exception, because a client that can reach the
+port can set all four.
 
 ## Deployment
 
@@ -327,8 +414,10 @@ The image defaults to HTTP transport on `0.0.0.0:3000` via `ALEXANDRIA_SERVER_*`
 
 Override config per-container with env vars (see [docs/configuration.md](docs/configuration.md)) or
 mount a TOML file and point `ALEXANDRIA_CONFIG` at it. Note the server binds `0.0.0.0` in the
-image and the MCP endpoint plus debug UI are unauthenticated — publish the port only behind a
-reverse proxy or on a trusted network. The debug UI needs no outbound network: its browser assets are
+image and the **MCP endpoint is authenticated by bearer token while the debug UI is authenticated by
+account session** — publish the port only behind a reverse proxy that terminates TLS, because the token
+and the session cookie both travel as bearer secrets and `server.public_origin` must name the `https`
+origin clients actually reach. The debug UI needs no outbound network: its browser assets are
 vendored into the binary, so a container with no egress still renders it (the first-run HuggingFace
 model download is the only thing that still needs the internet).
 

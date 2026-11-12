@@ -1,0 +1,15 @@
+{% extends "layout.html" %}
+{% block title %}Session archive{% endblock %}
+{% block body %}<h1>Session archive</h1>
+<p>The whole-session read of your own history: what each session was summarized as, and which tags you gave it. This is the <em>only</em> page that shows that prose, and it is here because you asked for it — a project's own view never carries it, since a session can span partitions and one partition's list must not speak for the others.</p>
+{% if let Some(note) = note %}<p class="badge">{{ note }}</p>{% endif %}
+{% if let Some(error) = error %}<p class="badge">Not applied: {{ error }}</p>{% endif %}
+{% if truncated %}<p class="muted">Showing the most recent page only; older sessions are reachable from <a class="link" href="/debug/sessions">Sessions</a>.</p>{% endif %}
+<table>
+<tr><th>Session</th><th>Agent</th><th>Ended</th><th>Live memories</th><th>Partitions now</th><th>Summary</th><th>Tags</th></tr>
+{% if sessions.is_empty() %}<tr><td colspan="7" class="empty">Nothing archived — no session of yours carries a summary yet.</td></tr>{% endif %}
+{% for row in sessions %}<tr><td>{{ row.external_id }}</td><td>{{ row.agent }}</td><td>{{ row.ended }}</td><td>{{ row.live_memory_count }}</td><td>{% if row.mixed %}<span class="badge">mixed — {{ row.scopes }}</span>{% else %}{{ row.scopes }}{% endif %}</td><td>{{ row.summary }}</td><td>{{ row.tags }}</td></tr>
+{% endfor %}</table>
+<p class="muted">The count is memories still live in your corpus. A soft-deleted or quarantined memory still belongs to the session and still counts as historical, so a session can show prose about rows no recall path reaches.</p>
+<p><a class="link" href="/debug/collections">Back to collections</a></p>
+{% endblock %}

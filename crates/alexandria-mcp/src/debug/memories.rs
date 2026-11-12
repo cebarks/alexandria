@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 
 use super::html::{self, error_page, page, unavailable};
+use super::web::{Boundary, BrowserSession};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 use alexandria_storage::repos::{DEFAULT_FACT_LIST_LIMIT, FactListQuery, FactSort, SortDir};
@@ -253,8 +254,10 @@ struct MemoriesTemplate {
     sorts: SortLinks,
 }
 
-pub async fn list(
-    State(server): State<AlexandriaServer>,
+pub(crate) async fn list(
+    server: State<AlexandriaServer>,
+    boundary: Boundary,
+    session: BrowserSession,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     // `Option<&str>` rather than the `Option<&String>` the map hands back, because every consumer
@@ -290,7 +293,14 @@ pub async fn list(
     let sort = parse_sort(params.get("sort"));
     let dir = parse_dir(params.get("dir"));
 
-    let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
+    // The caller's own population, resolved from the session the guard authenticated: the account and
+    // partition predicates are in the statement before `LIMIT`, so this is a page of *this owner's*
+    // facts rather than a global page trimmed afterwards, and the total below counts the same
+    // population the rows came from.
+    let Ok((owner, read)) = boundary.corpus(&session).await else {
+        return page_with_status(403, "this page requires an authenticated owner session");
+    };
+    let repo = alexandria_storage::repos::ScopedMemoryRepo::new(server.db.inner(), &owner, &read);
     // One filter value feeds the page, its total, and every href on it, so the count above the
     // table cannot disagree with the rows under it and a sort or pagination hop cannot drop the
     // operator's view. Quarantine is opt-in and read-only: this page is the operator view #43
@@ -303,7 +313,7 @@ pub async fn list(
         include_quarantined,
     };
     let filter = filters.query(sort, dir, limit, offset);
-    let rows = match repo.list(&filter).await {
+    let rows = match repo.page(&filter).await {
         Ok(r) => r,
         Err(e) => return error_page("memories", &e.to_string()),
     };
@@ -439,32 +449,48 @@ struct MemoryDetailTemplate {
     metadata: Option<String>,
 }
 
-pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<String>) -> Response {
-    let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
-    let fact = match repo.get_fact(&id).await {
+pub(crate) async fn detail(
+    State(server): State<AlexandriaServer>,
+    boundary: Boundary,
+    session: BrowserSession,
+    Path(id): Path<String>,
+) -> Response {
+    let Ok((owner, read)) = boundary.corpus(&session).await else {
+        return page_with_status(403, "this page requires an authenticated owner session");
+    };
+    let repo = alexandria_storage::repos::ScopedMemoryRepo::new(server.db.inner(), &owner, &read);
+    // A foreign id and an absent id are one 404: `get_fact` answers through the caller's population,
+    // so "not yours" is indistinguishable from "not there" — which is the equivalence the scoped reads
+    // were built to provide, on the page where a distinguishable answer would be a probe.
+    let Ok(handle) = surrealdb::types::RecordId::parse_simple(&id) else {
+        return memory_not_found();
+    };
+    let fact = match repo.get_fact(&handle).await {
         Ok(Some(f)) => f,
         Ok(None) => {
             // The detail page has always answered a missing id with 404, so keep the status
             // rather than taking `error_page`'s 200.
-            let mut response = error_page("memories", "Memory not found.");
-            *response.status_mut() = StatusCode::NOT_FOUND;
-            return response;
+            return memory_not_found();
         }
         // A data-layer failure keeps the 500 this page has always returned, but through the shared
         // helper rather than a hand-inlined `status_mut`.
         Err(e) => return unavailable("memories", "memory", e),
     };
 
-    let heat_repo = alexandria_storage::repos::HeatRepo::new(server.db.inner());
-    let heat = heat_repo.get(&id).await.ok().flatten().map(|h| HeatView {
-        heat: format!("{:.3}", h.heat),
-        stability: format!("{:.3}", h.stability),
-        access_count: h.access_count,
-        last_touched: html::format_dt(h.last_touched),
-    });
+    let heat = repo
+        .heat_of(&handle)
+        .await
+        .ok()
+        .flatten()
+        .map(|h| HeatView {
+            heat: format!("{:.3}", h.heat),
+            stability: format!("{:.3}", h.stability),
+            access_count: h.access_count,
+            last_touched: html::format_dt(h.last_touched),
+        });
 
     let cluster = repo
-        .cluster_for_fact(&id)
+        .cluster_of(&handle)
         .await
         .ok()
         .flatten()
@@ -473,12 +499,13 @@ pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<Strin
             id: c.id.as_ref().map(record_id_to_string).unwrap_or_default(),
         });
 
-    let edge_repo = alexandria_storage::repos::EdgeRepo::new(server.db.inner());
-    let edges = edge_repo
-        .get_edges_for(&id)
+    // Edges are drawn only where the *other* end is also the caller's to read: a line to a foreign
+    // row would name it.
+    let edges = repo
+        .edges_of(&handle)
         .await
         .unwrap_or_default()
-        .iter()
+        .into_iter()
         .map(|e| EdgeView {
             edge_type: e.edge_type.clone(),
             in_id: e
@@ -517,8 +544,25 @@ pub async fn detail(State(server): State<AlexandriaServer>, Path(id): Path<Strin
     })
 }
 
+/// The one 404 an unreadable-by-this-caller memory id gets, whether it is absent, foreign, or not a
+/// `fact` handle at all.
+fn memory_not_found() -> Response {
+    let mut response = error_page("memories", "Memory not found.");
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response
+}
+
+/// A refusal rendered as a page rather than the guard's plain text, for a handler that got past the
+/// guard but could not resolve its caller's population.
+fn page_with_status(status: u16, message: &str) -> Response {
+    let mut response = error_page("memories", message);
+    *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
+    response
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::HOST_HEADER;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -536,11 +580,15 @@ mod tests {
         .await
         .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/memories")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -571,11 +619,15 @@ mod tests {
         .await
         .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/memories")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -616,11 +668,15 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/memories?search=apple")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -650,10 +706,19 @@ mod tests {
             .unwrap();
         heat_repo.create_for_memory(&id, 1.5).await.unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -678,10 +743,19 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -715,11 +789,15 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/memories?limit=2&offset=0")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -758,11 +836,15 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/memories?limit=2&offset=2")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -787,11 +869,15 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/memories")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -824,11 +910,15 @@ mod tests {
             .unwrap();
         repo.soft_delete_fact(&id).await.unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/memories?include_deleted=true")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -853,10 +943,19 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -867,6 +966,7 @@ mod tests {
             text.contains("/debug/memories"),
             "expected back link to memories list"
         );
+        std::fs::write("/tmp/t9-detail.html", &text).unwrap();
         assert!(text.contains("Back"), "expected Back text in link");
     }
 
@@ -880,10 +980,19 @@ mod tests {
             .unwrap();
         repo.soft_delete_fact(&id).await.unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -905,10 +1014,19 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -922,26 +1040,23 @@ mod tests {
     #[tokio::test]
     async fn test_memory_detail_cluster_is_a_link() {
         let server = super::super::test_support::test_server().await;
-        let repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
-        let cluster_repo = alexandria_storage::repos::ClusterRepo::new(server.db.inner());
-
-        let fact_id = repo
-            .create_fact("linked cluster test", 0.5, &[0.1, 0.2], &[])
-            .await
-            .unwrap();
-        let cluster_id = cluster_repo
-            .create(Some("my cluster"), &[0.1, 0.2])
-            .await
-            .unwrap();
-        cluster_repo
-            .add_member(&cluster_id, &fact_id)
-            .await
-            .unwrap();
-
-        let app = crate::debug::router(server);
+        // Seeded through the owner's own scoped writers rather than through the unscoped repos plus the
+        // fixture's adoption: this page's claim is about a *cluster the caller owns*, and a cluster that
+        // only became owned because a fixture stamped it is a weaker fixture than the one this test needs.
+        let fixture = super::super::test_support::authenticated_on_server(server).await;
+        let fact_id = fixture.seed_personal("linked cluster test").await;
+        let cluster_id = fixture.seed_cluster(Some("my cluster"), &[0.1, 0.2]).await;
+        fixture.add_cluster_member(&cluster_id, &fact_id).await;
+        let app = fixture.session_router();
         let uri = format!("/debug/memories/{}", fact_id.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -977,10 +1092,19 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/memories/{}", id_a.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1004,10 +1128,19 @@ mod tests {
             .await
             .unwrap();
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let uri = format!("/debug/memories/{}", id.replace(':', "%3A"));
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1023,11 +1156,15 @@ mod tests {
     #[tokio::test]
     async fn test_memory_detail_404_for_missing_id() {
         let server = super::super::test_support::test_server().await;
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/memories/fact%3Anonexistent")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1050,7 +1187,13 @@ mod tests {
     async fn body_of(app: &axum::Router, uri: &str) -> String {
         let response = app
             .clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200, "unexpected status for {uri}");
@@ -1131,7 +1274,10 @@ mod tests {
     async fn test_sort_orders_rows_by_the_requested_column() {
         let server = super::super::test_support::test_server().await;
         seed_sortable(&server).await;
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
 
         // confidence: 0.1 / 0.5 / 0.9 are distinct, so no tie-break is doing this work.
         let asc = body_of(&app, "/debug/memories?sort=confidence&dir=asc").await;
@@ -1180,7 +1326,10 @@ mod tests {
         // else would mean the fallback depends on what the junk looked like.
         let server = super::super::test_support::test_server().await;
         seed_sortable(&server).await;
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
 
         let plain = body_of(&app, "/debug/memories").await;
         for uri in [
@@ -1226,7 +1375,10 @@ mod tests {
         seed_sortable(&server).await;
         // The router takes the server by value, so it gets a clone: this test reads the table back
         // through `server` afterwards to prove the payload was inert rather than merely refused.
-        let app = crate::debug::router(server.clone());
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
+            fixture.session_router()
+        };
         let plain = body_of(&app, "/debug/memories").await;
 
         for uri in [
@@ -1370,7 +1522,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let needle = "50% #hash plus+ sign";
         let first = body_of(
             &app,
@@ -1427,7 +1582,10 @@ mod tests {
     async fn test_pagination_and_headers_carry_the_active_sort() {
         let server = super::super::test_support::test_server().await;
         seed_sortable(&server).await;
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
 
         let page = body_of(
             &app,
@@ -1484,7 +1642,10 @@ mod tests {
     async fn test_flipping_the_active_column_and_switching_columns() {
         let server = super::super::test_support::test_server().await;
         seed_sortable(&server).await;
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
 
         // Descending confidence: its header offers ascending.
         let page = body_of(&app, "/debug/memories?limit=20&sort=confidence&dir=desc").await;
@@ -1719,27 +1880,23 @@ mod tests {
 
     /// Storage failure ⇒ `html::UNAVAILABLE_STATUS`, asserted on bytes the handler produced.
     ///
-    /// Forced by handing the handler a database that was never migrated: the first repo call then
-    /// fails for real, with no mock and no change to `alexandria-storage`. The body assertion matters
+    /// Forced by removing the one table the detail read needs, on a store that *is* migrated: the
+    /// handler's repo call then fails for real, with no mock and no change to `alexandria-storage`.
+    /// (The pre-Task 9 injection was an unmigrated database, which the boundary now refuses before the
+    /// handler is reached — a page cannot be shown to fail on a store that cannot sign anybody in.) The body assertion matters
     /// as much as the status one — it is what proves this page goes through `html::unavailable`
     /// rather than re-inlining `error_page` plus a `status_mut` (the old `memories.rs` shape), which
     /// would keep the status identical and only change the wording.
     #[tokio::test]
     async fn test_memory_storage_failure_answers_with_the_one_status() {
-        let db = alexandria_storage::Database::connect_embedded()
-            .await
-            .unwrap();
-        let server = crate::AlexandriaServer::new(
-            std::sync::Arc::new(db),
-            std::sync::Arc::new(super::super::test_support::StubEmbedding),
-            0.75,
-            crate::server::HeatSettings::default(),
-        );
-        let app = crate::debug::router(server);
+        let fixture = super::super::test_support::authenticated_app(true).await;
+        fixture.drop_table("fact").await;
+        let app = fixture.session_router();
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/memories/fact:absent")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1803,9 +1960,24 @@ mod tests {
             .unwrap();
     }
 
+    /// One fixture per **test**, not per fetch: `authenticated_on_server` enrols a fresh owner and the
+    /// session router adopts unowned rows to *that* owner, so calling it twice would build two owners
+    /// and the second would see an empty corpus — a privacy assertion that passes because the fixture
+    /// was rebuilt, which is the vacuity this crate has already been warned about once.
+    ///
+    /// `server` is taken by value the first time; tests that fetch more than one page hold the router
+    /// from a single fixture instead via [`page_from`].
     async fn memories_page(server: crate::AlexandriaServer, uri: &str) -> String {
-        let app = crate::debug::router(server);
-        body_of(&app, uri).await
+        let fixture = super::super::test_support::authenticated_on_server(server).await;
+        body_of(&fixture.session_router(), uri).await
+    }
+
+    /// One fixture, several fetches.
+    async fn page_of(
+        fixture: &super::super::test_support::AuthenticatedTestApp,
+        uri: &str,
+    ) -> String {
+        body_of(&fixture.session_router(), uri).await
     }
 
     /// The operator view #43 promises: a quarantined memory is invisible by default, because the
@@ -1923,8 +2095,9 @@ mod tests {
         repo.soft_delete_fact(&id).await.unwrap();
         quarantine(&server, &id).await;
 
-        let page = memories_page(
-            server.clone(),
+        let fixture = super::super::test_support::authenticated_on_server(server.clone()).await;
+        let page = page_of(
+            &fixture,
             "/debug/memories?include_deleted=true&include_quarantined=true",
         )
         .await;
@@ -1935,6 +2108,122 @@ mod tests {
         assert!(
             !page.contains(r#"class="deleted""#),
             "and the row does not carry both classes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod boundary {
+    //! The debug pages as a second owner sees them. The pre-Task 9 suites could not express this at
+    //! all — every request was the whole store — so "the page is scoped" is a new claim, and these
+    //! cases are where it is pinned for the memories surface. `web_auth_test` proves the same
+    //! property through the HTTP stack end to end; this proves the *handlers* do not fall back to
+    //! the unscoped repos when the router is assembled by a suite rather than by `main.rs`.
+    use crate::debug::test_support as support;
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn the_list_page_shows_one_owners_rows_and_not_the_others() {
+        let server = crate::debug::test_support::test_server().await;
+        let alice = support::authenticated_on_server(server.clone()).await;
+        let bob = alice.second_owner("debug-fixture-second").await;
+
+        let alice_fact = alice.seed_personal("alice-only-marker").await;
+        let bob_fact = bob.seed_personal("bob-only-marker").await;
+
+        let (status, page) = alice.get("/debug/memories").await;
+        assert_eq!(status, StatusCode::OK, "{}", support::clip(&page));
+        assert!(
+            page.contains(&alice_fact),
+            "the owner's own row is missing: {}",
+            support::clip(&page)
+        );
+        assert!(
+            !page.contains(&bob_fact) && !page.contains("bob-only-marker"),
+            "a second owner's row was listed: {}",
+            support::clip(&page)
+        );
+
+        // The same page, from the other side: the claim is about the population, not about which
+        // fixture asked first.
+        let (status, bobs_page) = bob.get("/debug/memories").await;
+        assert_eq!(status, StatusCode::OK, "{}", support::clip(&bobs_page));
+        assert!(
+            bobs_page.contains(&bob_fact) && !bobs_page.contains(&alice_fact),
+            "the second owner saw the first owner's row: {}",
+            support::clip(&bobs_page)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_id_is_the_same_404_as_an_absent_one() {
+        let server = crate::debug::test_support::test_server().await;
+        let alice = support::authenticated_on_server(server.clone()).await;
+        let bob = alice.second_owner("debug-fixture-second").await;
+        let bob_fact = bob.seed_personal("bob-private-content").await;
+
+        let foreign = format!("/debug/memories/{}", bob_fact.replace(':', "%3A"));
+        let (foreign_status, foreign_body) = alice.get(&foreign).await;
+        let (absent_status, absent_body) = alice.get("/debug/memories/fact%3Anever-existed").await;
+        assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            absent_status, foreign_status,
+            "a foreign id is distinguishable from an absent one"
+        );
+        assert!(
+            !foreign_body.contains("bob-private-content"),
+            "the detail page rendered another owner's content: {}",
+            support::clip(&foreign_body)
+        );
+        assert_eq!(
+            absent_body.matches("Memory not found").count(),
+            foreign_body.matches("Memory not found").count(),
+            "the two refusals do not read alike"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_anonymous_and_no_context_builds_reach_no_rows() {
+        // The fail-closed half, at this suite's own level: an unsigned request and the legacy
+        // `router(server)` build both answer without a single row, so no page is reachable by a
+        // caller the boundary did not authenticate.
+        let server = crate::debug::test_support::test_server().await;
+        let alice = support::authenticated_on_server(server.clone()).await;
+        let marker = alice.seed_personal("leak-marker").await;
+
+        let (status, body) = alice.get_anonymous("/debug/memories").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "an unsigned read succeeded");
+        assert!(
+            !body.contains(&marker) && !body.contains("leak-marker"),
+            "the anonymous read reached the corpus: {}",
+            support::clip(&body)
+        );
+
+        let legacy = support::no_context_router().await;
+        let response = tower::ServiceExt::oneshot(
+            legacy,
+            axum::http::Request::builder()
+                .uri("/debug/memories")
+                .header(axum::http::header::HOST, support::HOST)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let legacy_status = response.status();
+        let legacy_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let legacy_body = String::from_utf8_lossy(&legacy_body).into_owned();
+        assert_eq!(
+            legacy_status,
+            StatusCode::FORBIDDEN,
+            "the legacy build served a private page"
+        );
+        assert!(
+            !legacy_body.contains("leak-marker"),
+            "the no-context build served corpus content: {}",
+            support::clip(&legacy_body)
         );
     }
 }

@@ -67,10 +67,16 @@ session page 1 showed while silently dropping another.
 
 | Tool | Session behavior |
 | --- | --- |
-| `store_memory` | Optional `session_id`. Auto-creates the session and relates the new fact to it. |
-| `retrieve_memories` | Optional `session_id` scopes the candidate set to that session's facts before ranking. |
-| `get_session` | Takes `session_id`; returns session metadata plus every linked memory (id, content, tags, confidence, `created_at`), ordered oldest first. The reported `memory_count` is the length of that live list, not a stored column. Errors if the id is unknown. |
-| `list_sessions` | All optional: `agent_id`, `tag`, `finalized` (`true` = has a summary, `false` = open), `limit` (default 20), `offset`. Returns sessions newest-first by `started_at`, each with the same metadata block as `get_session` and a live non-deleted `memory_count`, in one query. |
+| `store_memory` | Optional `session_id`. Auto-creates the session and relates the new fact to it. The create is a guarded write: if the caller's credential is revoked between claim and commit, the transaction conflicts and no session row appears. |
+| `retrieve_memories` | Optional `session_id` narrows the candidate set to that session's facts before ranking. It narrows, it does not widen: the rows are read through the caller's **resolved partitions**, so an `auto` read with no project over a session that also holds project rows answers with the personal ones. |
+| `get_session` | Takes `session_id`, plus `project` and `view` — there is no `scope` parameter on either session tool. Default `view: "scoped"` returns the session's memories (id, content, tags, confidence, `created_at`) **inside the resolved population**, oldest first, with `summary` and `tags` withheld and `memory_count` counted in that same population. `view: "archive"` is the deliberate whole-session read: the owner's own prose included, across the owned scopes, and no memory body at all. Errors if the id is unknown, and an unknown id — including somebody else's — answers the same way. |
+| `list_sessions` | All optional: `view`, `project`, `agent_id`, `tag`, `finalized` (`true` = has a summary, `false` = open), `limit` (default 20), `offset`. Returns sessions newest-first by `ended_at` (then `external_id`, the tie-break that makes the order total — see above), each with a live non-deleted `memory_count` counted inside the resolved population. `tag` is accepted only with `view: "archive"`; asking a scoped page to filter by prose it does not expose is refused rather than quietly answered with nothing. |
+
+`view` is a separate decision from `session_id`, and that is the point: a caller who can name a
+session is not thereby entitled to the account-private summary written about it. Passing an id is
+not archive access — `archive` is an explicit parameter, and the scoped default withholds `summary`
+and `tags` by not projecting the columns at all (withholding on the decoded row as well, because
+`SessionListItem` cannot decode a row missing `tags`).
 | `finalize_session` | Takes `session_id` and optional `summary` / `tags`; sets `ended_at = time::now()` plus whichever fields were supplied. Errors if the id is unknown. |
 
 Both `Option` fields on `finalize_session` are genuinely optional: calling it with only

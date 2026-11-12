@@ -1,8 +1,7 @@
-use super::scope_handle::ScopeHandle;
+use super::scope_handle::RecallHandle;
 use crate::clusters::ClusterInfo;
 use crate::search::{cosine_similarity, rank_by_similarity};
-
-use std::time::{SystemTime, UNIX_EPOCH};
+use alexandria_storage::models::ClusterVersion;
 
 /// A memory's summary for recall results.
 #[derive(Debug, Clone)]
@@ -14,10 +13,18 @@ pub struct FactSummary {
 }
 
 /// A cluster with its member facts loaded.
+///
+/// `version` is what the caller's own read saw about this cluster — its stored membership guard and the
+/// live member count — and `broad_recall` stamps it into the handle it issues. It is part of the input
+/// rather than something the algorithm derives from `members`: the count the pass holds *is* a truncated
+/// representative set in some paths, and the guard is not in the rows at all. A caller that has no
+/// versioned read to offer (the interim unscoped arm, which resolves no owned cluster row) says so with
+/// `membership_revision: None` rather than inventing a stamp.
 #[derive(Debug, Clone)]
 pub struct ClusterWithMembers {
     pub info: ClusterInfo,
     pub members: Vec<FactSummary>,
+    pub version: ClusterVersion,
 }
 
 /// A matched cluster in broad recall results.
@@ -46,9 +53,15 @@ pub struct BroadRecallResult {
 }
 
 /// Result of focused recall.
+///
+/// `snapshot_moved` says whether the cluster has changed since the handle was issued. It is deliberately
+/// *not* the public response: `recall` promises to narrow into a cluster, never into a frozen view of
+/// one, so a moved snapshot is answered with current rows and this flag exists for the server's own
+/// owner-safe diagnostic and for tests that need to see the comparison actually happened.
 #[derive(Debug)]
 pub struct FocusedRecallResult {
     pub memories: Vec<MemoryResult>,
+    pub snapshot_moved: bool,
 }
 
 /// Broad recall: find top matching clusters for a query.
@@ -65,11 +78,6 @@ pub fn broad_recall(
     limit: usize,
     min_similarity: f32,
 ) -> BroadRecallResult {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
     let mut matches: Vec<ClusterMatch> = clusters
         .iter()
         .filter_map(|cwm| {
@@ -105,12 +113,10 @@ pub fn broad_recall(
                 })
                 .collect();
 
-            // Build scope handle
-            let handle = ScopeHandle {
-                cluster_id: cwm.info.id.clone(),
-                depth: 0,
-                issued_at: now,
-            };
+            // The handle is a locator plus the version this pass read. `issued_at` used to live here and
+            // was a wall clock, which made two identical passes look different and a moved cluster look
+            // the same; neither of those is a fact about the cluster.
+            let handle = RecallHandle::new(cwm.info.id.clone(), cwm.version);
 
             Some(ClusterMatch {
                 cluster_id: cwm.info.id.clone(),
@@ -133,10 +139,16 @@ pub fn broad_recall(
     BroadRecallResult { clusters: matches }
 }
 
-/// Focused recall: narrow within a specific cluster using a scope handle.
+/// Focused recall: narrow within a specific cluster using a recall handle.
+///
+/// The rows served are `cluster_data`'s — whatever the caller's own read found just now — never anything
+/// reconstructed from the handle, which is why the handle can be an unsigned string. The handle's
+/// version is compared with the cluster's current one and reported as `snapshot_moved`: the point of the
+/// number is that this pass can say it is answering about a cluster that has changed since the caller
+/// last looked, instead of implying the two calls saw the same thing.
 pub fn focused_recall(
     query_embedding: &[f32],
-    _scope: &ScopeHandle,
+    handle: &RecallHandle,
     cluster_data: &ClusterWithMembers,
 ) -> FocusedRecallResult {
     let member_embeddings: Vec<Vec<f32>> = cluster_data
@@ -159,5 +171,8 @@ pub fn focused_recall(
         })
         .collect();
 
-    FocusedRecallResult { memories }
+    FocusedRecallResult {
+        memories,
+        snapshot_moved: handle.snapshot_moved(&cluster_data.version),
+    }
 }
