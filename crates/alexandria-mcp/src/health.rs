@@ -7,7 +7,7 @@
 //! A 200 means one trivial query round-tripped through the engine at request time,
 //! not that the process merely exists; a wedged or closed store answers 503.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use axum::Router;
 use axum::http::{StatusCode, header};
@@ -29,7 +29,21 @@ pub fn router(db: Arc<Database>) -> Router {
 }
 
 async fn check(db: Arc<Database>) -> Response {
-    let (status, body) = match db.ping().await {
+    probe_response(
+        async { db.ping().await.map_err(|err| err.to_string()) },
+        Duration::from_secs(1),
+    )
+    .await
+}
+
+async fn probe_response(
+    probe: impl Future<Output = Result<(), String>>,
+    deadline: Duration,
+) -> Response {
+    let result = tokio::time::timeout(deadline, probe)
+        .await
+        .unwrap_or_else(|_| Err("storage health probe timed out".to_owned()));
+    let (status, body) = match result {
         Ok(()) => (
             StatusCode::OK,
             serde_json::json!({
@@ -85,6 +99,26 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn health_is_503_when_the_probe_never_completes() {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            probe_response(
+                std::future::pending::<Result<(), String>>(),
+                std::time::Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the health deadline must bound a pending probe");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "unavailable");
+        assert!(json["error"].as_str().unwrap().contains("timed out"));
     }
 
     #[tokio::test]

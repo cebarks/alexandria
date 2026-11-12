@@ -1,12 +1,11 @@
 """Client tests against the mock Alexandria MCP server (real HTTP, real protocol)."""
 
-import sys
 import threading
 import unittest
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+from _bootstrap import bootstrap_hermes
+
+bootstrap_hermes()
 
 from alexandria.client import AlexandriaClient, AlexandriaError, AlexandriaToolError  # noqa: E402
 from mock_server import make_server  # noqa: E402
@@ -58,14 +57,13 @@ class TestTools(ClientTestCase):
     def test_tool_error_surfaces_as_typed_exception(self):
         with self.assertRaises(AlexandriaToolError) as ctx:
             self.client.call_tool("delete_memory", {"id": "nope"})
-        self.assertIn("not implement", str(ctx.exception))
+        self.assertIn("not found", str(ctx.exception))
 
     def test_session_loss_triggers_one_rehandshake(self):
         self.client.call_tool("store_memory", {"content": "before restart"})
         sid = self.client._session_id
         # Simulate server restart: the server forgets every session.
-        from mock_server import Handler
-        Handler.sessions.clear()
+        self.server.RequestHandlerClass.sessions.clear()
         out = self.client.call_tool("retrieve_memories", {"query": "before restart"})
         self.assertNotEqual(self.client._session_id, sid)
         self.assertEqual(len(out["results"]), 1)

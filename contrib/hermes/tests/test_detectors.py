@@ -2,18 +2,11 @@
 (contrib/pi/extensions/alexandria/tests/detectors-*.test.ts). Case-for-case where the
 semantics transfer; Hermes naming added for the tool tracker."""
 
-import sys
 import unittest
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-_hermes_src = Path.home() / ".hermes" / "hermes-agent"  # real ABC when Hermes is installed here
-if _hermes_src.is_dir():
-    sys.path.insert(0, str(_hermes_src))
-try:
-    import agent.memory_provider  # noqa: F401
-except ImportError:
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "_hermes_stub"))
+from _bootstrap import bootstrap_hermes
+
+bootstrap_hermes()
 
 from alexandria.detectors import (  # noqa: E402
     ErrorTracker,
@@ -152,10 +145,10 @@ class TestToolTracker(unittest.TestCase):
         return {"recorded": recorded, "stored": buffer.get_all_stored_contents()}
 
     def test_records_store_tools_in_client_namings(self):
-        # pi 0.99+, adapter 2.x, bare, Hermes native MCP, and Hermes provider-tool naming.
+        # Only names bound to Alexandria establish persistence in this backend.
         for name in ("mcp__alexandria__store_memory", "alexandria_store_memory",
-                     "mcp_alexandria_store_memory", "store_memory",
-                     "mcp__alexandria__update_memory", "update_memory"):
+                     "mcp_alexandria_store_memory", "alexandria_update_memory",
+                     "mcp__alexandria__update_memory", "mcp_alexandria_update_memory"):
             with self.subTest(name=name):
                 self.assertEqual(self.call(name), {"recorded": True, "stored": ["fact"]})
 
@@ -169,10 +162,9 @@ class TestToolTracker(unittest.TestCase):
         self.assertEqual(self.call("mcp__alexandria__store_memory", 42), {"recorded": False, "stored": []})
         self.assertEqual(self.call("mcp__alexandria__store_memory", ""), {"recorded": False, "stored": []})
 
-    def test_known_bound_bare_name_other_server_accepted(self):
-        # Pinned with pi: exact-name matching cannot identify the server (see tool-tracker.ts).
-        self.assertEqual(self.call("mcp__agentmemory__store_memory"), {"recorded": True, "stored": ["fact"]})
-        self.assertEqual(self.call("bulk_store_memory"), {"recorded": True, "stored": ["fact"]})
+    def test_foreign_or_unbound_name_is_not_local_persistence(self):
+        for name in ("mcp__agentmemory__store_memory", "bulk_store_memory", "store_memory", "update_memory"):
+            self.assertEqual(self.call(name), {"recorded": False, "stored": []})
 
     def test_bare_tool_name_reduction(self):
         self.assertEqual(bare_tool_name("mcp__alexandria__store_memory"), "store_memory")

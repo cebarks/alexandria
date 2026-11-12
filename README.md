@@ -178,11 +178,12 @@ three levels:
    recall and much denser capture; recall, store, and reminders each toggle independently. The Claude
    Code equivalent is the set of `UserPromptSubmit`, `PreToolUse`, and `Stop` hooks at
    [`contrib/claude/hooks/`](contrib/claude/hooks/).
-4. **Hermes Agent memory provider** — [`contrib/hermes/`](contrib/hermes/) goes one step past the
-   companion extension: Hermes has a first-class external-memory-provider slot, so Alexandria
-   becomes the agent's memory backend rather than a tool it may reach for. Recall is injected
-   before every model call, the same ported detector suite plus session-end extraction capture
-   without any per-tool decision, and the reminder tools surface natively.
+4. **Hermes Agent memory provider** — [`contrib/hermes/`](contrib/hermes/) integrates with Hermes'
+   external-memory-provider slot for automatic cross-session recall, heuristic capture,
+   session-end extraction, and native memory/reminder tools. The recommended configuration
+   disables Hermes' built-in curated stores so Alexandria is the only active long-term memory
+   backend; conversation history stays Hermes-owned. Coexistence is also supported, without
+   copying or synchronizing native memory entries into Alexandria.
 
 Items 2–4 are client-side integrations, not part of the MCP server itself — see
 [`contrib/pi/README.md`](contrib/pi/README.md), [`contrib/claude/README.md`](contrib/claude/README.md),
@@ -275,8 +276,9 @@ with no error. Restoring the copy is the only way back, as SurrealDB's own
 ### Health check
 
 `GET /health` answers `200 {"status":"ok","version":"…"}` when a trivial query round-trips through
-the engine at request time, and `503 {"status":"unavailable","error":"…"}` when it does not — a
-wedged or closed store is never reported healthy from process state alone. No auth (the server has
+the engine at request time within a one-second deadline, and
+`503 {"status":"unavailable","error":"…"}` when the probe fails or times out — a wedged or closed
+store is never reported healthy from process state alone. No auth (the server has
 none anywhere) and nothing sensitive in the body. It exists for supervisors: systemd watchdogs,
 container healthchecks, and agent memory-status panels (the Hermes companion's `plugin.yaml` probes
 it during setup).

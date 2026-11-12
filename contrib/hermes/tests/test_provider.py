@@ -4,22 +4,13 @@ tool-event tracking, error->resolution pairing, session end, tool dispatch, and 
 non-primary context write gate."""
 
 import json
-import sys
 import tempfile
 import threading
 import time
 import unittest
-from pathlib import Path
+from _bootstrap import bootstrap_hermes
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-_hermes_src = Path.home() / ".hermes" / "hermes-agent"  # real ABC when Hermes is installed here
-if _hermes_src.is_dir():
-    sys.path.insert(0, str(_hermes_src))
-try:
-    import agent.memory_provider  # noqa: F401
-except ImportError:
-    sys.path.insert(0, str(ROOT / "tests" / "_hermes_stub"))
+bootstrap_hermes()
 
 from alexandria import AlexandriaMemoryProvider  # noqa: E402
 from alexandria.client import AlexandriaClient  # noqa: E402
@@ -184,11 +175,10 @@ class ProviderTestCase(unittest.TestCase):
         out = json.loads(self.provider.handle_tool_call("alexandria_store_memory", {"content": "x"}))
         self.assertIn("result", out)
 
-    def test_on_memory_write_mirrors_builtin(self):
-        self.provider.on_memory_write("add", "user", "User prefers terse answers")
-        self.assertTrue(any("Built-in memory (add user)" in c for c in self.stored_contents()))
-        self.provider.on_memory_write("remove", "memory", "gone")
-        self.assertFalse(any("gone" in c for c in self.stored_contents()))
+    def test_builtin_memory_write_is_not_mirrored(self):
+        for action in ("add", "replace", "remove"):
+            self.provider.on_memory_write(action, "user", "local only")
+        self.assertEqual(self.stored_contents(), [])
 
     def test_session_switch_reset_clears_state(self):
         self.provider.sync_turn("Always run just lint.", "ok", session_id="sess-3",

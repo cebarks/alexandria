@@ -14,6 +14,7 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import re
 import threading
 import uuid
 from typing import Any, Optional
@@ -70,30 +71,28 @@ class AlexandriaClient:
         return headers
 
     @staticmethod
-    def _decode_body(resp: httpx.Response) -> Optional[dict[str, Any]]:
-        """Return the JSON-RPC message from a response body (plain JSON or SSE)."""
+    def _decode_body(resp: httpx.Response, expected_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+        """Decode a matching JSON-RPC reply, assembling multiline SSE data fields."""
         body = resp.text
         if not body.strip():
             return None
-        ctype = resp.headers.get("content-type", "")
-        if "text/event-stream" in ctype:
-            # SSE: the JSON-RPC message rides a `data:` line (possibly several events).
-            for line in body.splitlines():
-                if line.startswith("data:"):
-                    chunk = line[5:].strip()
-                    if not chunk or chunk == "[DONE]":
-                        continue
-                    try:
-                        msg = json.loads(chunk)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(msg, dict) and ("result" in msg or "error" in msg):
-                        return msg
+        if "text/event-stream" in resp.headers.get("content-type", ""):
+            for event in re.split(r"\r?\n\r?\n", body):
+                data = "\n".join(line[5:].lstrip(" ") for line in event.splitlines() if line.startswith("data:"))
+                try:
+                    msg = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if (isinstance(msg, dict) and ("result" in msg or "error" in msg)
+                        and (expected_id is None or msg.get("id") == expected_id)):
+                    return msg
             return None
         try:
             msg = json.loads(body)
         except json.JSONDecodeError as exc:
             raise AlexandriaError(f"non-JSON response from {resp.request.url}: {body[:200]!r}") from exc
+        if expected_id is not None and (not isinstance(msg, dict) or msg.get("id") != expected_id):
+            raise AlexandriaError("JSON-RPC response id does not match request")
         return msg if isinstance(msg, dict) else None
 
     def _post(self, message: dict[str, Any], *, want_reply: bool) -> Optional[dict[str, Any]]:
@@ -107,7 +106,7 @@ class AlexandriaClient:
             raise _SessionLost(f"session rejected ({resp.status_code})")
         if resp.status_code >= 400:
             raise AlexandriaError(f"HTTP {resp.status_code} from {self.url}: {resp.text[:200]!r}")
-        msg = self._decode_body(resp)
+        msg = self._decode_body(resp, message.get("id"))
         if want_reply and msg is None:
             raise AlexandriaError("no JSON-RPC reply in response body")
         return msg
@@ -132,7 +131,7 @@ class AlexandriaClient:
                 raise AlexandriaError(f"alexandria unreachable at {self.url}: {exc}") from exc
             if resp.status_code >= 400:
                 raise AlexandriaError(f"initialize failed: HTTP {resp.status_code} {resp.text[:200]!r}")
-            msg = self._decode_body(resp) or {}
+            msg = self._decode_body(resp, req["id"]) or {}
             if "error" in msg:
                 raise AlexandriaError(f"initialize error: {msg['error']}")
             result = msg.get("result", {})

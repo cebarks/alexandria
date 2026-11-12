@@ -26,6 +26,7 @@ class SessionDedupBuffer:
     def __init__(self) -> None:
         self._normalized: set[str] = set()
         self._raw: list[str] = []
+        self._tool_normalized: set[str] = set()
 
     @staticmethod
     def _normalize(s: str) -> str:
@@ -40,9 +41,23 @@ class SessionDedupBuffer:
         self._raw.append(content)
         return True
 
+    def discard_heuristic_store(self, content: str) -> None:
+        """Release a failed reservation without erasing a successful native store."""
+        norm = self._normalize(content)
+        if norm not in self._tool_normalized:
+            self._normalized.discard(norm)
+            self._raw = [raw for raw in self._raw if self._normalize(raw) != norm]
+
     def add_tool_store(self, content: str) -> None:
-        """Record an agent-initiated store_memory call."""
-        self._raw.append(content)
+        """Record confirmed persistence in this backend, not another memory service."""
+        norm = self._normalize(content)
+        self._tool_normalized.add(norm)
+        if norm not in self._normalized:
+            self._raw.append(content)
+        self._normalized.add(norm)
+
+    def contains(self, content: str) -> bool:
+        return self._normalize(content) in self._normalized
 
     def get_all_stored_contents(self) -> list[str]:
         return list(self._raw)
@@ -137,8 +152,8 @@ STORE_TOOLS = {"store_memory", "update_memory"}
 
 # Hermes names provider tools ``alexandria_*`` and natively-mounted MCP tools
 # ``mcp_<server>_<tool>``; pi names ``mcp__<server>__<tool>``; adapter 2.x used
-# ``<server>_<tool>``. All reduce to the bare name below, matched exactly — a suffix
-# test would accept another server's ``auto_store_memory`` (pi's comment, kept).
+# ``<server>_<tool>``. Bare-name reduction is diagnostic only; persistence tracking
+# requires an explicit Alexandria binding so another service cannot poison dedup.
 
 
 def bare_tool_name(tool_name: str) -> str:
@@ -152,7 +167,9 @@ def bare_tool_name(tool_name: str) -> str:
 
 
 def is_store_tool_call(tool_name: str) -> bool:
-    return tool_name in STORE_TOOLS or bare_tool_name(tool_name) in STORE_TOOLS
+    return any(tool_name == prefix + name
+               for prefix in ("alexandria_", "mcp_alexandria_", "mcp__alexandria__")
+               for name in STORE_TOOLS)
 
 
 def track_tool_store(tool_name: str, content: Any, is_error: bool, buffer: SessionDedupBuffer) -> bool:
@@ -277,14 +294,24 @@ class ErrorTracker:
                 self._resolutions.append((err, success_text))
                 return
 
-    def flush(self) -> list[DetectedMemory]:
-        memories = [
+    def pending_resolutions(self) -> list[DetectedMemory]:
+        """Snapshot paired lessons without consuming unacknowledged persistence."""
+        return [
             {
                 "content": f"Error with {err.tool_name}: {err.error_text}\nResolution: {success}",
                 "tags": ["error-resolution", "auto-detected", err.tool_name],
             }
             for err, success in self._resolutions
         ]
+
+    def acknowledge(self, memory: DetectedMemory) -> None:
+        for idx, candidate in enumerate(self.pending_resolutions()):
+            if candidate == memory:
+                self._resolutions.pop(idx)
+                return
+
+    def flush(self) -> list[DetectedMemory]:
+        memories = self.pending_resolutions()
         # Unpaired errors taught us nothing: release their class claims so the same
         # error recurring next turn followed by a real fix is still storable. Classes
         # that DID produce a memory keep their claim — that is what stops the flood.

@@ -390,6 +390,26 @@ what project hint it sends with the question.
 
 ---
 
+### Hermes Agent companion
+
+The Hermes provider reads `memory.alexandria` in Hermes' `config.yaml`, not the Pi client
+configuration above. See [the Hermes reference](../contrib/hermes/README.md#configuration)
+for all provider settings and [the recommended setup](../contrib/hermes/README.md#install)
+for Alexandria-only curated memory. Set `memory.provider: alexandria`,
+`memory.memory_enabled: false`, and `memory.user_profile_enabled: false`, while retaining
+the `memory` toolset. These native-store flags do not disable the external provider or
+redirect Hermes' SQLite conversation history.
+
+The provider's `auto_store`, `extract`, and `store_session` settings are booleans. Explicit
+`true`/`false` strings are normalized for older saved settings; malformed values are refused.
+`auto_store` controls heuristic/error-resolution capture, independently of LLM `extract`;
+explicit native tool writes are unaffected. `store_session` attributes writes but never
+restricts default recall to the current conversation. No built-in-memory mirroring is performed.
+Automatic reminder consumption is primary-foreground-only and never cached. Hermes currently
+skips provider prefetch on trivial prompts, so automatic delivery waits for a nontrivial foreground
+prompt; explicit `alexandria_check_reminders` remains available. Host timeouts still make
+presentation best-effort rather than guaranteed.
+
 ## Legacy Migration
 
 Alexandria previously stored all files under `~/.alexandria/`. The new layout uses XDG Base Directory paths:
