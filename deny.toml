@@ -16,6 +16,15 @@ ignore = [
     # 0.13 cannot take. We never configure object storage, so that XML parser never runs.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # Data race / double free via unsound Send/Sync in reblessive 0.4.3, reachable through
+    # surrealdb-core 3.3.0's dbs::Executor. No fix in the 3.3 line — patched in surrealdb-core
+    # 4.0.0. Tracked by the SurrealDB 4 upgrade: https://github.com/cebarks/alexandria/issues/55
+    "RUSTSEC-2026-0454",
+    # Out-of-bounds read decoding internal keys shorter than 16 bytes in surrealkv 0.21.4,
+    # reachable at the on-disk SSTable decode boundary. Fixed in surrealkv 1.2.0, which only
+    # ships with SurrealDB 4.0.0. Tracked by the SurrealDB 4 upgrade:
+    # https://github.com/cebarks/alexandria/issues/55
+    "RUSTSEC-2026-0452",
 ]
 
 [licenses]
