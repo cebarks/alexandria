@@ -32,7 +32,7 @@ codegen-units = 16
 opt-level = 3
 
 [workspace.dependencies]
-tokio = { version = "1", default-features = false, features = [
+tokio = { version = "1.53.3", default-features = false, features = [
   "rt-multi-thread",
   "macros",
   "signal",
@@ -50,7 +50,7 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # re-read of the README upgrade note — while the dev recipes are not lock-resolved either (see
 # justfile `--locked`). Bumping this line is the deliberate act the pin exists to force.
 surrealdb = { version = "=3.3.0", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
-rmcp = { version = "3.1", default-features = false, features = [
+rmcp = { version = "3.9", default-features = false, features = [
   "server",
   "transport-io",
   "transport-streamable-http-server",
@@ -78,7 +78,7 @@ cron = "0.17"
 iana-time-zone = "0.1"
 uuid = { version = "1", default-features = false, features = ["std", "v4", "serde"] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
-candle-core = { version = "0.11", default-features = false }
+candle-core = { version = "0.11.1", default-features = false }
 candle-nn = { version = "0.11", default-features = false }
 candle-transformers = { version = "0.11", default-features = false }
 tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
