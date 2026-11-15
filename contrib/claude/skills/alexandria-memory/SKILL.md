@@ -135,22 +135,42 @@ not what you meant (a restricted day-of-month with a restricted day-of-week, a `
 turn** — a mis-parsed "every Friday" is cheapest to fix while they're still there. Optional `note` and
 provenance fields ride along at delivery for context.
 
-Targeting: reminders are **global** by default (delivered in any context). Use `target_project` for
-repo-bound follow-ups; delivery matches the project name exactly and case-sensitively. A targeted
-reminder in a project that stops being visited is not lost — once it is at least the server's
-escalation window overdue (`[reminders].escalation_hours`) it delivers everywhere, flagged
-`escalated: true`.
+Targeting: reminders are **account-bound**. For a project-specific follow-up, use an existing owned,
+issued `project:<opaque-id>` returned by `mcp__alexandria__resolve_project` or
+`mcp__alexandria__list_projects`. Copy that handle exactly into `set_reminder.target_project`,
+`check_reminders.project`, and `list_reminders.target_project`. A display name, alias, repository name,
+or checkout basename is not that handle; unknown and foreign handles are refused, even if no rows
+are due.
+
+If you only know a basename/name, first propose resolving the project or selecting it from the owned
+project listing, using the available tool's schema. Wait for an actual successful result before using
+its handle. Do not invent a resolver result, an issued ID, or an account-management RPC. If those
+tools are unavailable, explain that an owned handle is needed. Do not silently omit a selector and
+widen a project-specific request. For deliberately global reminders or account-wide/context-free
+checks, omit the respective optional selector instead.
+
+Global delivery and overdue escalation stay **within the reminder owner's account**. A valid project
+target at least `[reminders].escalation_hours` overdue may deliver in another project context of that
+same account, flagged `escalated: true`; it never transfers to another account, even with the same
+checkout basename. Held rows and unresolved historical text targets stay pending and suppressed,
+not global or escalated. There is no automatic historical mapping.
+
+The current Pi companion still defaults to sending a checkout basename. That default is unsupported
+by the typed server contract; no automatic owned-handle discovery is implemented. An explicit
+existing owned-ID override can be passed through as documented in the companion README, but the
+server still validates it for the authenticated account. Do not claim the default has been fixed.
 
 Delivery happens only when something calls **`mcp__alexandria__check_reminders`**, and the Claude Code
 hooks here do not call it — they only auto-recall. So under Claude Code you are that something: call
 it when the user asks "anything due?", when a reminder they expected hasn't shown up, or when you have
-just set a reminder that was already due, passing the current project so project-targeted reminders
-match. That call is the *only* thing that consumes reminders (recurring ones advance; missed fires
+just set a reminder that was already due, passing the actual owned issued project handle so typed
+targets match (or omitting context for an intentional account-wide check). That call is the *only* thing that consumes reminders (recurring ones advance; missed fires
 coalesce rather than trickle). The `due_reminders` array on `mcp__alexandria__retrieve_memories` /
 `mcp__alexandria__recall` responses is a read-only safety net (a small oldest-due sample) that is
-*untargeted* and consumes nothing: entries appear there with their `target` whatever project they
-belong to, so another project's entry is informational — it reaches the user through
-`mcp__alexandria__check_reminders`.
+*untargeted within your account* and consumes nothing: eligible entries carry `global` or a typed
+project handle. Another owned project's entry is informational, not consumed; delivery occurs through
+a matching or eligible escalated `mcp__alexandria__check_reminders` call. Held/unresolved targets are
+excluded from that sample but remain inspectable in your unfiltered reminder history.
 
 ## Guidelines
 

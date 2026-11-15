@@ -348,7 +348,9 @@ async fn destination_inventory(
             page.entries
                 .into_iter()
                 .map(|entry| DestinationChoice {
-                    handle: record_id_to_string(entry.project.id.as_record_id()),
+                    handle: alexandria_storage::project_handle::format_project_handle(
+                        entry.project.id.as_record_id(),
+                    ),
                     label: entry
                         .project
                         .display_name
@@ -366,7 +368,8 @@ fn destination_spelled(destination: &MemoryScope, projects: &[DestinationChoice]
         MemoryScope::Personal => "personal".to_string(),
         MemoryScope::Unassigned => "unassigned (review)".to_string(),
         MemoryScope::Project(project) => {
-            let handle = record_id_to_string(project.as_record_id());
+            let handle =
+                alexandria_storage::project_handle::format_project_handle(project.as_record_id());
             // The label is the owner's own string for their own project, and the handle stays visible
             // beside it because the handle is what the form posts back and what a conflict names.
             match projects.iter().find(|choice| choice.handle == handle) {

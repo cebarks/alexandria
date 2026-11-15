@@ -50,6 +50,13 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # re-read of the README upgrade note — while the dev recipes are not lock-resolved either (see
 # justfile `--locked`). Bumping this line is the deliberate act the pin exists to force.
 surrealdb = { version = "=3.3.0", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
+# Full-input PROJECT-handle parsing. `surrealdb-core` is already resolved in `Cargo.lock` through the
+# engine family, so this adds a direct-dependency edge and no new package. Exact-pinned to the same
+# 3.3.0 family: core is explicitly unstable internal API (its own lib.rs banner says so, no SemVer
+# between patch versions), and the pin plus the engine-family review policy is the mitigation. Only
+# its `syn` facade is used, which is not feature-gated; `default-features = false` keeps kv backends
+# and graphql out of this edge.
+surrealdb-core = { version = "=3.3.0", default-features = false }
 rmcp = { version = "3.1", default-features = false, features = [
   "server",
   "transport-io",

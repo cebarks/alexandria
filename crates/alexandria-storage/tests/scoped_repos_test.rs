@@ -852,8 +852,8 @@ async fn reminder_rows(fx: &Fixture) -> Vec<serde_json::Value> {
 /// Every scoped reminder write refuses a revoked credential — **and** the same context writes while the
 /// credential is live.
 ///
-/// `set_reminder` is admitted for hosted bearers (it is deliberately not a D4 refusal: its target is free
-/// text, not a partition), so these four writes were the last places on the request path where a
+/// `set_reminder` is admitted for hosted bearers without a corpus-write grant (an explicit target
+/// must still be an owned project handle), so these writes were the last request-path places where a
 /// revocation landing after `admit` still got a committed row. The positive control runs first, on the
 /// same context and the same store, so the refusals below cannot be the quiet success of a fixture that
 /// could not write at all.

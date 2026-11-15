@@ -87,7 +87,9 @@ pub struct ProjectDescriptor {
 impl ProjectDescriptor {
     fn from_row(project: &ResolvedProjectRow) -> Self {
         Self {
-            id: alexandria_storage::record_id_to_string(project.id.as_record_id()),
+            id: alexandria_storage::project_handle::format_project_handle(
+                project.id.as_record_id(),
+            ),
             display_name: project.display_name.clone(),
             canonical_identity: project.normalized_alias.clone(),
         }
@@ -216,7 +218,7 @@ impl<'a> ScopeService<'a> {
         display_name: Option<&str>,
     ) -> Result<EstablishedProject, ServiceError> {
         let alias = match (text, remote) {
-            (Some(text), None) => match parse_project_handle(text) {
+            (Some(text), None) => match parse_project_handle(text)? {
                 Some(handle) => {
                     let project = ScopedProjectRepo::new(self.db.inner(), owner)
                         .resolve_id(&handle)
@@ -272,7 +274,7 @@ impl<'a> ScopeService<'a> {
             ));
         }
         let repo = ScopedProjectRepo::new(self.db.inner(), owner);
-        if let Some(handle) = parse_project_handle(text) {
+        if let Some(handle) = parse_project_handle(text)? {
             return repo.resolve_id(&handle).await.map_err(ServiceError::from);
         }
         // Not a handle: an alias. The resolver's own order (primary identity, then the explicit alias
@@ -602,10 +604,17 @@ fn word(value: Option<&str>) -> Option<&str> {
 }
 
 /// A caller-supplied `project:<key>` handle, or `None` when the text is an alias instead.
-fn parse_project_handle(text: &str) -> Option<ProjectId> {
-    parse_record_handle(text)
-        .filter(|id| id.table.as_str() == "project")
-        .and_then(|id| ProjectId::try_from(id).ok())
+fn parse_project_handle(text: &str) -> Result<Option<ProjectId>, ServiceError> {
+    match alexandria_storage::project_handle::parse_project_selector(text) {
+        Ok(project) => Ok(project),
+        // Handle-namespace text that is not a valid canonical point names nothing. The refusal is the
+        // same `NotFound` a foreign or never-minted handle gets, so a caller cannot tell "mine but
+        // malformed" from "not mine" — the uniformity `scope_tools_test` pins — and it is never
+        // re-read as an alias, so no project-prefixed text can establish or adopt a name. Reminder
+        // targets keep the loud strict refusal instead: they are a different contract.
+        Err(_) if text.starts_with("project:") => Err(ServiceError::NotFound),
+        Err(error) => Err(ServiceError::from(error)),
+    }
 }
 
 /// A `table:key` handle, parsed and re-checked for the table it claims.

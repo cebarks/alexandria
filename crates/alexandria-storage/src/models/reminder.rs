@@ -20,8 +20,14 @@ pub mod schedule_kind {
 pub struct Reminder {
     pub id: Option<RecordId>,
     pub message: String,
-    /// None = global target; Some(name) = deliver only in that project (until escalation).
+    /// Legacy free text, never an authenticated routing key.
     pub target_project: Option<String>,
+    pub account: Option<RecordId>,
+    /// Authenticated routing uses an owned project handle, or NONE for global delivery.
+    pub project: Option<RecordId>,
+    pub migration_hold: Option<bool>,
+    /// Historical provenance, not a project selector.
+    pub legacy_target_project: Option<String>,
     // Provenance (display-only metadata)
     pub prov_project: Option<String>,
     pub prov_session_id: Option<String>,

@@ -56,6 +56,7 @@ use alexandria_storage::models::mutation::{
 use alexandria_storage::models::{
     Cluster, ClusterVersion, MemoryScope, ReadSelection, Version, operation_kind,
 };
+use alexandria_storage::project_handle::format_project_handle;
 use alexandria_storage::repos::{
     ClusterRepo, EdgeRepo, HeatRepo, HeatUpdate, MemoryRepo, MutationRepo, RetrievalStrategy,
     ScopeFilter, ScopedClusterRepo, ScopedGraphReader, ScopedHeatWriter, ScopedMemoryRepo,
@@ -638,17 +639,15 @@ impl AlexandriaServer {
     }
 
     #[tool(
-        description = "Schedule a reminder to be delivered on a future interaction — one-shot (due_at) or recurring (pattern/cron). Use this when the user asks to be reminded of something later, when they say 'remind me', 'don't let me forget', or when a follow-up action will be needed at a specific time ('check the deploy at 3pm', 'ping me about this tomorrow morning'). Delivery happens on the next check_reminders call after the row comes due — the server runs no timer and reaches no one until some client asks. That call injects the reminder into the agent's context; clients that also surface it to the human do so themselves (the pi companion notifies, a client with no UI does not), so never tell the user a notification was sent. Project-targeted reminders escalate to global delivery once they are at least escalation_hours overdue, so they are never silently lost. The response includes the next fire times — confirm them with the user when the schedule was parsed from natural language, and read the response's `warning` field before you end the turn."
+        description = "Schedule a reminder to be delivered on a future interaction — one-shot (due_at) or recurring (pattern/cron). Use this when the user asks to be reminded of something later, when they say 'remind me', 'don't let me forget', or when a follow-up action will be needed at a specific time ('check the deploy at 3pm', 'ping me about this tomorrow morning'). Delivery happens on the next check_reminders call after the row comes due — the server runs no timer and reaches no one until some client asks. That call injects the reminder into the agent's context; clients that also surface it to the human do so themselves (the pi companion notifies, a client with no UI does not), so never tell the user a notification was sent. Targets and check contexts must be owned project IDs, never names or checkout basenames. Valid project-targeted reminders escalate within your account once at least escalation_hours overdue; held or unresolved legacy targets stay pending and suppressed. The response includes the next fire times — confirm them with the user when the schedule was parsed from natural language, and read the response's `warning` field before you end the turn."
     )]
     async fn set_reminder(
         &self,
         Parameters(params): Parameters<SetReminderParams>,
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        // A reminder is an owned row, but its `target_project` is free text the caller chooses, so no
-        // partition has to be *supplied* for the write to be lawful — unlike `store_memory`, this is not
-        // a D4 refusal. Admission still comes first, and the account stamp below is what keeps one
-        // account's reminder out of another's delivery.
+        // Reminder ownership does not require a corpus-write grant. An explicit target must still
+        // resolve to this owner's typed project; a name/basename must not become a global fallback.
         let scope = match self.admit(&ctx, ReadSelection::Auto(None)).await {
             Ok(scope) => scope,
             Err(error) => return refusal(error),
@@ -657,7 +656,7 @@ impl AlexandriaServer {
     }
 
     #[tool(
-        description = "Check for reminders that have come due and consume them. Client integrations call this automatically at the start of each interaction; you generally don't need to call it manually unless the user asks 'any reminders?'. Delivery is best-effort-once and one-way: what this returns is injected into your context and the row is advanced or retired, so a reminder you fail to act on is gone until its next fire. Recurring rows move to their next occurrence, coalescing elapsed fires into missed_occurrences (missed_occurrences_saturated means that number is a floor, not a count)."
+        description = "Check for reminders that have come due and consume them. Client integrations call this automatically at the start of each interaction; you generally don't need to call it manually unless the user asks 'any reminders?'. Delivery is best-effort-once and one-way: what this returns is injected into your context and the row is advanced or retired, so a reminder you fail to act on is gone until its next fire. Recurring rows move to their next occurrence, coalescing elapsed fires into missed_occurrences (missed_occurrences_saturated means that number is a floor, not a count). Supply only an owned project ID as context, not a name or basename; invalid contexts are refused even if nothing is due. Held/unresolved legacy targets are never consumed."
     )]
     async fn check_reminders(
         &self,
@@ -783,7 +782,7 @@ impl AlexandriaServer {
                     .entries
                     .iter()
                     .map(|entry| serde_json::json!({
-                        "id": record_id_to_string(entry.project.id.as_record_id()),
+                        "id": format_project_handle(entry.project.id.as_record_id()),
                         "display_name": entry.project.display_name,
                         "canonical_identity": entry.project.normalized_alias,
                         "memory_count": entry.live_memory_count,
@@ -877,10 +876,10 @@ Project scope: call resolve_project once per repository before storing anything 
 Use update_memory (not store_memory) when correcting something already stored — it preserves lineage. Use import_document for bulk reference material (specs, READMEs, notes). Use delete_memory only when the user wants something actually forgotten.
 
 \
-Reminders: use set_reminder when the user asks to be reminded of something later or a follow-up will be needed at a specific time. Omit target_project for anything the user should see anywhere; set it for repo-bound follow-ups (exact, case-sensitive match). The response carries next_fire_preview and the timezone the schedule was parsed in — confirm those with the user whenever the schedule came from natural language. Due reminders are delivered when a client calls check_reminders at the start of an interaction — the server runs no timer, so nothing fires on its own and a client that never calls it never receives one. check_reminders is the only tool that consumes them (recurring ones advance; missed fires coalesce rather than trickle) and it injects them into your context only: telling the user is your job. Call it yourself when the user asks whether anything is due, or when a reminder they expected has not shown up.
+Reminders: use set_reminder when the user asks to be reminded of something later or a follow-up will be needed at a specific time. Omit target_project for anything the user should see anywhere; set it to an existing owned project ID for project-bound follow-ups, never a name or checkout basename. Supply that same typed handle as check_reminders.project; omit the context when no handle is known. Unknown/foreign handles are refused even if no rows are due. Held or unresolved legacy text targets remain pending and suppressed, not global. The response carries next_fire_preview and the timezone the schedule was parsed in — confirm those with the user whenever the schedule came from natural language. Due reminders are delivered when a client calls check_reminders at the start of an interaction — the server runs no timer, so nothing fires on its own and a client that never calls it never receives one. check_reminders is the only tool that consumes them (recurring ones advance; missed fires coalesce rather than trickle) and it injects them into your context only: telling the user is your job. Call it yourself when the user asks whether anything is due, or when a reminder they expected has not shown up.
 
 \
-Reminder delivery: retrieve_memories and recall responses also carry a due_reminders array: a read-only, untargeted view of what is currently due (a short oldest-due sample, each entry has a target of global or project:<name>) that consumes nothing. An entry targeting another project is informational there; it reaches the user through the next check_reminders, which also delivers project reminders once they are at least the server's escalation window overdue. Use list_reminders to review what is scheduled and cancel_reminder when a reminder is no longer needed."
+Reminder delivery: retrieve_memories and recall responses also carry a due_reminders array: a read-only, untargeted view of what is currently due (a short oldest-due sample, each entry has a target of global or an owned project:<opaque-id>) that consumes nothing. An entry targeting another project is informational there; it reaches the user through the next check_reminders, which also delivers project reminders once they are at least the server's escalation window overdue. Use list_reminders to review what is scheduled and cancel_reminder when a reminder is no longer needed."
 )]
 impl ServerHandler for AlexandriaServer {}
 
@@ -1039,10 +1038,8 @@ fn scope_label(scope: &MemoryScope) -> String {
     match scope {
         MemoryScope::Personal => "personal".to_string(),
         MemoryScope::Unassigned => "unassigned".to_string(),
-        // The handle *is* the label: `record_id_to_string` already spells `project:<key>`, and a caller
-        // can hand exactly that back as `project`. Prefixing it again would produce an id that resolves
-        // nowhere.
-        MemoryScope::Project(project) => record_id_to_string(project.as_record_id()),
+        // This label is handed back as a selector: preserve the typed key and quote it only once.
+        MemoryScope::Project(project) => format_project_handle(project.as_record_id()),
     }
 }
 
@@ -1298,6 +1295,11 @@ impl AlexandriaServer {
             None => chrono::Duration::MAX,
         };
         let repo = ScopedReminderRepo::new(self.db.inner(), scope.owner().clone());
+        // Validate even when no rows are due: a context is an owned handle, never a best-effort hint.
+        let context = match params.project.as_deref() {
+            Some(project) => Some(repo.resolve_target(project).await?),
+            None => None,
+        };
         let due = repo.list_due(now).await.map_err(anyhow::Error::from)?;
         let mut delivered = Vec::new();
         for reminder in &due {
@@ -1311,37 +1313,47 @@ impl AlexandriaServer {
                     continue;
                 }
             };
-            let targeted = reminder.target_project.is_some();
-            let matches = params
-                .project
-                .as_deref()
-                .is_some_and(|project| reminder.target_project.as_deref() == Some(project));
-            let overdue_far = reminder
-                .next_due_at
-                .is_some_and(|due_at| now - due_at >= escalation);
-            // Same delivery policy as the interim path — global rows always deliver, project rows
-            // deliver when named or once escalated — now evaluated only over rows this caller owns.
-            if targeted && !matches && !overdue_far {
+            let (Some(id), Some(due_at)) = (reminder.id.as_ref(), reminder.next_due_at) else {
+                continue;
+            };
+            let matches = context
+                .as_ref()
+                .is_some_and(|project| reminder.project.as_ref() == Some(project.as_record_id()));
+            let escalated = reminder.project.is_some() && !matches;
+            if escalated && now - due_at < escalation {
                 continue;
             }
-            let next = match sched::next_fire(&spec, now, tz) {
-                Ok(next) => next,
-                Err(error) => {
-                    tracing::debug!("check_reminders: no next fire: {}", error_message(&error));
-                    continue;
+            let recurring = !matches!(spec, sched::ScheduleSpec::Once { .. });
+            let missed = if recurring {
+                match sched::occurrences_between(&spec, due_at, now, tz) {
+                    Ok(missed) => missed,
+                    Err(error) => {
+                        tracing::debug!(
+                            "check_reminders: cannot coalesce: {}",
+                            error_message(&error)
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                sched::OccurrenceCount {
+                    count: 0,
+                    saturated: false,
                 }
             };
+            let next = if recurring {
+                match sched::next_fire(&spec, now, tz) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        tracing::debug!("check_reminders: no next fire: {}", error_message(&error));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let taken = repo
-                .record_delivery(
-                    &reminder
-                        .id
-                        .as_ref()
-                        .map(record_id_to_string)
-                        .unwrap_or_default(),
-                    next,
-                    reminder.next_due_at,
-                    now,
-                )
+                .record_delivery(&record_id_to_string(id), next, Some(due_at), now)
                 .await
                 .map_err(anyhow::Error::from)?;
             if !taken {
@@ -1350,10 +1362,23 @@ impl AlexandriaServer {
             delivered.push(serde_json::json!({
                 "id": reminder.id.as_ref().map(record_id_to_string),
                 "message": reminder.message,
-                "target": match &reminder.target_project {
-                    Some(project) => serde_json::json!(format!("project:{project}")),
-                    None => serde_json::json!("global"),
+                "target": reminder.project.as_ref().map(format_project_handle)
+                    .unwrap_or_else(|| "global".into()),
+                "escalated": escalated,
+                "recurring": recurring,
+                "missed_occurrences": missed.count,
+                "missed_occurrences_saturated": missed.saturated,
+                "due_at": rfc3339_utc(due_at),
+                "schedule": sched::human_readable(&spec),
+                "note": reminder.note,
+                "provenance": {
+                    "project": reminder.prov_project,
+                    "session_id": reminder.prov_session_id,
                 },
+                "next_due_at": next.map(rfc3339_utc),
+                "timezone": tz.name(),
+                "due_at_local": due_at.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z").to_string(),
+                "next_due_at_local": next.map(|at| at.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z").to_string()),
             }));
         }
         Ok(serde_json::json!({
@@ -1439,6 +1464,13 @@ impl AlexandriaServer {
                         "id": r.id.as_ref().map(record_id_to_string),
                         "message": r.message,
                         "status": r.status,
+                        "target": r.project.as_ref().map(format_project_handle).or_else(|| {
+                            (r.target_project.is_none() && r.legacy_target_project.is_none())
+                                .then(|| "global".to_string())
+                        }),
+                        "migration_hold": r.migration_hold.unwrap_or(false),
+                        "legacy_target_project": r.legacy_target_project,
+                        "unresolved_target_project": r.target_project,
                         "schedule_kind": r.schedule_kind,
                         "next_due_at": r.next_due_at.map(rfc3339_utc),
                         "delivered_count": r.delivered_count,
@@ -3901,7 +3933,7 @@ impl AlexandriaServer {
             .is_some_and(|project| project.trim().is_empty())
         {
             anyhow::bail!(
-                "target_project must be a non-empty project name, or omit it for a global reminder"
+                "target_project must be a non-empty owned project ID, or omit it for a global reminder"
             );
         }
 
@@ -4550,10 +4582,8 @@ impl AlexandriaServer {
                         "message": r.message,
                         "due_at": r.next_due_at.map(rfc3339_utc),
                         "due_at_local": r.next_due_at.map(|at| at.with_timezone(&self.reminders.tz).format("%Y-%m-%d %H:%M").to_string()),
-                        "target": match &r.target_project {
-                            Some(project) => serde_json::json!(format!("project:{project}")),
-                            None => serde_json::json!("global"),
-                        },
+                        "target": r.project.as_ref().map(format_project_handle)
+                            .unwrap_or_else(|| "global".into()),
                         "recurring": !matches!(
                             spec,
                             alexandria_engine::reminders::ScheduleSpec::Once { .. }
@@ -6029,6 +6059,886 @@ mod get_info_tests {
             .await
             .unwrap();
         RequestScope::issued(owner, read)
+    }
+
+    type Task12ProjectWire = tokio::io::BufReader<tokio::io::DuplexStream>;
+
+    async fn task12_project_wire_request(
+        wire: &mut Task12ProjectWire,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let request =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        wire.write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("fixture MCP request writes");
+        wire.flush().await.expect("fixture MCP request flushes");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut line = String::new();
+            let size = tokio::time::timeout_at(deadline, wire.read_line(&mut line))
+                .await
+                .expect("fixture MCP response is bounded")
+                .expect("fixture MCP response reads");
+            assert!(size > 0, "fixture MCP transport closed during {method}");
+            let response: serde_json::Value =
+                serde_json::from_str(&line).expect("fixture MCP JSON response");
+            if response["id"] != 1 {
+                continue;
+            }
+            assert!(
+                response.get("error").is_none(),
+                "actual MCP {method} refused: {response}"
+            );
+            return response["result"].clone();
+        }
+    }
+
+    async fn task12_project_wire_tool(
+        wire: &mut Task12ProjectWire,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let result = task12_project_wire_request(
+            wire,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+        )
+        .await;
+        assert_ne!(
+            result["isError"], true,
+            "actual tool {name} refused: {result}"
+        );
+        assert!(
+            result["structuredContent"].is_object(),
+            "actual tool {name} must return structured JSON: {result}"
+        );
+        result["structuredContent"].clone()
+    }
+
+    async fn task12_project_wire_fixture() -> (
+        AlexandriaServer,
+        RequestScope,
+        RequestScope,
+        Task12ProjectWire,
+        rmcp::service::RunningService<RoleServer, AlexandriaServer>,
+    ) {
+        use rmcp::ServiceExt;
+        use tokio::io::AsyncWriteExt;
+        // Same sealed two-owner chain as two_trusted_local_owners; retain startup authority only
+        // long enough to issue the real stdio principal needed by the actual MCP tool router.
+        let mut db = Database::connect_embedded().await.unwrap();
+        alexandria_storage::schema::migrate(db.inner())
+            .await
+            .unwrap();
+        let system = db.claim_system_authority().unwrap();
+        let server = AlexandriaServer::new(
+            Arc::new(db),
+            Arc::new(StubEmbedding),
+            0.75,
+            HeatSettings::default(),
+        );
+        let alice = trusted_local_scope(&server, &system, "handle-alice").await;
+        let bob = trusted_local_scope(&server, &system, "handle-bob").await;
+        let principal = AccessRepo::new(&server.db)
+            .local_principal(&system, alice.owner().account())
+            .await
+            .unwrap();
+        let server = server.with_stdio_identity(crate::auth::StdioIdentity::issued(principal));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut wire = tokio::io::BufReader::new(client_io);
+        let initialize = async {
+            let result = task12_project_wire_request(
+                &mut wire,
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "task12-project-handle-fixture", "version": "1"}
+                }),
+            )
+            .await;
+            assert!(
+                result["serverInfo"].is_object(),
+                "actual MCP initialized: {result}"
+            );
+            wire.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .unwrap();
+            wire.flush().await.unwrap();
+        };
+        let (running, ()) = tokio::join!(server.clone().serve(server_io), initialize);
+        (
+            server,
+            alice,
+            bob,
+            wire,
+            running.expect("fixture MCP service initializes"),
+        )
+    }
+
+    async fn task12_seed_project_key(
+        server: &AlexandriaServer,
+        owner: &OwnerContext,
+        id: &surrealdb::types::RecordId,
+        alias: &str,
+    ) {
+        let mut response = server
+            .db
+            .inner()
+            .query("CREATE $id SET workspace = $workspace, normalized_alias = $alias RETURN AFTER;")
+            .bind(("id", id.clone()))
+            .bind(("workspace", owner.workspace().as_record_id().clone()))
+            .bind(("alias", alias.to_string()))
+            .await
+            .expect("typed project creation executes")
+            .check()
+            .expect("typed project creation commits");
+        let created: Vec<alexandria_storage::models::Project> =
+            response.take(0).expect("typed project creation decodes");
+        assert_eq!(
+            created.len(),
+            1,
+            "exactly one typed project created for {alias}"
+        );
+        assert_eq!(
+            created[0].id.as_ref(),
+            Some(id),
+            "creation preserves key type/content for {alias}"
+        );
+        let mut response = server
+            .db
+            .inner()
+            .query("SELECT * FROM $id WHERE workspace = $workspace;")
+            .bind(("id", id.clone()))
+            .bind(("workspace", owner.workspace().as_record_id().clone()))
+            .await
+            .expect("typed project fixture selection executes")
+            .check()
+            .expect("typed project fixture selection succeeds");
+        let read: Vec<alexandria_storage::models::Project> =
+            response.take(0).expect("typed fixture selection decodes");
+        assert_eq!(read.len(), 1, "typed fixture read retains {alias}");
+        assert_eq!(read[0].id.as_ref(), Some(id));
+        assert_eq!(read[0].normalized_alias, alias);
+    }
+
+    async fn task12_project_handle_roundtrip(keys: [surrealdb::types::RecordId; 2]) {
+        let (server, alice, bob, mut wire, running) = task12_project_wire_fixture().await;
+        let aliases = ["handle-first", "handle-second"];
+        for (id, alias) in keys.iter().zip(aliases) {
+            task12_seed_project_key(&server, alice.owner(), id, alias).await;
+        }
+        let foreign = surrealdb::types::RecordId::new("project", "foreign-handle-control");
+        task12_seed_project_key(&server, bob.owner(), &foreign, "foreign-control").await;
+        let catalog =
+            alexandria_storage::repos::ScopedProjectRepo::new(server.db.inner(), alice.owner())
+                .list(None, 10)
+                .await
+                .expect("owned typed catalog positive control");
+        assert_eq!(
+            catalog.entries.len(),
+            2,
+            "owned catalog contains both typed twins, not foreign row"
+        );
+        for id in &keys {
+            assert!(
+                catalog
+                    .entries
+                    .iter()
+                    .any(|entry| entry.project.id.as_record_id() == id),
+                "actual typed catalog contains {id:?} before wire assertions"
+            );
+        }
+        let listed =
+            task12_project_wire_tool(&mut wire, "list_projects", serde_json::json!({"limit": 10}))
+                .await;
+        let entries = listed["projects"]
+            .as_array()
+            .expect("actual list_projects JSON entries");
+        assert_eq!(
+            entries.len(),
+            2,
+            "actual project listing remains owner-bound"
+        );
+        let handles: Vec<String> = aliases
+            .iter()
+            .map(|alias| {
+                entries
+                    .iter()
+                    .find(|entry| entry["canonical_identity"] == *alias)
+                    .expect("actual list contains owned fixture alias")["id"]
+                    .as_str()
+                    .expect("actual list ID is wire text")
+                    .to_string()
+            })
+            .collect();
+        assert_ne!(
+            handles[0], handles[1],
+            "distinct actual project keys require distinct public JSON handles"
+        );
+        let repo = ScopedReminderRepo::new(server.db.inner(), alice.owner().clone());
+        for (index, alias) in aliases.into_iter().enumerate() {
+            let resolved = task12_project_wire_tool(
+                &mut wire,
+                "resolve_project",
+                serde_json::json!({"project": alias}),
+            )
+            .await;
+            assert_eq!(
+                resolved["project"]["id"], handles[index],
+                "actual resolve/list producers agree"
+            );
+            let created = task12_project_wire_tool(
+                &mut wire,
+                "set_reminder",
+                serde_json::json!({
+                    "message": format!("roundtrip {alias}"),
+                    "due_at": (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+                    "target_project": handles[index],
+                }),
+            )
+            .await;
+            let reminder_id = created["id"]
+                .as_str()
+                .expect("actual reminder creation returns its ID");
+            let stored = repo
+                .get(reminder_id)
+                .await
+                .unwrap()
+                .expect("actual created reminder exists");
+            assert_eq!(
+                stored.project.as_ref(),
+                Some(&keys[index]),
+                "copying the actual project handle must preserve the intended typed DB target"
+            );
+            let delivered = task12_project_wire_tool(
+                &mut wire,
+                "check_reminders",
+                serde_json::json!({"project": handles[index]}),
+            )
+            .await;
+            assert_eq!(delivered["count"], 1);
+            assert_eq!(delivered["delivered"][0]["id"], reminder_id);
+            assert_eq!(delivered["delivered"][0]["target"], handles[index]);
+            let history = task12_project_wire_tool(
+                &mut wire,
+                "list_reminders",
+                serde_json::json!({"status": "all", "target_project": handles[index]}),
+            )
+            .await;
+            assert_eq!(
+                history["count"], 1,
+                "typed filter must distinguish the two project keys"
+            );
+            assert_eq!(history["reminders"][0]["id"], reminder_id);
+            assert_eq!(history["reminders"][0]["target"], handles[index]);
+            let stored = repo.get(reminder_id).await.unwrap().unwrap();
+            assert_eq!(stored.project.as_ref(), Some(&keys[index]));
+            assert_eq!(stored.delivered_count, 1);
+        }
+        drop(running);
+    }
+
+    #[tokio::test]
+    async fn task12_project_handle_numeric_and_string_twin_roundtrip() {
+        task12_project_handle_roundtrip([
+            surrealdb::types::RecordId::new("project", 7_i64),
+            surrealdb::types::RecordId::new("project", "7"),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task12_project_handle_trailing_input_refuses_owned_prefix() {
+        let (server, alice, bob, mut wire, running) = task12_project_wire_fixture().await;
+        let keys = [
+            surrealdb::types::RecordId::new("project", "inside;semicolon"),
+            surrealdb::types::RecordId::new("project", "tail-control"),
+        ];
+        let aliases = ["quoted-semicolon-control", "tail-control"];
+        for (id, alias) in keys.iter().zip(aliases) {
+            task12_seed_project_key(&server, alice.owner(), id, alias).await;
+        }
+        let foreign = surrealdb::types::RecordId::new("project", "foreign-tail-control");
+        task12_seed_project_key(&server, bob.owner(), &foreign, "foreign-tail-control").await;
+        let catalog =
+            alexandria_storage::repos::ScopedProjectRepo::new(server.db.inner(), alice.owner())
+                .list(None, 10)
+                .await
+                .unwrap();
+        assert_eq!(catalog.entries.len(), 2);
+        for id in &keys {
+            assert!(
+                catalog
+                    .entries
+                    .iter()
+                    .any(|entry| entry.project.id.as_record_id() == id)
+            );
+        }
+        let listed =
+            task12_project_wire_tool(&mut wire, "list_projects", serde_json::json!({"limit": 10}))
+                .await;
+        let entries = listed["projects"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "actual producer excludes foreign project");
+        let handles: Vec<String> = aliases
+            .iter()
+            .map(|alias| {
+                entries
+                    .iter()
+                    .find(|entry| entry["canonical_identity"] == *alias)
+                    .unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let resolved = task12_project_wire_tool(
+            &mut wire,
+            "resolve_project",
+            serde_json::json!({"project": handles[0]}),
+        )
+        .await;
+        assert_eq!(
+            resolved["project"]["id"], handles[0],
+            "semicolon INSIDE a quoted key remains a valid point"
+        );
+        let created = task12_project_wire_tool(
+            &mut wire,
+            "set_reminder",
+            serde_json::json!({
+                "message": "owned quoted-semicolon control", "target_project": handles[0],
+                "due_at": (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+            }),
+        )
+        .await;
+        let repo = ScopedReminderRepo::new(server.db.inner(), alice.owner().clone());
+        let saved = repo
+            .get(created["id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.project.as_ref(), Some(&keys[0]));
+        assert_eq!(saved.delivered_count, 0);
+        let before = serde_json::to_value(repo.list(None, None, 100, 0).await.unwrap().0).unwrap();
+        let trailing = format!("{}; {}", handles[0], handles[1]);
+        // Check FIRST: the prefix is genuinely owned and due, so lookup cannot mask parser acceptance.
+        for (name, arguments) in [
+            ("check_reminders", serde_json::json!({"project": trailing})),
+            (
+                "set_reminder",
+                serde_json::json!({"message": "must not create", "target_project": trailing,
+                "due_at": (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()}),
+            ),
+            (
+                "list_reminders",
+                serde_json::json!({"status": "all", "target_project": trailing}),
+            ),
+        ] {
+            let result = task12_project_wire_request(
+                &mut wire,
+                "tools/call",
+                serde_json::json!({"name": name, "arguments": arguments}),
+            )
+            .await;
+            assert_eq!(
+                result["isError"], true,
+                "actual {name} must reject non-full-input selector {trailing:?}: {result}"
+            );
+            assert_eq!(
+                serde_json::to_value(repo.list(None, None, 100, 0).await.unwrap().0).unwrap(),
+                before,
+                "malformed selectors cannot create/consume/mutate reminders"
+            );
+        }
+        let projects_after =
+            task12_project_wire_tool(&mut wire, "list_projects", serde_json::json!({"limit": 10}))
+                .await;
+        assert_eq!(
+            projects_after, listed,
+            "strict reminder selectors never establish aliases"
+        );
+        let delivered = task12_project_wire_tool(
+            &mut wire,
+            "check_reminders",
+            serde_json::json!({"project": handles[0]}),
+        )
+        .await;
+        assert_eq!(
+            delivered["count"], 1,
+            "valid quoted-semicolon point still delivers after refusals"
+        );
+        assert_eq!(delivered["delivered"][0]["id"], created["id"]);
+        assert_eq!(delivered["delivered"][0]["target"], handles[0]);
+        let repeated = task12_project_wire_tool(
+            &mut wire,
+            "check_reminders",
+            serde_json::json!({"project": handles[0]}),
+        )
+        .await;
+        assert_eq!(repeated["count"], 0);
+        drop(running);
+    }
+
+    #[tokio::test]
+    async fn task12_project_handle_uuid_and_string_twin_roundtrip() {
+        const UUID_TEXT: &str = "123e4567-e89b-42d3-a456-426614174000";
+        let uuid = UUID_TEXT.parse::<surrealdb::types::Uuid>().unwrap();
+        task12_project_handle_roundtrip([
+            surrealdb::types::RecordId::new("project", uuid),
+            surrealdb::types::RecordId::new("project", UUID_TEXT),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task12_project_handle_literal_backticks_and_plain_twin_roundtrip() {
+        task12_project_handle_roundtrip([
+            surrealdb::types::RecordId::new("project", "`ticktwin`"),
+            surrealdb::types::RecordId::new("project", "ticktwin"),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task12_project_handle_reminder_selectors_refuse_nonliteral_range_wrong_table_and_foreign()
+     {
+        let (server, alice, bob, mut wire, running) = task12_project_wire_fixture().await;
+        let foreign = surrealdb::types::RecordId::new("project", "foreign_control");
+        task12_seed_project_key(&server, bob.owner(), &foreign, "foreign-control").await;
+        let owned = task12_project_wire_tool(
+            &mut wire,
+            "resolve_project",
+            serde_json::json!({"project": "owned-control"}),
+        )
+        .await;
+        let own_handle = owned["project"]["id"].as_str().unwrap();
+        for selector in ["project:", "project:1..9", "workspace:7", "fact:7"] {
+            let result = task12_project_wire_request(
+                &mut wire,
+                "tools/call",
+                serde_json::json!({
+                    "name": "resolve_project", "arguments": {"project": selector}
+                }),
+            )
+            .await;
+            assert_eq!(
+                result["isError"], true,
+                "explicit malformed/wrong-table selector cannot establish an alias: {result}"
+            );
+        }
+        let invalid = [
+            "",
+            "owned-control",
+            "workspace:7",
+            "fact:7",
+            "project:missing",
+            "project:",
+            "project:1..9",
+            "[project:7]",
+            "type::record('project', 7)",
+            "project:7; project:8",
+            "7",
+        ];
+        let mut invalid: Vec<String> = invalid.into_iter().map(str::to_string).collect();
+        invalid.push(format_project_handle(&foreign));
+        for selector in invalid {
+            for (name, arguments) in [
+                (
+                    "set_reminder",
+                    serde_json::json!({"message": "must not become global",
+                    "due_at": (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(), "target_project": selector}),
+                ),
+                ("check_reminders", serde_json::json!({"project": selector})),
+                (
+                    "list_reminders",
+                    serde_json::json!({"status": "all", "target_project": selector}),
+                ),
+            ] {
+                let result = task12_project_wire_request(
+                    &mut wire,
+                    "tools/call",
+                    serde_json::json!({"name": name, "arguments": arguments}),
+                )
+                .await;
+                assert_eq!(
+                    result["isError"], true,
+                    "actual {name} must refuse selector {selector:?}: {result}"
+                );
+            }
+        }
+        let repo = ScopedReminderRepo::new(server.db.inner(), alice.owner().clone());
+        assert!(
+            repo.list(None, None, 100, 0).await.unwrap().0.is_empty(),
+            "invalid targets cannot create global reminders"
+        );
+        let projects =
+            task12_project_wire_tool(&mut wire, "list_projects", serde_json::json!({})).await;
+        assert_eq!(
+            projects["count"], 1,
+            "strict reminder selectors never establish aliases or reveal foreign rows"
+        );
+        let created = task12_project_wire_tool(&mut wire, "set_reminder", serde_json::json!({
+            "message": "owned positive control", "due_at": (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+            "target_project": own_handle,
+        })).await;
+        let delivered = task12_project_wire_tool(
+            &mut wire,
+            "check_reminders",
+            serde_json::json!({"project": own_handle}),
+        )
+        .await;
+        assert_eq!(delivered["count"], 1);
+        assert_eq!(delivered["delivered"][0]["id"], created["id"]);
+        assert_eq!(delivered["delivered"][0]["target"], own_handle);
+        drop(running);
+    }
+
+    fn typed_reminder_request(target: &str) -> SetReminderParams {
+        SetReminderParams {
+            message: "typed service delivery witness".into(),
+            due_at: Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()),
+            pattern: None,
+            cron: None,
+            target_project: Some(target.into()),
+            prov_project: Some("display-only-not-routing".into()),
+            session_id: None,
+            note: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn task12_reminder_api_checks_owned_typed_context_even_with_no_due_rows() {
+        let (server, alice, bob) = two_trusted_local_owners().await;
+        let foreign =
+            alexandria_storage::repos::ScopedProjectRepo::new(server.db.inner(), bob.owner())
+                .establish("same-alias", None)
+                .await
+                .unwrap();
+        let foreign = record_id_to_string(foreign.project.id.as_record_id());
+        for project in [foreign, "same-alias".into(), "project:missing".into()] {
+            assert!(
+                server
+                    .reminder_check(
+                        &alice,
+                        &CheckRemindersParams {
+                            project: Some(project.clone())
+                        }
+                    )
+                    .await
+                    .is_err(),
+                "typed delivery context {project:?} must be owned, not a hint or fallback"
+            );
+            assert!(
+                server
+                    .reminder_list(
+                        &alice,
+                        &ListRemindersParams {
+                            status: Some("all".into()),
+                            target_project: Some(project.clone()),
+                            limit: None,
+                            offset: None,
+                        }
+                    )
+                    .await
+                    .is_err(),
+                "typed list filter {project:?} must be owned too"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task12_reminder_api_holds_a_different_owned_project_then_delivers_exact_target() {
+        let (server, alice, _) = two_trusted_local_owners().await;
+        let projects =
+            alexandria_storage::repos::ScopedProjectRepo::new(server.db.inner(), alice.owner());
+        let own = projects.establish("target", None).await.unwrap();
+        let other = projects.establish("other", None).await.unwrap();
+        let target = record_id_to_string(own.project.id.as_record_id());
+        let created: serde_json::Value = serde_json::from_str(
+            &server
+                .reminder_create(&alice, typed_reminder_request(&target))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let held: serde_json::Value = serde_json::from_str(
+            &server
+                .reminder_check(
+                    &alice,
+                    &CheckRemindersParams {
+                        project: Some(record_id_to_string(other.project.id.as_record_id())),
+                    },
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            held["count"], 0,
+            "a typed target is not global merely because legacy text is NONE"
+        );
+        let delivered: serde_json::Value = serde_json::from_str(
+            &server
+                .reminder_check(
+                    &alice,
+                    &CheckRemindersParams {
+                        project: Some(target.clone()),
+                    },
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(delivered["count"], 1);
+        assert_eq!(delivered["delivered"][0]["id"], created["id"]);
+        assert_eq!(
+            delivered["delivered"][0]["target"], target,
+            "never prefix an already typed handle twice"
+        );
+        assert_eq!(delivered["delivered"][0]["escalated"], false);
+        assert_eq!(delivered["delivered"][0]["missed_occurrences"], 0);
+        assert_eq!(
+            delivered["delivered"][0]["missed_occurrences_saturated"],
+            false
+        );
+        let again: serde_json::Value = serde_json::from_str(
+            &server
+                .reminder_check(&alice, &CheckRemindersParams { project: None })
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again["count"], 0, "the one-shot is consumed exactly once");
+    }
+
+    #[tokio::test]
+    async fn task12_reminder_api_recurring_claim_reports_coalescing_and_advances_once() {
+        let (server, alice, _) = two_trusted_local_owners().await;
+        let own =
+            alexandria_storage::repos::ScopedProjectRepo::new(server.db.inner(), alice.owner())
+                .establish("recurring-target", None)
+                .await
+                .unwrap();
+        let target = record_id_to_string(own.project.id.as_record_id());
+        let mut params = typed_reminder_request(&target);
+        params.due_at = None;
+        params.cron = Some("* * * * *".into());
+        let created: serde_json::Value =
+            serde_json::from_str(&server.reminder_create(&alice, params).await.unwrap()).unwrap();
+        let repo = ScopedReminderRepo::new(server.db.inner(), alice.owner().clone());
+        let id = created["id"].as_str().unwrap();
+        let row = repo.get(id).await.unwrap().unwrap();
+        let due = Utc::now() - chrono::Duration::minutes(3);
+        server
+            .db
+            .inner()
+            .query("UPDATE $id SET next_due_at = $due;")
+            .bind(("id", row.id.unwrap()))
+            .bind(("due", due))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let delivered: serde_json::Value = serde_json::from_str(
+            &server
+                .reminder_check(
+                    &alice,
+                    &CheckRemindersParams {
+                        project: Some(target.clone()),
+                    },
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(delivered["count"], 1);
+        let fire = &delivered["delivered"][0];
+        assert_eq!(fire["target"], target);
+        assert_eq!(fire["recurring"], true);
+        assert!(
+            fire["missed_occurrences"]
+                .as_u64()
+                .is_some_and(|count| count >= 2)
+        );
+        assert_eq!(fire["missed_occurrences_saturated"], false);
+        assert_eq!(fire["due_at"], rfc3339_utc(due));
+        let stored = repo.get(id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "pending");
+        assert_eq!(stored.delivered_count, 1);
+        assert!(stored.next_due_at.unwrap() > Utc::now());
+        let again: serde_json::Value = serde_json::from_str(
+            &server
+                .reminder_check(&alice, &CheckRemindersParams { project: None })
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again["count"], 0);
+        assert_eq!(repo.get(id).await.unwrap().unwrap().delivered_count, 1);
+    }
+
+    #[tokio::test]
+    async fn task12_reminder_api_keeps_held_history_and_typed_piggyback_without_consuming() {
+        let (server, alice, _) = two_trusted_local_owners().await;
+        let project =
+            alexandria_storage::repos::ScopedProjectRepo::new(server.db.inner(), alice.owner())
+                .establish("history-target", None)
+                .await
+                .unwrap();
+        let target = record_id_to_string(project.project.id.as_record_id());
+        let repo = ScopedReminderRepo::new(server.db.inner(), alice.owner().clone());
+        let mut ids = Vec::new();
+        for message in ["typed eligible", "typed held", "unresolved history"] {
+            let mut params = typed_reminder_request(&target);
+            params.message = message.into();
+            let created: serde_json::Value =
+                serde_json::from_str(&server.reminder_create(&alice, params).await.unwrap())
+                    .unwrap();
+            ids.push(created["id"].as_str().unwrap().to_string());
+        }
+        let held = repo.get(&ids[1]).await.unwrap().unwrap();
+        server
+            .db
+            .inner()
+            .query("UPDATE $id SET migration_hold = true;")
+            .bind(("id", held.id.unwrap()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let legacy = repo.get(&ids[2]).await.unwrap().unwrap();
+        server.db.inner().query("UPDATE $id SET project = NONE, target_project = 'old-name', legacy_target_project = 'old-name';")
+            .bind(("id", legacy.id.unwrap())).await.unwrap().check().unwrap();
+        let sample = server.due_reminders_summary_for(&alice, 5).await;
+        assert_eq!(sample.len(), 1);
+        assert_eq!(sample[0]["id"], ids[0]);
+        assert_eq!(sample[0]["target"], target);
+        assert_eq!(
+            repo.get(&ids[0]).await.unwrap().unwrap().delivered_count,
+            0,
+            "piggyback is informational, not the consuming check"
+        );
+        let history = server
+            .reminder_list(
+                &alice,
+                &ListRemindersParams {
+                    status: Some("all".into()),
+                    target_project: None,
+                    limit: Some(100),
+                    offset: None,
+                },
+            )
+            .await
+            .unwrap();
+        let rows = history["reminders"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "suppression must not erase owned history");
+        let targeted = server
+            .reminder_list(
+                &alice,
+                &ListRemindersParams {
+                    status: Some("all".into()),
+                    target_project: Some(target.clone()),
+                    limit: Some(100),
+                    offset: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            targeted["count"], 2,
+            "typed history filter includes the held typed row, not unresolved text"
+        );
+        assert!(
+            targeted["reminders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["target"] == target)
+        );
+        let held = rows.iter().find(|row| row["id"] == ids[1]).unwrap();
+        assert_eq!(held["migration_hold"], true);
+        assert_eq!(held["target"], target);
+        let legacy = rows.iter().find(|row| row["id"] == ids[2]).unwrap();
+        assert!(
+            legacy["target"].is_null(),
+            "unresolved history must not be labelled global"
+        );
+        assert_eq!(legacy["legacy_target_project"], "old-name");
+        let delivered: serde_json::Value = serde_json::from_str(
+            &server
+                .reminder_check(
+                    &alice,
+                    &CheckRemindersParams {
+                        project: Some(target),
+                    },
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(delivered["count"], 1);
+        for id in &ids[1..] {
+            let row = repo.get(id).await.unwrap().unwrap();
+            assert_eq!(row.status, "pending");
+            assert_eq!(row.delivered_count, 0);
+        }
+        server
+            .reminder_cancel(&alice, &CancelReminderParams { id: ids[1].clone() })
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get(&ids[1]).await.unwrap().unwrap().status,
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn task12_reminder_api_global_and_escalation_stay_within_the_owner_account() {
+        let (mut server, alice, bob) = two_trusted_local_owners().await;
+        server.reminders.escalation_hours = 1;
+        let project =
+            alexandria_storage::repos::ScopedProjectRepo::new(server.db.inner(), alice.owner())
+                .establish("escalation-target", None)
+                .await
+                .unwrap();
+        let target = record_id_to_string(project.project.id.as_record_id());
+        let mut targeted = typed_reminder_request(&target);
+        targeted.due_at = Some((Utc::now() - chrono::Duration::hours(2)).to_rfc3339());
+        server.reminder_create(&alice, targeted).await.unwrap();
+        let mut global = typed_reminder_request(&target);
+        global.target_project = None;
+        server.reminder_create(&alice, global).await.unwrap();
+        let mut foreign = typed_reminder_request(&target);
+        foreign.target_project = None;
+        let foreign: serde_json::Value =
+            serde_json::from_str(&server.reminder_create(&bob, foreign).await.unwrap()).unwrap();
+        let delivered: serde_json::Value = serde_json::from_str(
+            &server
+                .reminder_check(&alice, &CheckRemindersParams { project: None })
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(delivered["count"], 2);
+        let rows = delivered["delivered"].as_array().unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row["target"] == "global" && row["escalated"] == false)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row["target"] == target && row["escalated"] == true)
+        );
+        let bobs = ScopedReminderRepo::new(server.db.inner(), bob.owner().clone());
+        let retained = bobs
+            .get(foreign["id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.status, "pending");
+        assert_eq!(retained.delivered_count, 0);
     }
 
     /// One `StoreMemoryParams` with nothing but content, so each case varies only what it names.

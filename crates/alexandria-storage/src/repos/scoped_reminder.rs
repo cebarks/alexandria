@@ -19,8 +19,8 @@
 //! Every write here re-asserts its authority inside its own transaction with
 //! [`guarded_run`](super::scope::guarded_run) — the same commit predicate the session, memory, graph and
 //! cluster writers use. The four reminder surfaces used to be the exception: `set_reminder` is admitted
-//! for hosted bearers (it is deliberately not a D4 refusal, because its target is free text rather than a
-//! partition), so `create`, `stamp_owner`, `record_delivery` and `cancel` were the places where a
+//! for hosted bearers without a corpus-write grant; explicit targets must still resolve to owned
+//! projects. `create`, `stamp_owner`, `record_delivery` and `cancel` were the places where a
 //! revocation landing after `admit` could still commit.
 //!
 //! `stamp_owner` is gone rather than guarded, for that reason: the create statement now carries the
@@ -37,21 +37,27 @@
 //!
 //! ## Targeting
 //!
-//! `target_project` is free text today and stays free text here: only the *owner* is authoritative. A
-//! caller may pass any project string they like, and it narrows within their own rows — which cannot
-//! reach another account, so it does not need to resolve to a `project` record to be safe. Casting an
-//! arbitrary legacy name into a typed id is Task 14's job, not this one.
+//! New `target_project` inputs must be existing project handles owned by this workspace. They are
+//! stored in `project`, never in the legacy free-text field. Unresolved historical text remains
+//! pending and suppressed before sampling/consumption; mapping it is Task 14, not name guessing.
 
 use crate::access::OwnerContext;
 use crate::error::StorageError;
-use crate::models::Reminder;
+use crate::models::{ProjectId, Reminder};
 use crate::repos::scope::{Bind, GuardedWrite, guarded_run};
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::RecordId;
 
+use super::ScopedProjectRepo;
 use super::reminder_repo::{NewReminder, ReminderRepo};
+
+// Shared by discovery and the conditional claim: held/unresolved rows must not cost a sample slot
+// or become claimable through a stale read. Legacy text is not authority, even after escalation.
+const DELIVERABLE: &str = "(migration_hold = NONE OR migration_hold != true) AND \
+    (project != NONE OR (target_project = NONE AND legacy_target_project = NONE)) AND \
+    (project = NONE OR project.workspace = $workspace)";
 
 pub struct ScopedReminderRepo<'a> {
     inner: ReminderRepo<'a>,
@@ -70,6 +76,15 @@ impl<'a> ScopedReminderRepo<'a> {
         self.owner.account().as_record_id().clone()
     }
 
+    /// Validate an explicit handle without resolving an alias, name, or filesystem hint.
+    pub async fn resolve_target(&self, input: &str) -> Result<ProjectId, StorageError> {
+        let project = crate::project_handle::parse_project_handle(input)?;
+        Ok(ScopedProjectRepo::new(self.owner_db(), &self.owner)
+            .resolve_id(&project)
+            .await?
+            .id)
+    }
+
     /// Creates a reminder owned by the bound account, in the statement that creates it.
     ///
     /// The `account` stamp comes from the context rather than an argument, so a caller cannot write a
@@ -86,15 +101,20 @@ impl<'a> ScopedReminderRepo<'a> {
         r: &NewReminder,
         now: DateTime<Utc>,
     ) -> Result<Reminder, StorageError> {
+        let project = match r.target_project.as_deref() {
+            Some(target) => Some(self.resolve_target(target).await?.as_record_id().clone()),
+            None => None,
+        };
         let write = GuardedWrite::new(
-            "CREATE reminder SET message = $message, target_project = $target_project, prov_project \
+            "CREATE reminder SET message = $message, project = $project, target_project = NONE, \
+             legacy_target_project = NONE, migration_hold = false, prov_project \
              = $prov_project, prov_session_id = $prov_session_id, note = $note, schedule_kind = \
              $schedule_kind, due_at = $due_at, freq = $freq, time_of_day = $time_of_day, weekdays = \
              $weekdays, day_of_month = $day_of_month, cron_expr = $cron_expr, next_due_at = \
              $next_due_at, status = 'pending', delivered_count = 0, account = $account RETURN AFTER;",
         )
         .value("message", Bind::Text(r.message.clone()))
-        .value("target_project", Bind::OptText(r.target_project.clone()))
+        .value("project", Bind::OptRecord(project))
         .value("prov_project", Bind::OptText(r.prov_project.clone()))
         .value("prov_session_id", Bind::OptText(r.prov_session_id.clone()))
         .value("note", Bind::OptText(r.note.clone()))
@@ -140,11 +160,12 @@ impl<'a> ScopedReminderRepo<'a> {
     pub async fn list_due(&self, now: DateTime<Utc>) -> Result<Vec<Reminder>, StorageError> {
         let mut response = self
             .owner_db()
-            .query(
+            .query(format!(
                 "SELECT * FROM reminder WHERE account = $account AND status = 'pending' \
-                 AND next_due_at <= $now AND (migration_hold = NONE OR migration_hold != true) \
-                 ORDER BY next_due_at ASC, id ASC;",
-            )
+                 AND next_due_at <= $now AND next_due_at != NONE AND {DELIVERABLE} \
+                 ORDER BY next_due_at ASC, id ASC;"
+            ))
+            .bind(("workspace", self.owner.workspace().as_record_id().clone()))
             .bind(("account", self.account()))
             .bind(("now", now))
             .await
@@ -172,12 +193,12 @@ impl<'a> ScopedReminderRepo<'a> {
     ) -> Result<Vec<Reminder>, StorageError> {
         let mut response = self
             .owner_db()
-            .query(
+            .query(format!(
                 "SELECT * FROM reminder WHERE account = $account AND status = 'pending' \
-                 AND next_due_at <= $now AND next_due_at != NONE \
-                 AND (migration_hold = NONE OR migration_hold != true) \
-                 ORDER BY next_due_at ASC, id ASC LIMIT $cap;",
-            )
+                 AND next_due_at <= $now AND next_due_at != NONE AND {DELIVERABLE} \
+                 ORDER BY next_due_at ASC, id ASC LIMIT $cap;"
+            ))
+            .bind(("workspace", self.owner.workspace().as_record_id().clone()))
             .bind(("account", self.account()))
             .bind(("now", now))
             .bind(("cap", cap))
@@ -200,9 +221,13 @@ impl<'a> ScopedReminderRepo<'a> {
         if status.is_some() {
             conditions.push("status = $status".to_string());
         }
-        if target_project.is_some() {
-            conditions.push("target_project = $target_project".to_string());
-        }
+        let project = match target_project {
+            Some(target) => {
+                conditions.push("project = $project".to_string());
+                Some(self.resolve_target(target).await?.as_record_id().clone())
+            }
+            None => None,
+        };
         let mut q = self
             .owner_db()
             .query(format!(
@@ -212,7 +237,7 @@ impl<'a> ScopedReminderRepo<'a> {
             ))
             .bind(("account", self.account()))
             .bind(("status", status.map(str::to_string)))
-            .bind(("target_project", target_project.map(str::to_string)))
+            .bind(("project", project))
             .bind(("limit", limit + 1))
             .bind(("offset", offset.max(0)));
         let _ = &mut q;
@@ -251,7 +276,8 @@ impl<'a> ScopedReminderRepo<'a> {
         };
         let sql = format!(
             "UPDATE type::record('reminder', $key) SET {set_clause} WHERE id = $id AND account = \
-             $account AND status = 'pending' AND next_due_at = $seen RETURN AFTER;"
+             $account AND status = 'pending' AND next_due_at = $seen AND next_due_at != NONE \
+             AND {DELIVERABLE} RETURN AFTER;"
         );
         let mut write = GuardedWrite::new(sql)
             .id("id", rid.clone())

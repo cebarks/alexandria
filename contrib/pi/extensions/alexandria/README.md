@@ -58,7 +58,9 @@ npm install --omit=dev --ignore-scripts
 ## Reminders
 
 The server runs no timer. A reminder becomes visible only when a client calls `check_reminders`, so
-this extension is the delivery path: it checks once per prompt, before the agent starts.
+this extension attempts delivery once per prompt, before the agent starts. The authenticated server
+requires an owned typed project handle when a check supplies context; the unchanged companion's
+basename default is incompatible with that requirement (see project targeting below).
 
 - **Delivered once.** `check_reminders` consumes what it returns, so a reminder appears exactly once
   — the agent has to act on it or tell the user, because nothing will raise it again. Recurring
@@ -75,26 +77,37 @@ this extension is the delivery path: it checks once per prompt, before the agent
   `due_at_local` and `timezone` beside the UTC instant, and the injected block shows each row's `id` so
   the agent can `cancel_reminder` without a round trip. More than 10 rows in one check are summarized
   with a pointer to `list_reminders` — they were still consumed, which is why the pointer is there.
-- **Project targeting.** Each check sends a project hint: `ALEXANDRIA_REMINDERS_PROJECT` if set,
-  otherwise the basename of `git rev-parse --show-toplevel` run **in the session's directory**
-  (`ctx.cwd`, not the process working directory — a resumed session can live in another project than
-  the one pi was launched from), otherwise nothing. Results are cached per directory. Reminders
-  targeted at that project are delivered; global ones are delivered anywhere. The match is exact and
-  case-sensitive against the `target_project` passed to `set_reminder`.
-- **Escalation.** A project-targeted reminder at least the server's `[reminders] escalation_hours`
-  (default 48) overdue is delivered regardless of the hint, labeled
-  `[OVERDUE — escalated from project targeting]`. So a project you stop visiting cannot silently keep
-  its reminders unsurfaced.
+- **Project targeting and current compatibility gap.** The authenticated server accepts only an
+  existing owned, issued `project:<opaque-id>` for `set_reminder.target_project`,
+  `check_reminders.project`, and `list_reminders.target_project`. Copy the actual handle returned by
+  `resolve_project` or `list_projects`, not its display name, alias, repository name or basename.
+  Resolve/select an owned handle first if none is known; do not invent a result or silently widen a
+  project-specific request. Unknown/foreign handles are refused even when no reminders are due.
+  This extension does **not** perform that lookup: each check uses the explicit env/TOML override if
+  set, otherwise the basename of `git rev-parse --show-toplevel` in the session's directory
+  (`ctx.cwd`), otherwise no context. Probes are cached per directory. The unchanged basename default
+  is unsupported by the typed server and produces a refused check, not late/global delivery.
+- **Escalation stays within the owner account.** On a check with an accepted or omitted context, a
+  valid typed target at least the server's `[reminders] escalation_hours` (default 48) overdue can
+  deliver in another project context of that same account, labeled
+  `[OVERDUE — escalated from project targeting]`. It never delivers another account's reminder,
+  regardless of matching basenames. Global reminders are account-local too. Held or unresolved
+  historical text targets stay pending and suppressed, never global/escalated; no automatic mapping
+  is implemented.
 - **Two audiences, unequally.** Every delivery is injected into context (the agent-visible half) and
   *announced* as `⏰ N Alexandria reminder(s) due`. The announcement is the weaker half:
   `ctx.ui.notify` is a no-op wherever pi has no dialog UI — `pi -p`, print mode, a headless run — so
   what it guarantees is that the human's own agent saw it, not that the human did. The rows are
   consumed either way.
 
-Set `ALEXANDRIA_REMINDERS_PROJECT` when the checkout directory is not the project name — most often
-in a **git worktree**, where the toplevel basename is the worktree directory (`feature/reminders`)
-rather than the repository (`alexandria`). Without the override, reminders targeted at the real
-project name arrive late and escalated rather than in their own project.
+An explicit **existing owned project ID** may be supplied through `ALEXANDRIA_REMINDERS_PROJECT`
+or `[reminders].project`: the current configuration/getProjectHint/checkReminders path passes that
+configured string into `check_reminders.project` without resolving it. Copy an actual successfully
+returned handle exactly; an override does not grant ownership, and the server still validates it.
+Setting another name/basename does not repair compatibility. Omitting the override inside a repository
+still selects the unsupported basename, not a context-free check; when no context is sent, only your
+global and eligible escalated reminders can deliver. Automatic issued-handle plumbing is separate
+work, not implemented here.
 
 Everything here is fail-open: an unreachable server, a missing `git`, or a malformed response
 produces a warning at most, never a blocked turn — and a notification that itself throws (pi's `ctx.ui`
@@ -193,7 +206,9 @@ extract_timeout_ms = 5000
 
 [reminders]
 enabled = true
-project = "alexandria"
+# Configure project only with an actual owned ID returned by resolve_project/list_projects.
+# No automatic lookup: the unchanged repository-basename default is unsupported.
+# project = "project:<actual-issued-id>"
 ```
 
 ### Environment Variables
@@ -208,7 +223,7 @@ project = "alexandria"
 | `ALEXANDRIA_EXTRACT_MODEL` | `vertex/claude-haiku-4-5` | Model for the LLM extraction pass |
 | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | `5000` | Extraction timeout in milliseconds |
 | `ALEXANDRIA_REMINDERS` | (enabled) | Set to `off` to disable per-prompt reminder checks |
-| `ALEXANDRIA_REMINDERS_PROJECT` | (git repo dir name) | Project hint sent to `check_reminders`, for exact matching against reminder targets |
+| `ALEXANDRIA_REMINDERS_PROJECT` | (git repo dir name; unsupported by typed server) | Explicit existing owned project ID passed to `check_reminders.project`; copy a real issued handle from `resolve_project`/`list_projects`. No automatic lookup or ownership grant. |
 | `ALEXANDRIA_CLIENT_CONFIG` | (XDG default) | Path to an alternate client TOML config |
 
 `ALEXANDRIA_AUTO_RECALL` is the original name of the recall toggle and is still the spelling it

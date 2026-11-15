@@ -33,7 +33,7 @@ use crate::access::OwnerContext;
 use crate::error::StorageError;
 use crate::models::auth::Project;
 use crate::models::identity::{ProjectId, WorkspaceId};
-use crate::repos::scope::{Bind, GuardedWrite, guarded_run, record_key};
+use crate::repos::scope::{Bind, GuardedWrite, guarded_run};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use surrealdb::Surreal;
@@ -205,11 +205,7 @@ impl<'a> ScopedProjectRepo<'a> {
     async fn read_by_id(&self, id: &RecordId) -> Result<ResolvedProject, StorageError> {
         let mut response = self
             .db
-            .query(
-                "SELECT * FROM type::record('project', $key) WHERE id = $id AND workspace = \
-                 $workspace LIMIT 1;",
-            )
-            .bind(("key", record_key(id)?))
+            .query("SELECT * FROM $id WHERE workspace = $workspace LIMIT 1;")
             .bind(("id", id.clone()))
             .bind(("workspace", self.workspace()))
             .await

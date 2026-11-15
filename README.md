@@ -142,11 +142,27 @@ cost of that design is that nothing reaches anyone until a client asks: the pi c
 `check_reminders` once per prompt and additionally notifies the human, and that client-side step is
 where "and the user" actually lives — a client that never calls the tool receives nothing.
 `set_reminder` validates schedules at set time and echoes the parsed next fire times for confirmation;
-`check_reminders` delivers and consumes them, one-way. Reminders target the global
-context or a specific project, and a project-targeted reminder that is overdue by at least
-`[reminders].escalation_hours` escalates to global delivery — nothing is silently lost. Overdue
-items are also surfaced read-only, capped and oldest-due first, in the `due_reminders` array of
-`retrieve_memories` and `recall` responses.
+`check_reminders` delivers and consumes them, one-way. All reminder operations are account-bound.
+Omit `set_reminder.target_project` for a global reminder **within your account**, or supply an existing
+owned `project:<opaque-id>` handle. `check_reminders.project` and `list_reminders.target_project`
+accept that same owned handle, not a name, alias, or checkout basename. Project tool results use
+canonical SurrealDB record text: copy it verbatim, including any quoting/escaping that distinguishes
+numeric, string, or literal-backtick keys. Do not strip delimiters or rebuild it from a display label.
+Unknown or foreign handles
+are refused even when nothing is due; omit a check context when no handle is known.
+
+A valid project target overdue by at least `[reminders].escalation_hours` escalates within its owner's
+account. A historical unresolved text target or `migration_hold` row stays pending and suppressed,
+including from the read-only due sample; escalation never turns it into a global reminder. No automatic
+legacy-name mapping is performed. Unfiltered `list_reminders` still exposes owned held/unresolved
+history for inspection (`target: null` for unresolved text, with separate legacy fields).
+Overdue eligible items are surfaced read-only, capped and oldest-due first, in the `due_reminders`
+array of `retrieve_memories` and `recall` responses. Targets there and in delivery responses are
+`global` or a single typed `project:<opaque-id>` handle, never a doubled prefix.
+
+Compatibility: older companion clients that send repository basenames do not satisfy this server
+contract. Configure an existing owned project handle where supported, or omit the context; automatic
+client-side handle discovery and historical target mapping are separate work, not provided here.
 
 Recurring schedules are evaluated as wall clock in `[reminders].timezone`, so a daily 09:00 stays 09:00
 local across a DST change: a time the spring-forward gap removed does not fire that day, and a time a

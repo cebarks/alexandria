@@ -35,7 +35,7 @@ pub struct SetReminderParams {
     )]
     pub cron: Option<String>,
     #[schemars(
-        description = "Optional project name to target delivery (e.g. 'alexandria'). Omit for a global reminder. Project reminders escalate to global delivery once they are at least escalation_hours overdue, so they are never silently lost. Matching is exact and case-sensitive — the basename of a worktree directory is a different project name."
+        description = "Optional owned project ID (project:<opaque-id>) to target delivery. Copy the existing project tool's canonical record text exactly, including quoting/escaping; never use a name, alias, or checkout basename; unknown and foreign handles are refused. Omit for a global reminder within your account. Valid project reminders escalate within your account once at least escalation_hours overdue. Historical unresolved text targets stay pending and suppressed, never global."
     )]
     pub target_project: Option<String>,
     #[schemars(

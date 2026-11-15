@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+#[path = "reminders_test/typed_targets.rs"]
+mod typed_targets;
+
 use alexandria_engine::reminders::{human_readable, spec_from_reminder};
 use alexandria_mcp::server::{AlexandriaServer, HeatSettings, RemindersSettings};
 use alexandria_mcp::tools::{

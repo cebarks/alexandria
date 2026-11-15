@@ -18,10 +18,13 @@
  *   Disable all store behavior: ALEXANDRIA_AUTO_STORE=off
  *
  * Reminders (before_agent_start, alongside recall):
- *   Calls check_reminders once per prompt with a project hint, so reminders the
- *   server has no timer for actually reach the user. Due ones are injected into
- *   context (agent-visible) and surfaced as a notification (human-visible);
- *   delivery is once-only, so consuming it is what advances recurring schedules.
+ *   Attempts check_reminders once per prompt with the configured string or git basename.
+ *   The authenticated server requires an existing owned issued project ID, copied from
+ *   resolve_project/list_projects; the unchanged basename default is unsupported.
+ *   An explicit owned-ID override is passed through, not resolved or granted authority.
+ *   No automatic handle discovery/mapping is implemented. Delivery and escalation stay
+ *   within the reminder owner's account. Accepted due rows are injected into context
+ *   and announced; consuming a fire advances its recurring schedule.
  *   Disable: ALEXANDRIA_REMINDERS=off
  *
  * Recall and reminders share a single before_agent_start handler: both blocks
@@ -37,8 +40,9 @@
  *   ALEXANDRIA_EXTRACT_MODEL                default: vertex/claude-haiku-4-5
  *   ALEXANDRIA_EXTRACT_TIMEOUT_MS           default: 5000
  *   ALEXANDRIA_REMINDERS                    set to "off" to disable reminder checks
- *   ALEXANDRIA_REMINDERS_PROJECT            project hint for reminder targeting
- *                                           (default: git repo directory name)
+ *   ALEXANDRIA_REMINDERS_PROJECT            explicit existing owned issued project ID
+ *                                           (passed through to check_reminders.project)
+ *                                           default: git repo basename, unsupported by typed server
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";

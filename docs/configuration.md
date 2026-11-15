@@ -338,12 +338,23 @@ re-measure by editing the const and this table together.
 
 ### `[reminders]`
 
-Controls how reminder schedules are interpreted and how project-targeted reminders are guaranteed to arrive. These keys affect the reminder tools only.
+Controls reminder schedule interpretation and overdue escalation for valid owned project targets.
+These keys affect the reminder tools only. Escalation never crosses an account boundary or releases a
+migration hold. `set_reminder.target_project`, `check_reminders.project`, and
+`list_reminders.target_project` take an existing owned `project:<opaque-id>` handle, not an alias,
+project name or repository basename. Copy the project tool's canonical record text verbatim, including
+quoting/escaping; numeric and string keys are distinct. Parsing is synchronous/local, accepts only an
+exact project record literal (not a range or expression), and still requires owned lookup.
+Unknown/foreign handles are errors even if no reminders are due;
+omit a check context when none is known. New reminders store a typed project link. Historical text
+without a resolved typed target stays pending and suppressed before sampling/claiming, regardless of
+age; these settings do not map it or turn it global. Owned held/unresolved history remains available
+through unfiltered `list_reminders` (unresolved `target` is null, with legacy provenance separate).
 
 | Key | Type | Default | Description |
 | ----- | ------ | --------- | ------------- |
 | `timezone` | string | `""` (system-local) | IANA timezone name (e.g. `"Europe/Stockholm"`) used to interpret naive datetimes passed to `set_reminder` and to evaluate recurring `pattern`/`cron` schedules (wall-clock semantics — a daily 09:00 stays 09:00 local across DST). Empty = the system-local timezone detected at startup, falling back to UTC if detection fails; an invalid IANA name is a startup error. Explicit ISO-8601 offsets in `due_at` are always honored regardless. Across a transition: a wall time removed by the spring-forward gap has no fire that day, and a time duplicated by a fall-back fold fires **once**, on the first pass — one wall-clock reading is one occurrence. Naive one-shot inputs that land in either zone are rejected at set time with a message naming the fix. |
-| `escalation_hours` | u64 | `48` | How long a project-targeted reminder may stay overdue before `check_reminders` delivers it regardless of the caller's project (labeled `escalated: true`), so a project that stops being visited can never silently swallow its reminders. The boundary is inclusive: a reminder escalates once it is *at least* this many hours overdue, which is what makes `0` escalate every overdue project reminder. An unparseable value in the env override is a startup error, and so is a value too large to represent as a duration — the delivery path would otherwise hold project reminders forever, on every check. One default, `alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS`, shared with the MCP server's fallback. |
+| `escalation_hours` | u64 | `48` | How long a valid typed project-targeted reminder may stay overdue before `check_reminders` delivers it within its owner's account regardless of a valid supplied project context (labeled `escalated: true`). Held/unresolved legacy targets are excluded, not escalated. The boundary is inclusive: a reminder escalates once it is *at least* this many hours overdue, which is what makes `0` escalate every overdue project reminder. An unparseable value in the env override is a startup error, and so is a value too large to represent as a duration — the delivery path would otherwise hold project reminders forever, on every check. One default, `alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS`, shared with the MCP server's fallback. |
 
 ## Environment Variable Overrides
 
@@ -435,7 +446,7 @@ what project hint it sends with the question.
 | Key | Type | Default | Env Override | Description |
 | ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_REMINDERS=off` | Call `check_reminders` on every prompt and inject whatever is due. The server runs no timer, so turning this off means reminders reach the user only if the agent calls `check_reminders` itself. |
-| `project` | string | (git repo dir name) | `ALEXANDRIA_REMINDERS_PROJECT` | Project hint sent with each check, matched exactly (case-sensitive) against the `target_project` set by `set_reminder`. Defaults to the basename of `git rev-parse --show-toplevel`; set it when the checkout directory is not the project name, as with a git worktree. Unset and outside a repo, only global and escalated reminders are delivered. |
+| `project` | string | (git repo dir name) | `ALEXANDRIA_REMINDERS_PROJECT` | The legacy client sends this string with each check, defaulting to the basename of `git rev-parse --show-toplevel`. That basename is **not accepted** by the authenticated server: configure an existing owned `project:<opaque-id>` handle rather than a project name. Automatic client handle discovery is not implemented here. A context-free check receives only your global and eligible escalated reminders; sending an unknown/name/foreign context is refused, not treated as context-free. |
 
 ---
 
