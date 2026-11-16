@@ -2242,14 +2242,16 @@ async fn list_unassigned_memories_bounds_its_page_and_completes_its_walk() {
 // §P1-2 — recall's `scope` restricts the recalled population, not just the candidate list
 // ---------------------------------------------------------------------------------------
 
-/// One cluster, members in three partitions, and four selections that must answer differently.
+/// Near-identical seeds in three partitions, and four selections that must answer differently.
 ///
-/// `recall` advertises the same `scope` word as `retrieve_memories`, so it must apply the same population
-/// predicate. A cluster row carries only `account`/`workspace` (v009), so the partition decision can only
-/// be made on the **members**: a candidate that has no member inside the resolved population is neither
-/// offered nor replayable, and a candidate that has some surfaces only those. Cluster *structure* —
-/// whether these rows should share a cluster at all — is Task 12's partitioned maintenance, and nothing
-/// here claims it.
+/// REWRITTEN to the partition-pure store semantics the signed base implements (owner decision;
+/// the task-8 mixed-cluster semantics are superseded): near-identical seeds across partitions land
+/// in **separate partition-scoped clusters** — the store path ranks destinations per partition and
+/// refuses a join that would leave one cluster holding members of two. What this test pins is the
+/// *read* side on top of that structure: `recall`'s `scope` word restricts the recalled population,
+/// so each selection surfaces exactly the members it may read (never another partition's), and a
+/// replayed handle answers from the selection it was replayed under. A cluster with no member in
+/// the resolved population is neither offered nor replayable.
 #[tokio::test(flavor = "multi_thread")]
 async fn recall_scope_selects_which_cluster_members_are_recalled() {
     let tools = Tools::hosted().await;
@@ -2308,6 +2310,23 @@ async fn recall_scope_selects_which_cluster_members_are_recalled() {
             format!("project:{}", short(&beta)),
         ],
         "the three seeds did not land in three distinct partitions: {partitions:?}"
+    );
+
+    // The partition-pure structure itself, as a positive control for everything below: the three
+    // near-identical seeds did NOT share a cluster — each partition got its own. Without this, a
+    // regression back to mixed clusters would still pass the selection assertions below (they pin
+    // the read side, which masks membership), so the structure this rewrite exists for is asserted
+    // where it lives.
+    let cluster_rows = tools
+        .rows(
+            "SELECT id FROM cluster WHERE workspace = $workspace;",
+            json!({"workspace": alice.workspace}),
+        )
+        .await;
+    assert_eq!(
+        cluster_rows.len(),
+        3,
+        "the three partition seeds did not land in three separate clusters: {cluster_rows:?}"
     );
 
     let members_of = |body: &Json| -> Vec<String> {
@@ -2451,10 +2470,12 @@ async fn recall_scope_selects_which_cluster_members_are_recalled() {
     );
 
     // 6. Replaying that handle under a *different* selection is legal — a handle names a cluster, not a
-    //    permission — but the served set is still the intersection, so rows that selection may not read do
-    //    not appear. The three seeds are near-identical and share one cluster, which makes this the
-    //    discriminating case rather than a vacuous one: a personal replay of a handle issued under a
-    //    project selection answers with the personal member and nothing from either project.
+    //    permission — but the served set is still the selection's read of that cluster. Under the
+    //    partition-pure store the beta handle names the beta partition's own cluster, which holds no
+    //    member a personal selection may read, so the replay answers with nothing. That is the
+    //    discriminating case rather than a vacuous one: a replay that widened the read would serve
+    //    the beta member, and point 5 already proved the handle itself resolves to a populated
+    //    cluster under its own selection.
     let cross = tools
         .call(
             &alice.bearer,
@@ -2477,8 +2498,8 @@ async fn recall_scope_selects_which_cluster_members_are_recalled() {
         .collect();
     assert_eq!(
         served,
-        vec!["rotation policy personal".to_string()],
-        "replaying a handle widened the read beyond the selection it was replayed under"
+        Vec::<String>::new(),
+        "replaying a handle under a selection with no member in its cluster still served rows"
     );
 
     // 7. A cluster with no eligible member is not offered at all, which is also what stops an outsider
@@ -2507,9 +2528,10 @@ async fn recall_scope_selects_which_cluster_members_are_recalled() {
 }
 
 // ---------------------------------------------------------------------------------------
-// §F1 — the write path's centroid average must count workspace membership, not the
-// partition selection it is writing into. This test exists because `CountingEmbedding` returns
-// the same vector for every text and cannot distinguish averaging from replacement.
+// §F1 — the write path's centroid is partition-pure: each partition-scoped cluster's running
+// average counts that partition's own membership, never another partition's. This test exists
+// because `CountingEmbedding` returns the same vector for every text and cannot distinguish
+// averaging from replacement.
 // ---------------------------------------------------------------------------------------
 
 fn nearly(actual: &[f32], expected: &[f32]) -> bool {
@@ -2520,6 +2542,12 @@ fn nearly(actual: &[f32], expected: &[f32]) -> bool {
             .all(|(a, e)| (a - e).abs() < 0.0001)
 }
 
+/// REWRITTEN to the partition-pure store semantics the signed base implements (owner decision;
+/// the task-8 mixed-cluster semantics are superseded): a cross-partition store does NOT join the
+/// caller's cluster in another partition — the destination ranking is per partition and a join
+/// that would straddle two is refused — so it mints that partition's own cluster, initialized
+/// from its sole member, and the first cluster's centroid is untouched. The running average a
+/// same-partition store performs counts the cluster's own (single-partition) membership.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cross_partition_store_updates_the_cluster_centroid_from_workspace_membership() {
     let tools = Tools::hosted_with_scripted_embeddings(vec![
@@ -2577,14 +2605,52 @@ async fn a_cross_partition_store_updates_the_cluster_centroid_from_workspace_mem
         !refused(&second),
         "cross-partition seed store refused: {second}"
     );
-    let after_cross = tools.stored_cluster_centroid(&cluster_id).await;
+    // Under the partition-pure store the project seed minted its own cluster rather than joining
+    // the personal one, so there are two clusters now — identified by membership, not by list
+    // order, because nothing pins which one a bare `ORDER BY id` returns first.
+    let cluster_of = |content_text: &str| {
+        let tools = &tools;
+        let workspace = alice.workspace.clone();
+        let content_text = content_text.to_string();
+        async move {
+            let rows = tools
+                .rows(
+                    "SELECT VALUE in FROM contains_memory WHERE out IN \
+                     (SELECT VALUE id FROM fact WHERE content = $content AND workspace = $workspace);",
+                    json!({"content": content_text, "workspace": workspace}),
+                )
+                .await;
+            assert_eq!(
+                rows.len(),
+                1,
+                "the seed did not land in exactly one cluster: {rows:?}"
+            );
+            rows[0].as_str().unwrap_or_default().to_string()
+        }
+    };
+    let personal_cluster = cluster_of("centroid first personal").await;
+    let project_cluster = cluster_of("centroid project second").await;
+    assert_ne!(
+        personal_cluster, project_cluster,
+        "a cross-partition store joined the caller's cluster in another partition"
+    );
     assert!(
-        nearly(&after_cross, &[0.95f32, 0.05f32]),
-        "a cross-partition store replaced/misweighted the centroid (got {after_cross:?}, expected [0.95,0.05])"
+        nearly(
+            &tools.stored_cluster_centroid(&personal_cluster).await,
+            &[1.0f32, 0.0f32]
+        ),
+        "a cross-partition store disturbed the first partition's centroid"
+    );
+    assert!(
+        nearly(
+            &tools.stored_cluster_centroid(&project_cluster).await,
+            &[0.9f32, 0.1f32]
+        ),
+        "the new partition's cluster was not initialized from its sole member"
     );
 
     // Positive control: the third store is in the same partition as the first and must average over
-    // the cluster's full workspace membership. If `n` were reset to zero again, the result would be
+    // that cluster's own membership. If `n` were reset to zero again, the result would be
     // [0.8,0.2], which is visibly different.
     let third = tools
         .call(
@@ -2598,10 +2664,16 @@ async fn a_cross_partition_store_updates_the_cluster_centroid_from_workspace_mem
         !refused(&third),
         "same-partition control store refused: {third}"
     );
-    let after_same = tools.stored_cluster_centroid(&cluster_id).await;
+    let after_same = tools.stored_cluster_centroid(&personal_cluster).await;
     assert!(
         nearly(&after_same, &[0.9f32, 0.1f32]),
         "the same-partition positive control did not exercise the running average (got {after_same:?}, expected [0.9,0.1])"
+    );
+    // And the other partition's cluster is untouched by a store it had no part in.
+    let project_after = tools.stored_cluster_centroid(&project_cluster).await;
+    assert!(
+        nearly(&project_after, &[0.9f32, 0.1f32]),
+        "a same-partition store moved another partition's centroid (got {project_after:?})"
     );
 }
 

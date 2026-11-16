@@ -97,7 +97,7 @@ server boot it checks the embedding-model lock (refusing on a mismatch) and defi
 index if it is missing. `alexandria dream` needs neither the model nor the index — it reads the
 stored vectors, heat and confidence. It validates stored embedding readiness/identity before
 schema or job writes and refuses unfinished or corrupt migration targets, without loading a
-provider or requiring the configured model to match. `--max-rows N` overrides `dreaming.max_rows_per_run`
+provider or requiring the configured model to match. The cap is one allowance per capped job per pass **across all eligible partitions** — the dispatcher enumerates active accounts' partitions, rotates fairly with a persisted cursor, and shares the allowance, so one account's many projects cannot take every turn and a suspended account's workspace is neither enumerated nor written. `cluster` and `merge` are not partitioned yet: they remain legacy-gated whole-store jobs (they refuse owned/workspace data by construction), with partitioned owned-cluster maintenance as named follow-up work. `--max-rows N` overrides `dreaming.max_rows_per_run`
 for that invocation only, without touching the config file.
 
 ## MCP Tools

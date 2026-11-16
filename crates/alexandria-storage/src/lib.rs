@@ -12,8 +12,12 @@ pub mod stats;
 pub mod system_config;
 
 pub use connection::Database;
+/// The typed record id, re-exported so downstream crates can carry storage's typed values
+/// without depending on the engine crate directly — the boundary rule is that the binary names
+/// ids through storage, not through `surrealdb`.
+pub use surrealdb::types::RecordId;
 
-use surrealdb::types::{RecordId, RecordIdKey};
+use surrealdb::types::RecordIdKey;
 
 /// Helper to convert RecordId to `table:key` string format for SurrealQL.
 pub fn record_id_to_string(id: &RecordId) -> String {

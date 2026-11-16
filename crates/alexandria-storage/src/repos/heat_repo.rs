@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{SurrealValue, ToSql};
+use surrealdb::types::{RecordId, SurrealValue, ToSql};
 
 use crate::models::HeatState;
 
@@ -283,6 +283,83 @@ impl<'a> HeatRepo<'a> {
             .query(Self::page_oldest_sql())
             .bind(("limit", limit as i64))
             .await?;
+        Ok(response.take(0)?)
+    }
+
+    /// Page the oldest anchors whose memories live in **one partition**, oldest first.
+    ///
+    /// The sweep's cursor, scoped: the partition's conjunct (`ScopeFilter::for_partition`) is applied
+    /// inside the sub-select so the page carries only rows the dispatching partition may write, and
+    /// the same compound `ORDER BY last_touched ASC, id ASC` as [`Self::page_oldest`] keeps the
+    /// walk deterministic at ties. Same deliberate non-filtering of fact liveness as the global
+    /// page, for the reason its doc records.
+    pub async fn page_oldest_in_partition(
+        &self,
+        partition: &crate::models::identity::Partition,
+        limit: usize,
+    ) -> Result<Vec<HeatState>> {
+        self.page_oldest_in_partition_after(partition, limit, None)
+            .await
+    }
+
+    /// [`Self::page_oldest_in_partition`], resuming strictly after one previously examined row.
+    ///
+    /// `after` is a heat row's own record id from a prior page's tail. Its `last_touched` is
+    /// re-read here (the persisted cursor stores only the id) and the resume predicate is the
+    /// lexicographic complement of the page's `ORDER BY last_touched ASC, id ASC`, so every row
+    /// at or before the cursor position is skipped this walk. This is what stops a page of
+    /// ineligible rows from occupying every subsequent pass: appraise does not move `last_touched`,
+    /// so without a cursor the same oldest rows are re-selected forever and later rows starve.
+    ///
+    /// An anchor that no longer exists, or whose `last_touched` is `NONE`, resumes from the head:
+    /// the position is unknowable, and re-examining rows is the safe direction (charges budget,
+    /// never skips eligible work). Rows moved by a concurrent sweep land *after* the cursor
+    /// position (their `last_touched` became now), so they are picked up later in the same walk
+    /// rather than lost.
+    pub async fn page_oldest_in_partition_after(
+        &self,
+        partition: &crate::models::identity::Partition,
+        limit: usize,
+        after: Option<&RecordId>,
+    ) -> Result<Vec<HeatState>> {
+        let anchor_touched = match after {
+            None => None,
+            Some(id) => {
+                let mut response = self
+                    .db
+                    .query("SELECT * FROM $id")
+                    .bind(("id", id.clone()))
+                    .await?;
+                let rows: Vec<HeatState> = response.take(0)?;
+                rows.into_iter().next().and_then(|row| row.last_touched)
+            }
+        };
+        let filter = crate::repos::scope::ScopeFilter::for_partition(partition);
+        let resume = match &anchor_touched {
+            // The timestamp itself is bound below from `anchor_touched`; this arm only decides
+            // that the resume predicate is present.
+            Some(_) => " AND (last_touched > $after_touched OR (last_touched = $after_touched AND \
+             id > $after_id))"
+                .to_string(),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT * FROM heat_state WHERE memory INSIDE (SELECT VALUE id FROM fact WHERE {}){} \
+             ORDER BY last_touched ASC, id ASC LIMIT $limit;",
+            filter.conjunct(),
+            resume
+        );
+        let mut prepared = self.db.query(sql).bind(("limit", limit as i64));
+        if let Some(touched) = &anchor_touched {
+            prepared = prepared.bind(("after_touched", *touched)).bind((
+                "after_id",
+                after
+                    .expect("an anchor id accompanies its timestamp")
+                    .clone(),
+            ));
+        }
+        prepared = filter.apply(prepared);
+        let mut response = prepared.await?;
         Ok(response.take(0)?)
     }
 

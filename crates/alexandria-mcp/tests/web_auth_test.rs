@@ -449,8 +449,8 @@ impl Web {
             .expect("cluster id");
         ClusterRepo::new(self.db.inner())
             .add_member(
-                &cluster_id,
-                &record_id_to_string(member.id.as_ref().expect("member id")),
+                cluster.id.as_ref().expect("cluster id"),
+                member.id.as_ref().expect("member id"),
             )
             .await
             .expect("a seeded membership");

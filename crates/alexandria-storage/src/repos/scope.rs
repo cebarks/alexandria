@@ -166,7 +166,7 @@ pub(crate) const GUARD_CONFLICT_ATTEMPTS: usize = 8;
 /// `Clone` because a guard retry re-issues the whole statement, so the binds have to survive as many
 /// attempts as the loop is willing to make.
 #[derive(Clone)]
-pub(crate) enum Bind {
+pub enum Bind {
     Text(String),
     OptText(Option<String>),
     Float(f64),
@@ -222,11 +222,11 @@ impl StatementFailure {
 /// `CREATE` plus the `RELATE` that links it): they share one query, so they share one transaction, and
 /// the decoded rows are the *first* statement's. `ids` binds record handles, `values` binds everything
 /// else, and `scope` adds the population binds a statement naming [`ScopeFilter::conjunct`] needs.
-pub(crate) struct GuardedWrite<'a> {
-    pub sql: String,
-    pub ids: Vec<(&'a str, RecordId)>,
-    pub values: Vec<(&'a str, Bind)>,
-    pub scope: Option<&'a ScopeFilter>,
+pub struct GuardedWrite<'a> {
+    sql: String,
+    ids: Vec<(&'a str, RecordId)>,
+    values: Vec<(&'a str, Bind)>,
+    scope: Option<&'a ScopeFilter>,
 }
 
 impl<'a> GuardedWrite<'a> {
@@ -396,6 +396,172 @@ where
     Err(StorageError::RetryableBookkeepingConflict)
 }
 
+/// The system writer's half of [`guarded_writes`]: same transaction shape, same retry bound, same
+/// rollback-on-conflict — only the claim differs.
+///
+/// The claim is the **actual-write active-account barrier**: the capability is verified against the
+/// issuing instance (pointer equality, no write), and then the partition's owner account is
+/// re-asserted *as a conditional write* inside the transaction — `status = 'active'` on the account
+/// row that owns the workspace — so a suspension landing between the dispatcher's enumeration and
+/// the write costs the commit a conflict and rolls the data write back with it. There is no
+/// credential half and no epoch half: system maintenance holds no credential, and an epoch bump
+/// revokes credentials rather than suspending an account. `Ok(None)` means the account was no
+/// longer active and the caller owes [`StorageError::Stale`].
+///
+/// This is deliberately a sibling of [`guarded_writes`] rather than a flag inside it: the owner
+/// claim binds an account *and* a credential from an [`OwnerContext`], and threading a "which kind
+/// of claimant" enum through every scoped writer would make the owner path carry a variant it never
+/// uses. The statement loop is the part that must not drift, and it is shared below.
+/// The single-statement form of [`guarded_system_writes`], mirroring the relationship
+/// [`guarded_run`] has to [`guarded_writes`]: one write, one flat row vector. Most maintenance
+/// writes are single statements, and the flat shape is what a caller reading `RETURN AFTER` rows
+/// from one statement wants without peeling a nested vec.
+///
+/// `pub` because the dreaming jobs live in the binary crate, not in storage: the system writer's
+/// entry points are the maintenance API surface, while everything they delegate to below stays
+/// crate-private.
+pub async fn guarded_system_run<T>(
+    db: &Surreal<Any>,
+    instance: &crate::Database,
+    system: &crate::access::SystemContext,
+    partition: &crate::models::identity::Partition,
+    write: &GuardedWrite<'_>,
+) -> Result<Option<Vec<T>>, StorageError>
+where
+    T: SurrealValue + Send,
+{
+    let per_statement =
+        guarded_system_writes(db, instance, system, partition, std::slice::from_ref(write)).await?;
+    Ok(per_statement.map(|mut rows| rows.remove(0)))
+}
+
+pub async fn guarded_system_writes<T>(
+    db: &Surreal<Any>,
+    instance: &crate::Database,
+    system: &crate::access::SystemContext,
+    partition: &crate::models::identity::Partition,
+    writes: &[GuardedWrite<'_>],
+) -> Result<Option<Vec<Vec<T>>>, StorageError>
+where
+    T: SurrealValue + Send,
+{
+    if !instance.holds_authority(system) {
+        return Err(StorageError::Stale);
+    }
+    if writes.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    for attempt in 0..GUARD_CONFLICT_ATTEMPTS {
+        let tx = db.clone().begin().await.map_err(guard_internal)?;
+        if !claim_system_for_workspace(&tx, partition.workspace.as_record_id()).await? {
+            tx.cancel().await.map_err(guard_internal)?;
+            return Ok(None);
+        }
+        let run = run_guarded_statements(&tx, writes, partition.workspace.as_record_id()).await;
+        match run {
+            StatementRun::Done(per_statement) => {
+                if let Err(error) = tx.commit().await {
+                    if is_write_conflict(&error) {
+                        if attempt + 1 < GUARD_CONFLICT_ATTEMPTS {
+                            continue;
+                        }
+                        return Err(StorageError::RetryableBookkeepingConflict);
+                    }
+                    return Err(guard_internal(error));
+                }
+                return Ok(Some(per_statement));
+            }
+            StatementRun::Conflict => {
+                tx.cancel().await.map_err(guard_internal)?;
+                if attempt + 1 < GUARD_CONFLICT_ATTEMPTS {
+                    continue;
+                }
+                return Err(StorageError::RetryableBookkeepingConflict);
+            }
+            StatementRun::Failed(error) => {
+                tx.cancel().await.map_err(guard_internal)?;
+                return Err(error);
+            }
+        }
+    }
+    Err(StorageError::RetryableBookkeepingConflict)
+}
+
+/// The statement loop both claimants share, parameterised only by the workspace their binds carry.
+async fn run_guarded_statements<T>(
+    tx: &Transaction<Any>,
+    writes: &[GuardedWrite<'_>],
+    workspace: &RecordId,
+) -> StatementRun<T>
+where
+    T: SurrealValue + Send,
+{
+    let mut per_statement: Vec<Vec<T>> = Vec::with_capacity(writes.len());
+    for write in writes {
+        let mut query = tx.query(write.sql.clone());
+        query = query.bind(("workspace", workspace.clone()));
+        for (name, id) in write.ids.clone() {
+            query = query.bind((name, id));
+        }
+        if let Some(scope) = write.scope {
+            query = scope.apply(query);
+        }
+        for (name, bind) in write.values.clone() {
+            query = bind.apply(query, name);
+        }
+        match query.await {
+            Ok(response) => match response.check() {
+                Ok(mut checked) => match checked.take::<Vec<T>>(0) {
+                    Ok(rows) => per_statement.push(rows),
+                    Err(error) => {
+                        return StatementRun::of(error);
+                    }
+                },
+                Err(error) => return StatementRun::of(error),
+            },
+            Err(error) => return StatementRun::of(error),
+        }
+    }
+    StatementRun::Done(per_statement)
+}
+
+/// What one pass over a guarded statement list produced: rows, a retryable conflict, or a failure.
+enum StatementRun<T> {
+    Done(Vec<Vec<T>>),
+    Conflict,
+    Failed(StorageError),
+}
+
+impl<T> StatementRun<T> {
+    fn of(error: surrealdb::Error) -> Self {
+        match StatementFailure::of(error) {
+            StatementFailure::Conflict => StatementRun::Conflict,
+            StatementFailure::Failed(error) => StatementRun::Failed(error),
+        }
+    }
+}
+
+/// The system claim's conditional write: the account row that owns this workspace, re-asserted as
+/// active at the moment the data statement is about to run.
+async fn claim_system_for_workspace(
+    tx: &Transaction<Any>,
+    workspace: &RecordId,
+) -> Result<bool, StorageError> {
+    let account_rows: Vec<serde_json::Value> = tx
+        .query(
+            "UPDATE account SET updated_at = time::now() WHERE id IN (SELECT VALUE owner FROM \
+             workspace WHERE id = $workspace) AND status = 'active' RETURN AFTER;",
+        )
+        .bind(("workspace", workspace.clone()))
+        .await
+        .map_err(guard_internal)?
+        .check()
+        .map_err(guard_internal)?
+        .take(0)
+        .map_err(guard_internal)?;
+    Ok(!account_rows.is_empty())
+}
+
 /// Re-asserts an [`OwnerContext`]'s write authorization *as a conditional write on the rows that carry
 /// it*, inside the caller's transaction. This is the single spelling of the Task 5 in-transaction
 /// commit predicate; every scoped writer in this crate calls it rather than restating the SQL.
@@ -503,4 +669,108 @@ pub(crate) fn is_write_conflict(error: &surrealdb::Error) -> bool {
 
 fn guard_internal(error: impl std::error::Error + Send + Sync + 'static) -> StorageError {
     StorageError::Internal(anyhow::Error::new(error))
+}
+
+#[cfg(test)]
+mod system_barrier_tests {
+    use super::*;
+    use crate::models::OperationId;
+
+    /// One owner, one seeded row in their workspace, and the two halves of the barrier: an active
+    /// account lets the guarded system write through, a suspended one refuses it with `None` and the
+    /// row is untouched.
+    #[tokio::test]
+    async fn a_suspended_account_blocks_the_guarded_system_write() {
+        let (db, system) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let ids = crate::repos::IdentityRepo::new(db.inner())
+            .bootstrap_owner(
+                "barrier-owner",
+                "digest-barrier-padding-padding-pad",
+                &OperationId::new("b1"),
+            )
+            .await
+            .unwrap();
+        let partition = crate::models::identity::Partition {
+            workspace: ids.workspace.clone(),
+            scope: crate::models::identity::MemoryScope::Personal,
+        };
+        db.inner()
+            .query(
+                "CREATE type::record('fact', 'barrier-row') SET content = 'before', \
+                    embedding = [0.1, 0.2], workspace = $workspace, deleted = false;",
+            )
+            .bind(("workspace", ids.workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let write = GuardedWrite::new(
+            "UPDATE type::record('fact', 'barrier-row') SET content = 'after' WHERE \
+             workspace = $workspace RETURN AFTER;",
+        );
+        let written: Option<Vec<serde_json::Value>> =
+            guarded_system_run(db.inner(), &db, &system, &partition, &write)
+                .await
+                .unwrap();
+        assert!(
+            written.is_some(),
+            "an active account lets the write through; guarded_system_run returned {written:?}"
+        );
+
+        db.inner()
+            .query("UPDATE ONLY $target SET status = 'suspended' RETURN NONE;")
+            .bind(("target", ids.account.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let write = GuardedWrite::new(
+            "UPDATE type::record('fact', 'barrier-row') SET content = 'must-not-land' WHERE \
+             workspace = $workspace RETURN AFTER;",
+        );
+        let refused: Option<Vec<serde_json::Value>> =
+            guarded_system_run(db.inner(), &db, &system, &partition, &write)
+                .await
+                .unwrap();
+        assert!(refused.is_none(), "a suspended account refuses the write");
+
+        let rows: Vec<serde_json::Value> = db
+            .inner()
+            .query("SELECT content FROM type::record('fact', 'barrier-row');")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(
+            rows[0]["content"], "after",
+            "the refused pass wrote nothing: {rows:?}"
+        );
+    }
+
+    /// The capability check is part of the barrier: a system context from another instance is
+    /// refused before any statement runs.
+    #[tokio::test]
+    async fn a_foreign_system_context_cannot_run_guarded_system_writes() {
+        let (_db, system) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let (other, _its_system) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let partition = crate::models::identity::Partition {
+            workspace: crate::models::identity::WorkspaceId::try_from(RecordId::new(
+                "workspace",
+                "w",
+            ))
+            .unwrap(),
+            scope: crate::models::identity::MemoryScope::Personal,
+        };
+        let write = GuardedWrite::new("UPDATE anything SET x = 1;");
+        let refused: Result<Option<Vec<serde_json::Value>>, _> =
+            guarded_system_run(other.inner(), &other, &system, &partition, &write).await;
+        assert!(matches!(refused, Err(StorageError::Stale)), "{refused:?}");
+    }
 }

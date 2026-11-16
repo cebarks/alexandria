@@ -65,7 +65,7 @@ use alexandria_storage::repos::{
 use chrono::{DateTime, SecondsFormat, Utc, Weekday};
 use rmcp::RoleServer;
 use rmcp::service::RequestContext;
-use surrealdb::types::{RecordId, ToSql};
+use surrealdb::types::RecordId;
 
 use crate::mutation::{ApplyService, ApprovedCluster, Plan};
 use crate::scope_service::{ReadScope, ScopeService};
@@ -2502,8 +2502,8 @@ impl AlexandriaServer {
         //    block writes carries no `account`, which is why no scoped reader can see it — the disclosed
         //    interim cost, not a hidden one.
         let memory_repo = MemoryRepo::new(self.db.inner());
-        let fact_id = memory_repo
-            .create_fact(&params.content, 0.5, embedding, &tags)
+        let (fact_id, fact_typed) = memory_repo
+            .create_fact_with_id(&params.content, 0.5, embedding, &tags)
             .await?;
 
         // Heat state, then a bare provenance create with no link (v009 stamped the link to a row this path
@@ -2517,7 +2517,7 @@ impl AlexandriaServer {
             .check()?;
 
         // Cluster assignment from the store-wide list, which is what makes this arm unsafe for a request.
-        self.assign_to_cluster_and_update(None, None, embedding, &fact_id)
+        self.assign_to_cluster_and_update(None, None, embedding, &fact_typed)
             .await?;
 
         // Session linkage (implicit create on first use)
@@ -3210,10 +3210,13 @@ impl AlexandriaServer {
                 continue;
             }
 
-            let fact_id = match (&scope, &target) {
+            // Both arms carry the TYPED id alongside the display string: the cluster assignment
+            // below binds typed, and the display string feeds the string-shaped callers (edges,
+            // session links) unchanged.
+            let (fact_id, fact_typed) = match (&scope, &target) {
                 (Some(scope), Some(target)) => {
-                    record_id_to_string(
-                        &ScopedMemoryRepo::new(self.db.inner(), scope.owner(), scope.read())
+                    let created =
+                        ScopedMemoryRepo::new(self.db.inner(), scope.owner(), scope.read())
                             .create_fact(
                                 chunk,
                                 1.0,
@@ -3226,13 +3229,14 @@ impl AlexandriaServer {
                                 Utc::now(),
                             )
                             .await
-                            .map_err(anyhow::Error::from)?
-                            .id
-                            .ok_or_else(|| anyhow::anyhow!("imported fact has no id"))?,
-                    )
+                            .map_err(anyhow::Error::from)?;
+                    let id = created
+                        .id
+                        .ok_or_else(|| anyhow::anyhow!("imported fact has no id"))?;
+                    (record_id_to_string(&id), id)
                 }
                 (None, None) => {
-                    repo.create_fact(chunk, 1.0, embedding, &import_tags)
+                    repo.create_fact_with_id(chunk, 1.0, embedding, &import_tags)
                         .await?
                 }
                 // Unreachable: `target` is derived from `scope` above. Reached only if a future edit
@@ -3257,7 +3261,7 @@ impl AlexandriaServer {
             // Cluster assignment, into the partition this chunk was just written into. The journaled arm
             // above never reaches here; this is the interim loop, and it passes its own `target` so the
             // ranking is destination-scoped whenever an owner exists at all.
-            self.assign_to_cluster_and_update(scope, partition.as_ref(), embedding, &fact_id)
+            self.assign_to_cluster_and_update(scope, partition.as_ref(), embedding, &fact_typed)
                 .await?;
 
             if let (Some(repo), Some(session_id)) = (&scoped_session, params.session_id.as_ref()) {
@@ -3701,7 +3705,13 @@ impl AlexandriaServer {
             // Focused recall
             let scope =
                 RecallHandle::decode(handle_str).map_err(|_| anyhow::anyhow!(MALFORMED_HANDLE))?;
-            let cluster_data = self.load_cluster_with_members(&scope.cluster_id).await?;
+            // The handle's cluster id is the display form this server minted from its own typed
+            // listing (the engine's `RecallHandle` is the wire type and carries text). Converting
+            // HERE — at the holder that produced the text — keeps the repo boundary typed; the
+            // handle re-typing is named follow-up alongside it.
+            let cluster = RecordId::parse_simple(&scope.cluster_id)
+                .map_err(|_| anyhow::anyhow!(MALFORMED_HANDLE))?;
+            let cluster_data = self.load_cluster_with_members(&cluster).await?;
             let result = focused_recall(query_emb, &scope, &cluster_data);
 
             let memories: Vec<serde_json::Value> = result
@@ -4668,7 +4678,7 @@ impl AlexandriaServer {
         scope: Option<&RequestScope>,
         destination: Option<&MemoryScope>,
         embedding: &[f32],
-        fact_id: &str,
+        fact_id: &RecordId,
     ) -> anyhow::Result<()> {
         let cluster_repo = ClusterRepo::new(self.db.inner());
         // A new fact may only join a cluster its owner can see, and only one its *partition* owns; joining
@@ -4691,7 +4701,7 @@ impl AlexandriaServer {
 
         match assignment {
             Some(cluster) => {
-                let cid = cluster.to_sql();
+                let cid = cluster;
                 // `cid` came out of the caller's own destination candidates above, so this edge and this
                 // centroid refresh aim at a cluster the caller can see *and that lives in the partition the
                 // fact was just filed into*; they stay `ClusterRepo` calls because the membership and
@@ -4703,8 +4713,8 @@ impl AlexandriaServer {
                     .and_then(|index| candidates.infos.get(index))
                     .ok_or_else(|| anyhow::anyhow!("ranked cluster has no captured population"))?;
                 let new_centroid = update_centroid(&old.centroid, embedding, old.member_count);
-                cluster_repo.add_member(&cid, fact_id).await?;
-                cluster_repo.update_centroid(&cid, &new_centroid).await?;
+                cluster_repo.add_member(cid, fact_id).await?;
+                cluster_repo.update_centroid(cid, &new_centroid).await?;
             }
             None => {
                 // A new cluster is an ownership-bearing row, so it is stamped where it is created. The
@@ -4722,8 +4732,8 @@ impl AlexandriaServer {
                         cluster
                             .id
                             .as_ref()
-                            .map(record_id_to_string)
                             .ok_or_else(|| anyhow::anyhow!("created cluster has no id"))?
+                            .clone()
                     }
                     None => cluster_repo.create(None, embedding).await?,
                 };
@@ -4911,24 +4921,12 @@ impl AlexandriaServer {
         )
     }
 
-    async fn load_cluster_infos(&self) -> anyhow::Result<Vec<ClusterInfo>> {
-        let clusters = ClusterRepo::new(self.db.inner()).list_with_counts().await?;
-        Ok(clusters
-            .into_iter()
-            .map(|(c, member_count)| ClusterInfo {
-                id: c.id.map(|r| record_id_to_string(&r)).unwrap_or_default(),
-                centroid: c.centroid,
-                member_count,
-            })
-            .collect())
-    }
-
     async fn load_cluster_with_members(
         &self,
-        cluster_id: &str,
+        cluster: &RecordId,
     ) -> anyhow::Result<ClusterWithMembers> {
         let cluster_repo = ClusterRepo::new(self.db.inner());
-        let members = cluster_repo.get_members(cluster_id).await?;
+        let members = cluster_repo.get_members(cluster).await?;
 
         let fact_summaries: Vec<FactSummary> = members
             .into_iter()
@@ -4945,7 +4943,7 @@ impl AlexandriaServer {
 
         Ok(ClusterWithMembers {
             info: ClusterInfo {
-                id: cluster_id.to_string(),
+                id: record_id_to_string(cluster),
                 centroid: vec![],
                 member_count: fact_summaries.len(),
             },
@@ -4962,14 +4960,23 @@ impl AlexandriaServer {
     }
 
     async fn load_all_clusters_with_members(&self) -> anyhow::Result<Vec<ClusterWithMembers>> {
-        let infos = self.load_cluster_infos().await?;
-        let mut result = Vec::with_capacity(infos.len());
-        for info in infos {
-            let cwm = self.load_cluster_with_members(&info.id).await?;
+        // The typed rows are the authority; their display forms are built once, at the response.
+        let clusters = ClusterRepo::new(self.db.inner()).list().await?;
+        let mut result = Vec::with_capacity(clusters.len());
+        for cluster in clusters {
+            let Some(id) = cluster.id.clone() else {
+                continue;
+            };
+            let info = ClusterInfo {
+                id: record_id_to_string(&id),
+                centroid: cluster.centroid.clone(),
+                member_count: 0,
+            };
+            let cwm = self.load_cluster_with_members(&id).await?;
             result.push(ClusterWithMembers {
                 info: ClusterInfo {
                     id: cwm.info.id,
-                    centroid: info.centroid,
+                    centroid: info.centroid.clone(),
                     member_count: cwm.members.len(),
                 },
                 version: ClusterVersion {

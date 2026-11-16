@@ -15,17 +15,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alexandria_engine::clusters::maintenance::{
     MaintenanceAction, MergeCheck, check_cohesion, check_merge,
 };
+use alexandria_engine::dreaming::budget::RowBudget;
 use alexandria_engine::dreaming::collapse::{Candidate, UNKNOWN_CREATED_AT, duplicate_groups};
+use alexandria_engine::dreaming::dispatch::{interleave_rounds, rotate_after};
 use alexandria_engine::dreaming::liveness::{Liveness, SharedLiveness};
 use alexandria_engine::dreaming::{DEMOTED_CONFIDENCE, Intervals, Job, JobReport, should_demote};
 use alexandria_engine::heat::{HeatColumns, HeatState as EngineHeatState, projected_heat};
+use alexandria_storage::access::SystemContext;
 use alexandria_storage::models::LiveConfidence;
+use alexandria_storage::models::identity::Partition;
+use alexandria_storage::models::maintenance::MaintenanceBudgetJob;
 use alexandria_storage::models::maintenance::{action, disposition, job as job_name};
 use alexandria_storage::repos::{
-    AuditContext, ClusterRepo, EdgeRepo, HeatMaterialise, HeatRepo, LogEntry, MaintenanceRepo,
-    MemoryRepo,
+    AuditContext, ClusterRepo, EdgeRepo, HeatMaterialise, HeatRepo, IdentityRepo, LogEntry,
+    MaintenanceRepo, MemoryRepo,
 };
-use alexandria_storage::{Database, record_id_to_string, system_config};
+use alexandria_storage::{Database, RecordId, record_id_to_string, system_config};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -70,6 +75,10 @@ pub(crate) fn now_secs() -> u64 {
 /// job cannot observe a different setting than the one the scheduler was started with.
 pub(crate) struct Jobs {
     db: Arc<Database>,
+    /// The instance's system authority, claimed once at startup and shared with the scheduler: the
+    /// dispatcher enumerates partitions and persists progress under it, and every maintenance write
+    /// re-asserts the partition's account is active through the M1 barrier.
+    system: SystemContext,
     intervals: Intervals,
     /// Published so the dashboard can tell a stopped loop from an idle one. Owned by `Jobs` because
     /// the silence limit is derived from the intervals, and shared with `DebugContext` by `Arc`.
@@ -87,10 +96,11 @@ pub(crate) struct Jobs {
 }
 
 impl Jobs {
-    pub(crate) fn new(db: Arc<Database>, config: &Config) -> Self {
+    pub(crate) fn new(db: Arc<Database>, system: SystemContext, config: &Config) -> Self {
         let intervals = config.dreaming.intervals();
         Self {
             db,
+            system,
             // Derived from the cadences rather than fixed: a loop that wakes late is not a dead one,
             // and nothing is legitimately due sooner than the shortest interval. Doubled, so one
             // overrun is not reported as a stalled scheduler.
@@ -123,11 +133,12 @@ impl Jobs {
     /// once rather than being told it has used up its allowance.
     pub(crate) fn spawn(
         db: Arc<Database>,
+        system: SystemContext,
         config: &Config,
         cancel: CancellationToken,
         liveness: SharedLiveness,
     ) -> JoinHandle<()> {
-        let mut jobs = Jobs::new(db, config);
+        let mut jobs = Jobs::new(db, system, config);
         // The caller's handle replaces the one `new` derived, so the dashboard and the loop observe
         // the same counters. Replacing rather than borrowing keeps `Jobs::new` unchanged for the job
         // tests, which have no supervisor and no dashboard.
@@ -258,6 +269,645 @@ impl Jobs {
         }
     }
 
+    /// One capped job's pass over every eligible partition, under one pass-wide row allowance.
+    ///
+    /// The dispatcher is real and the job *bodies* are not yet partitioned (see
+    /// [`Self::run_partitioned`]): enumeration, fair planning, budget accounting and progress
+    /// persistence are the contracts this method owns, and the witnesses below pin them against
+    /// whatever the body currently does.
+    ///
+    /// The pass shape, in order: enumerate the partitions the store says are eligible (active
+    /// accounts only — a suspended account's workspace is absent before any write is attempted);
+    /// load the job's persisted progress; rotate the workspaces so the pass continues after the
+    /// last one visited and interleave the turn's visits round-robin so one account's many
+    /// projects cannot take every slot; reserve the pass allowance **before** dispatch; run the
+    /// body once per visited partition, charging `budget_used` and refunding only the verified
+    /// unused amount; advance past failures and refusals rather than aborting the pass; and
+    /// persist the advanced progress under the M1 CAS.
+    pub(crate) async fn dispatch_job(&self, job: Job, run_id: &str) -> anyhow::Result<PassReport> {
+        let Some(budget_job) = capped(job) else {
+            // Cluster and merge are not row-budgeted; their bodies stay global until M3 gives
+            // them partitioned reads, and the old entry keeps working in the meantime.
+            let report = self.run_job(job, run_id).await?;
+            return Ok(PassReport {
+                report,
+                visited: 0,
+                refused: 0,
+                failed: 0,
+                budget_used: 0,
+                last_error: None,
+            });
+        };
+
+        let partitions =
+            IdentityRepo::maintenance_partitions(self.db.inner(), &self.db, &self.system).await?;
+        let mut progress =
+            MaintenanceRepo::load_progress(&self.db, &self.system, budget_job).await?;
+        // An exhausted cursor only counts against a partition the store still enumerates. A
+        // partition whose account suspended (or whose workspace vanished) since it was marked
+        // exhausted is stale coordination data: counting it against this pass would underflow
+        // `partitions.len() - exhausted.len()` when the enumerated set shrank, and — short of
+        // that — would claim visits the pass cannot make. Matching is on the cursor's own
+        // workspace/scope pair, never a parse of any display string.
+        //
+        // Cycle wrap: when every partition the store still enumerates is exhausted, the walk has
+        // covered the corpus and the cursors reset so the next pass starts a fresh cycle — heat
+        // has decayed and rows have arrived in the meantime, so re-appraisal is the job's
+        // purpose, not a spin. A store with no partitions at all has nothing to wrap.
+        if !partitions.is_empty()
+            && partitions
+                .iter()
+                .all(|partition| cursor_exhausted(&progress, partition))
+        {
+            for cursor in &mut progress.cursors {
+                cursor.exhausted = false;
+                cursor.row_cursor = None;
+                cursor.units_done = 0;
+            }
+        }
+        let pending: Vec<Partition> = partitions
+            .iter()
+            .filter(|partition| !cursor_exhausted(&progress, partition))
+            .cloned()
+            .collect();
+        let pending_count = pending.len();
+
+        // Fair rotation and bounded shares, as pure decisions: rotate the *workspace* order after
+        // the last pass's anchor, then take one partition per workspace per round up to the turn's
+        // slot count. The slot count is the pass's whole allowance: a capped job visits at most as
+        // many partitions as it could afford rows for, and the budget below — not this count — is
+        // what stops dispatch when the allowance runs out.
+        let mut workspace_order: Vec<alexandria_storage::models::identity::WorkspaceId> =
+            pending.iter().map(|p| p.workspace.clone()).collect();
+        workspace_order.dedup();
+        let rotated = rotate_after(workspace_order, progress.last_workspace.as_ref());
+        let rank = |partition: &Partition| {
+            rotated
+                .iter()
+                .position(|workspace| *workspace == partition.workspace)
+                .unwrap_or(usize::MAX)
+        };
+        let mut ordered: Vec<Partition> = pending;
+        ordered.sort_by_key(|partition| rank(partition));
+        // Every pending partition is visited at most once per pass — the interleave still orders
+        // the visits round-robin across workspaces, but the pass is not CUT at a visit count: an
+        // empty or failed partition consumes no budget and must not end the pass while rows
+        // remain, which a cut at the row cap would do (the first visit can be an empty personal
+        // partition, and other accounts' projects must not strand behind it). The ROW budget
+        // below is the bound that matters.
+        let visits = interleave_rounds(
+            ordered,
+            |partition: &Partition| rank(partition),
+            pending_count,
+        );
+
+        let mut budget = RowBudget::new(self.max_rows_per_run);
+        let mut report = JobReport::new(job);
+        let (mut visited, mut refused, mut failed) = (0usize, 0usize, 0usize);
+        let mut last_error: Option<String> = None;
+        // Per-partition paging outcomes to persist: the advancing row cursor and the exhaustion
+        // verdict, keyed by the partition that produced them.
+        let mut paged: Vec<(Partition, Option<RecordId>, bool, usize)> = Vec::new();
+        // The rotation anchor is the last partition the pass actually RAN, not the last one it
+        // planned: with no visit cut, the plan can name partitions the budget never reached, and
+        // anchoring on an unvisited workspace would rotate the next pass back to the one that
+        // just ran instead of forward.
+        let mut anchor: Option<alexandria_storage::models::identity::WorkspaceId> = None;
+        // A bounded per-visit share, not the whole remaining allowance: dividing the pass evenly
+        // over the turn's visits is what stops the FIRST partition from eating the entire cap and
+        // leaving every other account unvisited — the budget half of the fairness contract, with
+        // the interleave above as its slot half. At least one row per visit, rounded up so a cap
+        // smaller than the visit count still serves the earlier rotations before it runs out.
+        let share = self.max_rows_per_run.div_ceil(visits.len().max(1)).max(1);
+        for partition in &visits {
+            let Some(reservation) = budget.reserve(share) else {
+                // Zero remaining allowance means no further capped partition dispatch — the whole
+                // pass's reserve was consumed by earlier partitions' verified work.
+                break;
+            };
+            let allowance = Some(reservation.rows());
+            // The partition's persisted row cursor, if any: where the last pass's page stopped, so
+            // this pass resumes after it instead of re-reading the same oldest rows.
+            let row_cursor = progress
+                .cursors
+                .iter()
+                .find(|cursor| {
+                    cursor.workspace == partition.workspace && cursor.scope == partition.scope
+                })
+                .and_then(|cursor| cursor.row_cursor.clone());
+            match self
+                .run_partitioned(job, partition, run_id, allowance, row_cursor.as_ref())
+                .await
+            {
+                Ok(outcome) => {
+                    let used = outcome.report.budget_used;
+                    // Refund only the verified unused reservation: an outcome that reports more
+                    // usage than it reserved is refused by the budget rather than clamped.
+                    if let Err(error) = budget.refund_verified(reservation, used) {
+                        anyhow::bail!("budget accounting refused a partition report: {error}");
+                    }
+                    report.examined += outcome.report.report.examined;
+                    report.acted += outcome.report.report.acted;
+                    report.skipped += outcome.report.report.skipped;
+                    visited += 1;
+                    anchor = Some(partition.workspace.clone());
+                    paged.push((
+                        partition.clone(),
+                        outcome.row_cursor,
+                        outcome.exhausted,
+                        used,
+                    ));
+                }
+                // A refused writer (the M1 barrier found the partition's account no longer
+                // active) advances the pass rather than aborting it: the partition is simply done
+                // for this pass, and the progress below records that it was passed over.
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<alexandria_storage::error::StorageError>(),
+                        Some(alexandria_storage::error::StorageError::Stale)
+                    ) =>
+                {
+                    refused += 1;
+                }
+                // A failed partition is that partition's news: recorded, not propagated, because
+                // the rest of the pass is still owed its turn. The charge stands — work of an
+                // unknown amount may have landed before the failure, so no refund is attempted.
+                Err(error) => {
+                    tracing::warn!(
+                        job = job.as_str(),
+                        "partition dispatch failed, advancing: {error}"
+                    );
+                    failed += 1;
+                    last_error = Some(error.to_string());
+                }
+            }
+        }
+
+        // Persist the advanced rotation anchor and the visited partitions' paging outcomes. The
+        // row cursors land here because the dispatcher — not the body — owns the pass ledger:
+        // the body reports where its page stopped, the ledger decides what the next pass resumes
+        // after. A refused or failed visit leaves the loaded cursor untouched (position unknown,
+        // the safe direction is to re-examine), and its charge stands.
+        let mut next = progress.clone();
+        next.version =
+            alexandria_storage::models::identity::Version::new(progress.version.get() + 1);
+        next.last_workspace = anchor.or(progress.last_workspace.clone());
+        for partition in &visits {
+            let cursor = next.cursors.iter_mut().find(|cursor| {
+                cursor.workspace == partition.workspace && cursor.scope == partition.scope
+            });
+            if cursor.is_none() {
+                next.cursors
+                    .push(alexandria_storage::models::maintenance::WorkspaceProgress {
+                        workspace: partition.workspace.clone(),
+                        scope: partition.scope.clone(),
+                        row_cursor: None,
+                        units_done: 0,
+                        exhausted: false,
+                    });
+            }
+        }
+        for (partition, row_cursor, exhausted, used) in &paged {
+            let Some(cursor) = next.cursors.iter_mut().find(|cursor| {
+                cursor.workspace == partition.workspace && cursor.scope == partition.scope
+            }) else {
+                continue;
+            };
+            cursor.row_cursor = row_cursor.clone();
+            cursor.exhausted = *exhausted;
+            cursor.units_done += *used as i64;
+        }
+        if let Err(error) =
+            MaintenanceRepo::save_progress(&self.db, &self.system, progress.version, &next).await
+        {
+            // Progress is coordination metadata, never the pass's result: a lost CAS race means
+            // another writer advanced the ledger, and the work this pass did stands.
+            tracing::warn!("maintenance progress save lost its race: {error}");
+        }
+
+        Ok(PassReport {
+            report,
+            visited,
+            refused,
+            failed,
+            // The reservation arithmetic nets to the actual chargeable units when bodies
+            // succeed (each Ok refunds its unused share), and conservatively keeps a failed
+            // visit's whole share — work of an unknown amount may have landed.
+            budget_used: self.max_rows_per_run - budget.remaining(),
+            last_error,
+        })
+    }
+
+    /// One job over one partition, under the slice of a pass's row allowance.
+    ///
+    /// SCAFFOLD: the bodies are not partitioned yet. This runs the job's existing whole-store body
+    /// and ignores `partition` and `row_allowance` — the honest intermediate state, because a fake
+    /// partition filter here would make the witnesses below pass for the wrong reason. M3 replaces
+    /// the body: per-partition reads through scoped repos and writes through the M1 guarded system
+    /// barrier, reporting the partition's own `budget_used`.
+    ///
+    // TODO(debt): partitioned body — M3 of the Task-12 plan.
+    async fn run_partitioned(
+        &self,
+        job: Job,
+        partition: &Partition,
+        run_id: &str,
+        row_allowance: Option<usize>,
+        row_cursor: Option<&RecordId>,
+    ) -> anyhow::Result<PartitionOutcome> {
+        match job {
+            // The sweep's partitioned body: read this partition's oldest anchors, project each to
+            // now, and materialise them through the M1 guarded system barrier — one transaction,
+            // one active-account claim, every statement the same per-row anchor CAS the global
+            // body uses. The two heat clocks stay two: the write names `heat` and `last_touched`
+            // only.
+            Job::Sweep => {
+                let limit = row_allowance.unwrap_or(self.max_rows_per_run);
+                let heat_repo = HeatRepo::new(self.db.inner());
+                let rows = heat_repo.page_oldest_in_partition(partition, limit).await?;
+
+                let mut report = JobReport::new(Job::Sweep);
+                report.examined = rows.len();
+                if rows.is_empty() {
+                    return Ok(PartitionOutcome {
+                        report: alexandria_engine::dreaming::PartitionJobReport {
+                            report,
+                            budget_used: 0,
+                        },
+                        row_cursor: None,
+                        exhausted: false,
+                    });
+                }
+
+                let now = now_secs();
+                let columns = HeatColumns {
+                    heat: rows.iter().map(|row| row.heat).collect(),
+                    stability: rows.iter().map(|row| row.stability).collect(),
+                    last_touched: rows
+                        .iter()
+                        .map(|row| {
+                            row.last_touched
+                                .map(|at| at.timestamp().max(0) as u64)
+                                .unwrap_or(0)
+                        })
+                        .collect(),
+                };
+                let projected = columns.projected_heat_bulk(now, self.decay_tau_secs);
+
+                let writes: Vec<alexandria_storage::repos::scope::GuardedWrite> = rows
+                    .iter()
+                    .zip(projected)
+                    .map(|(row, heat)| {
+                        alexandria_storage::repos::scope::GuardedWrite::new(
+                            "UPDATE heat_state SET heat = $h, last_touched = time::now() \
+                             WHERE memory = $m AND last_touched = $t RETURN AFTER;",
+                        )
+                        .id("m", row.memory.clone())
+                        .value("h", alexandria_storage::repos::scope::Bind::Float(heat))
+                        .value(
+                            "t",
+                            alexandria_storage::repos::scope::Bind::OptTime(row.last_touched),
+                        )
+                    })
+                    .collect();
+                // The turbofish pins the statement's row type: `RETURN AFTER` on `heat_state`
+                // yields `HeatState` rows, and the sweep only counts them — without the pin the
+                // count alone leaves the type parameter unconstrained.
+                let written = alexandria_storage::repos::scope::guarded_system_writes::<
+                    alexandria_storage::models::HeatState,
+                >(
+                    self.db.inner(), &self.db, &self.system, partition, &writes
+                )
+                .await?;
+                let Some(per_statement) = written else {
+                    // The barrier refused the partition: its account stopped being active between
+                    // enumeration and the write. The dispatcher owes this a Stale, which it
+                    // reports as a refusal rather than a failure.
+                    return Err(alexandria_storage::error::StorageError::Stale.into());
+                };
+                report.acted = per_statement.iter().map(|statement| statement.len()).sum();
+                report.skipped = rows.len().saturating_sub(report.acted);
+                Ok(PartitionOutcome {
+                    report: alexandria_engine::dreaming::PartitionJobReport {
+                        report,
+                        // Selected page rows are charged, including ones a lost anchor race
+                        // skipped.
+                        budget_used: rows.len(),
+                    },
+                    // Sweep self-advances: materialisation moves `last_touched` to now, so the
+                    // rows it processed go to the tail of the oldest-first order and the next
+                    // page is new rows. No cursor to persist.
+                    row_cursor: None,
+                    exhausted: false,
+                })
+            }
+            // Cold-row demotion, partition-scoped. Same rule as the whole-store body — heat is
+            // *projected* here (no ordering contract with the sweep), the precondition is
+            // conjunctive (cold AND never accessed AND confidence at or below the ceiling), rows
+            // created before access recording was armed are skipped not demoted, and the value
+            // this job writes exempts itself from the rule so a daily pass cannot keep lowering
+            // the same row. The demotion and its audit row go through the M1 barrier.
+            //
+            // Paging: appraise does NOT move `last_touched`, so the page is resumed after the
+            // persisted cursor — without it, a page of ineligible rows (the armed-at
+            // precondition failing) would be re-selected every pass and later eligible rows would
+            // starve. Examined-but-ineligible rows still advance the cursor: they were looked at,
+            // and the walk owes the rows behind them.
+            Job::Appraise => {
+                let limit = row_allowance.unwrap_or(self.max_rows_per_run);
+                let Some(armed_at) =
+                    system_config::access_recording_armed_at(self.db.inner()).await?
+                else {
+                    tracing::warn!(
+                        "Appraise: access recording has never been armed on this store, so \
+                         demoting nothing."
+                    );
+                    // Not exhausted: the store may arm access recording later, and this partition
+                    // is owed a real walk when it does. No budget was consumed either way.
+                    return Ok(PartitionOutcome {
+                        report: alexandria_engine::dreaming::PartitionJobReport {
+                            report: JobReport::new(Job::Appraise),
+                            budget_used: 0,
+                        },
+                        row_cursor: None,
+                        exhausted: false,
+                    });
+                };
+                let heat_repo = HeatRepo::new(self.db.inner());
+                let memories = MemoryRepo::new(self.db.inner());
+                let rows = heat_repo
+                    .page_oldest_in_partition_after(partition, limit, row_cursor)
+                    .await?;
+                let confidences: HashMap<String, LiveConfidence> = memories
+                    .live_confidences_in_partition(partition)
+                    .await?
+                    .into_iter()
+                    .map(|row| (record_id_to_string(&row.id), row))
+                    .collect();
+
+                let mut report = JobReport::new(Job::Appraise);
+                let now = now_secs();
+                let audit = MaintenanceRepo::with_audit(
+                    self.db.inner(),
+                    AuditContext::dreaming(run_id, job_name::APPRAISE),
+                );
+                let mut demotions: Vec<(RecordId, f64)> = Vec::new();
+                for row in &rows {
+                    let id = record_id_to_string(&row.memory);
+                    let Some(live) = confidences.get(&id) else {
+                        report.skipped += 1;
+                        continue;
+                    };
+                    if live.created_at.is_none_or(|at| at < armed_at) {
+                        report.skipped += 1;
+                        continue;
+                    }
+                    report.examined += 1;
+                    let state = EngineHeatState {
+                        heat: row.heat,
+                        stability: row.stability,
+                        last_touched: row
+                            .last_touched
+                            .map(|at| at.timestamp().max(0) as u64)
+                            .unwrap_or(0),
+                        last_accessed_at: row
+                            .last_accessed_at
+                            .map(|at| at.timestamp().max(0) as u64)
+                            .unwrap_or(0),
+                        access_count: row.access_count.max(0) as u64,
+                    };
+                    let projected = projected_heat(&state, now, self.decay_tau_secs);
+                    if !should_demote(
+                        projected,
+                        row.access_count,
+                        live.confidence,
+                        self.cold_heat_floor,
+                        self.demote_confidence_ceiling,
+                    ) {
+                        continue;
+                    }
+                    demotions.push((row.memory.clone(), live.confidence));
+                }
+                if demotions.is_empty() {
+                    return Ok(PartitionOutcome {
+                        report: alexandria_engine::dreaming::PartitionJobReport {
+                            report,
+                            budget_used: rows.len(),
+                        },
+                        row_cursor: Self::page_cursor(&rows),
+                        exhausted: rows.len() < limit,
+                    });
+                }
+                // One transaction for every demotion in this partition: one active-account claim,
+                // every statement the same single-column update the whole-store body issues.
+                let writes: Vec<alexandria_storage::repos::scope::GuardedWrite> = demotions
+                    .iter()
+                    .map(|(fact, _)| {
+                        alexandria_storage::repos::scope::GuardedWrite::new(
+                            "UPDATE $f SET confidence = $c WHERE workspace = $workspace AND \
+                             deleted = false AND quarantined_at = NONE RETURN AFTER;",
+                        )
+                        .id("f", fact.clone())
+                        .value(
+                            "c",
+                            alexandria_storage::repos::scope::Bind::Float(DEMOTED_CONFIDENCE),
+                        )
+                    })
+                    .collect();
+                let written = alexandria_storage::repos::scope::guarded_system_writes::<
+                    alexandria_storage::models::Fact,
+                >(
+                    self.db.inner(), &self.db, &self.system, partition, &writes
+                )
+                .await?;
+                let Some(per_statement) = written else {
+                    return Err(alexandria_storage::error::StorageError::Stale.into());
+                };
+                for (index, (fact, previous)) in demotions.iter().enumerate() {
+                    // A row that acted but failed to log is worse than the reverse: the log write
+                    // is outside the barrier transaction and its failure is warned, not unwound —
+                    // the same discipline the whole-store body keeps.
+                    if per_statement[index].is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = audit
+                        .record(&LogEntry {
+                            action: action::DEMOTE.to_string(),
+                            source_id: record_id_to_string(fact),
+                            target_ids: Vec::new(),
+                            members_moved: 0,
+                            disposition: Some(disposition::DEMOTE.to_string()),
+                            previous_value: Some(*previous),
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            "Appraise: cannot log the demotion of {}: {e}",
+                            record_id_to_string(fact)
+                        );
+                    }
+                    report.acted += 1;
+                }
+                Ok(PartitionOutcome {
+                    report: alexandria_engine::dreaming::PartitionJobReport {
+                        report,
+                        budget_used: rows.len(),
+                    },
+                    row_cursor: Self::page_cursor(&rows),
+                    exhausted: rows.len() < limit,
+                })
+            }
+            // Duplicate retirement, partition-scoped. The grouping sees only this partition's
+            // live rows, so a byte-identical row in another account's corpus is never a collapse
+            // partner. The `derived_from` edge is written BEFORE the soft-delete inside ONE
+            // barrier transaction per retirement — reversed, a failure between the two would
+            // leave a dead row with no path back to its survivor. Budget counts retirements.
+            Job::Collapse => {
+                let limit = row_allowance.unwrap_or(self.max_rows_per_run);
+                let memories = MemoryRepo::new(self.db.inner());
+                let rows = memories.collapse_candidates_in_partition(partition).await?;
+                let candidates: Vec<Candidate> = rows
+                    .iter()
+                    .map(|row| Candidate {
+                        id: record_id_to_string(&row.id),
+                        content: row.content.clone(),
+                        confidence: row.confidence,
+                        created_at: row
+                            .created_at
+                            .map(|at| at.timestamp())
+                            .unwrap_or(UNKNOWN_CREATED_AT),
+                    })
+                    .collect();
+
+                let mut report = JobReport::new(Job::Collapse);
+                report.examined = rows.len();
+                let audit = MaintenanceRepo::with_audit(
+                    self.db.inner(),
+                    AuditContext::dreaming(run_id, job_name::COLLAPSE),
+                );
+                // The engine groups by display string; the typed ids the scoped read returned are
+                // the authority, so the strings are only keys back into this map. No id is ever
+                // *parsed* from text - that is the type-erasing trap the reminder work removed.
+                let typed: HashMap<String, RecordId> = rows
+                    .iter()
+                    .map(|row| (record_id_to_string(&row.id), row.id.clone()))
+                    .collect();
+                let mut retired: Vec<(RecordId, RecordId)> = Vec::new();
+                'groups: for group in duplicate_groups(&candidates) {
+                    for collapsed in &group.collapsed {
+                        if retired.len() >= limit {
+                            break 'groups;
+                        }
+                        let Some(from) = typed.get(collapsed) else {
+                            continue;
+                        };
+                        let Some(to) = typed.get(&group.survivor) else {
+                            continue;
+                        };
+                        let (from, to) = (from.clone(), to.clone());
+                        // Edge first, delete second, one claim for both.
+                        let writes = vec![
+                            alexandria_storage::repos::scope::GuardedWrite::new(
+                                "RELATE $from->memory_edge->$to SET edge_type = $edge_type, \
+                                 strength = $strength;",
+                            )
+                            .id("from", from.clone())
+                            .id("to", to.clone())
+                            .value(
+                                "edge_type",
+                                alexandria_storage::repos::scope::Bind::Text(
+                                    "derived_from".to_string(),
+                                ),
+                            )
+                            .value(
+                                "strength",
+                                alexandria_storage::repos::scope::Bind::Float(1.0),
+                            ),
+                            alexandria_storage::repos::scope::GuardedWrite::new(
+                                "UPDATE $f SET deleted = true WHERE workspace = $workspace AND \
+                                 deleted = false AND quarantined_at = NONE RETURN AFTER;",
+                            )
+                            .id("f", from.clone()),
+                        ];
+                        // The rows decode as JSON values because the two statements return
+                        // different row shapes: the RELATE yields `memory_edge` records and the
+                        // UPDATE yields `fact` rows, and one type parameter cannot name both.
+                        // Landing is judged by the UPDATE's rows (index 1) alone — the delete is
+                        // the retirement; the edge's own result shape is not a contract.
+                        let written = alexandria_storage::repos::scope::guarded_system_writes::<
+                            serde_json::Value,
+                        >(
+                            self.db.inner(), &self.db, &self.system, partition, &writes
+                        )
+                        .await?;
+                        let Some(per_statement) = written else {
+                            return Err(alexandria_storage::error::StorageError::Stale.into());
+                        };
+                        if per_statement.get(1).is_none_or(|rows| rows.is_empty()) {
+                            // The retirement did not land (a raced row state, most likely):
+                            // counted as skipped, the next pass re-groups whatever is left.
+                            report.skipped += 1;
+                            continue;
+                        }
+                        retired.push((from, to));
+                    }
+                }
+                for (collapsed, survivor) in &retired {
+                    if let Err(e) = audit
+                        .record(&LogEntry {
+                            action: action::COLLAPSE.to_string(),
+                            source_id: record_id_to_string(collapsed),
+                            target_ids: vec![record_id_to_string(survivor)],
+                            members_moved: 0,
+                            disposition: Some(disposition::SOFT_DELETE.to_string()),
+                            previous_value: None,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            "Collapse: cannot log the collapse of {}: {e}",
+                            record_id_to_string(collapsed)
+                        );
+                    }
+                    report.acted += 1;
+                }
+                Ok(PartitionOutcome {
+                    report: alexandria_engine::dreaming::PartitionJobReport {
+                        report,
+                        // Collapse charges successful retirements, not candidate reads.
+                        budget_used: retired.len(),
+                    },
+                    // Collapse self-advances: retired rows are soft-deleted and leave the live
+                    // candidate set, so the next pass groups only what is left.
+                    row_cursor: None,
+                    exhausted: false,
+                })
+            }
+            // SCAFFOLD, still: cluster and merge (the uncapped pair) keep their whole-store bodies
+            // until their partition-scoped cluster reads land (M3c); they take no row allowance.
+            //
+            // TODO(debt): partitioned cluster/merge bodies — M3c.
+            Job::Cluster | Job::Merge => {
+                let report = self.run_job(job, run_id).await?;
+                Ok(PartitionOutcome {
+                    report: alexandria_engine::dreaming::PartitionJobReport {
+                        report,
+                        budget_used: 0,
+                    },
+                    row_cursor: None,
+                    exhausted: false,
+                })
+            }
+        }
+    }
+
+    /// The paging cursor for an appraise page: the last row the body examined, in the page's own
+    /// `(last_touched, id)` order. An empty page keeps `None` — nothing was examined, so there is
+    /// nothing to resume after.
+    fn page_cursor(rows: &[alexandria_storage::models::HeatState]) -> Option<RecordId> {
+        rows.last().and_then(|row| row.id.clone())
+    }
+
     /// Heat materialisation: project every row's decay to now and store the result, oldest anchor
     /// first, at most `max_rows_per_run` rows.
     ///
@@ -324,6 +974,18 @@ impl Jobs {
         );
         let clusters = self.all_clusters().await?;
         let mut report = JobReport::new(Job::Cluster);
+        // The engine's verdicts are labelled by display string; the typed ids the listing
+        // returned are the authority, so the strings are only keys back into this map. No id is
+        // ever parsed from text.
+        let typed: HashMap<String, RecordId> = clusters
+            .iter()
+            .filter_map(|cluster| {
+                cluster
+                    .id
+                    .as_ref()
+                    .map(|id| (record_id_to_string(id), id.clone()))
+            })
+            .collect();
 
         for cluster in &clusters {
             let cid = cluster
@@ -331,7 +993,10 @@ impl Jobs {
                 .as_ref()
                 .map(record_id_to_string)
                 .unwrap_or_default();
-            let members = match cluster_repo.get_members(&cid).await {
+            let Some(cluster_id) = typed.get(&cid) else {
+                continue;
+            };
+            let members = match cluster_repo.get_members(cluster_id).await {
                 Ok(m) => m,
                 // A single unreadable cluster must not abort the pass: the others are still
                 // checkable, and this job runs again in five minutes.
@@ -363,12 +1028,26 @@ impl Jobs {
                     group_a.len(),
                     group_b.len()
                 );
+                let source = typed
+                    .get(&cluster_id)
+                    .expect("the split verdict names a listed cluster");
                 match cluster_repo
-                    .execute_split(&cid, &members, &group_a, &group_b, &centroid_a, &centroid_b)
+                    .execute_split(
+                        source,
+                        &members,
+                        &group_a,
+                        &group_b,
+                        &centroid_a,
+                        &centroid_b,
+                    )
                     .await
                 {
                     Ok((cid_a, cid_b)) => {
-                        tracing::info!("Split complete: {cluster_id} -> {cid_a}, {cid_b}");
+                        tracing::info!(
+                            "Split complete: {cluster_id} -> {}, {}",
+                            record_id_to_string(&cid_a),
+                            record_id_to_string(&cid_b)
+                        );
                         report.acted += 1;
                     }
                     Err(e) => tracing::warn!("Split failed for {cluster_id}: {e}"),
@@ -391,15 +1070,27 @@ impl Jobs {
         loop {
             let merge_clusters = self.all_clusters().await?;
             report.examined += merge_clusters.len();
+            // Typed ids from the listing are the authority; the engine's verdict labels are
+            // display strings keyed back into this map, never parsed.
+            let typed: HashMap<String, RecordId> = merge_clusters
+                .iter()
+                .filter_map(|c| {
+                    c.id.as_ref()
+                        .map(|id| (record_id_to_string(id), id.clone()))
+                })
+                .collect();
 
             let mut infos: Vec<(String, Vec<f32>, usize)> = Vec::new();
             for c in &merge_clusters {
                 let id = c.id.as_ref().map(record_id_to_string).unwrap_or_default();
-                let count = cluster_repo
-                    .get_members(&id)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let count = match typed.get(&id) {
+                    Some(cluster_id) => cluster_repo
+                        .get_members(cluster_id)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0),
+                    None => 0,
+                };
                 infos.push((id, c.centroid.clone(), count));
             }
 
@@ -422,8 +1113,13 @@ impl Jobs {
                     } = result
                     {
                         tracing::info!("Merging cluster {remove_id} into {keep_id}");
+                        let (Some(keep), Some(remove)) =
+                            (typed.get(&keep_id), typed.get(&remove_id))
+                        else {
+                            continue;
+                        };
                         match cluster_repo
-                            .execute_merge(&keep_id, &remove_id, &merged_centroid)
+                            .execute_merge(keep, remove, &merged_centroid)
                             .await
                         {
                             Ok(()) => {
@@ -676,6 +1372,65 @@ pub(crate) fn summary(config: &crate::config::DreamingConfig) -> String {
     )
 }
 
+/// Whether one partition's persisted cursor marks it exhausted. A free function rather than a
+/// closure so the pass can mutate the progress it reads between calls — the cycle wrap resets the
+/// flags this predicate tests.
+fn cursor_exhausted(
+    progress: &alexandria_storage::models::maintenance::MaintenanceProgress,
+    partition: &Partition,
+) -> bool {
+    progress.cursors.iter().any(|cursor| {
+        cursor.exhausted
+            && cursor.workspace == partition.workspace
+            && cursor.scope == partition.scope
+    })
+}
+
+/// The capped jobs, in the engine's budget vocabulary. `None` for cluster and merge, which are not
+/// row-budgeted and keep their existing whole-store behaviour until M3.
+fn capped(job: Job) -> Option<MaintenanceBudgetJob> {
+    match job {
+        Job::Sweep => Some(MaintenanceBudgetJob::Sweep),
+        Job::Collapse => Some(MaintenanceBudgetJob::Collapse),
+        Job::Appraise => Some(MaintenanceBudgetJob::Appraise),
+        Job::Cluster | Job::Merge => None,
+    }
+}
+
+/// One partition's dispatch outcome: the engine's chargeable report plus the paging facts the
+/// dispatcher persists. The row cursor and exhaustion verdict are appraise's alone — sweep
+/// self-advances (materialisation moves `last_touched` to now, sending processed rows to the
+/// tail of the oldest-first order) and collapse self-advances (retired rows leave the live
+/// candidate set) — but the shape is shared so the dispatcher persists one kind of outcome.
+#[derive(Debug)]
+pub(crate) struct PartitionOutcome {
+    pub report: alexandria_engine::dreaming::PartitionJobReport,
+    /// The last row the body examined, so the next pass resumes after it. `None` leaves the
+    /// persisted cursor where it was.
+    pub row_cursor: Option<RecordId>,
+    /// The body's page came back short of its share, so the partition is fully processed this
+    /// cycle and later passes skip it until the cycle wraps.
+    pub exhausted: bool,
+}
+
+/// One capped job's whole pass, as the scheduler and CLI report it.
+#[derive(Debug)]
+pub(crate) struct PassReport {
+    pub report: JobReport,
+    /// Partitions whose body ran to completion this pass.
+    pub visited: usize,
+    /// Partitions the M1 barrier refused (the account stopped being active mid-pass).
+    pub refused: usize,
+    /// Partitions whose body failed; the pass advanced past them.
+    pub failed: usize,
+    /// Chargeable units the pass consumed against its allowance.
+    pub budget_used: usize,
+    /// The last per-partition failure, carried for the operator and the witnesses: a pass that
+    /// advances past failures is silent by design, and "failed: 1" without the error is a
+    /// diagnostic dead end.
+    pub last_error: Option<String>,
+}
+
 /// The loop. Sleeps until the soonest job is due rather than waking on a fixed tick, runs the whole
 /// due set in declared order, and marks each job as run whether it succeeded or not.
 ///
@@ -722,7 +1477,31 @@ pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
         // it is one event, not two.
         let run_id = tick_run_id(now, tick);
         for job in due {
-            match jobs.run_job(job, &run_id).await {
+            // The capped jobs run as partitioned passes under the dispatcher (enumeration, fair
+            // shares, pass-wide budget, persisted rotation); the uncapped cluster/merge keep their
+            // whole-store bodies until their partitioned reads land. This is the loop half of the
+            // Task-12 wiring; `alexandria dream` joins it when its CLI witness turns green.
+            let ran = if capped(job).is_some() {
+                jobs.dispatch_job(job, &run_id).await.map(|pass| {
+                    // The pass's own observability, at the same debug level a single
+                    // JobReport gets: which partitions ran, which were refused by the
+                    // barrier or failed and advanced, and what the pass charged against
+                    // its global allowance.
+                    tracing::debug!(
+                        job = pass.report.job.as_str(),
+                        visited = pass.visited,
+                        refused = pass.refused,
+                        failed = pass.failed,
+                        budget_used = pass.budget_used,
+                        last_error = ?pass.last_error,
+                        "dreaming pass finished"
+                    );
+                    pass.report
+                })
+            } else {
+                jobs.run_job(job, &run_id).await
+            };
+            match ran {
                 Ok(report) => tracing::debug!(
                     job = report.job.as_str(),
                     examined = report.examined,
@@ -757,12 +1536,15 @@ mod tests {
 
     /// An embedded database with the schema applied and nothing in it: the state every first boot
     /// starts from, and the one the jobs must treat as success rather than as an error.
-    async fn migrated_db() -> Arc<Database> {
-        let db = Arc::new(Database::connect_embedded().await.unwrap());
+    async fn migrated_db() -> (Arc<Database>, SystemContext) {
+        let mut db = Database::connect_embedded().await.unwrap();
         alexandria_storage::schema::migrate(db.inner())
             .await
             .expect("schema applies to a fresh database");
-        db
+        let system = db
+            .claim_system_authority()
+            .expect("a fresh embedded store has an unclaimed system authority");
+        (Arc::new(db), system)
     }
 
     /// A heat row with an old decay anchor and a known access history, so the sweep has something to
@@ -809,10 +1591,10 @@ mod tests {
     /// at the defaults) and under-grow stability roughly 24x, which is why the column exists.
     #[tokio::test]
     async fn the_sweep_materialises_heat_without_touching_the_access_clock() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         let id = seed_cold(&db, "a memory nobody has looked at in years").await;
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Sweep, "run-test")
             .await
@@ -848,14 +1630,14 @@ mod tests {
     /// and everything past `max_rows_per_run` would never decay at all.
     #[tokio::test]
     async fn the_sweep_is_bounded_and_drains_a_larger_corpus_across_runs() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         for i in 0..3 {
             seed_cold(&db, &format!("memory {i}")).await;
         }
 
         let mut config = Config::default();
         config.dreaming.max_rows_per_run = 2;
-        let jobs = Jobs::new(db.clone(), &config);
+        let jobs = Jobs::new(db.clone(), system.clone(), &config);
 
         let first = jobs
             .run_job(Job::Sweep, "run-test")
@@ -888,8 +1670,8 @@ mod tests {
     /// nothing rather than as an error the scheduler logs every hour.
     #[tokio::test]
     async fn the_sweep_on_an_empty_corpus_is_a_quiet_success() {
-        let db = migrated_db().await;
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let (db, system) = migrated_db().await;
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Sweep, "run-test")
             .await
@@ -912,8 +1694,8 @@ mod tests {
     /// are normal for a 1-hour sweep cadence, and "quiet" stops meaning anything.
     #[tokio::test]
     async fn the_loop_stamps_the_heartbeat_even_when_nothing_is_due() {
-        let db = migrated_db().await;
-        let jobs = Jobs::new(db, &Config::default());
+        let (db, system) = migrated_db().await;
+        let jobs = Jobs::new(db, system.clone(), &Config::default());
         let liveness = Arc::new(Liveness::new(600));
         // Same field `spawn` sets, and the same reason: a dashboard reading a different `Liveness`
         // than the loop writes would report `NotStarted` forever.
@@ -944,7 +1726,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_split_attributes_its_audit_row_to_the_tick_that_wrote_it() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         let memories = MemoryRepo::new(db.inner());
         let clusters = ClusterRepo::new(db.inner());
 
@@ -959,14 +1741,14 @@ mod tests {
             .iter()
             .enumerate()
         {
-            let fid = memories
-                .create_fact(&format!("member {i}"), 0.5, point, &[])
+            let (_, fid) = memories
+                .create_fact_with_id(&format!("member {i}"), 0.5, point, &[])
                 .await
                 .unwrap();
             clusters.add_member(&wide, &fid).await.unwrap();
         }
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Cluster, "run-split-attrib")
             .await
@@ -999,20 +1781,20 @@ mod tests {
     /// scan happened to reach first.
     #[tokio::test]
     async fn a_merge_attributes_its_audit_row_to_the_tick_that_wrote_it() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         let memories = MemoryRepo::new(db.inner());
         let clusters = ClusterRepo::new(db.inner());
 
         // Centroid similarity well over the 0.75 join threshold, so these two merge.
         let a = clusters.create(Some("a"), &[1.0_f32, 0.0]).await.unwrap();
         let b = clusters.create(Some("b"), &[0.99_f32, 0.01]).await.unwrap();
-        let fid = memories
-            .create_fact("shared", 0.5, &[0.99_f32, 0.01], &[])
+        let (_, fid) = memories
+            .create_fact_with_id("shared", 0.5, &[0.99_f32, 0.01], &[])
             .await
             .unwrap();
         clusters.add_member(&b, &fid).await.unwrap();
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Merge, "run-merge-attrib")
             .await
@@ -1036,18 +1818,116 @@ mod tests {
         // And the direction is the documented one: the kept cluster is the one with more members,
         // so `b` (one member) survives and `a` (none) is the source. Asserted rather than incidental,
         // because a merge that deleted the populated cluster would still log an attributed row.
-        assert_eq!(merge.source_id, a, "the empty cluster is the one removed");
+        // `create` returns the typed id now; the audit row carries the canonical display form.
+        assert_eq!(
+            merge.source_id,
+            record_id_to_string(&a),
+            "the empty cluster is the one removed"
+        );
         assert_eq!(
             merge.target_ids,
-            vec![b],
+            vec![record_id_to_string(&b)],
             "the cluster holding the member is the one kept"
+        );
+    }
+
+    /// REGRESSION WITNESS (run 50): the merge drain over clusters whose keys need quoting
+    /// (`cluster:`quoted key``) or are numeric (`cluster:7`) must terminate and land its audit rows.
+    ///
+    /// Before the typed-id boundary, `ClusterRepo::delete` bound the cluster's *display string* into
+    /// `type::record($id)`, which matches nothing for a quoted key and binds a string key for a numeric
+    /// one — so `execute_merge` moved the members, "succeeded", and deleted nothing. The drain loop
+    /// re-read the cluster set, found the same near-identical pair again, and merged forever: the job
+    /// hung with an empty audit trail. The timeout below IS the assertion — the pre-fix code fails it
+    /// by hanging, not by returning.
+    ///
+    /// Determinism: `check_merge` keeps the cluster with more members, so the numeric-keyed cluster
+    /// (two members) is the survivor and the quoted-keyed one (one member) is the source, whatever
+    /// order `all_clusters` returns them in. Both are legacy-gate-admissible by construction (no
+    /// owner fields set), which is the population the merge job reads.
+    #[tokio::test]
+    async fn the_merge_drain_terminates_on_quoted_and_numeric_cluster_keys() {
+        let (db, system) = migrated_db().await;
+        let memories = MemoryRepo::new(db.inner());
+        let clusters = ClusterRepo::new(db.inner());
+
+        let numeric = RecordId::new("cluster", 7_i64);
+        let quoted = RecordId::new("cluster", "quoted key with spaces");
+        for (id, label) in [(numeric.clone(), "numeric"), (quoted.clone(), "quoted")] {
+            db.inner()
+                .query("CREATE $id SET label = $label, centroid = $centroid, depth = 0")
+                .bind(("id", id.clone()))
+                .bind(("label", label.to_string()))
+                .bind(("centroid", vec![1.0_f32, 0.0]))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        // Two members for the numeric cluster, one for the quoted: the keep/remove direction is
+        // pinned by member count, not by scan order.
+        for (cluster, content) in [
+            (numeric.clone(), "drain member one"),
+            (numeric.clone(), "drain member two"),
+            (quoted.clone(), "drain member three"),
+        ] {
+            let (_, fact) = memories
+                .create_fact_with_id(content, 0.5, &[1.0_f32, 0.0], &[])
+                .await
+                .unwrap();
+            clusters.add_member(&cluster, &fact).await.unwrap();
+        }
+
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            jobs.run_job(Job::Merge, "run-quoted-numeric-drain"),
+        )
+        .await
+        .expect("the merge drain terminated")
+        .expect("merge job succeeds");
+        assert_eq!(
+            report.acted, 1,
+            "the quoted/numeric pair must merge, or the witness measures an empty tick"
+        );
+
+        // The drain finished AND finished its work: the quoted-keyed cluster is gone, the
+        // numeric-keyed survivor holds every member, and the audit row names both keys in their
+        // canonical display forms.
+        assert!(
+            clusters.get(&quoted).await.unwrap().is_none(),
+            "the quoted-keyed cluster survived its own merge"
+        );
+        assert_eq!(
+            clusters.get_members(&numeric).await.unwrap().len(),
+            3,
+            "the surviving numeric-keyed cluster did not inherit every member"
+        );
+        let logs = ClusterRepo::new(db.inner())
+            .list_maintenance_logs(10, 0, None)
+            .await
+            .unwrap();
+        let merge = logs
+            .iter()
+            .find(|row| row.action == "merge")
+            .expect("a merge was logged for the quoted/numeric pair");
+        assert_eq!(merge.run_id.as_deref(), Some("run-quoted-numeric-drain"));
+        assert_eq!(
+            merge.source_id,
+            record_id_to_string(&quoted),
+            "the audit row did not carry the quoted key in canonical display form"
+        );
+        assert_eq!(
+            merge.target_ids,
+            vec![record_id_to_string(&numeric)],
+            "the audit row did not carry the numeric key in canonical display form"
         );
     }
 
     #[tokio::test]
     async fn the_cluster_and_merge_jobs_survive_an_empty_database() {
-        let db = migrated_db().await;
-        let jobs = Jobs::new(db, &Config::default());
+        let (db, system) = migrated_db().await;
+        let jobs = Jobs::new(db, system.clone(), &Config::default());
 
         // Both jobs used to live inline in `main.rs`, where an early `continue` on a query error was
         // the only failure handling. They now return `Result`, so "no clusters at all" has to be the
@@ -1160,8 +2040,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_loop_exits_when_cancelled() {
-        let db = migrated_db().await;
-        let jobs = Jobs::new(db, &Config::default());
+        let (db, system) = migrated_db().await;
+        let jobs = Jobs::new(db, system.clone(), &Config::default());
         let cancel = CancellationToken::new();
 
         let handle = tokio::spawn(run(Arc::new(jobs), cancel.clone()));
@@ -1200,7 +2080,7 @@ mod tests {
     /// merely hidden, so it is asserted and not assumed.
     #[tokio::test]
     async fn collapse_keeps_the_stronger_copy_and_links_the_duplicate_to_it() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         let memories = MemoryRepo::new(db.inner());
         let weak = memories
             .create_fact("the token rotates nightly", 0.3, &[0.1, 0.2], &[])
@@ -1211,7 +2091,7 @@ mod tests {
             .await
             .unwrap();
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Collapse, "run-collapse-1")
             .await
@@ -1251,7 +2131,7 @@ mod tests {
     /// is soft-deleted and therefore not a candidate, so the second run acts on nothing.
     #[tokio::test]
     async fn a_second_collapse_run_finds_nothing_to_do() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         let memories = MemoryRepo::new(db.inner());
         for confidence in [0.4, 0.8] {
             memories
@@ -1260,7 +2140,7 @@ mod tests {
                 .unwrap();
         }
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let first = jobs
             .run_job(Job::Collapse, "run-1")
             .await
@@ -1289,7 +2169,7 @@ mod tests {
     /// timestamp range and a guess.
     #[tokio::test]
     async fn collapse_attributes_every_row_to_the_run_that_wrote_it() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         let memories = MemoryRepo::new(db.inner());
         for _ in 0..3 {
             memories
@@ -1298,7 +2178,7 @@ mod tests {
                 .unwrap();
         }
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Collapse, "run-77")
             .await
@@ -1327,7 +2207,7 @@ mod tests {
     /// still candidates.
     #[tokio::test]
     async fn collapse_honours_max_rows_per_run_and_finishes_on_the_next_run() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         let memories = MemoryRepo::new(db.inner());
         for _ in 0..3 {
             memories
@@ -1338,7 +2218,7 @@ mod tests {
 
         let mut config = Config::default();
         config.dreaming.max_rows_per_run = 1;
-        let jobs = Jobs::new(db.clone(), &config);
+        let jobs = Jobs::new(db.clone(), system.clone(), &config);
 
         let first = jobs
             .run_job(Job::Collapse, "run-a")
@@ -1414,11 +2294,11 @@ mod tests {
     /// attributed audit row. Nothing is deleted or hidden, so being wrong costs a number.
     #[tokio::test]
     async fn appraise_demotes_a_cold_never_retrieved_memory_and_logs_it() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         armed_long_ago(&db).await;
         let id = seed_for_appraise(&db, "nobody ever asked for this", 0.5, 0, true).await;
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Appraise, "run-demote-1")
             .await
@@ -1468,7 +2348,7 @@ mod tests {
     /// test would pass for a job that does nothing at all.
     #[tokio::test]
     async fn a_memory_stored_before_access_recording_was_armed_is_never_demoted() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         // Armed now, which is what the first boot of this build does.
         system_config::arm_access_recording(db.inner())
             .await
@@ -1485,7 +2365,7 @@ mod tests {
             .check()
             .unwrap();
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Appraise, "run-arming")
             .await
@@ -1523,10 +2403,10 @@ mod tests {
     /// writes nothing rather than treating every `access_count == 0` as evidence of disuse.
     #[tokio::test]
     async fn appraise_demotes_nothing_until_access_recording_has_been_armed() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         let id = seed_for_appraise(&db, "cold, unused, unarmed", 0.5, 0, true).await;
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Appraise, "run-unarmed")
             .await
@@ -1554,14 +2434,14 @@ mod tests {
     /// used, current, or explicitly trusted — which is the complaint that would end this feature.
     #[tokio::test]
     async fn appraise_leaves_accessed_warm_and_confident_memories_alone() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         armed_long_ago(&db).await;
         let accessed = seed_for_appraise(&db, "retrieved three times", 0.5, 3, true).await;
         let warm = seed_for_appraise(&db, "touched today", 0.5, 0, false).await;
         let confident = seed_for_appraise(&db, "asserted with confidence", 0.95, 0, true).await;
         let demotable = seed_for_appraise(&db, "cold and unused", 0.5, 0, true).await;
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Appraise, "run-selective")
             .await
@@ -1589,11 +2469,11 @@ mod tests {
     /// unreadable, since every run would report the same demotions forever.
     #[tokio::test]
     async fn a_second_appraise_run_does_not_demote_the_same_row_twice() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         armed_long_ago(&db).await;
         seed_for_appraise(&db, "cold and unused", 0.5, 0, true).await;
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let first = jobs
             .run_job(Job::Appraise, "run-1")
             .await
@@ -1624,7 +2504,7 @@ mod tests {
     /// the join against the live-fact read is what keeps dead rows out.
     #[tokio::test]
     async fn appraise_skips_heat_rows_whose_fact_is_not_live() {
-        let db = migrated_db().await;
+        let (db, system) = migrated_db().await;
         armed_long_ago(&db).await;
         let deleted = seed_for_appraise(&db, "already deleted", 0.5, 0, true).await;
         let quarantined = seed_for_appraise(&db, "quarantined", 0.5, 0, true).await;
@@ -1642,7 +2522,7 @@ mod tests {
             .check()
             .unwrap();
 
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let jobs = Jobs::new(db.clone(), system.clone(), &Config::default());
         let report = jobs
             .run_job(Job::Appraise, "run-liveness")
             .await
@@ -1668,5 +2548,765 @@ mod tests {
             0.5,
             "a quarantined row is hidden from retrieval already; demoting it would be noise in the              audit log for a row nobody can see"
         );
+    }
+    // ---------------------------------------------------------------------------------------
+    // Task 12 M2: the partitioned dispatcher's outward witnesses. The dispatcher is real
+    // (enumeration, fair planning, budget, progress CAS); `run_partitioned` is the disclosed
+    // scaffold that still runs the whole-store body, so these are the behavioral RED for the
+    // partition-scoping contracts M3's bodies must deliver.
+    // ---------------------------------------------------------------------------------------
+
+    /// One enrolled owner with a cold heat row in their workspace, `age_secs` in the past: the
+    /// fixture every dispatcher witness seeds accounts with. Returns the fact's typed id.
+    async fn seed_owner_cold(
+        db: &Database,
+        login: &str,
+        content: &str,
+        age_secs: i64,
+    ) -> alexandria_storage::models::identity::WorkspaceId {
+        let ids = IdentityRepo::new(db.inner())
+            .bootstrap_owner(
+                login,
+                "digest-dispatch-padding-padding",
+                &alexandria_storage::models::OperationId::new(format!("op-{login}")),
+            )
+            .await
+            .unwrap();
+        let memories = MemoryRepo::new(db.inner());
+        let heat = HeatRepo::new(db.inner());
+        let fact = memories
+            .create_fact(content, 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        heat.create_for_memory(&fact, 1.0).await.unwrap();
+        let touched = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+        db.inner()
+            .query("UPDATE heat_state SET last_touched = $touched WHERE memory = type::record($m);")
+            .bind(("touched", touched))
+            .bind(("m", fact.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        // Stamp the fact into the owner's workspace and the personal scope, so the partition's
+        // conjunct (`workspace = $w AND scope = 'personal'`) finds it.
+        db.inner()
+            .query(
+                "UPDATE type::record($f) SET workspace = $workspace, scope = 'personal', \
+                 deleted = false;",
+            )
+            .bind(("f", fact.clone()))
+            .bind(("workspace", ids.workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        ids.workspace
+    }
+
+    /// Another cold row in an *existing* owner's workspace: the second seed for witnesses that
+    /// need more eligible rows than the cap in one account.
+    async fn seed_cold_in_workspace(
+        db: &Database,
+        workspace: &alexandria_storage::models::identity::WorkspaceId,
+        content: &str,
+        age_secs: i64,
+    ) {
+        let memories = MemoryRepo::new(db.inner());
+        let heat = HeatRepo::new(db.inner());
+        let fact = memories
+            .create_fact(content, 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        heat.create_for_memory(&fact, 1.0).await.unwrap();
+        let touched = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+        db.inner()
+            .query("UPDATE heat_state SET last_touched = $touched WHERE memory = type::record($m);")
+            .bind(("touched", touched))
+            .bind(("m", fact.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        db.inner()
+            .query(
+                "UPDATE type::record($f) SET workspace = $workspace, scope = 'personal', \
+                 deleted = false;",
+            )
+            .bind(("f", fact.clone()))
+            .bind(("workspace", workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+
+    /// A workspace's heat rows, by content, for asserting who was and was not touched.
+    ///
+    /// Typed reads, not JSON: `last_touched` lives on `heat_state`, not on `fact`, so a single-table
+    /// select silently reads NONE for it — the exact defect that made the M2 RED and the 37 run fail
+    /// identically whatever the body did. The join is by record id in Rust, and the rows come back
+    /// as `HeatState`/`Fact` models so the anchor is a real `DateTime` or a real `None`.
+    async fn workspace_heats(
+        db: &Database,
+        workspace: &alexandria_storage::models::identity::WorkspaceId,
+    ) -> Vec<(String, f64, Option<chrono::DateTime<chrono::Utc>>)> {
+        let heats: Vec<alexandria_storage::models::HeatState> = db
+            .inner()
+            .query(
+                "SELECT * FROM heat_state WHERE memory INSIDE (SELECT VALUE id FROM fact WHERE \
+                 workspace = $workspace);",
+            )
+            .bind(("workspace", workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        let facts: Vec<alexandria_storage::models::Fact> = db
+            .inner()
+            .query("SELECT * FROM fact WHERE workspace = $workspace;")
+            .bind(("workspace", workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        let contents: std::collections::HashMap<String, String> = facts
+            .iter()
+            .map(|fact| {
+                (
+                    record_id_to_string(fact.id.as_ref().expect("a seeded fact has an id")),
+                    fact.content.clone(),
+                )
+            })
+            .collect();
+        let mut rows: Vec<(String, f64, Option<chrono::DateTime<chrono::Utc>>)> = heats
+            .iter()
+            .map(|state| {
+                (
+                    contents
+                        .get(&record_id_to_string(&state.memory))
+                        .cloned()
+                        .unwrap_or_default(),
+                    state.heat,
+                    state.last_touched,
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// WITNESS 1 — suspension: a suspended account has no maintenance partition, and nothing the
+    /// pass does writes one of its rows. First-reached failure at the scaffold: the whole-store
+    /// body sweeps the suspended account's rows too, because nothing scopes it yet.
+    #[tokio::test]
+    async fn suspended_account_has_no_maintenance_partition_or_write() {
+        let (db, system) = migrated_db().await;
+        let suspended = seed_owner_cold(
+            &db,
+            "disp-suspended",
+            "suspended account memory",
+            86_400 * 365,
+        )
+        .await;
+        let active =
+            seed_owner_cold(&db, "disp-active", "active account memory", 86_400 * 30).await;
+        db.inner()
+            .query("UPDATE account SET status = 'suspended' WHERE login = 'disp-suspended';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        // Enumeration excludes the suspended workspace before any write is attempted.
+        let partitions = IdentityRepo::maintenance_partitions(db.inner(), &db, &system)
+            .await
+            .unwrap();
+        assert!(
+            partitions
+                .iter()
+                .all(|partition| partition.workspace != suspended),
+            "a suspended account's workspace is not a maintenance partition: {partitions:?}"
+        );
+
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        let pass = jobs
+            .dispatch_job(Job::Sweep, "run-dispatch-suspended")
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.visited, 1,
+            "exactly the active account's partition ran"
+        );
+
+        let suspended_rows = workspace_heats(&db, &suspended).await;
+        assert_eq!(
+            suspended_rows.len(),
+            1,
+            "the suspended account's row count is unchanged"
+        );
+        assert!(
+            suspended_rows[0]
+                .2
+                .is_some_and(|touched| touched < chrono::Utc::now() - chrono::Duration::hours(1)),
+            "a suspended account's decay anchor was moved by a maintenance pass: \
+             {suspended_rows:?}"
+        );
+        // Later branch, reached only if the refusal above held: the active account was served.
+        let active_rows = workspace_heats(&db, &active).await;
+        assert!(
+            active_rows[0]
+                .2
+                .is_some_and(|touched| touched > chrono::Utc::now() - chrono::Duration::hours(1)),
+            "the active account's row was swept: {active_rows:?}"
+        );
+    }
+
+    /// WITNESS 2 — the allowance is one per capped job per pass across all partitions, and a
+    /// second account still gets its turn. First-reached failure at the scaffold: the whole-store
+    /// body serves the globally-oldest rows, so one account can consume the entire pass.
+    #[tokio::test]
+    async fn row_allowance_is_global_per_job_not_per_partition() {
+        let (db, system) = migrated_db().await;
+        // The first account holds MORE eligible rows than the cap; the second holds one. The
+        // property under test is that the pass's two units are shared across the accounts rather
+        // than both taken by the first account's older rows — which needs a cap of two to be
+        // expressible at all (a cap of one can only ever serve one account, by the owner's
+        // one-allowance-per-job-per-pass contract).
+        let first =
+            seed_owner_cold(&db, "disp-first", "first account memory a", 86_400 * 365).await;
+        seed_cold_in_workspace(&db, &first, "first account memory b", 86_400 * 364).await;
+        let second =
+            seed_owner_cold(&db, "disp-second", "second account memory", 86_400 * 363).await;
+
+        let mut config = Config::default();
+        config.dreaming.max_rows_per_run = 2;
+        let jobs = Jobs::new(db.clone(), system, &config);
+        let pass = jobs
+            .dispatch_job(Job::Sweep, "run-dispatch-global-budget")
+            .await
+            .unwrap();
+
+        assert!(
+            pass.budget_used <= 2,
+            "the pass's chargeable units stayed within the single global allowance: {pass:?}"
+        );
+        let second_rows = workspace_heats(&db, &second).await;
+        assert!(
+            second_rows[0]
+                .2
+                .is_some_and(|touched| touched > chrono::Utc::now() - chrono::Duration::hours(1)),
+            "a second account with eligible rows got no turn: the allowance was not shared: \
+             {second_rows:?}"
+        );
+        // Later branch: the first account was served exactly one row — its second-oldest stays
+        // anchored in the past, which is also the proof the cap is a *global* two rather than a
+        // per-partition two.
+        let first_rows = workspace_heats(&db, &first).await;
+        assert_eq!(
+            first_rows.len(),
+            2,
+            "both seeded rows remain: {first_rows:?}"
+        );
+        assert!(
+            first_rows[0]
+                .2
+                .is_some_and(|touched| touched > chrono::Utc::now() - chrono::Duration::hours(1)),
+            "the first account's oldest row was swept: {first_rows:?}"
+        );
+        assert!(
+            first_rows[1]
+                .2
+                .is_some_and(|touched| touched < chrono::Utc::now() - chrono::Duration::hours(1)),
+            "the first account's second row was also swept: the cap was not global: {first_rows:?}"
+        );
+    }
+
+    /// WITNESS 3 — progress survives a restart: a second pass, over a freshly constructed
+    /// dispatcher, continues the rotation instead of replaying the first account again.
+    ///
+    /// The store's workspace enumeration is deterministic *per run* but its keys are
+    /// engine-minted random ids, so the witness names the accounts by their TURN (first and
+    /// second enumerated) rather than by their seed order - the rotation property is symmetric,
+    /// and a seed-order assumption was a per-run coin flip. Both accounts hold two rows to a cap
+    /// of one, so whichever account pass one serves, its second row must wait for a later pass
+    /// and pass two must rotate to the other account.
+    #[tokio::test]
+    async fn maintenance_progress_survives_restart_and_many_projects() {
+        let (db, system) = migrated_db().await;
+        // "rotation alpha" is each account's OLDEST row and sorts before "rotation beta".
+        let a = seed_owner_cold(&db, "disp-rot-a", "rotation alpha", 86_400 * 365).await;
+        seed_cold_in_workspace(&db, &a, "rotation beta", 86_400 * 364).await;
+        let b = seed_owner_cold(&db, "disp-rot-b", "rotation alpha", 86_400 * 363).await;
+        seed_cold_in_workspace(&db, &b, "rotation beta", 86_400 * 362).await;
+
+        // Name the accounts by their turn: the enumeration order is the rotation's starting point.
+        let partitions = IdentityRepo::maintenance_partitions(db.inner(), &db, &system)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2, "two accounts, one partition each");
+        let (first, second) = (
+            partitions[0].workspace.clone(),
+            partitions[1].workspace.clone(),
+        );
+
+        let mut config = Config::default();
+        config.dreaming.max_rows_per_run = 1;
+        let jobs = Jobs::new(db.clone(), system.clone(), &config);
+        let first_pass = jobs
+            .dispatch_job(Job::Sweep, "run-dispatch-restart-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            first_pass.visited, 1,
+            "pass one ran one partition: {first_pass:?} (last partition error: {:?})",
+            first_pass.last_error
+        );
+
+        // Pass one served the FIRST-enumerated account's oldest row only: its beta row and the
+        // whole second account keep their seeded anchors.
+        let after_first_first = workspace_heats(&db, &first).await;
+        let after_first_second = workspace_heats(&db, &second).await;
+        assert_eq!(
+            after_first_first.len(),
+            2,
+            "both of the first turn's rows remain: {after_first_first:?}"
+        );
+        assert!(
+            after_first_first[0]
+                .2
+                .is_some_and(|touched| touched > chrono::Utc::now() - chrono::Duration::hours(1)),
+            "pass one served the first turn's oldest row: {after_first_first:?} \
+             (pass one: {first_pass:?})"
+        );
+        assert!(
+            after_first_first[1]
+                .2
+                .is_some_and(|touched| touched < chrono::Utc::now() - chrono::Duration::hours(1)),
+            "pass one's single-row allowance did not reach the first turn's second row: \
+             {after_first_first:?}"
+        );
+        assert!(
+            after_first_second.iter().all(|row| row
+                .2
+                .is_some_and(|touched| touched < chrono::Utc::now() - chrono::Duration::hours(1))),
+            "pass one served only the first turn's account: {after_first_second:?}"
+        );
+        let first_turn_anchor = after_first_first[0].2;
+
+        // A second Jobs over the same store is the inline stand-in for a restart: nothing but the
+        // persisted ledger can tell it where the first pass stopped.
+        let jobs = Jobs::new(db.clone(), system, &config);
+        let second_pass = jobs
+            .dispatch_job(Job::Sweep, "run-dispatch-restart-2")
+            .await
+            .unwrap();
+        assert_eq!(
+            second_pass.visited, 1,
+            "the second pass ran one partition: {second_pass:?} (last error: {:?})",
+            second_pass.last_error
+        );
+
+        // The rotation advanced: pass two served the OTHER account's oldest row.
+        let after_second_second = workspace_heats(&db, &second).await;
+        assert_ne!(
+            after_second_second[0].2, after_first_second[0].2,
+            "the second pass did not continue the rotation onto the second turn's account: \
+             {after_second_second:?} (after pass one: {after_first_second:?})"
+        );
+        assert!(
+            after_second_second[1]
+                .2
+                .is_some_and(|touched| touched < chrono::Utc::now() - chrono::Duration::hours(1)),
+            "the second pass's single-row allowance did not reach the second turn's beta row: \
+             {after_second_second:?}"
+        );
+        let after_second_first = workspace_heats(&db, &first).await;
+        assert_eq!(
+            after_second_first[0].2, first_turn_anchor,
+            "the first turn's already-swept row was swept a second time: {after_second_first:?} \
+             (its anchor after pass one was {first_turn_anchor:?})"
+        );
+        assert!(
+            after_second_first[1]
+                .2
+                .is_some_and(|touched| touched < chrono::Utc::now() - chrono::Duration::hours(1)),
+            "the first turn's second row was swept by the second pass - the rotation skipped a \
+             turn: {after_second_first:?}"
+        );
+    }
+
+    /// WITNESS 4 — a partition the writer refuses (the account stopped being active mid-pass)
+    /// advances the pass, is reported as refused rather than failed or visited, and does not give
+    /// its reservation back to the budget.
+    #[tokio::test]
+    async fn partial_partition_failure_cannot_reset_the_budget() {
+        let (db, system) = migrated_db().await;
+        let refused =
+            seed_owner_cold(&db, "disp-refused", "refused account memory", 86_400 * 365).await;
+        let active = seed_owner_cold(
+            &db,
+            "disp-refused-active",
+            "active peer memory",
+            86_400 * 364,
+        )
+        .await;
+        // Suspend after seeding: the partition exists in the corpus, and the pass must refuse its
+        // writes through the barrier rather than serve or crash on them.
+        db.inner()
+            .query("UPDATE account SET status = 'suspended' WHERE login = 'disp-refused';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let mut config = Config::default();
+        config.dreaming.max_rows_per_run = 2;
+        let jobs = Jobs::new(db.clone(), system, &config);
+        let pass = jobs
+            .dispatch_job(Job::Sweep, "run-dispatch-partial-failure")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (pass.visited, pass.refused, pass.failed),
+            (1, 0, 0),
+            "the suspended partition was neither visited nor reported as a refusal: {pass:?}"
+        );
+        assert!(
+            pass.budget_used <= 2,
+            "a refused or failed partition did not return its reservation to the budget: {pass:?}"
+        );
+        // Later branch: the active peer still got its turn.
+        let active_rows = workspace_heats(&db, &active).await;
+        assert!(
+            active_rows[0]
+                .2
+                .is_some_and(|touched| touched > chrono::Utc::now() - chrono::Duration::hours(1)),
+            "the active peer lost its turn to a refused partition: {active_rows:?}"
+        );
+        let refused_rows = workspace_heats(&db, &refused).await;
+        assert!(
+            refused_rows[0]
+                .2
+                .is_some_and(|touched| touched < chrono::Utc::now() - chrono::Duration::hours(1)),
+            "the suspended account's row was written: {refused_rows:?}"
+        );
+    }
+
+    /// WITNESS 5a — appraise is partition-scoped: a cold, never-accessed, post-arm row in the
+    /// active account is demoted, and a byte-identical eligible row in a suspended account is not
+    /// (no partition, no write), with the audit rows attributed to this run.
+    #[tokio::test]
+    async fn appraise_is_partition_scoped_and_audited() {
+        let (db, system) = migrated_db().await;
+        // Arm access recording first: appraise's precondition. Rows created after the arm with
+        // zero accesses are the demotion population.
+        alexandria_storage::system_config::arm_access_recording(db.inner())
+            .await
+            .unwrap();
+        let active =
+            seed_owner_cold(&db, "disp-appraise-active", "cold memory", 86_400 * 400).await;
+        let suspended =
+            seed_owner_cold(&db, "disp-appraise-suspended", "cold memory", 86_400 * 400).await;
+        db.inner()
+            .query(
+                "UPDATE account SET status = 'suspended' WHERE login = 'disp-appraise-suspended';",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        let pass = jobs
+            .dispatch_job(Job::Appraise, "run-dispatch-appraise")
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.visited, 1,
+            "only the active account's partition ran: {pass:?}"
+        );
+        assert_eq!(
+            pass.report.acted, 1,
+            "the active account's cold row was demoted: {pass:?}"
+        );
+
+        let rows: Vec<serde_json::Value> = db
+            .inner()
+            .query("SELECT content, confidence FROM fact WHERE workspace INSIDE $workspaces ORDER BY content;")
+            .bind(("workspaces", vec![
+                active.as_record_id().clone(),
+                suspended.as_record_id().clone(),
+            ]))
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both rows remain: {rows:?}");
+        assert_eq!(
+            rows[0]["confidence"].as_f64(),
+            Some(alexandria_engine::dreaming::DEMOTED_CONFIDENCE),
+            "the active account's row was demoted: {rows:?}"
+        );
+        assert_eq!(
+            rows[1]["confidence"].as_f64(),
+            Some(0.5),
+            "the suspended account's row kept its confidence: {rows:?}"
+        );
+        let logs: Vec<serde_json::Value> = db
+            .inner()
+            .query("SELECT source_id, job, actor FROM maintenance_log WHERE run_id = 'run-dispatch-appraise';")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "exactly one audit row for the demotion: {logs:?}"
+        );
+        assert_eq!(logs[0]["job"], "appraise");
+        assert_eq!(logs[0]["actor"], "system:dreaming");
+    }
+
+    /// WITNESS 5c (run 84, finding 1) — appraise's page must ADVANCE past examined-but-ineligible
+    /// rows: a partition whose oldest rows fail the armed-at precondition still reaches its newer
+    /// eligible rows within bounded passes. Without the persisted row cursor the same ineligible
+    /// page is re-selected every pass (appraise does not move `last_touched`, so the oldest-first
+    /// order never changes under it) and the eligible rows behind it starve forever.
+    #[tokio::test]
+    async fn appraise_pages_past_an_ineligible_head_within_bounded_passes() {
+        let (db, system) = migrated_db().await;
+        // The ineligible head FIRST, so its facts are created before the arm and the appraise
+        // rule must skip them (created_at < armed_at): three cold rows, oldest first.
+        let workspace = seed_owner_cold(
+            &db,
+            "disp-appraise-page",
+            "ineligible head one",
+            86_400 * 400,
+        )
+        .await;
+        seed_cold_in_workspace(&db, &workspace, "ineligible head two", 86_400 * 399).await;
+        seed_cold_in_workspace(&db, &workspace, "ineligible head three", 86_400 * 398).await;
+        // Arm access recording now: everything seeded above predates it.
+        alexandria_storage::system_config::arm_access_recording(db.inner())
+            .await
+            .unwrap();
+        // The eligible tail: created after the arm, cold, never accessed — the demotion
+        // population, sitting BEHIND the ineligible head in the oldest-first order.
+        seed_cold_in_workspace(&db, &workspace, "eligible tail one", 86_400 * 397).await;
+        seed_cold_in_workspace(&db, &workspace, "eligible tail two", 86_400 * 396).await;
+
+        // A two-row page: pass 1 examines the first two ineligible rows and advances past them,
+        // pass 2 the third plus the first eligible row, pass 3 the last. Bounded at three passes
+        // for two eligible rows behind a three-row ineligible head — the unfixable shape re-read
+        // the same head forever.
+        let mut config = Config::default();
+        config.dreaming.max_rows_per_run = 2;
+        let jobs = Jobs::new(db.clone(), system, &config);
+
+        let mut demotions = 0usize;
+        for pass in 1..=3 {
+            let report = jobs
+                .dispatch_job(Job::Appraise, &format!("run-appraise-page-{pass}"))
+                .await
+                .unwrap();
+            assert_eq!(report.visited, 1, "the one partition ran: {report:?}");
+            assert!(report.last_error.is_none(), "the pass failed: {report:?}");
+            demotions += report.report.acted;
+        }
+        assert_eq!(
+            demotions, 2,
+            "both eligible tail rows were demoted within three bounded passes"
+        );
+
+        // And the head was skipped, not demoted: the armed-at precondition held.
+        let rows: Vec<serde_json::Value> = db
+            .inner()
+            .query("SELECT content, confidence FROM fact WHERE workspace = $workspace ORDER BY content;")
+            .bind(("workspace", workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(rows.len(), 5, "every seeded row remains: {rows:?}");
+        for row in &rows {
+            let expected = if row["content"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("ineligible")
+            {
+                0.5
+            } else {
+                alexandria_engine::dreaming::DEMOTED_CONFIDENCE
+            };
+            assert_eq!(
+                row["confidence"].as_f64(),
+                Some(expected),
+                "wrong confidence for {}: {rows:?}",
+                row["content"].as_str().unwrap_or_default()
+            );
+        }
+    }
+
+    /// WITNESS 5d (run 84, finding 2) — a partition exhausted in one pass whose account suspends
+    /// before the next must not underflow the pass arithmetic: the stale exhausted cursor is
+    /// coordination data for a partition the store no longer enumerates, and it must not affect
+    /// the pass at all. Pre-fix, `partitions.len() - exhausted.len()` panicked on the unsigned
+    /// underflow the moment the enumerated set shrank below the exhausted set.
+    #[tokio::test]
+    async fn a_suspended_exhausted_partition_does_not_underflow_the_pass() {
+        let (db, system) = migrated_db().await;
+        alexandria_storage::system_config::arm_access_recording(db.inner())
+            .await
+            .unwrap();
+        seed_owner_cold(&db, "disp-underflow-a", "cold memory a", 86_400 * 400).await;
+        seed_owner_cold(&db, "disp-underflow-b", "cold memory b", 86_400 * 400).await;
+
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        // Pass 1: both partitions visited, both cold rows demoted, both pages short of the
+        // share (one row against hundreds), so both cursors are marked exhausted.
+        let pass1 = jobs
+            .dispatch_job(Job::Appraise, "run-underflow-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            (pass1.visited, pass1.report.acted),
+            (2, 2),
+            "both partitions ran and demoted: {pass1:?}"
+        );
+
+        // Suspend one account between passes: its partition leaves the enumeration while its
+        // exhausted cursor stays in the ledger.
+        db.inner()
+            .query("UPDATE account SET status = 'suspended' WHERE login = 'disp-underflow-a';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        // Pass 2: enumerated = one partition; stale exhausted = two. The pass must complete
+        // (this is the line that underflowed), wrap the cycle — the one enumerated partition is
+        // exhausted — and visit that partition fresh.
+        let pass2 = jobs
+            .dispatch_job(Job::Appraise, "run-underflow-2")
+            .await
+            .unwrap();
+        assert_eq!(
+            pass2.visited, 1,
+            "the remaining account's partition ran: {pass2:?}"
+        );
+        // Its row already carries the demoted confidence, which exempts itself from the rule, so
+        // the fresh walk demotes nothing — the pass is correct, not merely non-crashing.
+        assert_eq!(pass2.report.acted, 0, "no second demotion: {pass2:?}");
+    }
+
+    /// WITNESS 5b — collapse is partition-scoped: byte-identical rows within EACH account's
+    /// partition collapse (edge before delete, one audit row per retirement), while the same
+    /// content in the *other* account's corpus is never a collapse partner, and the pass charges
+    /// retirements against the budget. Both accounts hold a duplicate pair, so the outcome is
+    /// independent of the store's per-run workspace enumeration order.
+    #[tokio::test]
+    async fn collapse_is_partition_scoped_and_counts_retirements() {
+        let (db, system) = migrated_db().await;
+        let first = seed_owner_cold(&db, "disp-collapse-a", "duplicate memory", 86_400 * 30).await;
+        seed_cold_in_workspace(&db, &first, "duplicate memory", 86_400 * 29).await;
+        let second = seed_owner_cold(&db, "disp-collapse-b", "duplicate memory", 86_400 * 28).await;
+        seed_cold_in_workspace(&db, &second, "duplicate memory", 86_400 * 27).await;
+
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        let pass = jobs
+            .dispatch_job(Job::Collapse, "run-dispatch-collapse")
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.visited, 2,
+            "both accounts' partitions ran: {pass:?} (last partition error: {:?})",
+            pass.last_error
+        );
+        // One retirement in each partition: each groups its own pair. The charge is retirements,
+        // not candidate reads (4 read, 2 retired).
+        assert_eq!(
+            pass.report.examined, 4,
+            "each partition read its own pair: {pass:?}"
+        );
+        assert_eq!(
+            pass.report.acted, 2,
+            "one retirement per partition: {pass:?}"
+        );
+        assert_eq!(
+            pass.budget_used, 2,
+            "the charge counts retirements: {pass:?}"
+        );
+
+        // The edge endpoints decode as typed record ids - no display string is ever parsed.
+        let endpoints: Vec<RecordId> = db
+            .inner()
+            .query("SELECT VALUE in FROM memory_edge WHERE edge_type = 'derived_from';")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(endpoints.len(), 2, "one lineage edge per retirement");
+        for source in &endpoints {
+            let rows: Vec<serde_json::Value> = db
+                .inner()
+                .query("SELECT workspace, deleted FROM $id;")
+                .bind(("id", source.clone()))
+                .await
+                .unwrap()
+                .take(0)
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0]["deleted"],
+                true,
+                "every edge source is soft-deleted (edge before delete): {}",
+                record_id_to_string(source)
+            );
+        }
+        // Cross-partition isolation: no edge crosses the two workspaces.
+        let cross: Vec<serde_json::Value> = db
+            .inner()
+            .query(
+                "SELECT VALUE in FROM memory_edge WHERE edge_type = 'derived_from' AND \
+                 (in.workspace != out.workspace);",
+            )
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert!(
+            cross.is_empty(),
+            "no cross-workspace collapse edge: {cross:?}"
+        );
+    }
+
+    /// WITNESS 5 — a store with no eligible rows terminates its pass cleanly rather than spinning.
+    #[tokio::test]
+    async fn empty_partitions_terminate_without_spinning() {
+        let (db, system) = migrated_db().await;
+        // An enrolled account with no memories at all: its personal partition is eligible and empty.
+        IdentityRepo::new(db.inner())
+            .bootstrap_owner(
+                "disp-empty",
+                "digest-empty-padding-padding-pad",
+                &alexandria_storage::models::OperationId::new("op-disp-empty"),
+            )
+            .await
+            .unwrap();
+
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        let pass = jobs
+            .dispatch_job(Job::Sweep, "run-dispatch-empty")
+            .await
+            .unwrap();
+        assert_eq!(
+            (pass.report.examined, pass.report.acted),
+            (0, 0),
+            "an empty population did nothing: {pass:?}"
+        );
+        assert_eq!(pass.visited, 1, "the empty partition was visited once");
     }
 }

@@ -1210,14 +1210,15 @@ mod tests {
         let project = |id: &str| {
             MemoryScope::Project(RecordId::parse_simple(id).unwrap().try_into().unwrap())
         };
-        let mover = app
+        let (mover, mover_t) = app
             .seed_personal("history <script>history-danger</script> & exact values")
             .await;
-        let stayer = app.seed_personal("history source survivor").await;
-        let hidden = app
+        let (stayer, stayer_t) = app.seed_personal("history source survivor").await;
+        let (hidden, hidden_t) = app
             .seed_quarantined_unassigned("retained hidden history member")
             .await;
-        let destination_member = app.seed_personal("history destination survivor").await;
+        let (destination_member, destination_member_t) =
+            app.seed_personal("history destination survivor").await;
         for (id, destination, key) in [
             (&mover, project(&a), "history-mover-a"),
             (&stayer, project(&a), "history-survivor-a"),
@@ -1227,13 +1228,13 @@ mod tests {
             assert!(app.move_row(id, destination, key).await);
         }
         let source = app.seed_cluster(Some("history source"), &[0.1, 0.2]).await;
-        for id in [&mover, &stayer, &hidden] {
+        for id in [&mover_t, &stayer_t, &hidden_t] {
             app.add_cluster_member(&source, id).await;
         }
         let target = app
             .seed_cluster(Some("history destination"), &[0.1, 0.2])
             .await;
-        app.add_cluster_member(&target, &destination_member).await;
+        app.add_cluster_member(&target, &destination_member_t).await;
         let edges = alexandria_storage::repos::EdgeRepo::new(app.db.inner());
         edges
             .create_edge(&mover, &hidden, "derived_from", 0.75)
@@ -1280,7 +1281,12 @@ mod tests {
             6,
             "every before/after snapshot needs exact-state disclosure"
         );
-        for value in [&a, &b, &source, &target] {
+        for value in [
+            a.as_str(),
+            b.as_str(),
+            &alexandria_storage::record_id_to_string(&source),
+            &alexandria_storage::record_id_to_string(&target),
+        ] {
             assert!(
                 body.contains(value),
                 "history omitted stored identity {value}"
@@ -1327,7 +1333,7 @@ mod tests {
     #[tokio::test]
     async fn an_owner_edit_pages_the_journal_and_history_shows_the_before_state() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app
+        let (id, _id_t) = app
             .seed_personal("the text before the owner corrected it")
             .await;
         // Control that the journal is empty *before*: the seed went in through a scoped writer, not a page.
@@ -1425,7 +1431,7 @@ mod tests {
     #[tokio::test]
     async fn an_owner_delete_journals_the_visibility_change() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app
+        let (id, _id_t) = app
             .seed_personal("a memory the owner decided to hide")
             .await;
         let (status, _) = app
@@ -1459,7 +1465,7 @@ mod tests {
     #[tokio::test]
     async fn an_owner_move_keeps_the_id_and_journals_the_move() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app.seed_personal("a memory about to be filed").await;
+        let (id, _id_t) = app.seed_personal("a memory about to be filed").await;
         let project = app.own_project("the-filing-destination").await;
         let revision = rendered_revision(&app, &id).await;
         let (status, location, _) = app
@@ -1507,7 +1513,7 @@ mod tests {
     async fn rendered_row_project_default_allows_nonproject_moves() {
         for destination in ["personal", "unassigned"] {
             let app = authenticated_on_server(test_server().await).await;
-            let id = app.seed_personal("rendered default move control").await;
+            let (id, _id_t) = app.seed_personal("rendered default move control").await;
             let project = app.own_project("first-project").await;
             app.own_project("second-project").await;
             let revision = rendered_revision(&app, &id).await;
@@ -1597,7 +1603,7 @@ mod tests {
     #[tokio::test]
     async fn a_move_to_where_the_memory_already_is_writes_nothing() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app.seed_personal("a memory already where it is").await;
+        let (id, _id_t) = app.seed_personal("a memory already where it is").await;
         let revision = rendered_revision(&app, &id).await;
         let (status, location, _) = app
             .post_form_located(
@@ -1624,7 +1630,7 @@ mod tests {
     #[tokio::test]
     async fn dismissing_a_proposal_decides_it_without_moving_anything() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app.seed_personal("a memory an agent guessed at").await;
+        let (id, _id_t) = app.seed_personal("a memory an agent guessed at").await;
         let proposal = propose(&app, &id).await;
 
         let (status, _) = app
@@ -1672,7 +1678,7 @@ mod tests {
     async fn approving_a_proposal_files_the_memory_and_keeps_quarantine() {
         let app = authenticated_on_server(test_server().await).await;
         // The review partition's own state: quarantined, awaiting a human decision.
-        let id = app
+        let (id, _) = app
             .seed_quarantined_unassigned("a quarantined memory awaiting a decision")
             .await;
         let proposal = propose(&app, &id).await;
@@ -1708,7 +1714,7 @@ mod tests {
     #[tokio::test]
     async fn one_owners_pages_never_show_another_owners_anything() {
         let app = authenticated_on_server(test_server().await).await;
-        let theirs = app
+        let (theirs, _) = app
             .seed_personal("a private memory of the first owner")
             .await;
         let second = app.second_owner("second-owner").await;
@@ -1784,7 +1790,7 @@ mod tests {
     #[tokio::test]
     async fn an_edit_without_a_rendered_revision_is_refused_and_writes_nothing() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app.seed_personal("a memory nobody gave a revision").await;
+        let (id, _id_t) = app.seed_personal("a memory nobody gave a revision").await;
         let (status, location, _) = app
             .post_form_located(
                 "/debug/collections/edit",
@@ -1956,8 +1962,8 @@ mod tests {
     #[tokio::test]
     async fn each_listed_memory_offers_its_own_prefilled_controls() {
         let app = authenticated_on_server(test_server().await).await;
-        let first = app.seed_personal("the first listed memory").await;
-        let second = app.seed_personal("the second listed memory").await;
+        let (first, _first_t) = app.seed_personal("the first listed memory").await;
+        let (second, _second_t) = app.seed_personal("the second listed memory").await;
         let (id_one, revision_one) = rendered_form(&app, &first).await;
         let (id_two, revision_two) = rendered_form(&app, &second).await;
         assert_eq!(
@@ -2019,10 +2025,10 @@ mod tests {
     #[tokio::test]
     async fn two_checked_boxes_approve_both_proposals_and_journal_two_moves() {
         let app = authenticated_on_server(test_server().await).await;
-        let first = app
+        let (first, _first_t) = app
             .seed_personal("the first memory an owner approves")
             .await;
-        let second = app
+        let (second, _second_t) = app
             .seed_personal("the second memory an owner approves")
             .await;
         let first_reference = propose(&app, &first).await;
@@ -2087,9 +2093,12 @@ mod tests {
     async fn two_checked_boxes_dismiss_both_without_writing_a_journal_row() {
         let app = authenticated_on_server(test_server().await).await;
         let first_reference =
-            propose(&app, &app.seed_personal("a memory dismissed first").await).await;
-        let second_reference =
-            propose(&app, &app.seed_personal("a memory dismissed second").await).await;
+            propose(&app, &app.seed_personal("a memory dismissed first").await.0).await;
+        let second_reference = propose(
+            &app,
+            &app.seed_personal("a memory dismissed second").await.0,
+        )
+        .await;
         let (status, location, _) = app
             .post_form_located(
                 "/debug/classification/decide",
@@ -2134,7 +2143,7 @@ mod tests {
     #[tokio::test]
     async fn one_checked_box_still_works_and_a_tampered_one_is_refused_whole() {
         let app = authenticated_on_server(test_server().await).await;
-        let lone = propose(&app, &app.seed_personal("a lone approval").await).await;
+        let lone = propose(&app, &app.seed_personal("a lone approval").await.0).await;
         let (status, location, _) = app
             .post_form_located(
                 "/debug/classification/decide",
@@ -2155,7 +2164,7 @@ mod tests {
         // quietly applying the parseable half is a different act from the one the owner took.
         let second = propose(
             &app,
-            &app.seed_personal("a memory nobody decided for").await,
+            &app.seed_personal("a memory nobody decided for").await.0,
         )
         .await;
         let (status, location, _) = app
@@ -2196,7 +2205,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_tags_field_keeps_the_tags_and_the_clear_control_removes_them() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app.seed_personal("a memory with tags worth keeping").await;
+        let (id, _id_t) = app.seed_personal("a memory with tags worth keeping").await;
         app.set_tags(&id, &["keep-me".to_string(), "and-me".to_string()])
             .await;
         let revision = rendered_revision(&app, &id).await;
@@ -2322,7 +2331,7 @@ mod tests {
     #[tokio::test]
     async fn a_move_binds_the_revision_the_page_rendered_and_a_stale_one_is_refused() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app.seed_personal("a memory whose page went stale").await;
+        let (id, _id_t) = app.seed_personal("a memory whose page went stale").await;
         let revision = rendered_revision(&app, &id).await;
 
         // Somebody else edits the row between the page render and the click — here, through the same
@@ -2393,7 +2402,7 @@ mod tests {
     #[tokio::test]
     async fn a_move_into_an_owned_project_files_the_memory_and_the_queue_offers_it() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app
+        let (id, _id_t) = app
             .seed_personal("a project fact that has to leave personal")
             .await;
         let project = app.own_project("moved-into-me").await;
@@ -2500,7 +2509,7 @@ mod tests {
             Some("the whole-session summary <b>tagged</b>"),
         )
         .await;
-        let id = app
+        let (id, _id_t) = app
             .seed_personal("a memory stored during that session")
             .await;
         app.link_session("mixed-session", &id).await;
@@ -2548,7 +2557,7 @@ mod tests {
     #[tokio::test]
     async fn an_agent_cannot_delete_a_review_row_a_human_can() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app
+        let (id, _) = app
             .seed_quarantined_unassigned("a quarantined row an agent should not purge")
             .await;
         let scope = app.corpus_scope().await;
@@ -2625,7 +2634,7 @@ mod tests {
     #[tokio::test]
     async fn revising_a_destination_invalidates_the_approval_it_replaced() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app
+        let (id, _id_t) = app
             .seed_personal("a memory whose destination changes")
             .await;
         let proposal = propose(&app, &id).await;
@@ -2921,7 +2930,7 @@ mod tests {
     async fn the_rendered_revise_form_carries_its_revision_on_both_pages() {
         for path in ["/debug/collections", "/debug/classification"] {
             let app = authenticated_on_server(test_server().await).await;
-            let id = app
+            let (id, _id_t) = app
                 .seed_personal("a memory whose rendered destination changes")
                 .await;
             let proposal = propose(&app, &id).await;
@@ -3016,7 +3025,7 @@ mod tests {
     async fn a_revise_form_extracted_before_a_newer_revision_is_refused() {
         for path in ["/debug/collections", "/debug/classification"] {
             let app = authenticated_on_server(test_server().await).await;
-            let id = app
+            let (id, _id_t) = app
                 .seed_personal("a memory with a superseded revision")
                 .await;
             let proposal = propose(&app, &id).await;
@@ -3077,7 +3086,7 @@ mod tests {
     #[tokio::test]
     async fn no_owner_page_parents_a_form_from_a_table_row() {
         let app = authenticated_on_server(test_server().await).await;
-        let id = app.seed_personal("a memory with a rendered decision").await;
+        let (id, _id_t) = app.seed_personal("a memory with a rendered decision").await;
         let proposal = propose(&app, &id).await;
         let handle = proposal
             .split(':')
@@ -3177,9 +3186,9 @@ mod tests {
         let app = authenticated_on_server(test_server().await).await;
         let mut expected = Vec::new();
         for label in ["first pinned cluster", "second pinned cluster"] {
-            let stayer = app.seed_personal(label).await;
+            let (_stayer, stayer_t) = app.seed_personal(label).await;
             let cluster = app.seed_cluster(Some(label), &[0.1, 0.2]).await;
-            app.add_cluster_member(&cluster, &stayer).await;
+            app.add_cluster_member(&cluster, &stayer_t).await;
             expected.push(cluster);
         }
         let mut plan = Plan::new(operation_kind::STORE)
@@ -3197,7 +3206,7 @@ mod tests {
             .embedding(&[0.1, 0.2]);
         for cluster in &expected {
             plan = plan.cluster(ApprovedCluster::Join {
-                cluster: RecordId::parse_simple(cluster).unwrap(),
+                cluster: cluster.clone(),
                 member: 0,
             });
         }
@@ -3221,6 +3230,11 @@ mod tests {
             .iter()
             .map(|row| row["in"].as_str().unwrap().to_string())
             .collect();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(alexandria_storage::record_id_to_string)
+            .collect();
+        let mut expected = expected;
         expected.sort();
         assert_eq!(
             actual, expected,
@@ -3270,7 +3284,7 @@ mod tests {
             .seed_cluster(Some("corrupt dimension"), &[0.1, 0.2])
             .await;
         for n in 0..2 {
-            let member = app.seed_personal(&format!("corrupt member {n}")).await;
+            let (member, member_t) = app.seed_personal(&format!("corrupt member {n}")).await;
             assert!(
                 app.move_row(&member, destination.clone(), &format!("seed-corrupt-{n}"))
                     .await
@@ -3283,9 +3297,9 @@ mod tests {
                 .unwrap()
                 .check()
                 .unwrap();
-            app.add_cluster_member(&corrupt, &member).await;
+            app.add_cluster_member(&corrupt, &member_t).await;
         }
-        let mover = app
+        let (mover, _mover_t) = app
             .seed_personal("a valid vector that must not overwrite the corrupt mean")
             .await;
         let revision = rendered_revision(&app, &mover).await;
@@ -3321,7 +3335,7 @@ mod tests {
             .db
             .inner()
             .query("SELECT centroid FROM $cluster;")
-            .bind(("cluster", RecordId::parse_simple(&corrupt).unwrap()))
+            .bind(("cluster", corrupt.clone()))
             .await
             .unwrap()
             .check()
@@ -3340,7 +3354,7 @@ mod tests {
         let b = app.own_project("project-b").await;
         let a_scope = MemoryScope::Project(RecordId::parse_simple(&a).unwrap().try_into().unwrap());
         let b_scope = MemoryScope::Project(RecordId::parse_simple(&b).unwrap().try_into().unwrap());
-        let b_member = app.seed_personal("classified into B first").await;
+        let (b_member, b_member_t) = app.seed_personal("classified into B first").await;
         let proposal = ClassificationRepo::new(app.db.inner(), &app.owner)
             .propose(
                 &RecordId::parse_simple(&b_member)
@@ -3365,15 +3379,16 @@ mod tests {
             "classification must create B's candidate: {location}"
         );
 
-        let a_member = app.seed_personal("A's surviving member").await;
+        let (a_member, a_member_t) = app.seed_personal("A's surviving member").await;
         assert!(app.move_row(&a_member, a_scope.clone(), "seed-a").await);
         let a_cluster = app.seed_cluster(Some("A"), &[0.1, 0.2]).await;
-        app.add_cluster_member(&a_cluster, &a_member).await;
-        let mover = app.seed_personal("same-vector memory moves twice").await;
-        let personal_stayer = app.seed_personal("Personal's surviving member").await;
+        app.add_cluster_member(&a_cluster, &a_member_t).await;
+        let (mover, mover_t) = app.seed_personal("same-vector memory moves twice").await;
+        let (_personal_stayer, personal_stayer_t) =
+            app.seed_personal("Personal's surviving member").await;
         let personal_cluster = app.seed_cluster(Some("Personal"), &[0.1, 0.2]).await;
-        app.add_cluster_member(&personal_cluster, &mover).await;
-        app.add_cluster_member(&personal_cluster, &personal_stayer)
+        app.add_cluster_member(&personal_cluster, &mover_t).await;
+        app.add_cluster_member(&personal_cluster, &personal_stayer_t)
             .await;
         let repo = MutationRepo::new(app.db.inner());
         let b_cluster = repo
@@ -3386,8 +3401,8 @@ mod tests {
         let mixed = app
             .seed_cluster(Some("historically mixed"), &[0.1, 0.2])
             .await;
-        app.add_cluster_member(&mixed, &personal_stayer).await;
-        app.add_cluster_member(&mixed, &b_member).await;
+        app.add_cluster_member(&mixed, &personal_stayer_t).await;
+        app.add_cluster_member(&mixed, &b_member_t).await;
         let initial_count = one(
             &app,
             "SELECT count() AS n FROM semantic_operation GROUP ALL;",
@@ -3396,7 +3411,7 @@ mod tests {
         let target = RecordId::parse_simple(&mover).unwrap();
         let fact = FactId::try_from(target.clone()).unwrap();
         for (step, project, scope, cluster) in [
-            (1, &a, a_scope, RecordId::parse_simple(&a_cluster).unwrap()),
+            (1, &a, a_scope, a_cluster.clone()),
             (2, &b, b_scope, b_cluster),
         ] {
             let path = if step == 1 {

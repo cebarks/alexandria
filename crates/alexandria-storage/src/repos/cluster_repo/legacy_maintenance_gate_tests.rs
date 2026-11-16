@@ -25,18 +25,18 @@ impl GateFixture {
         Self { db, owner }
     }
 
-    async fn cluster(&self, label: &str, owned: bool) -> String {
+    async fn cluster(&self, label: &str, owned: bool) -> surrealdb::types::RecordId {
         let repo = ClusterRepo::new(self.db.inner());
         let id = repo.create(Some(label), &[1.0, 0.0]).await.unwrap();
         for i in 0..2 {
-            let fact = MemoryRepo::new(self.db.inner())
-                .create_fact(&format!("{label}-{i}"), 0.5, &[1.0, 0.0], &[])
+            let (_fact, fact_t) = MemoryRepo::new(self.db.inner())
+                .create_fact_with_id(&format!("{label}-{i}"), 0.5, &[1.0, 0.0], &[])
                 .await
                 .unwrap();
-            repo.add_member(&id, &fact).await.unwrap();
+            repo.add_member(&id, &fact_t).await.unwrap();
             if owned {
                 self.db.inner().query("UPDATE $fact SET account = $account, workspace = $workspace, scope = 'personal';")
-                    .bind(("fact", RecordId::parse_simple(&fact).unwrap()))
+                    .bind(("fact", fact_t.clone()))
                     .bind(("account", self.owner.account.as_record_id().clone()))
                     .bind(("workspace", self.owner.workspace.as_record_id().clone()))
                     .await.unwrap().check().unwrap();
@@ -48,11 +48,11 @@ impl GateFixture {
         id
     }
 
-    async fn mark_cluster_owned(&self, id: &str) {
+    async fn mark_cluster_owned(&self, id: &surrealdb::types::RecordId) {
         self.db
             .inner()
             .query("UPDATE $cluster SET workspace = $workspace;")
-            .bind(("cluster", RecordId::parse_simple(id).unwrap()))
+            .bind(("cluster", id.clone()))
             .bind(("workspace", self.owner.workspace.as_record_id().clone()))
             .await
             .unwrap()
@@ -192,7 +192,7 @@ async fn legacy_maintenance_rechecks_selected_candidate() {
             .await
             .unwrap()
             .iter()
-            .any(|row| row.id.as_ref() == Some(&RecordId::parse_simple(&id).unwrap()))
+            .any(|row| row.id.as_ref() == Some(&id))
     );
     f.mark_cluster_owned(&id).await;
     let members = repo.get_members(&id).await.unwrap();
@@ -222,7 +222,9 @@ async fn legacy_maintenance_refuses_missing_or_unidentified_inputs_without_effec
         let other = f.cluster("valid other", false).await;
         let repo = ClusterRepo::new(f.db.inner());
         let mut members = repo.get_members(&source).await.unwrap();
-        let wrong_table = members[0].id.as_ref().unwrap().to_sql();
+        // The same opaque key, deliberately under the wrong table: the gate must refuse a
+        // well-formed id that is not a cluster.
+        let wrong_table = RecordId::new("workspace", members[0].id.as_ref().unwrap().key.clone());
         if scenario == "missing-fact" {
             members[0].id = Some(RecordId::new("fact", "missing-input"));
         }
@@ -232,20 +234,28 @@ async fn legacy_maintenance_refuses_missing_or_unidentified_inputs_without_effec
         let before = f.observed().await;
         let result = match scenario {
             "missing-keep" => {
-                repo.execute_merge("cluster:missing-input", &source, &[1.0, 0.0])
-                    .await
+                repo.execute_merge(
+                    &RecordId::new("cluster", "missing-input"),
+                    &source,
+                    &[1.0, 0.0],
+                )
+                .await
             }
             "missing-remove" => {
-                repo.execute_merge(&source, "cluster:missing-input", &[1.0, 0.0])
-                    .await
+                repo.execute_merge(
+                    &source,
+                    &RecordId::new("cluster", "missing-input"),
+                    &[1.0, 0.0],
+                )
+                .await
             }
             _ => {
                 let selected = match scenario {
-                    "missing-source" => "cluster:missing-input",
-                    "wrong-table" => &wrong_table,
-                    _ => &source,
+                    "missing-source" => RecordId::new("cluster", "missing-input"),
+                    "wrong-table" => wrong_table.clone(),
+                    _ => source.clone(),
                 };
-                repo.execute_split(selected, &members, &[0], &[1], &[1.0, 0.0], &[1.0, 0.0])
+                repo.execute_split(&selected, &members, &[0], &[1], &[1.0, 0.0], &[1.0, 0.0])
                     .await
                     .map(|_| ())
             }
@@ -312,7 +322,7 @@ async fn legacy_maintenance_rejects_hidden_owned_merge_population_on_either_side
                 .unwrap()
                 .check()
                 .unwrap();
-            repo.add_member(&mixed, &hidden.to_sql()).await.unwrap();
+            repo.add_member(&mixed, &hidden).await.unwrap();
             assert_eq!(
                 repo.get_members(&mixed).await.unwrap().len(),
                 2,

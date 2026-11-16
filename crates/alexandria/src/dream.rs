@@ -4,7 +4,8 @@
 //! actually used was to set all five `*_interval_secs` to `1` (the loader only refuses `0`), restart
 //! with `alexandria::dreaming=debug`, and revert — three mutations to a live service to answer one
 //! question. This runs the same job bodies the scheduler runs, through the same entry point
-//! (`dreaming::Jobs::run_job`), prints one report line per job and the run id its audit rows carry,
+//! (capped jobs through `dreaming::Jobs::dispatch_job`, cluster/merge through `run_job`'s
+//! legacy-gated bodies), prints one report line per job and the run id its audit rows carry,
 //! and exits. There is no second implementation of "run a job" to keep in step with the first.
 //!
 //! It is operator tooling, not an MCP tool and not a debug-UI route: a write route under `debug/`
@@ -52,9 +53,11 @@ this answers \"run that job now\" without editing a live service's config and re
 
 Options:
   --job NAME       all, sweep, cluster, merge, collapse or appraise (repeatable)
-  --max-rows N     rows one job may write in this pass, overriding [dreaming]
+  --max-rows N     rows one capped job may write in this pass, overriding [dreaming]
                    max_rows_per_run for this invocation only. The config file is never
-                   written to. Must be 1 or more.
+                   written to. Must be 1 or more. The cap is one allowance per capped job
+                   per pass across all eligible partitions - not per partition - so a pass
+                   over many accounts shares it fairly rather than multiplying it.
   -h, --help       print this text and exit 0
 
 SINGLE WRITER: the data store is SurrealKV and SurrealKV is single-writer, so only one process
@@ -304,17 +307,35 @@ pub(crate) async fn pass(request: &Request, mut config: Config) -> anyhow::Resul
 
     // First, and therefore before anything is examined or written: if the store is held, this is the
     // point the command stops.
-    let db = Arc::new(open_store(&config.database.data_dir).await?);
+    let mut db = open_store(&config.database.data_dir).await?;
+    // The CLI process is its own single writer: claiming here is what authorises the dispatcher's
+    // partition enumeration, progress ledger and (from M3) barrier-guarded writes.
+    let system = db.claim_system_authority().map_err(|error| {
+        anyhow::anyhow!("this store's system authority is already claimed: {error}")
+    })?;
+    let db = Arc::new(db);
     // Jobs use stored vectors: validate readiness without provisioning or relabelling a provider.
     let _ = system_config::stored_embedding_space(db.inner()).await?;
     schema::migrate(db.inner()).await?;
 
     let run_id = dreaming::cli_run_id(dreaming::now_secs());
-    let jobs = dreaming::Jobs::new(Arc::clone(&db), &config);
+    let jobs = dreaming::Jobs::new(Arc::clone(&db), system, &config);
 
     let mut entries = Vec::with_capacity(request.jobs.len());
     for job in &request.jobs {
-        let entry = match jobs.run_job(*job, &run_id).await {
+        // The capped jobs run as partitioned passes under the dispatcher (active-account
+        // enumeration, fair rotation, one global allowance per job per pass, persisted progress);
+        // cluster and merge stay on the legacy-gated whole-store bodies by owner decision — the
+        // legacy maintenance gate refuses owned/workspace data by construction, so partitioned
+        // cluster/merge awaits the owned-cluster write paths (named follow-up).
+        let ran = if matches!(job, Job::Cluster | Job::Merge) {
+            jobs.run_job(*job, &run_id).await
+        } else {
+            jobs.dispatch_job(*job, &run_id)
+                .await
+                .map(|pass| pass.report)
+        };
+        let entry = match ran {
             Ok(report) => Entry::Ran(report),
             // The loop's own rule, kept: one job's failure is that job's news, not a reason to
             // abandon the rest of the set the operator asked for.
@@ -474,7 +495,7 @@ mod tests {
     /// hitting it, and the job list is the only place they learn the names. Both are assertions
     /// here because both are prose in a string literal that nothing else compiles against.
     #[test]
-    fn the_help_names_every_job_and_the_single_writer_constraint() {
+    fn the_dream_help_names_every_job_and_the_single_writer_constraint() {
         for name in ALL_JOBS.into_iter().map(Job::as_str) {
             assert!(HELP.contains(name), "help must name {name}");
         }
@@ -484,6 +505,10 @@ mod tests {
             "help must state the constraint the refusal exists for"
         );
         assert!(HELP.contains("--max-rows"), "help must document --max-rows");
+        assert!(
+            HELP.contains("across all eligible partitions"),
+            "help must state that the cap is global per job, not per partition"
+        );
         assert!(
             HELP.contains("run-cli-"),
             "help must state the run id shape"
@@ -500,11 +525,36 @@ mod tests {
         let path = dir.path().join("data");
         let held = Database::connect_persistent(&path).await.unwrap();
         schema::migrate(held.inner()).await.unwrap();
+        // An enrolled owner, so the released-store positive control has a partition the
+        // dispatcher can find — the CLI's capped jobs dispatch over active accounts now.
+        let owner = alexandria_storage::repos::IdentityRepo::new(held.inner())
+            .bootstrap_owner(
+                "dream-held-owner",
+                "digest-dream-held-padding-padding",
+                &alexandria_storage::models::OperationId::new("dream-held-1"),
+            )
+            .await
+            .unwrap();
         let memories = MemoryRepo::new(held.inner());
         for _ in 0..2 {
             memories
                 .create_fact("the same text twice", 0.5, &[0.1, 0.2], &[])
                 .await
+                .unwrap();
+            let fact: Vec<alexandria_storage::RecordId> = held
+                .inner()
+                .query("SELECT VALUE id FROM fact ORDER BY created_at DESC, id DESC LIMIT 1;")
+                .await
+                .unwrap()
+                .take(0)
+                .unwrap();
+            held.inner()
+                .query("UPDATE $f SET workspace = $workspace, scope = 'personal';")
+                .bind(("f", fact[0].clone()))
+                .bind(("workspace", owner.workspace.as_record_id().clone()))
+                .await
+                .unwrap()
+                .check()
                 .unwrap();
         }
 
@@ -673,11 +723,41 @@ mod tests {
         let path = dir.join("data");
         let db = Database::connect_persistent(&path).await.unwrap();
         schema::migrate(db.inner()).await.unwrap();
+        // The CLI's capped jobs dispatch over active accounts' partitions, so the fixture's rows
+        // must live in one: an enrolled owner, and every fact stamped into that owner's workspace
+        // and personal scope. (The pre-Task-12 fixture wrote ownerless rows, which the dispatcher
+        // correctly has no partition for.)
+        let owner = alexandria_storage::repos::IdentityRepo::new(db.inner())
+            .bootstrap_owner(
+                "dream-fixture-owner",
+                "digest-dream-fixture-padding-pad",
+                &alexandria_storage::models::OperationId::new("dream-fixture-1"),
+            )
+            .await
+            .unwrap();
         let memories = MemoryRepo::new(db.inner());
         for content in contents {
             memories
                 .create_fact(content, 0.5, &[0.1, 0.2], &[])
                 .await
+                .unwrap();
+            // `create_fact` returns the display string, and binding that back is the exact trap
+            // the typed-id rule exists for — so the stamp re-reads the row's TYPED id. The store
+            // is fixture-fresh and inserts are sequential, so the fact just created is the newest.
+            let fact: Vec<alexandria_storage::RecordId> = db
+                .inner()
+                .query("SELECT VALUE id FROM fact ORDER BY created_at DESC, id DESC LIMIT 1;")
+                .await
+                .unwrap()
+                .take(0)
+                .unwrap();
+            db.inner()
+                .query("UPDATE $f SET workspace = $workspace, scope = 'personal';")
+                .bind(("f", fact[0].clone()))
+                .bind(("workspace", owner.workspace.as_record_id().clone()))
+                .await
+                .unwrap()
+                .check()
                 .unwrap();
         }
         drop(db);

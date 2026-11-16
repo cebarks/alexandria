@@ -7,8 +7,8 @@ async fn test_create_and_get_fact() {
     schema::bootstrap(db.inner()).await.unwrap();
 
     let repo = MemoryRepo::new(db.inner());
-    let id = repo
-        .create_fact(
+    let (id, _id_t) = repo
+        .create_fact_with_id(
             "OAuth tokens expire after 7 days",
             0.8,
             &vec![0.1_f32; 384],
@@ -29,8 +29,8 @@ async fn test_soft_delete_fact() {
     schema::bootstrap(db.inner()).await.unwrap();
 
     let repo = MemoryRepo::new(db.inner());
-    let id = repo
-        .create_fact("temp fact", 0.5, &vec![0.0_f32; 384], &[])
+    let (id, _id_t) = repo
+        .create_fact_with_id("temp fact", 0.5, &vec![0.0_f32; 384], &[])
         .await
         .unwrap();
 
@@ -45,8 +45,8 @@ async fn test_create_and_get_heat_state() {
     schema::bootstrap(db.inner()).await.unwrap();
 
     let memory_repo = MemoryRepo::new(db.inner());
-    let fact_id = memory_repo
-        .create_fact("test", 0.5, &vec![0.0_f32; 384], &[])
+    let (fact_id, _fact_id_t) = memory_repo
+        .create_fact_with_id("test", 0.5, &vec![0.0_f32; 384], &[])
         .await
         .unwrap();
 
@@ -65,8 +65,8 @@ async fn test_create_cluster_and_add_member() {
     schema::bootstrap(db.inner()).await.unwrap();
 
     let memory_repo = MemoryRepo::new(db.inner());
-    let fact_id = memory_repo
-        .create_fact("auth fact", 0.9, &vec![0.1_f32; 384], &["auth".to_string()])
+    let (_fact_id, fact_id_t) = memory_repo
+        .create_fact_with_id("auth fact", 0.9, &vec![0.1_f32; 384], &["auth".to_string()])
         .await
         .unwrap();
 
@@ -77,7 +77,7 @@ async fn test_create_cluster_and_add_member() {
         .unwrap();
 
     cluster_repo
-        .add_member(&cluster_id, &fact_id)
+        .add_member(&cluster_id, &fact_id_t)
         .await
         .unwrap();
 
@@ -99,12 +99,12 @@ async fn quarantine_none_predicate_pins_the_trap() {
     schema::bootstrap(db.inner()).await.unwrap();
 
     let repo = MemoryRepo::new(db.inner());
-    let legacy = repo
-        .create_fact("legacy row", 0.5, &vec![0.1_f32; 384], &[])
+    let (legacy, _legacy_t) = repo
+        .create_fact_with_id("legacy row", 0.5, &vec![0.1_f32; 384], &[])
         .await
         .unwrap();
-    let secret = repo
-        .create_fact("quarantined row", 0.5, &vec![0.1_f32; 384], &[])
+    let (secret, _secret_t) = repo
+        .create_fact_with_id("quarantined row", 0.5, &vec![0.1_f32; 384], &[])
         .await
         .unwrap();
 

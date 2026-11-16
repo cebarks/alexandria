@@ -1,7 +1,7 @@
 use anyhow::Result;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{RecordId, RecordIdKeyRange, SurrealValue, ToSql};
+use surrealdb::types::{RecordId, RecordIdKeyRange, SurrealValue};
 
 use crate::models::{CollapseCandidate, Fact, LiveConfidence, RawRecord};
 use crate::record_id_to_string;
@@ -170,6 +170,25 @@ impl<'a> MemoryRepo<'a> {
         embedding: &[f32],
         tags: &[String],
     ) -> Result<String> {
+        Ok(self
+            .create_fact_with_id(content, confidence, embedding, tags)
+            .await?
+            .0)
+    }
+
+    /// [`Self::create_fact`], also returning the row's **typed** id.
+    ///
+    /// The display string alone cannot be handed back to a typed-id API (the display form is not a
+    /// parser-safe round trip), and re-reading the id by content or recency is a guess. One
+    /// statement, both forms: the display string for the string-shaped callers this crate has
+    /// always had, and the typed id for membership edges and any other typed bind.
+    pub async fn create_fact_with_id(
+        &self,
+        content: &str,
+        confidence: f64,
+        embedding: &[f32],
+        tags: &[String],
+    ) -> Result<(String, surrealdb::types::RecordId)> {
         let mut response = self
             .db
             .query(
@@ -191,7 +210,7 @@ impl<'a> MemoryRepo<'a> {
         let id = fact
             .id
             .ok_or_else(|| anyhow::anyhow!("Created fact has no id"))?;
-        Ok(id.to_sql())
+        Ok((crate::record_id_to_string(&id), id))
     }
 
     /// Create a `raw` record holding a full source document for `import_document`.
@@ -533,6 +552,44 @@ impl<'a> MemoryRepo<'a> {
         Ok(response.take(0)?)
     }
 
+    /// [`Self::live_confidences`] scoped to one partition: the same live predicate
+    /// (`deleted = false AND quarantined_at = NONE`, from [`Self::fact_filter_clause`]) plus the
+    /// partition's conjunct, so `appraise` judges only rows the dispatching partition may write.
+    pub async fn live_confidences_in_partition(
+        &self,
+        partition: &crate::models::identity::Partition,
+    ) -> Result<Vec<LiveConfidence>> {
+        let filter = crate::repos::scope::ScopeFilter::for_partition(partition);
+        let sql = format!(
+            "SELECT id, confidence, created_at FROM fact WHERE deleted = false AND \
+             quarantined_at = NONE AND {}",
+            filter.conjunct()
+        );
+        let mut prepared = self.db.query(&sql);
+        prepared = filter.apply(prepared);
+        let mut response = prepared.await?;
+        Ok(response.take(0)?)
+    }
+
+    /// [`Self::collapse_candidates`] scoped to one partition: duplicate grouping sees only the
+    /// partition's live rows, so a byte-identical row in another account's corpus is never a
+    /// collapse partner — the cross-partition leak the partitioned body exists to close.
+    pub async fn collapse_candidates_in_partition(
+        &self,
+        partition: &crate::models::identity::Partition,
+    ) -> Result<Vec<CollapseCandidate>> {
+        let filter = crate::repos::scope::ScopeFilter::for_partition(partition);
+        let sql = format!(
+            "SELECT id, content, confidence, created_at FROM fact WHERE deleted = false AND \
+             quarantined_at = NONE AND {}",
+            filter.conjunct()
+        );
+        let mut prepared = self.db.query(&sql);
+        prepared = filter.apply(prepared);
+        let mut response = prepared.await?;
+        Ok(response.take(0)?)
+    }
+
     /// Rewrite only a pre-existing fact's vector, binding its opaque ID directly.
     /// Migration cannot round-trip IDs through the display-string formatter.
     pub async fn write_reembed_embedding(&self, id: &RecordId, embedding: &[f32]) -> Result<()> {
@@ -613,6 +670,7 @@ impl<'a> MemoryRepo<'a> {
 mod tests {
     use super::*;
     use crate::connection::Database;
+    use surrealdb::types::ToSql;
 
     #[tokio::test]
     async fn reembed_page_plan_seeks_a_bound_record_range_not_a_repeated_table_scan() {
@@ -676,8 +734,8 @@ mod tests {
         repo.create_fact("beta content", 0.5, &[0.3, 0.4], &["tag2".to_string()])
             .await
             .unwrap();
-        let deleted_id = repo
-            .create_fact("gamma content", 0.5, &[0.5, 0.6], &[])
+        let (deleted_id, _deleted_id_t) = repo
+            .create_fact_with_id("gamma content", 0.5, &[0.5, 0.6], &[])
             .await
             .unwrap();
         repo.soft_delete_fact(&deleted_id).await.unwrap();
@@ -761,19 +819,19 @@ mod tests {
             .unwrap();
         let repo = MemoryRepo::new(db.inner());
 
-        let near = repo
-            .create_fact("near", 0.5, &[1.0, 0.0], &[])
+        let (near, _near_t) = repo
+            .create_fact_with_id("near", 0.5, &[1.0, 0.0], &[])
             .await
             .unwrap();
-        let mid = repo
-            .create_fact("mid", 0.5, &[0.7, 0.7], &[])
+        let (mid, _mid_t) = repo
+            .create_fact_with_id("mid", 0.5, &[0.7, 0.7], &[])
             .await
             .unwrap();
         repo.create_fact("far", 0.5, &[0.0, 1.0], &[])
             .await
             .unwrap();
-        let gone = repo
-            .create_fact("gone", 0.5, &[1.0, 0.1], &[])
+        let (gone, _gone_t) = repo
+            .create_fact_with_id("gone", 0.5, &[1.0, 0.1], &[])
             .await
             .unwrap();
         repo.soft_delete_fact(&gone).await.unwrap();
@@ -838,8 +896,8 @@ mod tests {
         crate::schema::migrate(db.inner()).await.unwrap();
 
         let repo = MemoryRepo::new(db.inner());
-        let id = repo
-            .create_fact("indexed target", 0.5, &[0.9, 0.1], &["x".to_string()])
+        let (id, _id_t) = repo
+            .create_fact_with_id("indexed target", 0.5, &[0.9, 0.1], &["x".to_string()])
             .await
             .unwrap();
         repo.create_fact("other", 0.5, &[0.1, 0.9], &[])
@@ -881,8 +939,8 @@ mod tests {
         let repo = MemoryRepo::new(db.inner());
         let cluster_repo = crate::repos::ClusterRepo::new(db.inner());
 
-        let fact_id = repo
-            .create_fact("clustered content", 0.5, &[0.1, 0.2], &[])
+        let (fact_id, fact_id_t) = repo
+            .create_fact_with_id("clustered content", 0.5, &[0.1, 0.2], &[])
             .await
             .unwrap();
         let cluster_id = cluster_repo
@@ -890,7 +948,7 @@ mod tests {
             .await
             .unwrap();
         cluster_repo
-            .add_member(&cluster_id, &fact_id)
+            .add_member(&cluster_id, &fact_id_t)
             .await
             .unwrap();
 
@@ -900,8 +958,8 @@ mod tests {
         assert_eq!(cluster_found.label.as_deref(), Some("test cluster"));
 
         // Fact with no cluster returns None
-        let orphan_id = repo
-            .create_fact("orphan content", 0.5, &[0.9, 0.9], &[])
+        let (orphan_id, _orphan_id_t) = repo
+            .create_fact_with_id("orphan content", 0.5, &[0.9, 0.9], &[])
             .await
             .unwrap();
         let none = repo.cluster_for_fact(&orphan_id).await.unwrap();
@@ -914,12 +972,12 @@ mod tests {
         crate::schema::migrate(db.inner()).await.unwrap();
         let repo = MemoryRepo::new(db.inner());
 
-        let a = repo
-            .create_fact("first", 0.5, &[0.1, 0.2], &[])
+        let (a, _a_t) = repo
+            .create_fact_with_id("first", 0.5, &[0.1, 0.2], &[])
             .await
             .unwrap();
-        let b = repo
-            .create_fact("second", 0.5, &[0.3, 0.4], &[])
+        let (b, _b_t) = repo
+            .create_fact_with_id("second", 0.5, &[0.3, 0.4], &[])
             .await
             .unwrap();
         repo.soft_delete_fact(&b).await.unwrap();
@@ -971,8 +1029,8 @@ mod tests {
             .unwrap();
         }
         // A soft-deleted fact's tags must not be counted: the tally is of live memory.
-        let gone = repo
-            .create_fact("gone", 0.5, &[0.1], &["ghost".to_string()])
+        let (gone, _gone_t) = repo
+            .create_fact_with_id("gone", 0.5, &[0.1], &["ghost".to_string()])
             .await
             .unwrap();
         repo.soft_delete_fact(&gone).await.unwrap();
@@ -1014,8 +1072,8 @@ mod tests {
         tags: &[&str],
         day: u32,
     ) -> String {
-        let id = repo
-            .create_fact(
+        let (id, _id_t) = repo
+            .create_fact_with_id(
                 content,
                 confidence,
                 &[0.1],
@@ -1548,8 +1606,14 @@ mod tests {
         crate::schema::migrate(db.inner()).await.unwrap();
         let repo = MemoryRepo::new(db.inner());
 
-        let live = repo.create_fact("live", 0.5, &[0.1], &[]).await.unwrap();
-        let secret = repo.create_fact("secret", 0.5, &[0.1], &[]).await.unwrap();
+        let (live, _live_t) = repo
+            .create_fact_with_id("live", 0.5, &[0.1], &[])
+            .await
+            .unwrap();
+        let (secret, _secret_t) = repo
+            .create_fact_with_id("secret", 0.5, &[0.1], &[])
+            .await
+            .unwrap();
         quarantine(db.inner(), &secret).await;
 
         let rows = repo.list(&FactListQuery::default()).await.unwrap();
@@ -1644,10 +1708,16 @@ mod tests {
         crate::schema::migrate(db.inner()).await.unwrap();
         let repo = MemoryRepo::new(db.inner());
 
-        let live = repo.create_fact("live", 0.5, &[0.1], &[]).await.unwrap();
-        let deleted = repo.create_fact("deleted", 0.5, &[0.1], &[]).await.unwrap();
-        let quarantined = repo
-            .create_fact("quarantined", 0.5, &[0.1], &[])
+        let (live, _live_t) = repo
+            .create_fact_with_id("live", 0.5, &[0.1], &[])
+            .await
+            .unwrap();
+        let (deleted, _deleted_t) = repo
+            .create_fact_with_id("deleted", 0.5, &[0.1], &[])
+            .await
+            .unwrap();
+        let (quarantined, _quarantined_t) = repo
+            .create_fact_with_id("quarantined", 0.5, &[0.1], &[])
             .await
             .unwrap();
         repo.soft_delete_fact(&deleted).await.unwrap();

@@ -103,30 +103,30 @@ impl EmbeddingProvider for ModelB {
 
 /// Seed: two live facts and one deleted fact, all 2-dim under lock model "a";
 /// one cluster holding both live facts with a 2-dim centroid.
-async fn seed() -> (Database, String, String, String, String) {
+async fn seed() -> (Database, String, String, String, surrealdb::types::RecordId) {
     let db = Database::connect_embedded().await.unwrap();
     alexandria_storage::schema::migrate(db.inner())
         .await
         .unwrap();
     let memories = MemoryRepo::new(db.inner());
-    let live1 = memories
-        .create_fact("one", 0.5, &[0.6, 0.8], &[])
+    let (live1, live1_t) = memories
+        .create_fact_with_id("one", 0.5, &[0.6, 0.8], &[])
         .await
         .unwrap();
-    let live2 = memories
-        .create_fact("two", 0.5, &[0.8, 0.6], &[])
+    let (live2, live2_t) = memories
+        .create_fact_with_id("two", 0.5, &[0.8, 0.6], &[])
         .await
         .unwrap();
-    let gone = memories
-        .create_fact("three", 0.5, &[0.0, 1.0], &[])
+    let (gone, _gone_t) = memories
+        .create_fact_with_id("three", 0.5, &[0.0, 1.0], &[])
         .await
         .unwrap();
     memories.soft_delete_fact(&gone).await.unwrap();
 
     let clusters = ClusterRepo::new(db.inner());
     let cid = clusters.create(None, &[0.7, 0.7]).await.unwrap();
-    clusters.add_member(&cid, &live1).await.unwrap();
-    clusters.add_member(&cid, &live2).await.unwrap();
+    clusters.add_member(&cid, &live1_t).await.unwrap();
+    clusters.add_member(&cid, &live2_t).await.unwrap();
 
     system_config::set_config(db.inner(), "embedding_model", "a")
         .await
@@ -225,9 +225,7 @@ async fn reembed_rewrites_facts_centroids_and_lock() {
         .await
         .unwrap()
         .into_iter()
-        .find(|(c, _)| {
-            c.id.as_ref().map(alexandria_storage::record_id_to_string) == Some(cid.clone())
-        })
+        .find(|(c, _)| c.id.as_ref() == Some(&cid))
         .expect("cluster still exists");
     assert_eq!(
         cluster.centroid,
@@ -350,8 +348,8 @@ async fn reembed_refuses_unlocked_database_with_facts() {
         .await
         .unwrap();
     let memories = MemoryRepo::new(db.inner());
-    let id = memories
-        .create_fact("pre-lock", 0.5, &[0.6, 0.8], &[])
+    let (id, _id_t) = memories
+        .create_fact_with_id("pre-lock", 0.5, &[0.6, 0.8], &[])
         .await
         .unwrap();
 
@@ -385,7 +383,12 @@ async fn reembed_drops_empty_clusters() {
         .into_iter()
         .filter_map(|c| c.id.as_ref().map(alexandria_storage::record_id_to_string))
         .collect();
-    assert_eq!(ids, vec![cid], "empty cluster {empty} should be gone");
+    assert_eq!(
+        ids,
+        vec![alexandria_storage::record_id_to_string(&cid)],
+        "empty cluster {} should be gone",
+        alexandria_storage::record_id_to_string(&empty)
+    );
 }
 
 #[tokio::test]

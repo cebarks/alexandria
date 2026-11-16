@@ -31,25 +31,25 @@ async fn owner_browser_fixture() {
 
     // A tagged memory, so a text-only save can be shown to preserve the tag set (H2) and the explicit
     // clear control shown to remove it.
-    let tagged = alice.seed_personal("Fixture tagged lesson <before>").await;
+    let (tagged, _) = alice.seed_personal("Fixture tagged lesson <before>").await;
     alice
         .set_tags(&tagged, &["fixture-tag".to_string(), "keep-me".to_string()])
         .await;
-    let editable = alice
+    let (editable, _) = alice
         .seed_personal("Fixture original owner lesson <before>")
         .await;
-    let removable = alice
+    let (removable, _) = alice
         .seed_personal("Fixture memory selected for soft deletion")
         .await;
     // The second row the multi-select journey needs: two proposals, checked together, approved in one
     // post that a real browser sends as two repeated `selected` pairs.
-    let multi_second = alice
+    let (multi_second, _) = alice
         .seed_personal("Fixture second classification candidate")
         .await;
-    let unassigned = alice
+    let (unassigned, unassigned_t) = alice
         .seed_quarantined_unassigned("Fixture quarantined classification candidate")
         .await;
-    let foreign = bob.seed_personal("Fixture Bob private control").await;
+    let (foreign, _) = bob.seed_personal("Fixture Bob private control").await;
 
     // Two projects of Alice's own, so a project move and a destination change are both selectable by a
     // human rather than typed as a guess. `own_project` establishes through the scoped repo, so the rows
@@ -58,7 +58,7 @@ async fn owner_browser_fixture() {
     let project_b = alice.own_project("fixture-project-b").await;
     // A row already inside a project, so a project→personal and project→project move are both reachable
     // from the listing without first performing one.
-    let in_project = alice
+    let (in_project, in_project_t) = alice
         .seed_personal("Fixture project memory already filed")
         .await;
     let in_project_revision = alice.semantic_revision(&in_project).await;
@@ -79,9 +79,9 @@ async fn owner_browser_fixture() {
     let source_a = alice
         .seed_cluster(Some("Fixture project A cluster"), &[0.1, 0.2])
         .await;
-    alice.add_cluster_member(&source_a, &in_project).await;
+    alice.add_cluster_member(&source_a, &in_project_t).await;
 
-    let unassigned_id = FactId::try_from(RecordId::parse_simple(&unassigned).unwrap()).unwrap();
+    let unassigned_id = FactId::try_from(unassigned_t).unwrap();
     let classify = ClassificationRepo::new(alice.db.inner(), &alice.owner);
     let proposal = classify
         .propose(
@@ -111,7 +111,7 @@ async fn owner_browser_fixture() {
     // The stale-control row: a memory whose rendered revision is about to be moved forward behind the
     // page's back. The fixture prints the *rendered* revision it had before the bump, so the parent's
     // journey can post exactly what a stale page would post and observe the refusal.
-    let stale = alice
+    let (stale, _) = alice
         .seed_personal("Fixture memory with a stale control")
         .await;
     let stale_rendered = alice.semantic_revision(&stale).await;

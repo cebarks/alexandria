@@ -266,11 +266,11 @@ mod tests {
             .create(Some("cluster one"), &[0.1, 0.1])
             .await
             .unwrap();
-        let f1 = memory_repo
-            .create_fact("f1", 0.5, &[0.1, 0.1], &[])
+        let (_f1, f1_t) = memory_repo
+            .create_fact_with_id("f1", 0.5, &[0.1, 0.1], &[])
             .await
             .unwrap();
-        cluster_repo.add_member(&c1, &f1).await.unwrap();
+        cluster_repo.add_member(&c1, &f1_t).await.unwrap();
         cluster_repo
             .create(Some("cluster two"), &[0.9, 0.9])
             .await
@@ -326,17 +326,27 @@ mod tests {
 
         // The fixture guard, stated as the engine's own verdicts.
         assert_eq!(
-            super::cohesion_of(&cid, &stored, &members, server.cohesion_floor),
+            super::cohesion_of(
+                &alexandria_storage::record_id_to_string(&cid),
+                &stored,
+                &members,
+                server.cohesion_floor
+            ),
             super::Cohesion::Healthy,
             "fixture's stored centroid must read as healthy"
         );
         assert_eq!(
-            super::cohesion_of(&cid, &average, &members, server.cohesion_floor),
+            super::cohesion_of(
+                &alexandria_storage::record_id_to_string(&cid),
+                &average,
+                &members,
+                server.cohesion_floor
+            ),
             super::Cohesion::NeedsSplit,
             "fixture's member average must read as needing a split, or the test proves nothing"
         );
 
-        let html = detail_html(&server, &cid).await;
+        let html = detail_html(&server, &alexandria_storage::record_id_to_string(&cid)).await;
         assert!(
             html.contains("Healthy"),
             "the page must report the stored centroid's verdict"
@@ -357,17 +367,20 @@ mod tests {
             .create(Some("cluster with members"), &[0.1, 0.1])
             .await
             .unwrap();
-        let f1 = memory_repo
-            .create_fact("member fact content", 0.5, &[0.1, 0.1], &[])
+        let (_f1, f1_t) = memory_repo
+            .create_fact_with_id("member fact content", 0.5, &[0.1, 0.1], &[])
             .await
             .unwrap();
-        cluster_repo.add_member(&c1, &f1).await.unwrap();
+        cluster_repo.add_member(&c1, &f1_t).await.unwrap();
 
         let app = {
             let fixture = super::super::test_support::authenticated_on_server(server).await;
             fixture.session_router()
         };
-        let uri = format!("/debug/clusters/{}", c1.replace(':', "%3A"));
+        let uri = format!(
+            "/debug/clusters/{}",
+            alexandria_storage::record_id_to_string(&c1).replace(':', "%3A")
+        );
         let response = app
             .oneshot(
                 Request::builder()
@@ -412,18 +425,21 @@ mod tests {
             .await
             .unwrap();
         for (i, embedding) in members.iter().enumerate() {
-            let fact = memory_repo
-                .create_fact(&format!("diffuse member {i}"), 0.5, embedding, &[])
+            let (_fact, fact_t) = memory_repo
+                .create_fact_with_id(&format!("diffuse member {i}"), 0.5, embedding, &[])
                 .await
                 .unwrap();
-            cluster_repo.add_member(&c1, &fact).await.unwrap();
+            cluster_repo.add_member(&c1, &fact_t).await.unwrap();
         }
 
         let app = {
             let fixture = super::super::test_support::authenticated_on_server(server).await;
             fixture.session_router()
         };
-        let uri = format!("/debug/clusters/{}", c1.replace(':', "%3A"));
+        let uri = format!(
+            "/debug/clusters/{}",
+            alexandria_storage::record_id_to_string(&c1).replace(':', "%3A")
+        );
         let response = app
             .oneshot(
                 Request::builder()
@@ -540,11 +556,13 @@ mod boundary {
         let bob = alice.second_owner("debug-fixture-second").await;
 
         let alice_cluster = alice.seed_cluster(Some("alice cluster"), &[0.1, 0.2]).await;
-        let alice_fact = alice.seed_personal("alice member text").await;
-        alice.add_cluster_member(&alice_cluster, &alice_fact).await;
+        let (_alice_fact, alice_fact_t) = alice.seed_personal("alice member text").await;
+        alice
+            .add_cluster_member(&alice_cluster, &alice_fact_t)
+            .await;
         let bob_cluster = bob.seed_cluster(Some("bob cluster"), &[0.3, 0.4]).await;
-        let bob_fact = bob.seed_personal("bob member text").await;
-        bob.add_cluster_member(&bob_cluster, &bob_fact).await;
+        let (_bob_fact, bob_fact_t) = bob.seed_personal("bob member text").await;
+        bob.add_cluster_member(&bob_cluster, &bob_fact_t).await;
 
         let (status, page) = alice.get("/debug/clusters").await;
         assert_eq!(status, StatusCode::OK, "{}", support::clip(&page));
@@ -561,7 +579,7 @@ mod boundary {
         let (own, own_body) = alice
             .get(&format!(
                 "/debug/clusters/{}",
-                alice_cluster.replace(':', "%3A")
+                alexandria_storage::record_id_to_string(&alice_cluster).replace(':', "%3A")
             ))
             .await;
         assert_eq!(own, StatusCode::OK, "{}", support::clip(&own_body));
@@ -578,7 +596,7 @@ mod boundary {
         let (foreign, _) = alice
             .get(&format!(
                 "/debug/clusters/{}",
-                bob_cluster.replace(':', "%3A")
+                alexandria_storage::record_id_to_string(&bob_cluster).replace(':', "%3A")
             ))
             .await;
         let (absent, _) = alice.get("/debug/clusters/cluster%3Ano-such").await;

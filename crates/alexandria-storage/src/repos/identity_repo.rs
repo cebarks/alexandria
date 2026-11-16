@@ -47,6 +47,78 @@ impl<'a> IdentityRepo<'a> {
         Self { db }
     }
 
+    /// The partitions system maintenance may work: one `personal` per workspace whose owner account
+    /// is **active**, plus one per project that workspace owns.
+    ///
+    /// Assigned scopes only — `unassigned` is a review partition no scheduled job may touch, and a
+    /// suspended account's whole workspace is absent rather than present-but-skipped, which is what
+    /// makes the enumeration itself the first half of the suspension barrier (the second half is the
+    /// in-transaction account check every guarded system write re-runs). System-only, verified
+    /// against the issuing instance like every other background capability.
+    ///
+    /// Deterministic order — workspace id, then scope — so a pass that enumerated in engine hash
+    /// order could not visit the same partition twice before another.
+    pub async fn maintenance_partitions(
+        db: &'a Surreal<Any>,
+        instance: &crate::Database,
+        system: &crate::access::SystemContext,
+    ) -> Result<Vec<crate::models::identity::Partition>, StorageError> {
+        if !instance.holds_authority(system) {
+            return Err(StorageError::Stale);
+        }
+        #[derive(SurrealValue)]
+        struct WorkspaceRow {
+            id: RecordId,
+        }
+        #[derive(SurrealValue)]
+        struct ProjectRow {
+            id: RecordId,
+            workspace: RecordId,
+        }
+        let mut response = db
+            .query(
+                "SELECT id FROM workspace WHERE owner IN (SELECT VALUE id FROM account WHERE status = \
+                 'active') ORDER BY id;",
+            )
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?;
+        let workspaces: Vec<WorkspaceRow> = response.take(0).map_err(internal)?;
+        let mut partitions = Vec::with_capacity(workspaces.len());
+        for row in &workspaces {
+            let workspace = crate::models::identity::WorkspaceId::try_from(row.id.clone())
+                .map_err(|_| missing_id("workspace"))?;
+            partitions.push(crate::models::identity::Partition {
+                workspace: workspace.clone(),
+                scope: crate::models::identity::MemoryScope::Personal,
+            });
+        }
+        if !workspaces.is_empty() {
+            let ids: Vec<RecordId> = workspaces.iter().map(|row| row.id.clone()).collect();
+            let mut response = db
+                .query("SELECT id, workspace FROM project WHERE workspace INSIDE $workspaces ORDER BY id;")
+                .bind(("workspaces", ids))
+                .await
+                .map_err(internal)?
+                .check()
+                .map_err(internal)?;
+            let projects: Vec<ProjectRow> = response.take(0).map_err(internal)?;
+            for row in projects {
+                let workspace =
+                    crate::models::identity::WorkspaceId::try_from(row.workspace.clone())
+                        .map_err(|_| missing_id("project workspace"))?;
+                let project = crate::models::identity::ProjectId::try_from(row.id.clone())
+                    .map_err(|_| missing_id("project"))?;
+                partitions.push(crate::models::identity::Partition {
+                    workspace,
+                    scope: crate::models::identity::MemoryScope::Project(project),
+                });
+            }
+        }
+        Ok(partitions)
+    }
+
     /// Creates the owner `login` names, with its private workspace, and returns both ids.
     ///
     /// Idempotent per ([`OperationId`], request): re-running the same operation with the same
@@ -232,5 +304,87 @@ impl<'a> IdentityRepo<'a> {
             .map_err(internal)?;
         let rows: Vec<Workspace> = response.take(0).map_err(internal)?;
         Ok(rows.into_iter().next())
+    }
+}
+
+#[cfg(test)]
+mod maintenance_partition_tests {
+    use super::*;
+    use crate::models::{OperationId, identity::MemoryScope};
+
+    /// Two enrolled owners — one then suspended — plus a project for the active one: the shape the
+    /// enumeration must answer with exactly one workspace's partitions.
+    #[tokio::test]
+    async fn maintenance_partitions_skip_suspended_accounts_and_unassigned() {
+        let (db, system) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let repo = IdentityRepo::new(db.inner());
+        let active = repo
+            .bootstrap_owner(
+                "part-active",
+                "digest-active-padding-padding",
+                &OperationId::new("p1"),
+            )
+            .await
+            .unwrap();
+        let suspended = repo
+            .bootstrap_owner(
+                "part-suspended",
+                "digest-suspended-padding-padding",
+                &OperationId::new("p2"),
+            )
+            .await
+            .unwrap();
+        db.inner()
+            .query("UPDATE ONLY $target SET status = 'suspended' RETURN NONE;")
+            .bind(("target", suspended.account.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let project = surrealdb::types::RecordId::new("project", "part-project");
+        db.inner()
+            .query("CREATE $id SET workspace = $workspace, normalized_alias = 'part-alias' RETURN NONE;")
+            .bind(("id", project.clone()))
+            .bind(("workspace", active.workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let partitions = IdentityRepo::maintenance_partitions(db.inner(), &db, &system)
+            .await
+            .unwrap();
+        assert_eq!(
+            partitions,
+            vec![
+                crate::models::identity::Partition {
+                    workspace: active.workspace.clone(),
+                    scope: MemoryScope::Personal,
+                },
+                crate::models::identity::Partition {
+                    workspace: active.workspace.clone(),
+                    scope: MemoryScope::Project(
+                        crate::models::identity::ProjectId::try_from(project).unwrap()
+                    ),
+                },
+            ],
+            "only the active account's personal and project partitions, in deterministic order: \
+             {partitions:?}"
+        );
+    }
+
+    /// A capability from another instance cannot enumerate this store's partitions.
+    #[tokio::test]
+    async fn maintenance_partitions_refuse_a_foreign_system_context() {
+        let (_db, system) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let (other, _its_system) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let refused = IdentityRepo::maintenance_partitions(other.inner(), &other, &system).await;
+        assert!(matches!(refused, Err(StorageError::Stale)), "{refused:?}");
     }
 }

@@ -7,7 +7,6 @@ use alexandria_storage::embedding_validation::{
 use alexandria_storage::models::embedding::{EmbeddingSpace, MigrationPhase, ReembedJournal};
 use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 use alexandria_storage::{Database, schema, system_config};
-use surrealdb::types::ToSql;
 
 fn journal() -> ReembedJournal {
     ReembedJournal {
@@ -29,15 +28,17 @@ fn journal() -> ReembedJournal {
     }
 }
 
-async fn fixture() -> (Database, String, String) {
+async fn fixture() -> (Database, String, surrealdb::types::RecordId) {
+    // The cluster id this fixture returns is TYPED (the repo boundary is typed); the one
+    // baseline comparison that wants the display form formats it at the comparison.
     let db = Database::connect_embedded().await.unwrap();
     schema::migrate(db.inner()).await.unwrap();
     system_config::check_embedding_space(db.inner(), &journal().source_space)
         .await
         .unwrap();
     let facts = MemoryRepo::new(db.inner());
-    let id = facts
-        .create_fact("public one", 0.6, &[1.0, 0.0], &["fixture".into()])
+    let (id, id_t) = facts
+        .create_fact_with_id("public one", 0.6, &[1.0, 0.0], &["fixture".into()])
         .await
         .unwrap();
     let clusters = ClusterRepo::new(db.inner());
@@ -45,7 +46,7 @@ async fn fixture() -> (Database, String, String) {
         .create(Some("populated"), &[1.0, 0.0])
         .await
         .unwrap();
-    clusters.add_member(&populated, &id).await.unwrap();
+    clusters.add_member(&populated, &id_t).await.unwrap();
     let empty = clusters
         .create(Some("truly empty"), &[0.0, 1.0])
         .await
@@ -65,7 +66,7 @@ async fn begin_persists_owned_baseline_and_counts_atomically_with_sentinel() {
     assert_eq!(baseline.empty_cluster_ids.len(), 1);
     assert_eq!(
         alexandria_storage::record_id_to_string(&baseline.empty_cluster_ids[0]),
-        empty
+        alexandria_storage::record_id_to_string(&empty)
     );
     assert_eq!(baseline.run_id, current.run_id);
     assert_eq!(
@@ -181,22 +182,13 @@ async fn deleted_only_cluster_preserves_baseline_and_memberships() {
         .unwrap()
         .id
         .unwrap();
-    let before = clusters.get_member_ids(&retained.to_sql()).await.unwrap();
+    let before = clusters.get_member_ids(&retained).await.unwrap();
     begin_target_reembed(db.inner(), &journal()).await.unwrap();
     let baseline = read_target_baseline(db.inner(), &journal()).await.unwrap();
     assert_eq!(baseline.cluster_count, 1);
     assert!(!baseline.empty_cluster_ids.contains(&retained));
-    assert!(
-        clusters
-            .get_members(&retained.to_sql())
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        clusters.get_member_ids(&retained.to_sql()).await.unwrap(),
-        before
-    );
+    assert!(clusters.get_members(&retained).await.unwrap().is_empty());
+    assert_eq!(clusters.get_member_ids(&retained).await.unwrap(), before);
     validate_target_metadata(db.inner(), &journal())
         .await
         .unwrap();
@@ -253,13 +245,13 @@ async fn deleted_only_fallback_refuses_quarantine_missing_and_other_references()
             .unwrap()
             .check()
             .unwrap();
-        let before = clusters.get_member_ids(&id.to_sql()).await.unwrap();
+        let before = clusters.get_member_ids(&id).await.unwrap();
         assert!(
             begin_target_reembed(db.inner(), &journal()).await.is_err(),
             "{scenario}"
         );
         assert_eq!(
-            clusters.get_member_ids(&id.to_sql()).await.unwrap(),
+            clusters.get_member_ids(&id).await.unwrap(),
             before,
             "{scenario}"
         );
@@ -315,13 +307,7 @@ async fn deleted_only_migration_population_keeps_typed_numeric_and_opaque_ids() 
             .iter()
             .all(|id| members.iter().any(|fact| fact.id.as_ref() == Some(id)))
     );
-    assert!(
-        clusters
-            .get_members(&cluster.to_sql())
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(clusters.get_members(&cluster).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -333,14 +319,8 @@ async fn hierarchy_reference_refuses_empty_cluster_removal() {
         .unwrap();
     db.inner()
         .query("RELATE $parent->contains_cluster->$child")
-        .bind((
-            "parent",
-            surrealdb::types::RecordId::parse_simple(&parent).unwrap(),
-        ))
-        .bind((
-            "child",
-            surrealdb::types::RecordId::parse_simple(&empty).unwrap(),
-        ))
+        .bind(("parent", parent.clone()))
+        .bind(("child", empty.clone()))
         .await
         .unwrap()
         .check()
@@ -361,10 +341,7 @@ async fn other_relation_references_are_not_silently_deleted_with_empty_clusters(
         .query(
             "CREATE provenance:p SET kind = 'public'; RELATE $empty->has_provenance->provenance:p",
         )
-        .bind((
-            "empty",
-            surrealdb::types::RecordId::parse_simple(&empty).unwrap(),
-        ))
+        .bind(("empty", empty.clone()))
         .await
         .unwrap()
         .check()

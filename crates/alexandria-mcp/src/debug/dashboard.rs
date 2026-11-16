@@ -936,11 +936,11 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let fact = memory_repo
-                .create_fact(&format!("{label} member {index}"), 0.5, embedding, &[])
+            let (_fact, fact_t) = memory_repo
+                .create_fact_with_id(&format!("{label} member {index}"), 0.5, embedding, &[])
                 .await
                 .unwrap();
-            cluster_repo.add_member(&cid, &fact).await.unwrap();
+            cluster_repo.add_member(&cid, &fact_t).await.unwrap();
         }
     }
 
@@ -1073,8 +1073,8 @@ mod tests {
         let heat_repo = alexandria_storage::repos::HeatRepo::new(server.db.inner());
         let memory_repo = alexandria_storage::repos::MemoryRepo::new(server.db.inner());
         for (index, heat) in [0.4_f64, 1.4, 2.4, 3.5, 9.75].iter().enumerate() {
-            let fact = memory_repo
-                .create_fact(&format!("heat fixture {index}"), 0.5, &[0.1, 0.2], &[])
+            let (fact, _fact_t) = memory_repo
+                .create_fact_with_id(&format!("heat fixture {index}"), 0.5, &[0.1, 0.2], &[])
                 .await
                 .unwrap();
             heat_repo.create_for_memory(&fact, *heat).await.unwrap();

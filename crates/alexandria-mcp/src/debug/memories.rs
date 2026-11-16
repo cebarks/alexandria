@@ -1044,9 +1044,9 @@ mod tests {
         // fixture's adoption: this page's claim is about a *cluster the caller owns*, and a cluster that
         // only became owned because a fixture stamped it is a weaker fixture than the one this test needs.
         let fixture = super::super::test_support::authenticated_on_server(server).await;
-        let fact_id = fixture.seed_personal("linked cluster test").await;
+        let (fact_id, fact_id_t) = fixture.seed_personal("linked cluster test").await;
         let cluster_id = fixture.seed_cluster(Some("my cluster"), &[0.1, 0.2]).await;
-        fixture.add_cluster_member(&cluster_id, &fact_id).await;
+        fixture.add_cluster_member(&cluster_id, &fact_id_t).await;
         let app = fixture.session_router();
         let uri = format!("/debug/memories/{}", fact_id.replace(':', "%3A"));
         let response = app
@@ -2128,8 +2128,8 @@ mod boundary {
         let alice = support::authenticated_on_server(server.clone()).await;
         let bob = alice.second_owner("debug-fixture-second").await;
 
-        let alice_fact = alice.seed_personal("alice-only-marker").await;
-        let bob_fact = bob.seed_personal("bob-only-marker").await;
+        let (alice_fact, _) = alice.seed_personal("alice-only-marker").await;
+        let (bob_fact, _bob_fact_t) = bob.seed_personal("bob-only-marker").await;
 
         let (status, page) = alice.get("/debug/memories").await;
         assert_eq!(status, StatusCode::OK, "{}", support::clip(&page));
@@ -2160,7 +2160,7 @@ mod boundary {
         let server = crate::debug::test_support::test_server().await;
         let alice = support::authenticated_on_server(server.clone()).await;
         let bob = alice.second_owner("debug-fixture-second").await;
-        let bob_fact = bob.seed_personal("bob-private-content").await;
+        let (bob_fact, _bob_fact_t) = bob.seed_personal("bob-private-content").await;
 
         let foreign = format!("/debug/memories/{}", bob_fact.replace(':', "%3A"));
         let (foreign_status, foreign_body) = alice.get(&foreign).await;
@@ -2189,7 +2189,7 @@ mod boundary {
         // caller the boundary did not authenticate.
         let server = crate::debug::test_support::test_server().await;
         let alice = support::authenticated_on_server(server.clone()).await;
-        let marker = alice.seed_personal("leak-marker").await;
+        let (marker, _) = alice.seed_personal("leak-marker").await;
 
         let (status, body) = alice.get_anonymous("/debug/memories").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "an unsigned read succeeded");

@@ -125,14 +125,14 @@ async fn seed(db: &Database) {
     let clusters = ClusterRepo::new(db.inner());
     for key in ["a", "b", "é:quote'"] {
         clusters
-            .add_member(
-                "cluster:a",
-                &alexandria_storage::record_id_to_string(&RecordId::new("fact", key)),
-            )
+            .add_member(&RecordId::new("cluster", "a"), &RecordId::new("fact", key))
             .await
             .unwrap();
     }
-    clusters.add_member("cluster:b", "fact:a").await.unwrap();
+    clusters
+        .add_member(&RecordId::new("cluster", "b"), &RecordId::new("fact", "a"))
+        .await
+        .unwrap();
     db.inner().query("CREATE raw:r SET content = 'public original'; CREATE session:s SET external_id = 'public-session', summary = 'preserved'; CREATE reminder:r SET message = 'public reminder', schedule_kind = 'once', next_due_at = d'2030-01-01T00:00:00Z'; CREATE heat_state:h SET memory = fact:a, heat = 0.2, stability = 7.0, access_count = 3; RELATE fact:c->extracted_from->raw:r; RELATE session:s->contains_session_memory->fact:c; RELATE fact:c->memory_edge->fact:a SET edge_type = 'derived_from'; CREATE provenance:p SET kind = 'test'; RELATE fact:a->has_provenance->provenance:p")
         .await.unwrap().check().unwrap();
     schema::ensure_vector_index(db.inner(), 2).await.unwrap();
@@ -167,14 +167,23 @@ async fn deleted_only_centroid_and_memberships_survive_partial_rewrite_resume() 
         .await.unwrap().check().unwrap();
     let clusters = ClusterRepo::new(db.inner());
     clusters
-        .add_member("cluster:archived", "fact:c")
+        .add_member(
+            &RecordId::new("cluster", "archived"),
+            &RecordId::new("fact", "c"),
+        )
         .await
         .unwrap();
     clusters
-        .add_member("cluster:archived", "fact:archived_second")
+        .add_member(
+            &RecordId::new("cluster", "archived"),
+            &RecordId::new("fact", "archived_second"),
+        )
         .await
         .unwrap();
-    let before = clusters.get_member_ids("cluster:archived").await.unwrap();
+    let before = clusters
+        .get_member_ids(&RecordId::new("cluster", "archived"))
+        .await
+        .unwrap();
     let current = journal();
     begin_target_reembed(db.inner(), &current).await.unwrap();
     let failing = Arc::new(Probe {
@@ -189,7 +198,10 @@ async fn deleted_only_centroid_and_memberships_survive_partial_rewrite_resume() 
     let partial = read_target_journal(db.inner()).await.unwrap().unwrap();
     assert_eq!(partial.phase, MigrationPhase::Facts);
     assert_eq!(
-        clusters.get_member_ids("cluster:archived").await.unwrap(),
+        clusters
+            .get_member_ids(&RecordId::new("cluster", "archived"))
+            .await
+            .unwrap(),
         before
     );
     let retry = Arc::new(Probe::default());
@@ -200,20 +212,27 @@ async fn deleted_only_centroid_and_memberships_survive_partial_rewrite_resume() 
         retry.calls.lock().unwrap().as_slice(),
         ["gone", "quarantine"]
     );
-    let archived = clusters.get("cluster:archived").await.unwrap().unwrap();
+    let archived = clusters
+        .get(&RecordId::new("cluster", "archived"))
+        .await
+        .unwrap()
+        .unwrap();
     let mut expected = vec![0.0; 768];
     expected[2] = 0.5;
     expected[4] = 0.5;
     assert_eq!(archived.centroid, expected);
     assert!(
         clusters
-            .get_members("cluster:archived")
+            .get_members(&RecordId::new("cluster", "archived"))
             .await
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        clusters.get_member_ids("cluster:archived").await.unwrap(),
+        clusters
+            .get_member_ids(&RecordId::new("cluster", "archived"))
+            .await
+            .unwrap(),
         before
     );
     assert!(
@@ -281,8 +300,19 @@ async fn rewrites_every_fact_preserves_metadata_recomputes_live_centroids_and_bu
         assert_eq!(record.embedding, vector(&fact.content));
     }
     let clusters = ClusterRepo::new(db.inner());
-    assert!(clusters.get("cluster:empty").await.unwrap().is_none());
-    let centroid = clusters.get("cluster:a").await.unwrap().unwrap().centroid;
+    assert!(
+        clusters
+            .get(&RecordId::new("cluster", "empty"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let centroid = clusters
+        .get(&RecordId::new("cluster", "a"))
+        .await
+        .unwrap()
+        .unwrap()
+        .centroid;
     assert_eq!(
         &centroid[..4],
         &[0.5, 0.5, 0.0, 0.0],
@@ -576,7 +606,7 @@ async fn centroid_write_failure_leaves_resumable_centroids_not_ready() {
     assert_eq!(stored.phase, MigrationPhase::Centroids);
     assert_eq!(
         ClusterRepo::new(db.inner())
-            .get("cluster:a")
+            .get(&RecordId::new("cluster", "a"))
             .await
             .unwrap()
             .unwrap()
@@ -586,7 +616,7 @@ async fn centroid_write_failure_leaves_resumable_centroids_not_ready() {
     );
     assert_eq!(
         ClusterRepo::new(db.inner())
-            .get("cluster:b")
+            .get(&RecordId::new("cluster", "b"))
             .await
             .unwrap()
             .unwrap()

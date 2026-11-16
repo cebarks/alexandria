@@ -18,11 +18,11 @@ async fn seed_cluster(
     let cluster = clusters.get(&handle).await.unwrap().unwrap();
     let mut facts = Vec::new();
     for (i, point) in points.iter().enumerate() {
-        let fact_handle = memories
-            .create_fact(&format!("{label}-{i}"), 0.5, point, &[])
+        let (fact_handle, fact_handle_t) = memories
+            .create_fact_with_id(&format!("{label}-{i}"), 0.5, point, &[])
             .await
             .unwrap();
-        clusters.add_member(&handle, &fact_handle).await.unwrap();
+        clusters.add_member(&handle, &fact_handle_t).await.unwrap();
         let fact = memories.get_fact(&fact_handle).await.unwrap().unwrap();
         if let Some(owner) = owner {
             db.inner().query("UPDATE $fact SET account = $account, workspace = $workspace, scope = 'personal';")
@@ -76,7 +76,7 @@ async fn protected_state(db: &Database, clusters: &[Cluster], facts: &[Fact]) ->
 #[tokio::test]
 async fn temporary_legacy_maintenance_skips_owned_and_runs_unowned() {
     for job in [Job::Cluster, Job::Merge] {
-        let db = Arc::new(Database::connect_embedded().await.unwrap());
+        let mut db = Database::connect_embedded().await.unwrap();
         alexandria_storage::schema::migrate(db.inner())
             .await
             .unwrap();
@@ -108,8 +108,8 @@ async fn temporary_legacy_maintenance_skips_owned_and_runs_unowned() {
         };
         let (mixed, mixed_facts) = seed_cluster(&db, "mixed-hidden", &mixed_points, None).await;
         let memories = MemoryRepo::new(db.inner());
-        let hidden_handle = memories
-            .create_fact("owned hidden witness", 0.5, &[1.0, 0.0], &[])
+        let (hidden_handle, hidden_handle_t) = memories
+            .create_fact_with_id("owned hidden witness", 0.5, &[1.0, 0.0], &[])
             .await
             .unwrap();
         let hidden = memories.get_fact(&hidden_handle).await.unwrap().unwrap();
@@ -117,10 +117,7 @@ async fn temporary_legacy_maintenance_skips_owned_and_runs_unowned() {
             .bind(("fact", hidden.id.clone().unwrap())).bind(("account", owner.account.as_record_id().clone()))
             .bind(("workspace", owner.workspace.as_record_id().clone())).await.unwrap().check().unwrap();
         ClusterRepo::new(db.inner())
-            .add_member(
-                &record_id_to_string(mixed.id.as_ref().unwrap()),
-                &hidden_handle,
-            )
+            .add_member(mixed.id.as_ref().unwrap(), &hidden_handle_t)
             .await
             .unwrap();
         protected_clusters.push(mixed);
@@ -133,7 +130,11 @@ async fn temporary_legacy_maintenance_skips_owned_and_runs_unowned() {
             seed_cluster(&db, "useful legacy merge-b", &[[0.0, 1.0]], None).await;
         }
         let before = protected_state(&db, &protected_clusters, &protected_facts).await;
-        let jobs = Jobs::new(db.clone(), &Config::default());
+        let system = db
+            .claim_system_authority()
+            .expect("a fresh embedded store has an unclaimed system authority");
+        let db = Arc::new(db);
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
         let report = jobs.run_job(job, "run-temporary-gate").await.unwrap();
         assert_eq!(
             protected_state(&db, &protected_clusters, &protected_facts).await,

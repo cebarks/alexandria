@@ -11,11 +11,15 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::SurrealValue;
+use surrealdb::types::{RecordId, SurrealValue};
 
+use crate::Database;
 use crate::access::AdminCapability;
+use crate::access::SystemContext;
 use crate::error::StorageError;
+use crate::models::identity::MemoryScope;
 use crate::models::maintenance::ACTOR_DREAMING;
+use crate::models::maintenance::{MaintenanceBudgetJob, MaintenanceProgress};
 
 /// Who wrote a row, and which run it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +184,188 @@ impl<'a> MaintenanceRepo<'a> {
             .await?
             .check()?;
         Ok(())
+    }
+
+    /// One capped job's persisted fair-share state, or `untouched` when none was written yet.
+    ///
+    /// System-only: the cursors are coordination metadata for the dreaming dispatcher, and a caller
+    /// that could read or write another job's ledger could steer the rotation. `system` is verified
+    /// against the instance the same way every other system capability is — pointer equality, so a
+    /// context minted by another store is refused even if the tables line up.
+    pub async fn load_progress(
+        instance: &Database,
+        system: &SystemContext,
+        job: MaintenanceBudgetJob,
+    ) -> Result<MaintenanceProgress, StorageError> {
+        if !instance.holds_authority(system) {
+            return Err(StorageError::Stale);
+        }
+        let mut response = instance
+            .inner()
+            .query("SELECT * FROM maintenance_progress WHERE job = $job;")
+            .bind(("job", job.as_str().to_string()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?;
+        let rows: Vec<ProgressRow> = response.take(0).map_err(internal)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(MaintenanceProgress::untouched(job));
+        };
+        Ok(MaintenanceProgress {
+            job,
+            version: crate::models::identity::Version::new(row.version.unwrap_or(0).max(0) as u64),
+            last_workspace: row
+                .last_workspace
+                .and_then(|id| crate::models::identity::WorkspaceId::try_from(id).ok()),
+            cursors: row
+                .cursors
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(cursor_from_row)
+                .collect(),
+        })
+    }
+
+    /// Persist one job's fair-share state under a compare-and-swap on its version.
+    ///
+    /// The first save (expected [`Version::ZERO`]) guards **absence**: it creates the row only when
+    /// no row exists, so two dispatchers racing on a fresh store cannot both mint version one. Every
+    /// later save updates **only** the row whose version equals `expected`; an empty result is
+    /// [`StorageError::Stale`] rather than a silent overwrite, which is what keeps a lost race from
+    /// erasing another writer's cursor. The version always increments by exactly one.
+    pub async fn save_progress(
+        instance: &Database,
+        system: &SystemContext,
+        expected: crate::models::identity::Version,
+        progress: &MaintenanceProgress,
+    ) -> Result<(), StorageError> {
+        if !instance.holds_authority(system) {
+            return Err(StorageError::Stale);
+        }
+        if progress.version.get() != expected.get() + 1 {
+            return Err(StorageError::InvalidInput(
+                "a progress save must increment the version by exactly one".to_string(),
+            ));
+        }
+        let cursors: Vec<CursorRow> = progress
+            .cursors
+            .iter()
+            .map(|c| CursorRow {
+                workspace: c.workspace.as_record_id().clone(),
+                scope: scope_word(&c.scope).to_string(),
+                project: match &c.scope {
+                    MemoryScope::Project(project) => Some(project.as_record_id().clone()),
+                    _ => None,
+                },
+                row_cursor: c.row_cursor.clone(),
+                units_done: c.units_done,
+                exhausted: c.exhausted,
+            })
+            .collect();
+        let last_workspace = progress
+            .last_workspace
+            .as_ref()
+            .map(|w| w.as_record_id().clone());
+        let next = progress.version.get() as i64;
+
+        if expected.get() == 0 {
+            // The first save guards absence: `CREATE` under the UNIQUE index on `job`, so two
+            // dispatchers racing on a fresh store cannot both mint version one. Losing that race
+            // surfaces as the engine's own unique-index error, which is a loud failure either way.
+            let mut created = instance
+                .inner()
+                .query(
+                    "CREATE maintenance_progress SET job = $job, version = $next, last_workspace = \
+                     $last_workspace, cursors = $cursors, updated_at = time::now() RETURN AFTER;",
+                )
+                .bind(("next", next))
+                .bind(("last_workspace", last_workspace))
+                .bind(("cursors", cursors))
+                .bind(("job", progress.job.as_str().to_string()))
+                .await
+                .map_err(internal)?
+                .check()
+                .map_err(internal)?;
+            let rows: Vec<ProgressRow> = created.take(0).map_err(internal)?;
+            if rows.is_empty() {
+                return Err(StorageError::Stale);
+            }
+            return Ok(());
+        }
+
+        // A later save updates only the row whose version equals `expected`; an empty result is a
+        // lost race, answered as `Stale` rather than overwritten.
+        let mut response = instance
+            .inner()
+            .query(
+                "UPDATE maintenance_progress SET version = $next, last_workspace = $last_workspace, \
+                 cursors = $cursors, updated_at = time::now() WHERE job = $job AND version = $expected \
+                 RETURN AFTER;",
+            )
+            .bind(("next", next))
+            .bind(("expected", expected.get() as i64))
+            .bind(("last_workspace", last_workspace))
+            .bind(("cursors", cursors))
+            .bind(("job", progress.job.as_str().to_string()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?;
+        let updated: Vec<ProgressRow> = response.take(0).map_err(internal)?;
+        if updated.is_empty() {
+            return Err(StorageError::Stale);
+        }
+        Ok(())
+    }
+}
+
+/// The `maintenance_progress` row shape, as v009 defines it.
+#[derive(Debug, Clone, SurrealValue)]
+struct ProgressRow {
+    version: Option<i64>,
+    last_workspace: Option<RecordId>,
+    cursors: Option<Vec<CursorRow>>,
+}
+
+/// One `cursors[*]` object, matching the v009 field set exactly.
+#[derive(Debug, Clone, SurrealValue)]
+struct CursorRow {
+    workspace: RecordId,
+    scope: String,
+    project: Option<RecordId>,
+    row_cursor: Option<RecordId>,
+    units_done: i64,
+    exhausted: bool,
+}
+
+/// Rebuild one cursor from its persisted shape. A row whose scope word is not one of the three, or
+/// whose project scope lost its project handle, is dropped rather than guessed at: a cursor that
+/// cannot name its own partition is not a cursor.
+fn cursor_from_row(row: CursorRow) -> Option<crate::models::maintenance::WorkspaceProgress> {
+    let workspace = crate::models::identity::WorkspaceId::try_from(row.workspace).ok()?;
+    let scope = match row.scope.as_str() {
+        "personal" => MemoryScope::Personal,
+        "unassigned" => MemoryScope::Unassigned,
+        "project" => {
+            MemoryScope::Project(crate::models::identity::ProjectId::try_from(row.project?).ok()?)
+        }
+        _ => return None,
+    };
+    Some(crate::models::maintenance::WorkspaceProgress {
+        workspace,
+        scope,
+        row_cursor: row.row_cursor,
+        units_done: row.units_done,
+        exhausted: row.exhausted,
+    })
+}
+
+fn scope_word(scope: &MemoryScope) -> &'static str {
+    match scope {
+        MemoryScope::Personal => "personal",
+        MemoryScope::Project(_) => "project",
+        MemoryScope::Unassigned => "unassigned",
     }
 }
 
@@ -530,5 +716,104 @@ mod tests {
                 .all(|row| row.run_id.as_deref() == Some("run-42")),
             "all rows of a run share its id: {rows:?}"
         );
+    }
+
+    /// The progress ledger's whole contract in one test: a first save guards absence, a load reads
+    /// the same cursors back, a second save CAS-increments, and a save against a lost version is
+    /// `Stale` rather than an overwrite.
+    #[tokio::test]
+    async fn progress_round_trips_and_a_lost_race_is_stale() {
+        let (db, system) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let job = MaintenanceBudgetJob::Sweep;
+
+        let untouched = MaintenanceRepo::load_progress(&db, &system, job)
+            .await
+            .unwrap();
+        assert_eq!(untouched, MaintenanceProgress::untouched(job));
+
+        let workspace =
+            crate::models::identity::WorkspaceId::try_from(RecordId::new("workspace", "w-1"))
+                .unwrap();
+        let project =
+            crate::models::identity::ProjectId::try_from(RecordId::new("project", "p-1")).unwrap();
+        let first = MaintenanceProgress {
+            job,
+            version: crate::models::identity::Version::new(1),
+            last_workspace: Some(workspace.clone()),
+            cursors: vec![crate::models::maintenance::WorkspaceProgress {
+                workspace: workspace.clone(),
+                scope: crate::models::identity::MemoryScope::Project(project),
+                row_cursor: Some(RecordId::new("fact", "row-1")),
+                units_done: 3,
+                exhausted: false,
+            }],
+        };
+        MaintenanceRepo::save_progress(
+            &db,
+            &system,
+            crate::models::identity::Version::ZERO,
+            &first,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            MaintenanceRepo::load_progress(&db, &system, job)
+                .await
+                .unwrap(),
+            first,
+            "the first save is readable back with its cursor and version"
+        );
+
+        let mut second = first.clone();
+        second.version = crate::models::identity::Version::new(2);
+        second.cursors[0].units_done = 5;
+        MaintenanceRepo::save_progress(
+            &db,
+            &system,
+            crate::models::identity::Version::new(1),
+            &second,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            MaintenanceRepo::load_progress(&db, &system, job)
+                .await
+                .unwrap(),
+            second
+        );
+
+        // A writer whose expected version is stale must not overwrite the winner's cursor.
+        let stale = MaintenanceRepo::save_progress(
+            &db,
+            &system,
+            crate::models::identity::Version::new(1),
+            &second,
+        )
+        .await;
+        assert!(matches!(stale, Err(StorageError::Stale)), "{stale:?}");
+        assert_eq!(
+            MaintenanceRepo::load_progress(&db, &system, job)
+                .await
+                .unwrap(),
+            second,
+            "a lost CAS race left the winner's ledger intact"
+        );
+    }
+
+    /// A capability minted by *another* instance is refused even on identical table shapes: the
+    /// progress ledger is coordination metadata for this store's dispatcher alone.
+    #[tokio::test]
+    async fn progress_refuses_a_foreign_system_context() {
+        let (_db, system) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let (other, _its_system) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let refused =
+            MaintenanceRepo::load_progress(&other, &system, MaintenanceBudgetJob::Sweep).await;
+        assert!(matches!(refused, Err(StorageError::Stale)), "{refused:?}");
     }
 }

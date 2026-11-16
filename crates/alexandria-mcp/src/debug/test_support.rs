@@ -174,7 +174,7 @@ pub(super) fn average_centroid(members: &[Vec<f32>]) -> Vec<f32> {
 /// 0.6 floor), while the member average is dragged out to roughly `[0.2, 0.98]`, which
 /// averages 0.40 (Needs split). A fixture where the two agree would pass either implementation
 /// and prove nothing — that agreement is exactly why the bug survived.
-pub(super) async fn disagreeing_cluster(server: &AlexandriaServer) -> String {
+pub(super) async fn disagreeing_cluster(server: &AlexandriaServer) -> surrealdb::types::RecordId {
     use alexandria_storage::repos::{ClusterRepo, MemoryRepo};
 
     let cluster_repo = ClusterRepo::new(server.db.inner());
@@ -193,11 +193,11 @@ pub(super) async fn disagreeing_cluster(server: &AlexandriaServer) -> String {
     .iter()
     .enumerate()
     {
-        let fact = memory_repo
-            .create_fact(&format!("disagreeing member {index}"), 0.5, embedding, &[])
+        let (_fact, fact_t) = memory_repo
+            .create_fact_with_id(&format!("disagreeing member {index}"), 0.5, embedding, &[])
             .await
             .unwrap();
-        cluster_repo.add_member(&cid, &fact).await.unwrap();
+        cluster_repo.add_member(&cid, &fact_t).await.unwrap();
     }
     cid
 }
@@ -512,7 +512,10 @@ impl AuthenticatedTestApp {
     }
 
     /// One live fact in the caller's Personal partition, returned as its record id.
-    pub(super) async fn seed_personal(&self, content: &str) -> String {
+    pub(super) async fn seed_personal(
+        &self,
+        content: &str,
+    ) -> (String, surrealdb::types::RecordId) {
         self.seed_into(&self.owner.clone(), content).await
     }
 
@@ -524,7 +527,10 @@ impl AuthenticatedTestApp {
     /// the owner and workspace stamps a scoped reader requires — a row with no `account` is invisible to
     /// `ScopeFilter`, and a test asserting "the owner sees it" against such a row would pass vacuously the
     /// moment the assertion were flipped to "nothing".
-    pub(super) async fn seed_quarantined_unassigned(&self, content: &str) -> String {
+    pub(super) async fn seed_quarantined_unassigned(
+        &self,
+        content: &str,
+    ) -> (String, surrealdb::types::RecordId) {
         let read = AccessRepo::new(&self.db)
             .select(&self.owner, ReadSelection::UnassignedReview)
             .await
@@ -552,15 +558,19 @@ impl AuthenticatedTestApp {
             .expect("quarantining")
             .check()
             .expect("the quarantine write ran");
-        alexandria_storage::record_id_to_string(&fact)
+        (alexandria_storage::record_id_to_string(&fact), fact)
     }
 
-    async fn seed_into(&self, owner: &OwnerContext, content: &str) -> String {
+    async fn seed_into(
+        &self,
+        owner: &OwnerContext,
+        content: &str,
+    ) -> (String, surrealdb::types::RecordId) {
         let read = AccessRepo::new(&self.db)
             .select(owner, ReadSelection::Assigned)
             .await
             .expect("the owner's own corpus resolves");
-        ScopedMemoryRepo::new(self.db.inner(), owner, &read)
+        let id = ScopedMemoryRepo::new(self.db.inner(), owner, &read)
             .create_fact(
                 content,
                 0.5,
@@ -572,8 +582,8 @@ impl AuthenticatedTestApp {
             .await
             .expect("a seeded fact")
             .id
-            .map(|id| record_id_to_string(&id))
-            .expect("a created fact has an id")
+            .expect("a created fact has an id");
+        (record_id_to_string(&id), id)
     }
 
     /// The caller's own request scope: the pair a journaled writer is admitted with.
@@ -737,20 +747,29 @@ impl AuthenticatedTestApp {
         }
     }
 
-    pub(super) async fn seed_cluster(&self, label: Option<&str>, centroid: &[f32]) -> String {
+    pub(super) async fn seed_cluster(
+        &self,
+        label: Option<&str>,
+        centroid: &[f32],
+    ) -> surrealdb::types::RecordId {
         let read = self.population().await;
         let repo = ScopedClusterRepo::new(self.db.inner(), &self.owner, &read);
         repo.create(label, centroid, Utc::now())
             .await
             .expect("a seeded cluster")
             .id
-            .map(|id| record_id_to_string(&id))
             .expect("a created cluster has an id")
     }
 
-    pub(super) async fn add_cluster_member(&self, cluster_id: &str, fact_id: &str) {
+    /// Fully typed, matching the production `ClusterRepo` boundary — the deferred conversion
+    /// from run 52 is now gone: no display string is parsed anywhere in the fixture support.
+    pub(super) async fn add_cluster_member(
+        &self,
+        cluster: &surrealdb::types::RecordId,
+        fact: &surrealdb::types::RecordId,
+    ) {
         ClusterRepo::new(self.db.inner())
-            .add_member(cluster_id, fact_id)
+            .add_member(cluster, fact)
             .await
             .expect("a seeded membership");
     }

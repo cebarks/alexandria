@@ -1153,8 +1153,8 @@ mod boundary {
         let alice = support::authenticated_on_server(server.clone()).await;
         let bob = alice.second_owner("debug-fixture-second").await;
 
-        let alice_fact = alice.seed_personal("alice graph centre").await;
-        let bob_fact = bob.seed_personal("bob graph centre").await;
+        let (alice_fact, _) = alice.seed_personal("alice graph centre").await;
+        let (bob_fact, _) = bob.seed_personal("bob graph centre").await;
 
         let (own, own_body) = alice
             .get(&format!(

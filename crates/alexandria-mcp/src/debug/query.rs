@@ -1526,8 +1526,8 @@ mod boundary {
         let server = support::test_server().await;
         let alice = support::authenticated_on_server(server).await;
         let bob = alice.second_owner("debug-query-header-second").await;
-        let alice_fact = alice.seed_personal("shared wording for the tester").await;
-        let bob_fact = bob.seed_personal("shared wording for the tester").await;
+        let (alice_fact, _) = alice.seed_personal("shared wording for the tester").await;
+        let (bob_fact, _) = bob.seed_personal("shared wording for the tester").await;
         seed_heat(&alice, &alice_fact, 0.2).await;
         seed_heat(&bob, &bob_fact, 0.2).await;
         let before = (
@@ -1573,8 +1573,8 @@ mod boundary {
 
         // Both owners seed the same words, so the query matches both rows by content: the only thing
         // that can keep bob's row out of alice's results is the population predicate.
-        let alice_fact = alice.seed_personal("shared wording for the tester").await;
-        let bob_fact = bob.seed_personal("shared wording for the tester").await;
+        let (alice_fact, _) = alice.seed_personal("shared wording for the tester").await;
+        let (bob_fact, _) = bob.seed_personal("shared wording for the tester").await;
 
         // Heat rows are seeded **below** the access reset value, because a recorded access sets heat to
         // 1.0: seeding 1.0 would make "the access happened" and "nothing happened" read identically —
@@ -1630,7 +1630,7 @@ mod boundary {
     async fn a_dry_run_writes_nothing() {
         let server = crate::debug::test_support::test_server().await;
         let alice = support::authenticated_on_server(server.clone()).await;
-        let fact = alice.seed_personal("dry run marker").await;
+        let (fact, _) = alice.seed_personal("dry run marker").await;
         // Seeded below the reset value for the same reason as the paired case: if the dry run *did*
         // record an access, the row would jump to 1.0 — which an assertion against a 1.0 seed could
         // never see.

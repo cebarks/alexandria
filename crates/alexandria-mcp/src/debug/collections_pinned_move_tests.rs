@@ -26,20 +26,20 @@ async fn classification_repair_vector_moves_into_unassigned() {
     )
     .await;
     for classification in [false, true] {
-        let id = app
+        let (id, id_t) = app
             .seed_personal(&format!("unassigned vector {classification}"))
             .await;
-        app.add_cluster_member(&source, &id).await;
+        app.add_cluster_member(&source, &id_t).await;
         app.db
             .inner()
             .query("UPDATE $id SET quarantined_at = $at;")
-            .bind(("id", RecordId::parse_simple(&id).unwrap()))
+            .bind(("id", id_t.clone()))
             .bind(("at", Utc::now()))
             .await
             .unwrap()
             .check()
             .unwrap();
-        let original = snapshot(&app, &id).await;
+        let original = snapshot(&app, &id_t).await;
         assert!(original.embedding.is_some());
         let before = ledger(&app).await;
         let (_, location, _) = if classification {
@@ -70,7 +70,7 @@ async fn classification_repair_vector_moves_into_unassigned() {
             .await
         };
         assert!(!location.contains("error="), "{location}");
-        let final_state = snapshot(&app, &id).await;
+        let final_state = snapshot(&app, &id_t).await;
         assert_eq!(final_state.id, original.id);
         assert_eq!(final_state.scope, MemoryScope::Unassigned);
         assert_eq!(final_state.visibility, original.visibility);
@@ -105,14 +105,14 @@ async fn classification_repair_route_two_approvals() {
     let mut citations = Vec::new();
     let mut facts = Vec::new();
     for content in ["route first arrival", "route second arrival"] {
-        let id = app.seed_quarantined_unassigned(content).await;
-        let state = snapshot(&app, &id).await;
+        let (_id, id_t) = app.seed_quarantined_unassigned(content).await;
+        let state = snapshot(&app, &id_t).await;
         let reference = ClassificationRepo::new(app.db.inner(), &app.owner)
             .propose(&state.id, state.version, MemoryScope::Personal, None)
             .await
             .unwrap();
         citations.push(format!("{}:{}", reference.id, reference.revision.get()));
-        facts.push((id, state));
+        facts.push((id_t, state));
     }
     let before = ledger(&app).await;
     let (denied, _, _) = app
@@ -170,8 +170,8 @@ async fn classification_repair_route_partial_message() {
     .into_iter()
     .enumerate()
     {
-        let id = app.seed_quarantined_unassigned(content).await;
-        let state = snapshot(&app, &id).await;
+        let (_id, id_t) = app.seed_quarantined_unassigned(content).await;
+        let state = snapshot(&app, &id_t).await;
         if index == 2 {
             app.db.inner().query("CREATE $id SET account = $account, workspace = $workspace, fact = $fact, \
                 source_revision = 0, revision = 0, destination_kind = 'personal', state = 'pending';")
@@ -261,17 +261,17 @@ async fn classification_repair_ranking_failure_is_not_ungrouped() {
     let app = authenticated_on_server(test_server().await).await;
     let (cluster, _) =
         population(&app, MemoryScope::Personal, "ranking witness", &[0.1, 0.2]).await;
-    let id = app
+    let (_id, id_t) = app
         .seed_quarantined_unassigned("ranking failure subject")
         .await;
-    let state = snapshot(&app, &id).await;
+    let state = snapshot(&app, &id_t).await;
     let reference = ClassificationRepo::new(app.db.inner(), &app.owner)
         .propose(&state.id, state.version, MemoryScope::Personal, None)
         .await
         .unwrap();
     let selected = format!("{}:{}", reference.id, reference.revision.get());
     app.db.inner().query("DEFINE FIELD OVERWRITE centroid ON cluster TYPE any; UPDATE $cluster SET centroid = 'undecodable';")
-        .bind(("cluster", RecordId::parse_simple(&cluster).unwrap())).await.unwrap().check().unwrap();
+        .bind(("cluster", cluster.clone())).await.unwrap().check().unwrap();
     let before = ledger(&app).await;
     let (_, location, _) = app
         .post_form_located(
@@ -285,9 +285,9 @@ async fn classification_repair_ranking_failure_is_not_ungrouped() {
         "{page}"
     );
     assert_eq!(ledger(&app).await, before);
-    assert_eq!(snapshot(&app, &id).await, state);
+    assert_eq!(snapshot(&app, &id_t).await, state);
     app.db.inner().query("UPDATE $cluster SET centroid = [0.1, 0.2]; DEFINE FIELD OVERWRITE centroid ON cluster TYPE array<float>;")
-        .bind(("cluster", RecordId::parse_simple(&cluster).unwrap())).await.unwrap().check().unwrap();
+        .bind(("cluster", cluster.clone())).await.unwrap().check().unwrap();
     let (_, location, _) = app
         .post_form_located(
             "/debug/classification/decide",
@@ -355,7 +355,7 @@ async fn classification_review_typed_arrival_preserves_original_cluster_identity
         assert_eq!(probe.population.len(), 1);
         assert_eq!(probe.population[0].id, preferred_member.unwrap());
 
-        let source = snapshot(&app, &alexandria_storage::record_id_to_string(&source)).await;
+        let source = snapshot(&app, &source).await;
         let scope = app.corpus_scope().await;
         let before = ledger(&app).await;
         let arrival = app
@@ -415,10 +415,10 @@ async fn deletion_hidden_member_keeps_live_mean_and_historical_membership() {
         &[1.0, 0.0],
     )
     .await;
-    let hidden = app
+    let (hidden, hidden_t) = app
         .seed_quarantined_unassigned("hidden delete contribution")
         .await;
-    app.add_cluster_member(&cluster, &hidden).await;
+    app.add_cluster_member(&cluster, &hidden_t).await;
     let before = deletion_observation(&app).await;
     let (status, location, _) = app
         .post_form_located(
@@ -495,9 +495,8 @@ async fn deletion_pins_centroid_effect_presence_in_both_population_drift_directi
             .unwrap()
             .id
             .unwrap();
-        let extra_handle = alexandria_storage::record_id_to_string(&extra);
         if initially_present {
-            app.add_cluster_member(&cluster, &extra_handle).await;
+            app.add_cluster_member(&cluster, &extra).await;
         }
         let original = snapshot(&app, &member).await;
         let service = ApplyService::new(&app.db, &app.owner, &read);
@@ -538,7 +537,7 @@ async fn deletion_pins_centroid_effect_presence_in_both_population_drift_directi
                 .check()
                 .unwrap();
         } else {
-            app.add_cluster_member(&cluster, &extra_handle).await;
+            app.add_cluster_member(&cluster, &extra).await;
         }
         let before = deletion_observation(&app).await;
         let result = service
@@ -582,7 +581,7 @@ async fn population(
     scope: MemoryScope,
     label: &str,
     vector: &[f32],
-) -> (String, String) {
+) -> (surrealdb::types::RecordId, surrealdb::types::RecordId) {
     let read = app.population().await;
     let target = match scope {
         MemoryScope::Personal => WriteTarget::Personal,
@@ -596,17 +595,13 @@ async fn population(
         .id
         .unwrap();
     let cluster = app.seed_cluster(Some(label), vector).await;
-    let fact = alexandria_storage::record_id_to_string(&fact);
     app.add_cluster_member(&cluster, &fact).await;
     (cluster, fact)
 }
 
-async fn snapshot(app: &AuthenticatedTestApp, id: &str) -> FactSnapshot {
+async fn snapshot(app: &AuthenticatedTestApp, id: &surrealdb::types::RecordId) -> FactSnapshot {
     MutationRepo::new(app.db.inner())
-        .state(
-            &app.owner,
-            &FactId::try_from(RecordId::parse_simple(id).unwrap()).unwrap(),
-        )
+        .state(&app.owner, &FactId::try_from(id.clone()).unwrap())
         .await
         .unwrap()
         .unwrap()
@@ -644,9 +639,9 @@ async fn pinned_move_refreshes_guards_and_centroids_without_selecting_a_new_winn
     )
     .await;
     let (source, _) = population(&app, MemoryScope::Personal, "source survivor", &[0.1, 0.2]).await;
-    let mover = app.seed_personal("pinned mover").await;
-    app.add_cluster_member(&source, &mover).await;
-    let existing = snapshot(&app, &mover).await;
+    let (_mover, mover_t) = app.seed_personal("pinned mover").await;
+    app.add_cluster_member(&source, &mover_t).await;
+    let existing = snapshot(&app, &mover_t).await;
     let scope = app.corpus_scope().await;
     let server = app.server();
     let plan = server
@@ -654,13 +649,13 @@ async fn pinned_move_refreshes_guards_and_centroids_without_selecting_a_new_winn
         .await
         .unwrap();
     let read = app.population().await;
-    let source_id = RecordId::parse_simple(&source).unwrap();
+    let source_id = source.clone();
     let repo = MutationRepo::new(app.db.inner());
     let before_guard = repo
         .cluster_expectation(&app.owner, &source_id)
         .await
         .unwrap();
-    let original_id = RecordId::parse_simple(&original).unwrap();
+    let original_id = original.clone();
     let destination_guard = repo
         .cluster_expectation(&app.owner, &original_id)
         .await
@@ -720,7 +715,7 @@ async fn pinned_move_refreshes_guards_and_centroids_without_selecting_a_new_winn
         .unwrap();
     assert!(
         matches!(fresh.arriving, DestinationMembership::Join { expectation, .. }
-        if expectation.cluster == RecordId::parse_simple(&competitor).unwrap()),
+        if expectation.cluster == competitor.clone()),
         "the new ranking must actually differ"
     );
     ApplyService::new(app.db.as_ref(), &app.owner, &read)
@@ -737,11 +732,11 @@ async fn pinned_move_refreshes_guards_and_centroids_without_selecting_a_new_winn
             .unwrap()
             .unwrap()
             .0,
-        RecordId::parse_simple(&original).unwrap(),
+        original.clone(),
         "refresh cannot change the approved destination"
     );
     let source = ScopedClusterRepo::new(app.db.inner(), &app.owner, &read)
-        .get(&source)
+        .get(&alexandria_storage::record_id_to_string(&source))
         .await
         .unwrap()
         .unwrap();
@@ -751,7 +746,7 @@ async fn pinned_move_refreshes_guards_and_centroids_without_selecting_a_new_winn
         "the source mean must be refreshed, not frozen with its guards"
     );
     let destination = ScopedClusterRepo::new(app.db.inner(), &app.owner, &read)
-        .get(&original)
+        .get(&alexandria_storage::record_id_to_string(&original))
         .await
         .unwrap()
         .unwrap();
@@ -780,8 +775,8 @@ async fn unlawful_pinned_destination_refuses_instead_of_reranking_or_creating() 
             &[0.2, 0.1],
         )
         .await;
-        let mover = app.seed_personal("pinned mover").await;
-        let existing = snapshot(&app, &mover).await;
+        let (mover, mover_t) = app.seed_personal("pinned mover").await;
+        let existing = snapshot(&app, &mover_t).await;
         let scope = app.corpus_scope().await;
         let server = app.server();
         let plan = server
@@ -793,14 +788,14 @@ async fn unlawful_pinned_destination_refuses_instead_of_reranking_or_creating() 
             app.db
                 .inner()
                 .query("UPDATE $member SET deleted = true;")
-                .bind(("member", RecordId::parse_simple(&member).unwrap()))
+                .bind(("member", member.clone()))
                 .await
                 .unwrap()
                 .check()
                 .unwrap();
         } else {
-            let intruder = app.seed_personal("wrong partition intruder").await;
-            app.add_cluster_member(&original, &intruder).await;
+            let (_intruder, intruder_t) = app.seed_personal("wrong partition intruder").await;
+            app.add_cluster_member(&original, &intruder_t).await;
         }
         let (competitor, _) =
             population(&app, destination.clone(), "lawful alternative", &[0.1, 0.2]).await;
@@ -810,7 +805,7 @@ async fn unlawful_pinned_destination_refuses_instead_of_reranking_or_creating() 
             .unwrap();
         assert!(
             matches!(fresh.arriving, DestinationMembership::Join { expectation, .. }
-            if expectation.cluster == RecordId::parse_simple(&competitor).unwrap())
+            if expectation.cluster == competitor.clone())
         );
         let before = ledger(&app).await;
         let read = app.population().await;
@@ -830,7 +825,7 @@ async fn unlawful_pinned_destination_refuses_instead_of_reranking_or_creating() 
             before,
             "a refusal must not create a fallback cluster or journal row"
         );
-        assert_eq!(snapshot(&app, &mover).await, existing);
+        assert_eq!(snapshot(&app, &mover_t).await, existing);
         // A new owner action is allowed to choose the now-lawful alternative.
         server
             .move_within(&scope, &mover, "project", Some(&project), existing.version)
@@ -843,7 +838,7 @@ async fn unlawful_pinned_destination_refuses_instead_of_reranking_or_creating() 
                 .unwrap()
                 .unwrap()
                 .0,
-            RecordId::parse_simple(&competitor).unwrap()
+            competitor.clone()
         );
     }
 }
@@ -859,8 +854,8 @@ async fn pinned_source_absence_does_not_adopt_a_new_membership_at_the_same_fact_
             .unwrap(),
     );
     population(&app, destination.clone(), "destination", &[0.1, 0.2]).await;
-    let mover = app.seed_personal("initially unclustered mover").await;
-    let existing = snapshot(&app, &mover).await;
+    let (mover, mover_t) = app.seed_personal("initially unclustered mover").await;
+    let existing = snapshot(&app, &mover_t).await;
     let scope = app.corpus_scope().await;
     let plan = app
         .server()
@@ -868,7 +863,7 @@ async fn pinned_source_absence_does_not_adopt_a_new_membership_at_the_same_fact_
         .await
         .unwrap();
     let (source, _) = population(&app, MemoryScope::Personal, "new source", &[0.1, 0.2]).await;
-    app.add_cluster_member(&source, &mover).await;
+    app.add_cluster_member(&source, &mover_t).await;
     assert_eq!(app.semantic_revision(&mover).await, existing.version.get());
     let before = ledger(&app).await;
     let read = app.population().await;
@@ -884,7 +879,7 @@ async fn pinned_source_absence_does_not_adopt_a_new_membership_at_the_same_fact_
         "the original incident-graph expectation must remain fixed: {outcome:?}"
     );
     assert_eq!(ledger(&app).await, before);
-    assert_eq!(snapshot(&app, &mover).await.scope, MemoryScope::Personal);
+    assert_eq!(snapshot(&app, &mover_t).await.scope, MemoryScope::Personal);
 }
 
 #[tokio::test]
@@ -897,20 +892,20 @@ async fn pinned_creation_does_not_switch_to_a_later_join() {
             .try_into()
             .unwrap(),
     );
-    let mover = app
+    let (_mover, mover_t) = app
         .seed_personal("mover with initially empty destination")
         .await;
     let source = app
         .seed_cluster(Some("single-member source"), &[0.1, 0.2])
         .await;
-    app.add_cluster_member(&source, &mover).await;
-    let source_id = RecordId::parse_simple(&source).unwrap();
+    app.add_cluster_member(&source, &mover_t).await;
+    let source_id = source.clone();
     let repo = MutationRepo::new(app.db.inner());
     let source_before = repo
         .cluster_expectation(&app.owner, &source_id)
         .await
         .unwrap();
-    let existing = snapshot(&app, &mover).await;
+    let existing = snapshot(&app, &mover_t).await;
     let scope = app.corpus_scope().await;
     let plan = app
         .server()
@@ -936,7 +931,7 @@ async fn pinned_creation_does_not_switch_to_a_later_join() {
         .0;
     assert_ne!(
         actual,
-        RecordId::parse_simple(&later).unwrap(),
+        later.clone(),
         "Create and Join are different approved effects"
     );
     assert_eq!(ledger(&app).await, (before.0 + 1, before.1 + 1));
@@ -971,11 +966,11 @@ async fn pinned_move_refuses_same_cluster_without_banning_unclustered_quarantine
         &[0.1, 0.2],
     )
     .await;
-    let mover = app
+    let (_mover, mover_t) = app
         .seed_quarantined_unassigned("historical hidden member")
         .await;
-    app.add_cluster_member(&cluster, &mover).await;
-    let existing = snapshot(&app, &mover).await;
+    app.add_cluster_member(&cluster, &mover_t).await;
+    let existing = snapshot(&app, &mover_t).await;
     let scope = app.corpus_scope().await;
     let before = ledger(&app).await;
     let outcome = app
@@ -987,10 +982,10 @@ async fn pinned_move_refuses_same_cluster_without_banning_unclustered_quarantine
         "the source and arrival cannot name the same cluster across scopes"
     );
     assert_eq!(ledger(&app).await, before);
-    let unclustered = app
+    let (_unclustered, unclustered_t) = app
         .seed_quarantined_unassigned("quarantine remains movable")
         .await;
-    let existing = snapshot(&app, &unclustered).await;
+    let existing = snapshot(&app, &unclustered_t).await;
     let plan = app
         .server()
         .prepare_move_plan(&scope, &existing, &destination)
@@ -1005,7 +1000,7 @@ async fn pinned_move_refuses_same_cluster_without_banning_unclustered_quarantine
         )
         .await
         .unwrap();
-    let after = snapshot(&app, &unclustered).await;
+    let after = snapshot(&app, &unclustered_t).await;
     assert_eq!(after.scope, destination);
     assert_eq!(
         after.visibility, existing.visibility,
@@ -1024,14 +1019,14 @@ async fn pinned_source_centroid_effect_cannot_appear_or_disappear_during_refresh
                 .try_into()
                 .unwrap(),
         );
-        let mover = app.seed_personal("mover with a pinned source effect").await;
+        let (mover, mover_t) = app.seed_personal("mover with a pinned source effect").await;
         let source = app.seed_cluster(Some("source"), &[0.1, 0.2]).await;
-        app.add_cluster_member(&source, &mover).await;
-        let survivor = app.seed_personal("source survivor").await;
+        app.add_cluster_member(&source, &mover_t).await;
+        let (_survivor, survivor_t) = app.seed_personal("source survivor").await;
         if change == "disappeared" {
-            app.add_cluster_member(&source, &survivor).await;
+            app.add_cluster_member(&source, &survivor_t).await;
         }
-        let existing = snapshot(&app, &mover).await;
+        let existing = snapshot(&app, &mover_t).await;
         let scope = app.corpus_scope().await;
         let server = app.server();
         let plan = server
@@ -1039,12 +1034,12 @@ async fn pinned_source_centroid_effect_cannot_appear_or_disappear_during_refresh
             .await
             .unwrap();
         if change == "appeared" {
-            app.add_cluster_member(&source, &survivor).await;
+            app.add_cluster_member(&source, &survivor_t).await;
         } else {
             app.db
                 .inner()
                 .query("UPDATE $member SET deleted = true;")
-                .bind(("member", RecordId::parse_simple(&survivor).unwrap()))
+                .bind(("member", survivor_t.clone()))
                 .await
                 .unwrap()
                 .check()
@@ -1064,13 +1059,13 @@ async fn pinned_source_centroid_effect_cannot_appear_or_disappear_during_refresh
             "{change}: a refresh must not change whether a centroid write was approved: {outcome:?}"
         );
         assert_eq!(ledger(&app).await, before);
-        assert_eq!(snapshot(&app, &mover).await, existing);
+        assert_eq!(snapshot(&app, &mover_t).await, existing);
         server
             .move_within(&scope, &mover, "project", Some(&project), existing.version)
             .await
             .unwrap();
         assert!(matches!(
-            snapshot(&app, &mover).await.scope,
+            snapshot(&app, &mover_t).await.scope,
             MemoryScope::Project(_)
         ));
     }
@@ -1090,13 +1085,13 @@ async fn quarantined_changes_do_not_enter_live_centroid_arithmetic() {
         );
         let (cluster, _) =
             population(&app, destination.clone(), "one live vector", &[1.0, 0.5]).await;
-        let id = app
+        let (id, id_t) = app
             .seed_quarantined_unassigned("inactive off-axis vector")
             .await;
         app.db
             .inner()
             .query("UPDATE $fact SET embedding = [1.0, 0.0];")
-            .bind(("fact", RecordId::parse_simple(&id).unwrap()))
+            .bind(("fact", id_t.clone()))
             .await
             .unwrap()
             .check()
@@ -1106,9 +1101,9 @@ async fn quarantined_changes_do_not_enter_live_centroid_arithmetic() {
                 app.move_row(&id, destination.clone(), "fixture-assigned-quarantine")
                     .await
             );
-            app.add_cluster_member(&cluster, &id).await;
+            app.add_cluster_member(&cluster, &id_t).await;
         }
-        let existing = snapshot(&app, &id).await;
+        let existing = snapshot(&app, &id_t).await;
         assert!(existing.visibility.quarantined_at.is_some());
         let scope = app.corpus_scope().await;
         let server = app.server();
@@ -1170,7 +1165,7 @@ async fn quarantined_changes_do_not_enter_live_centroid_arithmetic() {
             }
             _ => unreachable!(),
         }
-        let after = snapshot(&app, &id).await;
+        let after = snapshot(&app, &id_t).await;
         assert_eq!(after.scope, destination);
         assert_eq!(
             after.visibility, existing.visibility,
@@ -1183,12 +1178,12 @@ async fn quarantined_changes_do_not_enter_live_centroid_arithmetic() {
                 .unwrap()
                 .unwrap()
                 .0,
-            RecordId::parse_simple(&cluster).unwrap(),
+            cluster.clone(),
             "this must exercise the existing cluster path"
         );
         let read = app.population().await;
         let after_cluster = ScopedClusterRepo::new(app.db.inner(), &app.owner, &read)
-            .get(&cluster)
+            .get(&alexandria_storage::record_id_to_string(&cluster))
             .await
             .unwrap()
             .unwrap();

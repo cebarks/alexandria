@@ -239,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
             service.waiting().await?;
         }
         "http" => {
-            serve_http(server, &config).await?;
+            serve_http(server, &config, system).await?;
         }
         other => {
             anyhow::bail!("Unknown transport: {other}. Use 'stdio' or 'http'.");
@@ -380,7 +380,11 @@ async fn trusted_local_identity(
     Ok(Some(alexandria_mcp::auth::StdioIdentity::issued(principal)))
 }
 
-async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result<()> {
+async fn serve_http(
+    server: AlexandriaServer,
+    config: &Config,
+    system: alexandria_storage::access::SystemContext,
+) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
@@ -417,8 +421,13 @@ async fn serve_http(server: AlexandriaServer, config: &Config) -> anyhow::Result
         // The supervisor's own handle is what gets dropped here, deliberately: it exits on `cancel`,
         // which is the HTTP service's own token, so the loop stops when serving stops. Watching it
         // would mean awaiting the server's lifetime from inside the server.
-        let _dreaming =
-            dreaming::Jobs::spawn(server.db.clone(), config, cancel.clone(), liveness.clone());
+        let _dreaming = dreaming::Jobs::spawn(
+            server.db.clone(),
+            system.clone(),
+            config,
+            cancel.clone(),
+            liveness.clone(),
+        );
     } else {
         tracing::info!("dreaming scheduler disabled by [dreaming] enabled = false");
     }
