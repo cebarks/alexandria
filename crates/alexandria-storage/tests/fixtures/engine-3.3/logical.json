@@ -1,0 +1,425 @@
+{
+  "cluster": [
+    {
+      "centroid": [
+        0.6,
+        0.8
+      ],
+      "created_at": "2026-11-15T01:09:03.892216357Z",
+      "depth": 0,
+      "id": "cluster:fixture",
+      "label": "preserved centroid"
+    }
+  ],
+  "contains_cluster": [],
+  "contains_memory": [
+    {
+      "id": "contains_memory:fixture",
+      "in": "cluster:fixture",
+      "out": "fact:deleted"
+    }
+  ],
+  "contains_session_memory": [
+    {
+      "id": "contains_session_memory:fixture",
+      "in": "session:fixture",
+      "out": "fact:deleted"
+    }
+  ],
+  "embedding_config": [],
+  "extracted_from": [
+    {
+      "id": "extracted_from:fixture",
+      "in": "fact:deleted",
+      "out": "raw:fixture"
+    }
+  ],
+  "fact": [
+    {
+      "confidence": 0.5,
+      "content": "identical vector 0",
+      "created_at": "2026-11-15T01:09:03.888158660Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:0",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 1",
+      "created_at": "2026-11-15T01:09:03.888371790Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:1",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 2",
+      "created_at": "2026-11-15T01:09:03.888661439Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:2",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 3",
+      "created_at": "2026-11-15T01:09:03.888941899Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:3",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 4",
+      "created_at": "2026-11-15T01:09:03.889169169Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:4",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 5",
+      "created_at": "2026-11-15T01:09:03.889385179Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:5",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 6",
+      "created_at": "2026-11-15T01:09:03.889585969Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:6",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 7",
+      "created_at": "2026-11-15T01:09:03.889808069Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:7",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 8",
+      "created_at": "2026-11-15T01:09:03.890007628Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:8",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 9",
+      "created_at": "2026-11-15T01:09:03.890181848Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:9",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 10",
+      "created_at": "2026-11-15T01:09:03.890414598Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:10",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 11",
+      "created_at": "2026-11-15T01:09:03.890651568Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:11",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 12",
+      "created_at": "2026-11-15T01:09:03.890889498Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:12",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 13",
+      "created_at": "2026-11-15T01:09:03.891102378Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:13",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 14",
+      "created_at": "2026-11-15T01:09:03.891311677Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:14",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "identical vector 15",
+      "created_at": "2026-11-15T01:09:03.891545177Z",
+      "deleted": false,
+      "embedding": [
+        1.0,
+        0.0
+      ],
+      "id": "fact:15",
+      "metadata": {
+        "sentinel": "preserve"
+      },
+      "tags": [
+        "upgrade"
+      ]
+    },
+    {
+      "confidence": 0.5,
+      "content": "hidden deleted",
+      "created_at": "2026-11-15T01:09:03.891773067Z",
+      "deleted": true,
+      "embedding": [
+        0.6,
+        0.8
+      ],
+      "id": "fact:deleted",
+      "tags": []
+    },
+    {
+      "confidence": 0.5,
+      "content": "hidden quarantined",
+      "created_at": "2026-11-15T01:09:03.891959737Z",
+      "deleted": false,
+      "embedding": [
+        0.6,
+        0.8
+      ],
+      "id": "fact:quarantined",
+      "quarantined_at": "2026-01-01T00:00:00Z",
+      "tags": []
+    }
+  ],
+  "has_provenance": [
+    {
+      "id": "has_provenance:fixture",
+      "in": "fact:deleted",
+      "out": "provenance:fixture"
+    }
+  ],
+  "heat_state": [
+    {
+      "access_count": 3,
+      "heat": 0.75,
+      "id": "heat_state:fixture",
+      "last_touched": "2026-11-15T01:09:03.893257036Z",
+      "memory": "fact:deleted",
+      "stability": 2.0
+    }
+  ],
+  "maintenance_log": [],
+  "memory_edge": [],
+  "provenance": [
+    {
+      "agent_id": "legacy-writer",
+      "id": "provenance:fixture",
+      "kind": "test",
+      "model": "fixture",
+      "timestamp": "2026-11-15T01:09:03.892513196Z"
+    }
+  ],
+  "raw": [
+    {
+      "content": "original document",
+      "created_at": "2026-11-15T01:09:03.892364437Z",
+      "deleted": false,
+      "id": "raw:fixture",
+      "metadata": {
+        "sentinel": "raw"
+      }
+    }
+  ],
+  "reminder": [
+    {
+      "created_at": "2026-11-15T01:09:03.892920336Z",
+      "delivered_count": 0,
+      "due_at": "2030-01-01T00:00:00Z",
+      "id": "reminder:fixture",
+      "message": "keep reminder",
+      "next_due_at": "2030-01-01T00:00:00Z",
+      "schedule_kind": "once",
+      "status": "pending",
+      "weekdays": []
+    }
+  ],
+  "session": [
+    {
+      "external_id": "upgrade-session",
+      "id": "session:fixture",
+      "started_at": "2026-11-15T01:09:03.892639376Z",
+      "summary": "keep summary",
+      "tags": [
+        "upgrade"
+      ]
+    }
+  ],
+  "system_config": [
+    {
+      "id": "system_config:5elp8xczhqki1jooopyf",
+      "key": "schema_version",
+      "updated_at": "2026-11-15T01:09:03.884034233Z",
+      "value": "8"
+    },
+    {
+      "id": "system_config:9nl4auaisa8to26rwkio",
+      "key": "embedding_max_tokens",
+      "updated_at": "2026-11-15T01:09:03.885983791Z",
+      "value": "256"
+    },
+    {
+      "id": "system_config:hjnxt3rcwezjww227zx1",
+      "key": "embedding_dimensions",
+      "updated_at": "2026-11-15T01:09:03.885746072Z",
+      "value": "2"
+    },
+    {
+      "id": "system_config:lcyerch1iwhfrahggd4d",
+      "key": "embedding_model",
+      "updated_at": "2026-11-15T01:09:03.885489322Z",
+      "value": "upgrade-fixture"
+    }
+  ]
+}
