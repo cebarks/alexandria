@@ -1,21 +1,33 @@
 # Alexandria — Agent Context
 
-## SurrealDB 3.3 Gotchas (Critical)
+## SurrealDB Query and Storage Gotchas (Critical)
 
-These will bite you. SurrealDB 3.3 differs from docs and prior versions:
+The current official engine family is **4.0.1** (protocol 0.14.1, backend SurrealKV 1.2.0).
+The query traps below were identified on 3.3; historical version references are observations,
+not the current pin. Storage tests run on the current engine. Follow
+`docs/surrealdb-4-upgrade.md` for the tested Linux copy-first 3.3 conversion: never engine-open
+the original/backup with 4.x, explicitly admit conversion only on a disposable copy, rebuild HNSW,
+and verify application identity/data/vectors/centroids and the real index plan. Rollback is the
+untouched 3.3 backup plus old binary, never a 4.x-touched target, even at Legacy feature level.
+`surreal start` forwards `SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X`; embedded `surreal sql` does not
+read that datastore environment option. Application startup must not globally opt in or blindly
+rebuild indexes. Tests alone use explicit copy-scoped SDK `datastore_option` admission.
+
+Historical 3.3 query observations (retained where the shipped query still relies on them):
 
 - `value` is a **reserved word** — use `SELECT * FROM table` not `SELECT value FROM table`
 - `session` is **not** a reserved word, whatever the backticks in the repo's queries suggest: unquoted `SELECT * FROM session`, `CREATE session:1` and `UPDATE session … WHERE` work on 3.2.4 and 3.3.0, and `v006` runs `UPDATE session UNSET …` unquoted. The backticks are harmless. The `session` table is `SCHEMAFULL`, so writing an undefined field is an error rather than being stored.
 - `$session` is a **reserved bind parameter name** (SurrealDB's own connection session). Use another name — `session_repo.rs` uses `$sess`.
-- `DELETE table WHERE ...` and `DELETE FROM table WHERE ...` both parse and commit on the pinned 3.3.0 engine, and the repo uses each (`system_config.rs:set_config` omits `FROM`). A spelling choice, not a constraint
+- `DELETE table WHERE ...` and `DELETE FROM table WHERE ...` both parse and commit on the then-pinned 3.3.0 engine, and the repo uses each (`system_config.rs:set_config` omits `FROM`). A spelling choice, not a constraint
 - `RELATE` needs pre-parsed `RecordId` via `.bind()` — inline `type::record()` in RELATE fails
 - `type::record()` replaces `type::thing()` (removed in 3.x)
 - Query result structs need `#[derive(SurrealValue)]` from `surrealdb::types`
 - `RecordId` display/JSON formatting: use `record_id_to_string()`, not `.to_string()`. **It is not a parser-safe SQL round trip**, especially for numeric or quoted opaque keys. Bind typed `RecordId`/`RecordIdKeyRange` for queries; where an existing string API requires a SQL record literal, use `ToSql::to_sql()`.
 - Connection: `surrealdb::engine::any::connect("mem://")` with `kv-mem` feature; `surrealkv://path` with `kv-surrealkv`
 - To count filtered records reached by a graph traversal *inline in a SELECT*, the `WHERE` goes **inside** the traversal target's parentheses: `(->contains_session_memory->(fact WHERE deleted = false)).len()`. The obvious `(->edge->fact WHERE ...).len()` fails with `Unexpected token WHERE expected delimiter )`, and so do the `array::len(...)` and `count(...)` spellings — no N+1 fallback is needed once you find this.
-- An absent `option<T>` field is `NONE`, and **`IS NOT NULL` and `!= NULL` are both satisfied by `NONE`** — they filter nothing; only `field != NONE` (or `NOT (field = NONE)`, or `type::is_none(field) = false`) excludes it. Verified against the pinned 3.3.0 engine: with one `NONE` and one set row, `WHERE next_due_at IS NOT NULL` returned both and `WHERE next_due_at != NONE` returned one. This bites ordering too, because `NONE` sorts below every datetime: such a row wins the head of an `ORDER BY next_due_at ASC LIMIT n` page.
-- `ORDER BY x DESC NULLS LAST` does **not** parse, and neither does `ORDER BY type::coalesce(a, b) DESC`. NULL sorts *smaller* than any datetime, so `ORDER BY ended_at DESC` already parks NULL `ended_at` at the tail — but the ties among those rows are unspecified, so any `LIMIT`/`START` pagination needs an explicit unique secondary key (see `SessionRepo::list`).
+- An absent `option<T>` field is `NONE`, and **`IS NOT NULL` and `!= NULL` are both satisfied by `NONE`** — they filter nothing; only `field != NONE` (or `NOT (field = NONE)`, or `type::is_none(field) = false`) excludes it. Verified against the then-pinned 3.3.0 engine: with one `NONE` and one set row, `WHERE next_due_at IS NOT NULL` returned both and `WHERE next_due_at != NONE` returned one. This bites ordering too, because `NONE` sorts below every datetime: such a row wins the head of an `ORDER BY next_due_at ASC LIMIT n` page.
+- 3.3 rejected `ORDER BY x DESC NULLS LAST` and `ORDER BY type::coalesce(a, b) DESC`. Do not assume all expression sorts are still rejected: 4.0 accepts `ORDER BY array::len(tags)`, and `FactSort::TagCount` now uses it directly without an alias projection. The closed literal allowlist and unique tie-break remain. The shipped date sorts still rely on tested NULL placement, not those historical parse errors: descending parks NULL at the tail; paginated ties need a unique secondary key (see `SessionRepo::list`).
+- 4.0's `array::group` deduplicates across grouped rows, unlike the prior tag-histogram query. `top_tags` reads only the live rows' tags and counts occurrences in Rust, preserving repetitions with one query. Keep the shared live predicate, descending count/name tie-break and cap; do not reintroduce the deduplicating aggregate.
 
 - Typed cursor paging uses a bound `RecordIdKeyRange` in `FROM $records`: `WHERE id > $cursor` instead plans as a repeated `TableScan`, even with `ORDER BY id LIMIT n`. `reembed_page_plan_seeks_a_bound_record_range_not_a_repeated_table_scan` pins the `RecordIdScan` plan.
 - `SELECT * OMIT embedding FROM $records` is the projection used by metadata attestation; omit vector fields in SQL rather than fetching them and stripping them in Rust.
@@ -50,9 +62,10 @@ These will bite you. SurrealDB 3.3 differs from docs and prior versions:
   `embedding <|k,150|> $q` (plan `KnnScan`), while `MemoryRepo::nearest()` issues
   `embedding <|k,COSINE|> $q`, which is a brute-force scan (`KnnTopK`) whether or not the index
   exists. `bench-retrieval` calls `nearest_indexed` too, after defining the index on its snapshot,
-  so its overlap line measures the index. `<|k,ef|>` without an index returns **no rows** on 3.3
-  (the planner evaluates the KNN condition per row as `false`; 3.2 stripped it to an unranked
-  plain scan), so `do_retrieve_memories` picks by
+  so its overlap line measures the index. `<|k,ef|>` without an index **errors on 4.0** (3.3
+  silently returned no rows; 3.2 stripped it to an unranked plain scan). The positive-control
+  regression is `nearest_indexed_without_an_index_errors_and_with_one_returns_rows`.
+  `do_retrieve_memories` still picks by
   `AlexandriaServer::vector_index`, which `main.rs` sets only when the define succeeded — a failed
   define logs an error and boots on the brute-force path (most tests never define the index and
   take that path too). `test_nearest_indexed_plan_uses_the_hnsw_index` asserts the plan, because
@@ -179,7 +192,7 @@ These will bite you. SurrealDB 3.3 differs from docs and prior versions:
 
 - The repo intentionally carries no `rust-toolchain.toml` and no `.cargo/config.toml` — `rust-version = "1.99"` + edition 2024 are the only compiler statement; mold/`target-cpu` live in each dev's `~/.cargo/config.toml` (see TODO-misc "Build / toolchain"). Don't re-add them to the repo.
 - Use the `just` recipes (they match CI; bare `just` lists every one, including the few not named here): `just test` (all-feature Rust), `just test-cpu` (CPU-only admission), `just cpu-deps` (CPU binary normal/build graph rejects known GPU backend/native packages; permits shared CubeCL utilities), `just artifact-ci` (standalone curator fmt/Clippy/hermetic tests/deny, no official model conversion), `just eval-test` (dependency-free Python scorer), `just ext-test` (pi companion: `npm run typecheck` + `npm test`, needs `just ext-install` once per checkout since `node_modules/` is gitignored), `just lint`, `just fmt`, `just ci` (fmt + lint + both Rust feature sets + curator + scorer + ext-test + `cargo deny` + `verify-assets`). `.github/workflows/ci.yml` mirrors it with a separate `Pi companion` job — the workflow does not call `just ci`, so a new gate has to be added in both places. `just verify-assets` checks `assets/SHA256SUMS`; `just vendor-assets` re-downloads the assets and re-verifies. `just install-hooks` wires `.githooks/pre-commit`.
-- `surrealdb` is pinned `=3.3.0` in `[workspace.dependencies]`, and `lint`/`test`/`check`/`run` pass `--locked`. An engine **minor** here is a storage-format decision, not a dependency bump: 3.3 rewrites table definitions (the graph fold) and HNSW pending-queue entries at revisions a 3.2 build cannot decode, and the store cannot be rolled back once that happens (README, "Upgrading a deployment"). A caret range plus lock-resolving recipes let `cargo update` walk the engine with no manifest edit and nobody re-reading that note — which is the same class of thing this repo already treats as a boot-time refusal, like the embedding-model lock. The SDK pin does not freeze its internal `surrealdb-*` crates: their compatible ranges can still move during a full update. Preserve the whole resolved family at 3.3.0 during ordinary refreshes and review any engine-family change separately against the README's claims; `just deny` is the exception, since `cargo deny` reads the lock and has no `--locked`.
+- `surrealdb` is pinned `=4.0.1` in `[workspace.dependencies]`, and `lint`/`test`/`check`/`run` pass `--locked`. Engine releases are storage-format decisions, not ordinary dependency bumps: the earlier 3.2→3.3 boundary was already one-way, and the 3.3→4.0 physical conversion is experimental, copy-only, and requires an index rebuild (see `docs/surrealdb-4-upgrade.md`). The SDK pin does not freeze internal `surrealdb-*` ranges; preserve the whole resolved family at 4.0.1 and independently versioned protocol/backend at 0.14.1/1.2.0 during ordinary refreshes. Review engine-family changes separately. `just deny` reads the lock and has no `--locked`. `docs/dependency-advisories.md` records the explicit, still-vulnerable crypto risk acceptance; do not describe its ignore as remediation or add unrelated exceptions.
 - Run tests on **stable**, not nightly: `diskann-wide` (SurrealDB transitive dep) fails trait inference on its NEON intrinsics under recent nightlies on aarch64, and the failure looks like it originates in this workspace. Run the suite with `just test` (Rust) and `just ext-test` (extension); there is also one `#[ignore]`d 130 s wall-clock delivery test that no gate runs (`cargo test -p alexandria --test reminders_test -- --ignored`). Test counts are deliberately not recorded here; they went stale in every doc that carried one.
 - Integration tests use `Database::connect_embedded()` (in-memory SurrealDB), so no disk state leaks between them. One deliberate exception opens a persistent SurrealKV store under a `tempfile::tempdir()` and reconnects to it, to prove round-trip survival; the tempdir keeps it isolated all the same.
 - `CandleProvider` tests download the real model on first run (~80MB) — they're slow the first time.
@@ -267,6 +280,9 @@ These will bite you. SurrealDB 3.3 differs from docs and prior versions:
 
 - `README.md` — feature/tool overview, quick start, deployment (systemd, Docker), debug UI
 - `docs/configuration.md` — every server and client config key, env overrides, XDG migration
+- `docs/surrealdb-4-upgrade.md` — tested Linux offline copy-first 3.3→4.0.1 procedure, mandatory HNSW rebuild, preservation checks and backup-only rollback
+- `docs/dependency-advisories.md` — patched dependencies, explicitly accepted crypto risk, exact policy changes and current validation
+- `CHANGELOG.md` — user-visible security changes and storage upgrade boundary
 - `docs/session-memory.md` — session data model, lifecycle, tool semantics, current limitations
 - `docs/minilm-test-data.md` — retrieval measurements for the embedding model, how to rerun
   `alexandria bench-retrieval`, metric definitions, and the frozen question set

@@ -9,6 +9,17 @@ Alexandria loads server config with this precedence:
    - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
 3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_EMBEDDING_BATCH_SIZE`, `ALEXANDRIA_EMBEDDING_MAX_TOKENS`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
 
+## Storage engine upgrades
+
+The embedded engine is pinned to SurrealDB 4.0.1. Keep the existing data path and
+embedding identity/token budget unchanged until the [offline copy-first upgrade
+procedure](surrealdb-4-upgrade.md) is complete and an operator separately approves
+cutover. `SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X` is an **external SurrealDB operator**
+option forwarded by `surreal start`, not an Alexandria config key or a global
+application migration switch. Ordinary startup refuses unconverted 3.x files
+and does not rebuild old HNSW indexes automatically. Never use embedding migration
+or identity overrides to bypass a physical-format refusal.
+
 ## Full Example
 
 ```toml
