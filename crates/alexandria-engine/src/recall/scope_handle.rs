@@ -2,6 +2,33 @@ use alexandria_storage::models::ClusterVersion;
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+/// A cluster's canonical display-form locator carried in the recall wire handle.
+///
+/// The engine does not parse or validate record IDs: the MCP/storage boundary owns native parsing and
+/// caller-scoped resolution. This wrapper makes the locator distinct from arbitrary algorithm strings
+/// without coupling the engine to SurrealDB's `RecordId`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ClusterHandle(String);
+
+impl ClusterHandle {
+    /// Keep the canonical display form unchanged for the MCP boundary to resolve.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ClusterHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
 
 /// The handle progressive recall issues for one cluster and accepts on the next call.
 ///
@@ -20,7 +47,7 @@ use serde::{Deserialize, Serialize};
 /// would be a public change for a word.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecallHandle {
-    pub cluster_id: String,
+    pub cluster_id: ClusterHandle,
     /// `#[serde(default)]` because a handle minted before this field existed carries no version, and an
     /// in-flight client must not start failing mid-conversation: the absent stamp is the version the
     /// store starts a cluster at, and the server serves current data either way.
@@ -32,7 +59,7 @@ impl RecallHandle {
     /// The handle for one cluster, stamped with the version the issuing read saw.
     pub fn new(cluster_id: impl Into<String>, version: ClusterVersion) -> Self {
         Self {
-            cluster_id: cluster_id.into(),
+            cluster_id: ClusterHandle::new(cluster_id),
             version,
         }
     }

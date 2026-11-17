@@ -40,6 +40,9 @@ fn test_recall_handle_roundtrip_carries_locator_and_version() {
         },
     );
 
+    let json = serde_json::to_value(&handle).unwrap();
+    assert_eq!(json["cluster_id"], "cluster:abc123");
+
     let decoded = RecallHandle::decode(&handle.encode().unwrap()).unwrap();
 
     assert_eq!(decoded.cluster_id, handle.cluster_id);
@@ -56,7 +59,7 @@ fn test_recall_handle_roundtrip_carries_locator_and_version() {
 fn a_handle_issued_before_the_version_field_still_decodes() {
     let legacy = base64url("{\"cluster_id\":\"cluster:old\",\"depth\":0,\"issued_at\":1}");
     let decoded = RecallHandle::decode(&legacy).expect("a pre-version handle must still decode");
-    assert_eq!(decoded.cluster_id, "cluster:old");
+    assert_eq!(decoded.cluster_id.as_str(), "cluster:old");
     assert_eq!(decoded.version.membership_revision, None);
     assert_eq!(decoded.version.members, 0);
 }
@@ -157,7 +160,7 @@ fn broad_recall_stamps_the_issue_time_version_into_the_handle() {
     )
     .unwrap();
 
-    assert_eq!(handle.cluster_id, "c1");
+    assert_eq!(handle.cluster_id.as_str(), "c1");
     assert_eq!(handle.version.membership_revision, Some(4));
     assert_eq!(handle.version.members, 1);
 }

@@ -1188,42 +1188,60 @@ mod tests {
     ///
     /// `propose` is Task 8's tool and already has transport coverage; what is under test here is the
     /// *decision*, so the proposal is fixture rather than subject.
-    async fn propose(app: &AuthenticatedTestApp, fact: &str) -> String {
-        let handle = RecordId::parse_simple(fact).expect("a fixture fact id");
+    async fn propose(app: &AuthenticatedTestApp, handle: &RecordId) -> (String, RecordId) {
         let reference = ClassificationRepo::new(app.db.inner(), &app.owner)
             .propose(
-                &FactId::try_from(handle).expect("a fact id"),
+                &FactId::try_from(handle.clone()).expect("a fact id"),
                 Version::new(0),
                 MemoryScope::Personal,
                 Some("a fixture suggestion"),
             )
             .await
             .expect("a proposal");
-        format!("{}:{}", reference.id, reference.revision.get())
+        let proposal_id = reference.id.clone();
+        let rows: Vec<alexandria_storage::models::ClassificationProposal> = app
+            .db
+            .inner()
+            .query("SELECT * FROM classification_proposal;")
+            .await
+            .expect("listing fixture proposals")
+            .check()
+            .expect("the proposal list ran")
+            .take(0)
+            .expect("the proposal rows decode");
+        let typed_id = rows
+            .into_iter()
+            .filter_map(|proposal| proposal.id)
+            .find(|id| alexandria_storage::record_id_to_string(id) == proposal_id)
+            .expect("the newly created proposal has a typed record id");
+        (
+            format!("{}:{}", proposal_id, reference.revision.get()),
+            typed_id,
+        )
     }
 
     #[tokio::test]
     async fn exact_history_disclosures_show_stored_values_without_widening_access() {
         let app = authenticated_on_server(test_server().await).await;
-        let a = app.own_project("history-a").await;
-        let b = app.own_project("history-b").await;
-        let project = |id: &str| {
-            MemoryScope::Project(RecordId::parse_simple(id).unwrap().try_into().unwrap())
-        };
+        let a_id = app.own_project_id("history-a").await;
+        let a = alexandria_storage::record_id_to_string(&a_id);
+        let b_id = app.own_project_id("history-b").await;
+        let b = alexandria_storage::record_id_to_string(&b_id);
+        let project = |id: &RecordId| MemoryScope::Project(id.clone().try_into().unwrap());
         let (mover, mover_t) = app
             .seed_personal("history <script>history-danger</script> & exact values")
             .await;
-        let (stayer, stayer_t) = app.seed_personal("history source survivor").await;
+        let (_stayer, stayer_t) = app.seed_personal("history source survivor").await;
         let (hidden, hidden_t) = app
             .seed_quarantined_unassigned("retained hidden history member")
             .await;
-        let (destination_member, destination_member_t) =
+        let (_destination_member, destination_member_t) =
             app.seed_personal("history destination survivor").await;
         for (id, destination, key) in [
-            (&mover, project(&a), "history-mover-a"),
-            (&stayer, project(&a), "history-survivor-a"),
-            (&hidden, project(&a), "history-hidden-a"),
-            (&destination_member, project(&b), "history-survivor-b"),
+            (&mover_t, project(&a_id), "history-mover-a"),
+            (&stayer_t, project(&a_id), "history-survivor-a"),
+            (&hidden_t, project(&a_id), "history-hidden-a"),
+            (&destination_member_t, project(&b_id), "history-survivor-b"),
         ] {
             assert!(app.move_row(id, destination, key).await);
         }
@@ -1245,7 +1263,7 @@ mod tests {
         app.db
             .inner()
             .query("UPDATE $fact SET confidence = 0.512345;")
-            .bind(("fact", RecordId::parse_simple(&mover).unwrap()))
+            .bind(("fact", mover_t.clone()))
             .await
             .unwrap()
             .check()
@@ -1630,8 +1648,8 @@ mod tests {
     #[tokio::test]
     async fn dismissing_a_proposal_decides_it_without_moving_anything() {
         let app = authenticated_on_server(test_server().await).await;
-        let (id, _id_t) = app.seed_personal("a memory an agent guessed at").await;
-        let proposal = propose(&app, &id).await;
+        let (_id, id_t) = app.seed_personal("a memory an agent guessed at").await;
+        let (proposal, _) = propose(&app, &id_t).await;
 
         let (status, _) = app
             .post(
@@ -1678,10 +1696,10 @@ mod tests {
     async fn approving_a_proposal_files_the_memory_and_keeps_quarantine() {
         let app = authenticated_on_server(test_server().await).await;
         // The review partition's own state: quarantined, awaiting a human decision.
-        let (id, _) = app
+        let (_id, id_t) = app
             .seed_quarantined_unassigned("a quarantined memory awaiting a decision")
             .await;
-        let proposal = propose(&app, &id).await;
+        let (proposal, _) = propose(&app, &id_t).await;
 
         let (status, body) = app
             .post(
@@ -2025,14 +2043,14 @@ mod tests {
     #[tokio::test]
     async fn two_checked_boxes_approve_both_proposals_and_journal_two_moves() {
         let app = authenticated_on_server(test_server().await).await;
-        let (first, _first_t) = app
+        let (first, first_t) = app
             .seed_personal("the first memory an owner approves")
             .await;
-        let (second, _second_t) = app
+        let (second, second_t) = app
             .seed_personal("the second memory an owner approves")
             .await;
-        let first_reference = propose(&app, &first).await;
-        let second_reference = propose(&app, &second).await;
+        let (first_reference, _) = propose(&app, &first_t).await;
+        let (second_reference, _) = propose(&app, &second_t).await;
         // The control both, exactly as two checked boxes post it: one `selected` pair each, no joining.
         let (status, location, _) = app
             .post_form_located(
@@ -2092,13 +2110,10 @@ mod tests {
     #[tokio::test]
     async fn two_checked_boxes_dismiss_both_without_writing_a_journal_row() {
         let app = authenticated_on_server(test_server().await).await;
-        let first_reference =
-            propose(&app, &app.seed_personal("a memory dismissed first").await.0).await;
-        let second_reference = propose(
-            &app,
-            &app.seed_personal("a memory dismissed second").await.0,
-        )
-        .await;
+        let (_, first_id) = app.seed_personal("a memory dismissed first").await;
+        let (_, second_id) = app.seed_personal("a memory dismissed second").await;
+        let (first_reference, _) = propose(&app, &first_id).await;
+        let (second_reference, _) = propose(&app, &second_id).await;
         let (status, location, _) = app
             .post_form_located(
                 "/debug/classification/decide",
@@ -2143,7 +2158,8 @@ mod tests {
     #[tokio::test]
     async fn one_checked_box_still_works_and_a_tampered_one_is_refused_whole() {
         let app = authenticated_on_server(test_server().await).await;
-        let lone = propose(&app, &app.seed_personal("a lone approval").await.0).await;
+        let (_, lone_id) = app.seed_personal("a lone approval").await;
+        let (lone, _) = propose(&app, &lone_id).await;
         let (status, location, _) = app
             .post_form_located(
                 "/debug/classification/decide",
@@ -2162,11 +2178,8 @@ mod tests {
 
         // A body where one of the two values is not a reference at all: refused *as a whole*, because
         // quietly applying the parseable half is a different act from the one the owner took.
-        let second = propose(
-            &app,
-            &app.seed_personal("a memory nobody decided for").await.0,
-        )
-        .await;
+        let (_, second_id) = app.seed_personal("a memory nobody decided for").await;
+        let (second, _) = propose(&app, &second_id).await;
         let (status, location, _) = app
             .post_form_located(
                 "/debug/classification/decide",
@@ -2205,8 +2218,8 @@ mod tests {
     #[tokio::test]
     async fn an_empty_tags_field_keeps_the_tags_and_the_clear_control_removes_them() {
         let app = authenticated_on_server(test_server().await).await;
-        let (id, _id_t) = app.seed_personal("a memory with tags worth keeping").await;
-        app.set_tags(&id, &["keep-me".to_string(), "and-me".to_string()])
+        let (id, id_t) = app.seed_personal("a memory with tags worth keeping").await;
+        app.set_tags(&id_t, &["keep-me".to_string(), "and-me".to_string()])
             .await;
         let revision = rendered_revision(&app, &id).await;
 
@@ -2331,12 +2344,12 @@ mod tests {
     #[tokio::test]
     async fn a_move_binds_the_revision_the_page_rendered_and_a_stale_one_is_refused() {
         let app = authenticated_on_server(test_server().await).await;
-        let (id, _id_t) = app.seed_personal("a memory whose page went stale").await;
+        let (id, id_t) = app.seed_personal("a memory whose page went stale").await;
         let revision = rendered_revision(&app, &id).await;
 
         // Somebody else edits the row between the page render and the click — here, through the same
         // journaled writer a second owner's page would use.
-        app.bump_semantic_revision(&id).await;
+        app.bump_semantic_revision(&id_t).await;
 
         let destination = app.own_project("stale-destination").await;
         let (status, location, _) = app
@@ -2634,10 +2647,10 @@ mod tests {
     #[tokio::test]
     async fn revising_a_destination_invalidates_the_approval_it_replaced() {
         let app = authenticated_on_server(test_server().await).await;
-        let (id, _id_t) = app
+        let (_id, id_t) = app
             .seed_personal("a memory whose destination changes")
             .await;
-        let proposal = propose(&app, &id).await;
+        let (proposal, _) = propose(&app, &id_t).await;
         let (handle, revision) = proposal
             .rsplit_once(':')
             .expect("a proposal reference carries its revision");
@@ -2930,10 +2943,10 @@ mod tests {
     async fn the_rendered_revise_form_carries_its_revision_on_both_pages() {
         for path in ["/debug/collections", "/debug/classification"] {
             let app = authenticated_on_server(test_server().await).await;
-            let (id, _id_t) = app
+            let (_id, id_t) = app
                 .seed_personal("a memory whose rendered destination changes")
                 .await;
-            let proposal = propose(&app, &id).await;
+            let (proposal, proposal_id) = propose(&app, &id_t).await;
             let handle = proposal
                 .rsplit_once(':')
                 .expect("a proposal reference")
@@ -2962,7 +2975,9 @@ mod tests {
                 .expect("a revision field");
             assert_eq!(
                 rendered,
-                store_proposal_revision(&app, &handle).await.to_string(),
+                store_proposal_revision(&app, &proposal_id)
+                    .await
+                    .to_string(),
                 "the revision the {path} form posts is not the revision the proposal carries"
             );
 
@@ -3011,7 +3026,7 @@ mod tests {
                 !location.contains("error=") && location.contains("revision%201"),
                 "the revise did not report a moved revision on {path}: {location}"
             );
-            let (kind, revision) = store_proposal_destination(&app, &handle).await;
+            let (kind, revision) = store_proposal_destination(&app, &proposal_id).await;
             assert_eq!(revision, 1, "the revision did not move on {path}");
             assert_eq!(
                 kind, chosen,
@@ -3025,10 +3040,10 @@ mod tests {
     async fn a_revise_form_extracted_before_a_newer_revision_is_refused() {
         for path in ["/debug/collections", "/debug/classification"] {
             let app = authenticated_on_server(test_server().await).await;
-            let (id, _id_t) = app
+            let (_id, id_t) = app
                 .seed_personal("a memory with a superseded revision")
                 .await;
-            let proposal = propose(&app, &id).await;
+            let (proposal, proposal_id) = propose(&app, &id_t).await;
             let handle = proposal
                 .rsplit_once(':')
                 .expect("a proposal reference")
@@ -3071,7 +3086,7 @@ mod tests {
                 "the superseded revise form was accepted rather than refused on {path}: {location}"
             );
             assert_eq!(
-                store_proposal_revision(&app, &handle).await,
+                store_proposal_revision(&app, &proposal_id).await,
                 1,
                 "a superseded revise form moved the revision again on {path}"
             );
@@ -3086,8 +3101,8 @@ mod tests {
     #[tokio::test]
     async fn no_owner_page_parents_a_form_from_a_table_row() {
         let app = authenticated_on_server(test_server().await).await;
-        let (id, _id_t) = app.seed_personal("a memory with a rendered decision").await;
-        let proposal = propose(&app, &id).await;
+        let (_id, id_t) = app.seed_personal("a memory with a rendered decision").await;
+        let (proposal, _) = propose(&app, &id_t).await;
         let handle = proposal
             .split(':')
             .next()
@@ -3140,27 +3155,20 @@ mod tests {
     }
 
     /// The revision a proposal row carries, read from the store rather than from any render.
-    async fn store_proposal_revision(app: &AuthenticatedTestApp, handle: &str) -> i64 {
-        store_proposal_destination(app, handle).await.1
+    async fn store_proposal_revision(app: &AuthenticatedTestApp, id: &RecordId) -> i64 {
+        store_proposal_destination(app, id).await.1
     }
 
     /// The proposal's stored destination kind and revision.
-    async fn store_proposal_destination(app: &AuthenticatedTestApp, handle: &str) -> (String, i64) {
+    async fn store_proposal_destination(
+        app: &AuthenticatedTestApp,
+        id: &RecordId,
+    ) -> (String, i64) {
         let rows: Vec<Json> = app
             .db
             .inner()
-            .query(
-                "SELECT destination_kind, revision FROM type::record('classification_proposal', $key) \
-                 WHERE id = $id LIMIT 1;",
-            )
-            .bind((
-                "key",
-                handle
-                    .split_once(':')
-                    .map(|(_, key)| key.to_string())
-                    .expect("a proposal handle"),
-            ))
-            .bind(("id", RecordId::parse_simple(handle).expect("a proposal id")))
+            .query("SELECT destination_kind, revision FROM $id LIMIT 1;")
+            .bind(("id", id.clone()))
             .await
             .expect("the proposal read ran")
             .check()
@@ -3169,7 +3177,7 @@ mod tests {
             .expect("the proposal decodes");
         let row = rows
             .first()
-            .unwrap_or_else(|| panic!("no stored proposal for {handle}"));
+            .unwrap_or_else(|| panic!("no stored proposal for {id:?}"));
         (
             row["destination_kind"]
                 .as_str()
@@ -3273,26 +3281,22 @@ mod tests {
     #[tokio::test]
     async fn a_corrupt_destination_population_is_not_replaced_by_the_arriving_vector() {
         let app = authenticated_on_server(test_server().await).await;
-        let project = app.own_project("corrupt-project").await;
-        let destination = MemoryScope::Project(
-            RecordId::parse_simple(&project)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
+        let project_id = app.own_project_id("corrupt-project").await;
+        let project = alexandria_storage::record_id_to_string(&project_id);
+        let destination = MemoryScope::Project(project_id.clone().try_into().unwrap());
         let corrupt = app
             .seed_cluster(Some("corrupt dimension"), &[0.1, 0.2])
             .await;
         for n in 0..2 {
-            let (member, member_t) = app.seed_personal(&format!("corrupt member {n}")).await;
+            let (_member, member_t) = app.seed_personal(&format!("corrupt member {n}")).await;
             assert!(
-                app.move_row(&member, destination.clone(), &format!("seed-corrupt-{n}"))
+                app.move_row(&member_t, destination.clone(), &format!("seed-corrupt-{n}"))
                     .await
             );
             app.db
                 .inner()
                 .query("UPDATE $member SET embedding = [0.1, 0.2, 0.3];")
-                .bind(("member", RecordId::parse_simple(&member).unwrap()))
+                .bind(("member", member_t.clone()))
                 .await
                 .unwrap()
                 .check()
@@ -3319,7 +3323,7 @@ mod tests {
             "the scope move itself must still work: {location}"
         );
         let repo = MutationRepo::new(app.db.inner());
-        let fact = FactId::try_from(RecordId::parse_simple(&mover).unwrap()).unwrap();
+        let fact = FactId::try_from(_mover_t.clone()).unwrap();
         assert_eq!(
             repo.expected_state(&app.owner, &fact).await.unwrap().scope,
             destination
@@ -3350,17 +3354,16 @@ mod tests {
     #[tokio::test]
     async fn constant_vector_browser_moves_choose_the_destination_partition_not_the_source() {
         let app = authenticated_on_server(test_server().await).await;
-        let a = app.own_project("project-a").await;
-        let b = app.own_project("project-b").await;
-        let a_scope = MemoryScope::Project(RecordId::parse_simple(&a).unwrap().try_into().unwrap());
-        let b_scope = MemoryScope::Project(RecordId::parse_simple(&b).unwrap().try_into().unwrap());
-        let (b_member, b_member_t) = app.seed_personal("classified into B first").await;
+        let a_id = app.own_project_id("project-a").await;
+        let a = alexandria_storage::record_id_to_string(&a_id);
+        let b_id = app.own_project_id("project-b").await;
+        let b = alexandria_storage::record_id_to_string(&b_id);
+        let a_scope = MemoryScope::Project(a_id.clone().try_into().unwrap());
+        let b_scope = MemoryScope::Project(b_id.clone().try_into().unwrap());
+        let (_b_member, b_member_t) = app.seed_personal("classified into B first").await;
         let proposal = ClassificationRepo::new(app.db.inner(), &app.owner)
             .propose(
-                &RecordId::parse_simple(&b_member)
-                    .unwrap()
-                    .try_into()
-                    .unwrap(),
+                &FactId::try_from(b_member_t.clone()).unwrap(),
                 Version::ZERO,
                 b_scope.clone(),
                 None,
@@ -3379,8 +3382,8 @@ mod tests {
             "classification must create B's candidate: {location}"
         );
 
-        let (a_member, a_member_t) = app.seed_personal("A's surviving member").await;
-        assert!(app.move_row(&a_member, a_scope.clone(), "seed-a").await);
+        let (_a_member, a_member_t) = app.seed_personal("A's surviving member").await;
+        assert!(app.move_row(&a_member_t, a_scope.clone(), "seed-a").await);
         let a_cluster = app.seed_cluster(Some("A"), &[0.1, 0.2]).await;
         app.add_cluster_member(&a_cluster, &a_member_t).await;
         let (mover, mover_t) = app.seed_personal("same-vector memory moves twice").await;
@@ -3392,7 +3395,7 @@ mod tests {
             .await;
         let repo = MutationRepo::new(app.db.inner());
         let b_cluster = repo
-            .cluster_of(&app.owner, &RecordId::parse_simple(&b_member).unwrap())
+            .cluster_of(&app.owner, &b_member_t)
             .await
             .unwrap()
             .unwrap()
@@ -3408,7 +3411,7 @@ mod tests {
             "SELECT count() AS n FROM semantic_operation GROUP ALL;",
         )
         .await;
-        let target = RecordId::parse_simple(&mover).unwrap();
+        let target = mover_t.clone();
         let fact = FactId::try_from(target.clone()).unwrap();
         for (step, project, scope, cluster) in [
             (1, &a, a_scope, a_cluster.clone()),
@@ -3440,7 +3443,7 @@ mod tests {
                 repo.expected_state(&app.owner, &fact).await.unwrap().scope,
                 scope
             );
-            assert_eq!(app.semantic_revision(&mover).await, step);
+            assert_eq!(app.semantic_revision(&mover_t).await, step);
             assert_eq!(
                 repo.cluster_of(&app.owner, &target)
                     .await

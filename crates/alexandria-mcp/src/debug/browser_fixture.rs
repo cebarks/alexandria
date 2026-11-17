@@ -7,7 +7,6 @@ use alexandria_storage::models::{FactId, MemoryScope, Version};
 use alexandria_storage::repos::ClassificationRepo;
 use axum::routing::get;
 use serde_json::{Value, json};
-use surrealdb::types::RecordId;
 
 use super::test_support::{AuthenticatedTestApp, PASSWORD, test_server};
 use super::{WebBoundary, WebPolicy};
@@ -31,9 +30,12 @@ async fn owner_browser_fixture() {
 
     // A tagged memory, so a text-only save can be shown to preserve the tag set (H2) and the explicit
     // clear control shown to remove it.
-    let (tagged, _) = alice.seed_personal("Fixture tagged lesson <before>").await;
+    let (tagged, tagged_id) = alice.seed_personal("Fixture tagged lesson <before>").await;
     alice
-        .set_tags(&tagged, &["fixture-tag".to_string(), "keep-me".to_string()])
+        .set_tags(
+            &tagged_id,
+            &["fixture-tag".to_string(), "keep-me".to_string()],
+        )
         .await;
     let (editable, _) = alice
         .seed_personal("Fixture original owner lesson <before>")
@@ -43,7 +45,7 @@ async fn owner_browser_fixture() {
         .await;
     // The second row the multi-select journey needs: two proposals, checked together, approved in one
     // post that a real browser sends as two repeated `selected` pairs.
-    let (multi_second, _) = alice
+    let (_multi_second, multi_second_id) = alice
         .seed_personal("Fixture second classification candidate")
         .await;
     let (unassigned, unassigned_t) = alice
@@ -54,22 +56,22 @@ async fn owner_browser_fixture() {
     // Two projects of Alice's own, so a project move and a destination change are both selectable by a
     // human rather than typed as a guess. `own_project` establishes through the scoped repo, so the rows
     // carry Alice's account and workspace and the resolver can find them by handle.
-    let project_a = alice.own_project("fixture-project-a").await;
-    let project_b = alice.own_project("fixture-project-b").await;
+    let project_a_id = alice.own_project_id("fixture-project-a").await;
+    let project_a = alexandria_storage::record_id_to_string(&project_a_id);
+    let project_b_id = alice.own_project_id("fixture-project-b").await;
+    let project_b = alexandria_storage::record_id_to_string(&project_b_id);
     // A row already inside a project, so a project→personal and project→project move are both reachable
     // from the listing without first performing one.
     let (in_project, in_project_t) = alice
         .seed_personal("Fixture project memory already filed")
         .await;
-    let in_project_revision = alice.semantic_revision(&in_project).await;
+    let in_project_revision = alice.semantic_revision(&in_project_t).await;
     let moved = alice
         .move_row(
-            &in_project,
+            &in_project_t,
             MemoryScope::Project(
-                alexandria_storage::models::ProjectId::try_from(
-                    RecordId::parse_simple(&project_a).expect("a fixture project handle"),
-                )
-                .expect("a project id"),
+                alexandria_storage::models::ProjectId::try_from(project_a_id.clone())
+                    .expect("a project id"),
             ),
             &format!("fixture-move-{in_project_revision}"),
         )
@@ -92,16 +94,14 @@ async fn owner_browser_fixture() {
         )
         .await
         .unwrap();
-    let second_id = FactId::try_from(RecordId::parse_simple(&multi_second).unwrap()).unwrap();
+    let second_id = FactId::try_from(multi_second_id.clone()).unwrap();
     let second_proposal = classify
         .propose(
             &second_id,
-            Version::new(alice.semantic_revision(&multi_second).await),
+            Version::new(alice.semantic_revision(&multi_second_id).await),
             MemoryScope::Project(
-                alexandria_storage::models::ProjectId::try_from(
-                    RecordId::parse_simple(&project_b).expect("a fixture project handle"),
-                )
-                .expect("a project id"),
+                alexandria_storage::models::ProjectId::try_from(project_b_id.clone())
+                    .expect("a project id"),
             ),
             Some("Synthetic second candidate for the multi-select journey"),
         )
@@ -111,12 +111,12 @@ async fn owner_browser_fixture() {
     // The stale-control row: a memory whose rendered revision is about to be moved forward behind the
     // page's back. The fixture prints the *rendered* revision it had before the bump, so the parent's
     // journey can post exactly what a stale page would post and observe the refusal.
-    let (stale, _) = alice
+    let (stale, stale_id) = alice
         .seed_personal("Fixture memory with a stale control")
         .await;
-    let stale_rendered = alice.semantic_revision(&stale).await;
-    alice.bump_semantic_revision(&stale).await;
-    let stale_current = alice.semantic_revision(&stale).await;
+    let stale_rendered = alice.semantic_revision(&stale_id).await;
+    alice.bump_semantic_revision(&stale_id).await;
+    let stale_current = alice.semantic_revision(&stale_id).await;
 
     // A session with memories in two partitions, so the archive's mixed-scope label is a fact the journey
     // can observe rather than a claim in a comment: one row is Personal, one was filed into a project, and

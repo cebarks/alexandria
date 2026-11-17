@@ -624,13 +624,8 @@ async fn ledger(app: &AuthenticatedTestApp) -> (usize, usize) {
 #[tokio::test]
 async fn pinned_move_refreshes_guards_and_centroids_without_selecting_a_new_winner() {
     let app = authenticated_on_server(test_server().await).await;
-    let project = app.own_project("pinned-project").await;
-    let destination = MemoryScope::Project(
-        RecordId::parse_simple(&project)
-            .unwrap()
-            .try_into()
-            .unwrap(),
-    );
+    let project_id = app.own_project_id("pinned-project").await;
+    let destination = MemoryScope::Project(project_id.clone().try_into().unwrap());
     let (original, _) = population(
         &app,
         destination.clone(),
@@ -761,13 +756,9 @@ async fn pinned_move_refreshes_guards_and_centroids_without_selecting_a_new_winn
 async fn unlawful_pinned_destination_refuses_instead_of_reranking_or_creating() {
     for change in ["empty", "mixed"] {
         let app = authenticated_on_server(test_server().await).await;
-        let project = app.own_project("pinned-project").await;
-        let destination = MemoryScope::Project(
-            RecordId::parse_simple(&project)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
+        let project_id = app.own_project_id("pinned-project").await;
+        let project = alexandria_storage::record_id_to_string(&project_id);
+        let destination = MemoryScope::Project(project_id.clone().try_into().unwrap());
         let (original, member) = population(
             &app,
             destination.clone(),
@@ -846,15 +837,10 @@ async fn unlawful_pinned_destination_refuses_instead_of_reranking_or_creating() 
 #[tokio::test]
 async fn pinned_source_absence_does_not_adopt_a_new_membership_at_the_same_fact_revision() {
     let app = authenticated_on_server(test_server().await).await;
-    let project = app.own_project("pinned-project").await;
-    let destination = MemoryScope::Project(
-        RecordId::parse_simple(&project)
-            .unwrap()
-            .try_into()
-            .unwrap(),
-    );
+    let project_id = app.own_project_id("pinned-project").await;
+    let destination = MemoryScope::Project(project_id.clone().try_into().unwrap());
     population(&app, destination.clone(), "destination", &[0.1, 0.2]).await;
-    let (mover, mover_t) = app.seed_personal("initially unclustered mover").await;
+    let (_mover, mover_t) = app.seed_personal("initially unclustered mover").await;
     let existing = snapshot(&app, &mover_t).await;
     let scope = app.corpus_scope().await;
     let plan = app
@@ -864,7 +850,10 @@ async fn pinned_source_absence_does_not_adopt_a_new_membership_at_the_same_fact_
         .unwrap();
     let (source, _) = population(&app, MemoryScope::Personal, "new source", &[0.1, 0.2]).await;
     app.add_cluster_member(&source, &mover_t).await;
-    assert_eq!(app.semantic_revision(&mover).await, existing.version.get());
+    assert_eq!(
+        app.semantic_revision(&mover_t).await,
+        existing.version.get()
+    );
     let before = ledger(&app).await;
     let read = app.population().await;
     let outcome = ApplyService::new(app.db.as_ref(), &app.owner, &read)
@@ -885,13 +874,8 @@ async fn pinned_source_absence_does_not_adopt_a_new_membership_at_the_same_fact_
 #[tokio::test]
 async fn pinned_creation_does_not_switch_to_a_later_join() {
     let app = authenticated_on_server(test_server().await).await;
-    let project = app.own_project("pinned-project").await;
-    let destination = MemoryScope::Project(
-        RecordId::parse_simple(&project)
-            .unwrap()
-            .try_into()
-            .unwrap(),
-    );
+    let project_id = app.own_project_id("pinned-project").await;
+    let destination = MemoryScope::Project(project_id.clone().try_into().unwrap());
     let (_mover, mover_t) = app
         .seed_personal("mover with initially empty destination")
         .await;
@@ -952,13 +936,8 @@ async fn pinned_creation_does_not_switch_to_a_later_join() {
 #[tokio::test]
 async fn pinned_move_refuses_same_cluster_without_banning_unclustered_quarantined_rows() {
     let app = authenticated_on_server(test_server().await).await;
-    let project = app.own_project("pinned-project").await;
-    let destination = MemoryScope::Project(
-        RecordId::parse_simple(&project)
-            .unwrap()
-            .try_into()
-            .unwrap(),
-    );
+    let project_id = app.own_project_id("pinned-project").await;
+    let destination = MemoryScope::Project(project_id.clone().try_into().unwrap());
     let (cluster, _) = population(
         &app,
         destination.clone(),
@@ -1012,13 +991,9 @@ async fn pinned_move_refuses_same_cluster_without_banning_unclustered_quarantine
 async fn pinned_source_centroid_effect_cannot_appear_or_disappear_during_refresh() {
     for change in ["appeared", "disappeared"] {
         let app = authenticated_on_server(test_server().await).await;
-        let project = app.own_project("pinned-project").await;
-        let destination = MemoryScope::Project(
-            RecordId::parse_simple(&project)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
+        let project_id = app.own_project_id("pinned-project").await;
+        let project = alexandria_storage::record_id_to_string(&project_id);
+        let destination = MemoryScope::Project(project_id.clone().try_into().unwrap());
         let (mover, mover_t) = app.seed_personal("mover with a pinned source effect").await;
         let source = app.seed_cluster(Some("source"), &[0.1, 0.2]).await;
         app.add_cluster_member(&source, &mover_t).await;
@@ -1076,13 +1051,8 @@ async fn quarantined_changes_do_not_enter_live_centroid_arithmetic() {
     let mut centers = Vec::new();
     for path in ["move", "classification", "edit"] {
         let app = authenticated_on_server(test_server().await).await;
-        let project = app.own_project("eligible-project").await;
-        let destination = MemoryScope::Project(
-            RecordId::parse_simple(&project)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
+        let project_id = app.own_project_id("eligible-project").await;
+        let destination = MemoryScope::Project(project_id.clone().try_into().unwrap());
         let (cluster, _) =
             population(&app, destination.clone(), "one live vector", &[1.0, 0.5]).await;
         let (id, id_t) = app
@@ -1098,7 +1068,7 @@ async fn quarantined_changes_do_not_enter_live_centroid_arithmetic() {
             .unwrap();
         if path == "edit" {
             assert!(
-                app.move_row(&id, destination.clone(), "fixture-assigned-quarantine")
+                app.move_row(&id_t, destination.clone(), "fixture-assigned-quarantine")
                     .await
             );
             app.add_cluster_member(&cluster, &id_t).await;

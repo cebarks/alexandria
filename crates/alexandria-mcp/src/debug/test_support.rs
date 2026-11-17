@@ -610,11 +610,16 @@ impl AuthenticatedTestApp {
     /// `establish` is storage's create, reached through the scoped repo, so the row carries the caller's
     /// account and workspace and the resolver can find it by handle — which is what a *page* posts back.
     pub(super) async fn own_project(&self, alias: &str) -> String {
+        record_id_to_string(&self.own_project_id(alias).await)
+    }
+
+    /// The typed id of one of the caller's own projects, for fixture setup that binds a record.
+    pub(super) async fn own_project_id(&self, alias: &str) -> RecordId {
         let established = ScopedProjectRepo::new(self.db.inner(), &self.owner)
             .establish(alias, None)
             .await
             .expect("establishing a fixture project");
-        record_id_to_string(established.project.id.as_record_id())
+        established.project.id.as_record_id().clone()
     }
 
     /// Attach one of the caller's facts to one of their sessions, the way a store's link does.
@@ -629,8 +634,8 @@ impl AuthenticatedTestApp {
     ///
     /// A raw write, deliberately: seeding tags through the *journaled* update path would make the case that
     /// checks what the journaled update path does to tags depend on itself.
-    pub(super) async fn set_tags(&self, fact_id: &str, tags: &[String]) {
-        let target = RecordId::parse_simple(fact_id).expect("a fixture fact handle");
+    pub(super) async fn set_tags(&self, target: &RecordId, tags: &[String]) {
+        let target = target.clone();
         self.db
             .inner()
             .query("UPDATE type::record('fact', $key) SET tags = $tags WHERE id = $id;")
@@ -660,8 +665,8 @@ impl AuthenticatedTestApp {
     /// Read from the store rather than from a rendered row because a fixture host that has to print the
     /// setup cannot also drive the browser to read a column; the journey itself then verifies the rendered
     /// value by posting it.
-    pub(super) async fn semantic_revision(&self, fact_id: &str) -> u64 {
-        let target = RecordId::parse_simple(fact_id).expect("a fixture fact handle");
+    pub(super) async fn semantic_revision(&self, target: &RecordId) -> u64 {
+        let target = target.clone();
         let rows: Vec<serde_json::Value> = self
             .db
             .inner()
@@ -689,18 +694,14 @@ impl AuthenticatedTestApp {
     /// observing fixture noise instead of product state.
     pub(super) async fn move_row(
         &self,
-        fact_id: &str,
+        target: &RecordId,
         destination: MemoryScope,
         key: &str,
     ) -> bool {
-        let target = match RecordId::parse_simple(fact_id) {
-            Ok(target) => target,
-            Err(_) => return false,
-        };
-        let Ok(fact) = alexandria_storage::models::FactId::try_from(target) else {
+        let Ok(fact) = alexandria_storage::models::FactId::try_from(target.clone()) else {
             return false;
         };
-        let revision = self.semantic_revision(fact_id).await;
+        let revision = self.semantic_revision(target).await;
         alexandria_storage::repos::MutationRepo::new(self.db.inner())
             .move_scope(
                 &self.owner,
@@ -718,8 +719,8 @@ impl AuthenticatedTestApp {
     /// This is the only way to test a stale-conflict control against *the revision the page rendered*:
     /// bumping the store without touching the form's copy is the whole scenario, and re-reading the
     /// current version at POST time is the bug this pins shut.
-    pub(super) async fn bump_semantic_revision(&self, fact_id: &str) {
-        let target = RecordId::parse_simple(fact_id).expect("a fixture fact handle");
+    pub(super) async fn bump_semantic_revision(&self, target: &RecordId) {
+        let target = target.clone();
         self.db
             .inner()
             .query(

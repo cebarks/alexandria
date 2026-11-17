@@ -1852,10 +1852,12 @@ impl AlexandriaServer {
             // a JSON mistake do not answer differently.
             let handle =
                 RecallHandle::decode(handle_str).map_err(|_| anyhow::anyhow!(MALFORMED_HANDLE))?;
-            let (version, members) = self.cluster_for_replay(scope, &handle.cluster_id).await?;
+            let (version, members) = self
+                .cluster_for_replay(scope, handle.cluster_id.as_str())
+                .await?;
             let cluster_data = ClusterWithMembers {
                 info: ClusterInfo {
-                    id: handle.cluster_id.clone(),
+                    id: handle.cluster_id.as_str().to_string(),
                     centroid: vec![],
                     member_count: members.len(),
                 },
@@ -3709,7 +3711,7 @@ impl AlexandriaServer {
             // listing (the engine's `RecallHandle` is the wire type and carries text). Converting
             // HERE — at the holder that produced the text — keeps the repo boundary typed; the
             // handle re-typing is named follow-up alongside it.
-            let cluster = RecordId::parse_simple(&scope.cluster_id)
+            let cluster = RecordId::parse_simple(scope.cluster_id.as_str())
                 .map_err(|_| anyhow::anyhow!(MALFORMED_HANDLE))?;
             let cluster_data = self.load_cluster_with_members(&cluster).await?;
             let result = focused_recall(query_emb, &scope, &cluster_data);
