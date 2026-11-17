@@ -708,7 +708,7 @@ fn session_id(session: &Session) -> Result<RecordId, StorageError> {
 /// Parses a caller-supplied `table:key` handle. A malformed handle is `InvalidInput`, not `NotFound`:
 /// the request was wrong, which is a different conclusion from "no such row".
 fn parse_id(text: &str, table: &str) -> Result<RecordId, StorageError> {
-    let id = RecordId::parse_simple(text)
+    let id = crate::parse_record_id(text)
         .map_err(|_| StorageError::InvalidInput(format!("malformed {table} id")))?;
     if id.table.as_str() != table {
         return Err(StorageError::InvalidInput(format!(

@@ -39,7 +39,7 @@ use alexandria_storage::models::{
     mutation::{FactSnapshot, OperationSummary},
 };
 use alexandria_storage::repos::{MAX_HISTORY_PAGE, MutationRepo};
-use surrealdb::types::{RecordId, Value};
+use surrealdb::types::Value;
 
 /// The nav key this page highlights, shared by both its routes.
 const NAV: &str = "history";
@@ -119,9 +119,10 @@ pub(crate) async fn detail(
     let Ok((owner, _read)) = boundary.corpus(&session).await else {
         return forbidden();
     };
-    // A malformed handle and a foreign one and an absent one are the same 404. `parse_simple` failing is
-    // not a 400: a caller who cannot name the row is not distinguished from one who may not read it.
-    let Ok(handle) = RecordId::parse_simple(&id) else {
+    // A malformed handle and a foreign one and an absent one are the same 404. The strict record-id
+    // parse failing is not a 400: a caller who cannot name the row is not distinguished from one who
+    // may not read it.
+    let Ok(handle) = alexandria_storage::parse_record_id(&id) else {
         return not_found();
     };
     let repo = MutationRepo::new(server.db.inner());

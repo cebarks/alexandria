@@ -979,6 +979,38 @@ async fn reminder_tools_never_list_deliver_or_consume_another_accounts_rows() {
     let _ = bobs_reminder;
 }
 
+/// Trailing input on a valid owned reminder id must not cancel the prefix record.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_reminder_id_with_trailing_input_is_refused() {
+    let tools = Tools::hosted().await;
+    let owner = tools.owner("t3-can-trailing").await;
+    let session = tools.handshake(&owner.bearer).await;
+    let id = tools
+        .seed_reminder("trailing-input-target", "still pending", &owner, None)
+        .await;
+    let malformed_id = format!("{id}; junk");
+
+    let result = tools
+        .call(
+            &owner.bearer,
+            &session,
+            "cancel_reminder",
+            json!({"id": malformed_id}),
+        )
+        .await;
+
+    assert!(
+        refused(&result),
+        "cancel_reminder accepted trailing input and cancelled the valid prefix id: {result}"
+    );
+    let stored = reminder_state_named(&tools, "trailing-input-target").await;
+    assert_eq!(
+        stored[0]["status"].as_str(),
+        Some("pending"),
+        "a refused malformed id must leave the prefix reminder pending"
+    );
+}
+
 /// A foreign reminder id answers as an absent one, and cancelling it changes nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_a_foreign_reminder_is_refused_and_changes_nothing() {

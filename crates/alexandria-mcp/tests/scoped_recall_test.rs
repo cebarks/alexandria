@@ -1101,14 +1101,16 @@ async fn a_decoded_handle_naming_an_unusable_cluster_refuses_like_an_undecodable
     }
 
     // The half that must *not* become a refusal: a well-formed `cluster` id the caller cannot read
-    // answers exactly as one that does not exist, and neither answers as an unreadable handle.
+    // answers exactly as one that does not exist, and neither answers as an unreadable handle. The
+    // made-up keys are bare identifiers on purpose: a hyphenated key would not parse as one record
+    // literal, which is the refused class the loop above already covers.
     let foreign = tools
         .replay(
             &alice,
             &session,
             "rotation note",
             &base64url_encode(
-                json!({ "cluster_id": "cluster:not-hers-at-all" })
+                json!({ "cluster_id": "cluster:notshersatall" })
                     .to_string()
                     .as_bytes(),
             ),
@@ -1120,7 +1122,7 @@ async fn a_decoded_handle_naming_an_unusable_cluster_refuses_like_an_undecodable
             &session,
             "rotation note",
             &base64url_encode(
-                json!({ "cluster_id": "cluster:deleted-long-ago" })
+                json!({ "cluster_id": "cluster:deletedlongago" })
                     .to_string()
                     .as_bytes(),
             ),

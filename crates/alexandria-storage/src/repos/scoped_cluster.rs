@@ -125,7 +125,7 @@ impl<'a> ScopedClusterRepo<'a> {
     /// no owner (a migration-pending row) is unreachable, which is the fail-closed answer rather than a
     /// gap to heal by falling back to an unscoped read.
     pub async fn get(&self, cluster_id: &str) -> Result<Option<Cluster>, StorageError> {
-        let id = RecordId::parse_simple(cluster_id)
+        let id = crate::parse_record_id(cluster_id)
             .map_err(|_| StorageError::InvalidInput("malformed cluster id".to_string()))?;
         if id.table.as_str() != "cluster" {
             return Err(StorageError::InvalidInput(
@@ -189,7 +189,7 @@ impl<'a> ScopedClusterRepo<'a> {
         if self.get(cluster_id).await?.is_none() {
             return Ok(vec![]);
         }
-        let id = RecordId::parse_simple(cluster_id)
+        let id = crate::parse_record_id(cluster_id)
             .map_err(|_| StorageError::InvalidInput("malformed cluster id".to_string()))?;
         let query = self
             .db
@@ -226,7 +226,7 @@ impl<'a> ScopedClusterRepo<'a> {
         if self.get(cluster_id).await?.is_none() {
             return Ok(vec![]);
         }
-        let id = RecordId::parse_simple(cluster_id)
+        let id = crate::parse_record_id(cluster_id)
             .map_err(|_| StorageError::InvalidInput("malformed cluster id".to_string()))?;
         let mut response = self
             .db
@@ -411,7 +411,7 @@ impl<'a> ScopedClusterRepo<'a> {
     pub async fn revision(&self, cluster_id: &str) -> Result<Option<i64>, StorageError> {
         // A string that is not a cluster record is the same answer as a cluster the caller cannot read,
         // so this cannot be used to tell "not yours" from "not a cluster" either.
-        let Ok(id) = RecordId::parse_simple(cluster_id) else {
+        let Ok(id) = crate::parse_record_id(cluster_id) else {
             return Ok(None);
         };
         if id.table.as_str() != "cluster" {

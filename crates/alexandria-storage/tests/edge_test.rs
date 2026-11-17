@@ -34,6 +34,32 @@ async fn test_create_and_query_edge() {
 }
 
 #[tokio::test]
+async fn create_edge_refuses_trailing_garbage_in_record_id() {
+    let db = setup().await;
+    let mem = MemoryRepo::new(db.inner());
+    let edges = EdgeRepo::new(db.inner());
+
+    let from = mem.create_fact("source", 0.9, &[0.1], &[]).await.unwrap();
+    let to = mem.create_fact("target", 0.9, &[0.2], &[]).await.unwrap();
+
+    // `parse_simple` split this at the colon and kept everything after it — `⟨key⟩; junk` — as
+    // the string key, so the RELATE targeted a record that does not exist instead of being
+    // refused. The strict parse must reject the input before any statement is issued.
+    let malformed = format!("{from}; junk");
+    let result = edges.create_edge(&malformed, &to, "relates_to", 0.85).await;
+
+    assert!(
+        result.is_err(),
+        "create_edge accepted trailing input: parse_simple invented a garbage-keyed record \
+         and the RELATE wrote an edge pointing at it"
+    );
+    assert!(
+        edges.get_edges_for(&to).await.unwrap().is_empty(),
+        "a refused record id must leave no edge pointing at the target fact"
+    );
+}
+
+#[tokio::test]
 async fn test_direct_neighbors() {
     let db = setup().await;
     let mem = MemoryRepo::new(db.inner());

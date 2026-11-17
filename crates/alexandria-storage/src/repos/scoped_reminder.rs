@@ -132,9 +132,11 @@ impl<'a> ScopedReminderRepo<'a> {
         rows.into_iter().next().ok_or_else(missing)
     }
 
-    /// The bound account's reminder for an id, or `None` for a foreign or absent one.
+    /// The bound account's reminder for an id, or `None` for a foreign, absent or unparseable one.
     pub async fn get(&self, id: &str) -> Result<Option<Reminder>, StorageError> {
-        let rid = parse(id)?;
+        let Some(rid) = parse(id)? else {
+            return Ok(None);
+        };
         let mut response = self
             .owner_db()
             .query("SELECT * FROM type::record('reminder', $key) WHERE id = $id AND account = $account LIMIT 1;")
@@ -268,7 +270,10 @@ impl<'a> ScopedReminderRepo<'a> {
         seen_next_due_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> Result<bool, StorageError> {
-        let rid = parse(id)?;
+        // An unparseable id claims nothing, the same way an absent or foreign one does.
+        let Some(rid) = parse(id)? else {
+            return Ok(false);
+        };
         let set_clause = if new_next_due_at.is_some() {
             "last_delivered_at = time::now(), delivered_count += 1, next_due_at = $next"
         } else {
@@ -300,7 +305,10 @@ impl<'a> ScopedReminderRepo<'a> {
     /// closes the window between `admit` and this commit — `Err(Stale)`, not a quiet `Ok(false)`, because
     /// a revoked bearer must not be handed an answer that reads like "it was already gone".
     pub async fn cancel(&self, id: &str, now: DateTime<Utc>) -> Result<bool, StorageError> {
-        let rid = parse(id)?;
+        // An unparseable id writes nothing, the same way an absent or foreign one does.
+        let Some(rid) = parse(id)? else {
+            return Ok(false);
+        };
         let write = GuardedWrite::new(
             "UPDATE type::record('reminder', $key) SET status = 'cancelled', cancelled_at = $now \
              WHERE id = $id AND account = $account RETURN AFTER;",
@@ -319,15 +327,21 @@ impl<'a> ScopedReminderRepo<'a> {
     }
 }
 
-fn parse(id: &str) -> Result<RecordId, StorageError> {
-    let rid = RecordId::parse_simple(id)
-        .map_err(|_| StorageError::InvalidInput("malformed reminder id".to_string()))?;
+/// The reminder record a caller-supplied id names, or `None` when the text is not one record
+/// literal at all — an unparseable id is skipped exactly like a foreign or absent one, so the read
+/// and claim layers' answer shapes never reveal which of the three it was. A parsed id in the wrong
+/// table is still `InvalidInput`: that is a well-formed handle aimed at the wrong boundary, which
+/// the request path reports rather than silently treating as absent.
+fn parse(id: &str) -> Result<Option<RecordId>, StorageError> {
+    let Some(rid) = crate::parse_record_id(id).ok() else {
+        return Ok(None);
+    };
     if rid.table.as_str() != "reminder" {
         return Err(StorageError::InvalidInput(
             "malformed reminder id".to_string(),
         ));
     }
-    Ok(rid)
+    Ok(Some(rid))
 }
 
 /// The record key alone, bound as a parameter — `record_id_to_string` is not a parser-safe SQL round

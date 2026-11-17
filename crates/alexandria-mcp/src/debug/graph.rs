@@ -147,7 +147,7 @@ async fn api_graph_with_radius(
     };
     let memory_repo =
         alexandria_storage::repos::ScopedMemoryRepo::new(server.db.inner(), &owner, &read);
-    let Ok(centre) = surrealdb::types::RecordId::parse_simple(id) else {
+    let Ok(centre) = alexandria_storage::parse_record_id(id) else {
         return graph_not_found();
     };
     let graph = match memory_repo.ego(&centre, hops, GRAPH_VISIT_CAP).await {
@@ -380,7 +380,7 @@ async fn load_fact_content(
 ) -> HashMap<String, String> {
     let mut content = HashMap::new();
     for node_id in node_ids.iter().filter(|nid| node_table_of(nid) == "fact") {
-        let Ok(handle) = surrealdb::types::RecordId::parse_simple(node_id) else {
+        let Ok(handle) = alexandria_storage::parse_record_id(node_id) else {
             continue;
         };
         match fact_repo.get_fact(&handle).await {

@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{RecordId, SurrealValue};
+use surrealdb::types::SurrealValue;
 
 use crate::models::{Session, SessionListItem};
 
@@ -175,8 +175,8 @@ impl<'a> SessionRepo<'a> {
 
     /// Create a contains_session_memory edge from session to fact.
     pub async fn add_memory(&self, session_id: &str, fact_id: &str) -> Result<()> {
-        let session_rid = RecordId::parse_simple(session_id)?;
-        let fact_rid = RecordId::parse_simple(fact_id)?;
+        let session_rid = crate::parse_record_id(session_id)?;
+        let fact_rid = crate::parse_record_id(fact_id)?;
         self.db
             .query("RELATE $sess->contains_session_memory->$fact")
             .bind(("sess", session_rid))

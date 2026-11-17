@@ -460,7 +460,7 @@ impl ClassificationRepo<'_> {
         use CaptureOutcome::*;
         // Malformed or wrong-table citations are refused, not probed: the same answer an absent row
         // gives, so the batch cannot be used to ask what exists.
-        let Ok(target) = RecordId::parse_simple(&reference.id) else {
+        let Ok(target) = crate::parse_record_id(&reference.id) else {
             return Refusal(BatchConflictReason::NotFound);
         };
         if target.table.as_str() != "classification_proposal" {

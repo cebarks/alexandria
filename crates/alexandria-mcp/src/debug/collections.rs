@@ -976,7 +976,7 @@ struct ArchiveTemplate {
 /// How a record handle crosses a browser boundary.
 ///
 /// **The round trip is display-form in, typed parse back** — `record_id_to_string` renders the handle the
-/// page shows, and `RecordId::parse_simple` reads it back. `AGENTS.md` warns that the display form is *not*
+/// page shows, and the store's strict `parse_record_id` reads it back. `AGENTS.md` warns that the display form is *not*
 /// a parser-safe SQL round trip (numeric and quoted opaque keys render ambiguously), and that warning is
 /// about splicing the rendering into a statement, which nothing here does: the parsed value is only ever
 /// **bound** (`type::record('table', $key)` with a typed key), never interpolated, so a key whose display

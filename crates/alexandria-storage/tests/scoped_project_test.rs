@@ -803,7 +803,7 @@ async fn a_scoped_session_view_filters_membership_and_the_assigned_view_does_not
             .db
             .inner()
             .query(
-                "CREATE type::record('fact', 'in-project') SET content = 'project row', confidence \
+                "CREATE type::record('fact', 'inproject') SET content = 'project row', confidence \
                  = 0.5, embedding = [1.0, 0.0], tags = [], deleted = false, account = $account, \
                  workspace = $workspace, scope = 'project', project = $project RETURN AFTER;",
             )
@@ -817,7 +817,10 @@ async fn a_scoped_session_view_filters_membership_and_the_assigned_view_does_not
         let rows: Vec<serde_json::Value> = response.take(0).unwrap();
         RecordId::parse_simple(rows[0]["id"].as_str().unwrap()).unwrap()
     };
-    let personal_fact = fact(&fx, &fx.alice, "in-personal", "personal row").await;
+    // The seeded keys are bare identifiers because the test round-trips each row's display string
+    // (`record_id_to_string`) back through `add_memory`'s strict parse — the form product callers
+    // hold, which only ever carries bare-safe auto keys.
+    let personal_fact = fact(&fx, &fx.alice, "inpersonal", "personal row").await;
 
     let sessions = ScopedSessionRepo::new(fx.db.inner(), fx.alice.owner.clone());
     sessions

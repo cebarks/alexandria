@@ -619,11 +619,13 @@ fn parse_project_handle(text: &str) -> Result<Option<ProjectId>, ServiceError> {
 
 /// A `table:key` handle, parsed and re-checked for the table it claims.
 ///
-/// `parse_simple` rather than a string split, and `type::record` on the storage side rather than this
-/// text in a statement: AGENTS.md records the display form as **not** a parser-safe round trip for
-/// numeric and quoted opaque keys, and nothing here interpolates what it parses.
+/// The store's strict [`parse_record_id`](alexandria_storage::parse_record_id) rather than a string
+/// split or `parse_simple`, and `type::record` on the storage side rather than this text in a
+/// statement: AGENTS.md records the display form as **not** a parser-safe round trip for numeric
+/// and quoted opaque keys, and nothing here interpolates what it parses. Trailing input is
+/// refused here rather than silently resolved to the record its prefix names.
 fn parse_record_handle(text: &str) -> Option<RecordId> {
-    RecordId::parse_simple(text).ok()
+    alexandria_storage::parse_record_id(text).ok()
 }
 
 /// Trim a page to whole records within [`MAX_SCOPE_PAGE_BYTES`], reporting what was dropped.

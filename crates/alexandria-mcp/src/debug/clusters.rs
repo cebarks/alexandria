@@ -161,9 +161,17 @@ pub(crate) async fn detail(
     };
     let cluster_repo =
         alexandria_storage::repos::ScopedClusterRepo::new(server.db.inner(), &owner, &read);
-    let cluster = match cluster_repo.get(&id).await {
-        Ok(cluster) => cluster,
-        Err(e) => return unavailable("clusters", "cluster", e),
+    // A handle that does not parse as one record literal is the same 404 as a foreign or an absent
+    // cluster — the uniform-absent discipline the boundary test pins. The parse lives here, in the
+    // page, rather than changing the repo's mapping: the repo's `InvalidInput` is what the recall
+    // replay folds into its one malformed-handle refusal, so this route owns its own 404 shape.
+    let cluster = if alexandria_storage::parse_record_id(&id).is_err() {
+        None
+    } else {
+        match cluster_repo.get(&id).await {
+            Ok(cluster) => cluster,
+            Err(e) => return unavailable("clusters", "cluster", e),
+        }
     };
     // A cluster the caller's population does not contain is a 404, and that includes one that is
     // genuinely absent: the scoped read cannot tell "deleted" from "someone else's", so neither can the

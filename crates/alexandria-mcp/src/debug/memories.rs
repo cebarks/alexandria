@@ -462,7 +462,7 @@ pub(crate) async fn detail(
     // A foreign id and an absent id are one 404: `get_fact` answers through the caller's population,
     // so "not yours" is indistinguishable from "not there" — which is the equivalence the scoped reads
     // were built to provide, on the page where a distinguishable answer would be a probe.
-    let Ok(handle) = surrealdb::types::RecordId::parse_simple(&id) else {
+    let Ok(handle) = alexandria_storage::parse_record_id(&id) else {
         return memory_not_found();
     };
     let fact = match repo.get_fact(&handle).await {
@@ -1150,6 +1150,36 @@ mod tests {
         assert!(
             text.contains("Metadata"),
             "expected Metadata section on detail page"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_detail_404_for_id_with_trailing_input() {
+        let server = super::super::test_support::test_server().await;
+        let id = alexandria_storage::repos::MemoryRepo::new(server.db.inner())
+            .create_fact("trailing input target", 0.5, &[0.1, 0.2], &[])
+            .await
+            .unwrap();
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
+        let uri = format!("/debug/memories/{}%3B%20junk", id.replace(':', "%3A"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            404,
+            "memory detail must refuse trailing input, not resolve its valid prefix"
         );
     }
 

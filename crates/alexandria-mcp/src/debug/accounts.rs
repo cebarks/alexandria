@@ -881,10 +881,10 @@ fn absent() -> String {
 ///
 /// The parse is strict and the table is checked, so `fact:1` presented to an account field is a
 /// refusal rather than a row nobody intended to name. Never `record_id_to_string`'s inverse: that
-/// rendering is not a parser-safe round trip, which is why the store's own `RecordId::parse_simple` is
-/// what decides.
+/// rendering is not a parser-safe round trip, which is why the store's strict
+/// `parse_record_id` is what decides.
 fn parse_record(raw: &str, table: &str) -> Option<RecordId> {
-    let id = RecordId::parse_simple(raw.trim()).ok()?;
+    let id = alexandria_storage::parse_record_id(raw.trim()).ok()?;
     (id.table.as_str() == table).then_some(id)
 }
 

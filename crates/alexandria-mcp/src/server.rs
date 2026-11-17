@@ -65,7 +65,7 @@ use alexandria_storage::repos::{
 use chrono::{DateTime, SecondsFormat, Utc, Weekday};
 use rmcp::RoleServer;
 use rmcp::service::RequestContext;
-use surrealdb::types::RecordId;
+use surrealdb::types::{RecordId, ToSql};
 
 use crate::mutation::{ApplyService, ApprovedCluster, Plan};
 use crate::scope_service::{ReadScope, ScopeService};
@@ -1353,7 +1353,7 @@ impl AlexandriaServer {
                 None
             };
             let taken = repo
-                .record_delivery(&record_id_to_string(id), next, Some(due_at), now)
+                .record_delivery(&id.to_sql(), next, Some(due_at), now)
                 .await
                 .map_err(anyhow::Error::from)?;
             if !taken {
@@ -1404,7 +1404,7 @@ impl AlexandriaServer {
         use alexandria_storage::repos::ScopedReminderRepo;
 
         let repo = ScopedReminderRepo::new(self.db.inner(), scope.owner().clone());
-        let id = surrealdb::types::RecordId::parse_simple(&params.id)
+        let id = alexandria_storage::parse_record_id(&params.id)
             .map_err(|_| anyhow::anyhow!("Reminder not found"))?;
         if id.table.as_str() != "reminder" {
             anyhow::bail!("Reminder not found");
@@ -2155,8 +2155,12 @@ impl AlexandriaServer {
         id: &str,
         reach: DeletionReach,
     ) -> Result<String, crate::error::ServiceError> {
-        let handle = surrealdb::types::RecordId::parse_simple(id)
-            .map_err(|_| crate::error::ServiceError::InvalidInput(MALFORMED_ID.to_string()))?;
+        let Ok(handle) = alexandria_storage::parse_record_id(id) else {
+            // An unparseable id is the same answer as a foreign or an absent one — `NotFound`,
+            // byte for byte — so a malformed handle cannot be told from a row the caller may not
+            // name.
+            return Err(crate::error::ServiceError::NotFound);
+        };
         if handle.table.as_str() != "fact" {
             return Err(crate::error::ServiceError::InvalidInput(
                 MALFORMED_ID.to_string(),
@@ -2252,8 +2256,12 @@ impl AlexandriaServer {
         project: Option<&str>,
         expected: Version,
     ) -> Result<serde_json::Value, crate::error::ServiceError> {
-        let handle = surrealdb::types::RecordId::parse_simple(id)
-            .map_err(|_| crate::error::ServiceError::InvalidInput(MALFORMED_ID.to_string()))?;
+        let Ok(handle) = alexandria_storage::parse_record_id(id) else {
+            // An unparseable id is the same answer as a foreign or an absent one — `NotFound`,
+            // byte for byte — so a malformed handle cannot be told from a row the caller may not
+            // name.
+            return Err(crate::error::ServiceError::NotFound);
+        };
         if handle.table.as_str() != "fact" {
             return Err(crate::error::ServiceError::InvalidInput(
                 MALFORMED_ID.to_string(),
@@ -2816,8 +2824,12 @@ impl AlexandriaServer {
         params: UpdateMemoryParams,
         expected: Option<Version>,
     ) -> anyhow::Result<String> {
-        let handle = surrealdb::types::RecordId::parse_simple(&params.id)
-            .map_err(|_| crate::error::ServiceError::InvalidInput(MALFORMED_ID.to_string()))?;
+        let Ok(handle) = alexandria_storage::parse_record_id(&params.id) else {
+            // An unparseable id is the same answer as a foreign or an absent one — `NotFound`,
+            // byte for byte — so a malformed handle cannot be told from a row the caller may not
+            // name.
+            return Err(crate::error::ServiceError::NotFound.into());
+        };
         if handle.table.as_str() != "fact" {
             return Err(crate::error::ServiceError::InvalidInput(MALFORMED_ID.to_string()).into());
         }
@@ -3072,7 +3084,7 @@ impl AlexandriaServer {
             None => {
                 let text = repo.create_raw(&params.content).await?;
                 Some(
-                    surrealdb::types::RecordId::parse_simple(&text)
+                    alexandria_storage::parse_record_id(&text)
                         .map_err(|_| anyhow::anyhow!("raw row has no usable id"))?,
                 )
             }
@@ -3112,7 +3124,7 @@ impl AlexandriaServer {
                             params.model.as_deref(),
                         )
                         .await?;
-                    surrealdb::types::RecordId::parse_simple(&text)
+                    alexandria_storage::parse_record_id(&text)
                         .map_err(|_| anyhow::anyhow!("session row has no usable id"))?
                 }
             }),
@@ -3581,7 +3593,10 @@ impl AlexandriaServer {
                 .iter()
                 .take(self.activation_top_n)
                 .filter_map(|(idx, _)| facts[*idx].id.as_ref())
-                .map(record_id_to_string)
+                // `to_sql`, not the display form: these strings are re-parsed one frame later, and a
+                // display form is not a parser-safe round trip for keys that are not bare
+                // identifiers — the typed id is in hand here, so the round trip stays lossless.
+                .map(|id| id.to_sql())
                 .collect();
             match scope {
                 // One pass, one authority claim, for the whole set of focals.
@@ -3711,7 +3726,7 @@ impl AlexandriaServer {
             // listing (the engine's `RecallHandle` is the wire type and carries text). Converting
             // HERE — at the holder that produced the text — keeps the repo boundary typed; the
             // handle re-typing is named follow-up alongside it.
-            let cluster = RecordId::parse_simple(scope.cluster_id.as_str())
+            let cluster = alexandria_storage::parse_record_id(scope.cluster_id.as_str())
                 .map_err(|_| anyhow::anyhow!(MALFORMED_HANDLE))?;
             let cluster_data = self.load_cluster_with_members(&cluster).await?;
             let result = focused_recall(query_emb, &scope, &cluster_data);
@@ -4509,6 +4524,11 @@ impl AlexandriaServer {
         use alexandria_storage::repos::ReminderRepo;
 
         let repo = ReminderRepo::new(self.db.inner());
+        // The same refusal the scoped path gives: an id that does not parse is "not found", not a
+        // second error text quoting the parse layer — a malformed handle, a foreign one and an
+        // absent one are one answer.
+        alexandria_storage::parse_record_id(&params.id)
+            .map_err(|_| anyhow::anyhow!("Reminder not found: {}", params.id))?;
         let Some(existing) = repo.get(&params.id).await? else {
             anyhow::bail!("Reminder not found: {}", params.id);
         };
@@ -4756,7 +4776,7 @@ impl AlexandriaServer {
         }
         let neighbor_data: Vec<(String, u32, f64)> = neighbors
             .iter()
-            .map(|n| (record_id_to_string(&n.id), n.hop, n.strength))
+            .map(|n| (n.id.to_sql(), n.hop, n.strength))
             .collect();
         let targets = compute_activation_targets(&neighbor_data, bump, &self.activation_config);
         let heat_repo = HeatRepo::new(self.db.inner());
@@ -4856,7 +4876,7 @@ impl AlexandriaServer {
         fact_id: &str,
         bump: f32,
     ) -> anyhow::Result<Vec<alexandria_storage::repos::WarmTarget>> {
-        let Some(focal) = surrealdb::types::RecordId::parse_simple(fact_id).ok() else {
+        let Some(focal) = alexandria_storage::parse_record_id(fact_id).ok() else {
             return Ok(Vec::new());
         };
         // The focal record's own partition, read from its row rather than passed in by the caller.
@@ -4879,7 +4899,7 @@ impl AlexandriaServer {
         let mut frontier = vec![focal.clone()];
         let mut hop = 0u32;
         let mut visited: std::collections::HashSet<String> =
-            std::collections::HashSet::from([record_id_to_string(&focal)]);
+            std::collections::HashSet::from([focal.to_sql()]);
         while hop < self.activation_config.max_hops && !frontier.is_empty() {
             hop += 1;
             let mut next = Vec::new();
@@ -4889,7 +4909,7 @@ impl AlexandriaServer {
                     .await
                     .map_err(anyhow::Error::from)?
                 {
-                    let key = record_id_to_string(&neighbor.id);
+                    let key = neighbor.id.to_sql();
                     if visited.insert(key.clone()) {
                         hop_of.insert(key.clone(), hop);
                         strengths.insert(key, neighbor.strength);
@@ -4912,7 +4932,7 @@ impl AlexandriaServer {
             compute_activation_targets(&neighbor_data, bump, &self.activation_config)
                 .into_iter()
                 .filter_map(|target| {
-                    let handle = surrealdb::types::RecordId::parse_simple(&target.id).ok()?;
+                    let handle = alexandria_storage::parse_record_id(&target.id).ok()?;
                     Some(alexandria_storage::repos::WarmTarget {
                         target: handle,
                         partition: partition.clone(),

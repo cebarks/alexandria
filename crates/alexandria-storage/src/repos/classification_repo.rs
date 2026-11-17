@@ -447,8 +447,8 @@ impl<'a> ClassificationRepo<'a> {
     ///
     /// Guards, each refusing without writing:
     ///
-    /// * the proposal must exist and be the caller's own — a foreign id and an absent one are one
-    ///   `NotFound`, so this is not a probe for what another workspace proposed;
+    /// * the proposal must exist and be the caller's own — a foreign, absent or unparseable
+    ///   citation is one `Stale`, so this is not a probe for what another workspace proposed;
     /// * `ref.revision` must equal the row's, or `Stale`;
     /// * a `project` destination must name a project of this workspace, or `NotFound` — the same answer
     ///   `propose` gives for an absent or foreign one;
@@ -459,8 +459,12 @@ impl<'a> ClassificationRepo<'a> {
         cited: ScopeProposalRef,
         destination: MemoryScope,
     ) -> Result<ScopeProposalRef, StorageError> {
-        let target = RecordId::parse_simple(&cited.id)
-            .map_err(|_| StorageError::InvalidInput("malformed proposal id".to_string()))?;
+        // A citation that does not parse gets the answer one that matches no pending row at the
+        // cited revision gets: `Stale`, the caller's cue to re-read the queue. A second refusal
+        // text for the same caller mistake would reveal which layer gave up.
+        let Ok(target) = crate::parse_record_id(&cited.id) else {
+            return Err(StorageError::Stale);
+        };
         if target.table.as_str() != "classification_proposal" {
             return Err(StorageError::NotFound);
         }
@@ -502,7 +506,7 @@ impl<'a> ClassificationRepo<'a> {
         &self,
         reference: &ScopeProposalRef,
     ) -> Result<Option<ProposalStateRow>, StorageError> {
-        let Ok(target) = RecordId::parse_simple(&reference.id) else {
+        let Ok(target) = crate::parse_record_id(&reference.id) else {
             return Ok(None);
         };
         if target.table.as_str() != "classification_proposal" {
@@ -603,8 +607,12 @@ impl<'a> ClassificationRepo<'a> {
     /// A dismissal writes **no** journal row, deliberately: it moves no
     /// memory, and `semantic_operation` is corpus-write history rather than an opinion log.
     pub async fn dismiss(&self, reference: &ScopeProposalRef) -> Result<(), StorageError> {
-        let target = RecordId::parse_simple(&reference.id)
-            .map_err(|_| StorageError::InvalidInput("malformed proposal id".to_string()))?;
+        // A citation that does not parse is the same answer as one that names no row this caller
+        // may decide: `NotFound`, indistinguishable from a foreign or an absent id — the
+        // uniform-absent discipline the dismissal oracles pin.
+        let Ok(target) = crate::parse_record_id(&reference.id) else {
+            return Err(StorageError::NotFound);
+        };
         if target.table.as_str() != "classification_proposal" {
             return Err(StorageError::NotFound);
         }
