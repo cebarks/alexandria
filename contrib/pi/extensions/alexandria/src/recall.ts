@@ -9,6 +9,7 @@ import {
 	type CallTool,
 } from "./mcp-client.js";
 import { CONFIG } from "./config.js";
+import type { RecallSettings } from "./recall-config.js";
 
 export interface RetrievedMemory {
 	id: string;
@@ -34,13 +35,18 @@ export async function retrieveMemories(
 	query: string,
 	call: CallTool = callToolWithRetry,
 	signal?: AbortSignal,
+	settings: Pick<RecallSettings, "limit" | "minSimilarity"> = {
+		limit: CONFIG.recallLimit,
+		minSimilarity: CONFIG.recallMinSimilarity,
+	},
 ): Promise<RecallCheck> {
+	const { limit, minSimilarity } = settings;
 	// Bounded: this awaits before the turn starts, so a hung server must not be
 	// able to spend a minute of it. A timeout costs one prompt of recall, not a
 	// blocked turn.
 	const result = await call(
 		"retrieve_memories",
-		{ query, limit: CONFIG.recallLimit },
+		{ query, limit },
 		PROMPT_CALL_TIMEOUT_MS,
 		signal,
 	);
@@ -84,7 +90,7 @@ export async function retrieveMemories(
 			!!m && typeof m === "object" && typeof m.content === "string",
 	);
 	return {
-		items: results.filter((m) => Number(m.similarity) >= CONFIG.recallMinSimilarity),
+		items: results.filter((m) => Number(m.similarity) >= minSimilarity),
 	};
 }
 

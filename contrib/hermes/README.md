@@ -19,7 +19,8 @@ What you get when it's active:
 ## Requirements
 
 - A running Alexandria HTTP server (see the root [README](../../README.md)); default
-  `http://127.0.0.1:3000/mcp`.
+  `http://127.0.0.1:3000/mcp`. Install and start it explicitly before configuring Hermes.
+  The companion checks `/health` but never installs or upgrades the server when that check fails.
 - Hermes Agent with the memory-provider plugin surface (`agent/memory_provider.py`).
 
 ## Install
@@ -101,17 +102,34 @@ later in-process session-end call, but there is no durable retry spool across pr
 
 ## Tests
 
-From the repository root, with Python 3.12+ and `httpx` installed:
+From the repository root, create a fresh Python 3.12+ environment and install the complete,
+hash-locked test dependencies. Only wheels are allowed, so dependency source-build hooks do not run:
 
 ```sh
-python3 -m pip install httpx
+python3 -m venv contrib/hermes/.venv
+. contrib/hermes/.venv/bin/activate
+python -m pip install --require-hashes --only-binary=:all: -r contrib/hermes/requirements-test.txt
 just hermes-test
-# Or, without installing into your current environment:
-uv run --python 3.12 --with httpx just hermes-test
+```
+
+Alternatively, use uv without installing dependencies into your current environment:
+
+```sh
+uv venv --python 3.12 contrib/hermes/.venv
+uv pip sync --python contrib/hermes/.venv/bin/python --require-hashes --only-binary=:all: contrib/hermes/requirements-test.txt
+PATH="$PWD/contrib/hermes/.venv/bin:$PATH" just hermes-test
+```
+
+`requirements-test.in` declares the direct dependency; `requirements-test.txt` pins its complete
+closure and artifact hashes. To deliberately refresh that lock after reviewing dependency changes:
+
+```sh
+uv pip compile --python-version 3.12 --universal --generate-hashes --only-binary=:all: --emit-build-options --default-index https://pypi.org/simple --output-file contrib/hermes/requirements-test.txt contrib/hermes/requirements-test.in
 ```
 
 `contrib/hermes/run_tests.sh` also works without Hermes installed; set `PYTHON` to select
-an interpreter. CI runs the same unittest discovery command as `just hermes-test`.
+the locked environment's interpreter. CI runs the same unittest discovery command as
+`just hermes-test`; its installer checks the pinned artifacts even if a dependency is already present.
 
 Plain `unittest`, no pytest. The suite runs against `mock_server.py`, an in-memory MCP
 StreamableHTTP server that speaks the same wire protocol as Alexandria (initialize handshake,
@@ -146,6 +164,6 @@ Listing defaults to `pending`, with `delivered`, `cancelled`, and `all` also sup
   behaviour. A smoke test against a real server is worth adding if this gains users.
 - The extraction pass uses whatever model the host has active; quality varies with it, and it is
   skipped entirely if the host exposes no plugin LLM.
-- Heat/Ebbinghaus ranking is inert server-side (see
-  [`docs/performance-and-ability-findings.md`](../../docs/performance-and-ability-findings.md) A2),
-  so recall orders by cosine similarity only.
+- Retrieval records access and updates heat, but ranking still ignores heat (see
+  [`docs/performance-and-ability-findings.md`](../../docs/performance-and-ability-findings.md) A2).
+  Recall therefore remains ordered by cosine similarity, not by the access/heat signal.

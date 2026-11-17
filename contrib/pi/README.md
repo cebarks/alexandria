@@ -75,10 +75,9 @@ extraction is thorough but arrives only at the end.
 
 ### Requires a dependency install
 
-It depends on `@modelcontextprotocol/client` and `smol-toml`. pi's extension loader (jiti) does not
-alias third-party npm packages the way it does pi's own internal packages, so a bare `.ts` file
-cannot resolve them — this has to be a package-style extension directory with its own
-`node_modules`.
+It depends on `@modelcontextprotocol/client`. Pi's extension loader (jiti) does not alias
+third-party npm packages the way it does Pi's own internal packages, so a bare `.ts` file cannot
+resolve them — this has to be a package-style extension directory with its own `node_modules`.
 
 **Install:**
 
@@ -93,34 +92,30 @@ The directory used to be `extensions/alexandria-auto-recall/`. If the old copy i
 
 ### Configuration
 
-Config file: `$XDG_CONFIG_HOME/alexandria/client.toml`, same precedence as the server
-(defaults → file → `ALEXANDRIA_CLIENT_CONFIG` → individual env vars). See
-[docs/configuration.md](../../docs/configuration.md) for the full reference. Every key is optional;
-the defaults work against a locally running server. `limit` and `min_similarity` are a pair read
-off one grid for `all-MiniLM-L6-v2`; change them together (see `[recall]` in docs/configuration.md).
+Config file: `$XDG_CONFIG_HOME/alexandria/client.json`. Defaults are overridden by that file (or
+the file selected by `ALEXANDRIA_CLIENT_CONFIG`), then by individual env vars. The companion no
+longer reads `client.toml`; convert an existing file to JSON manually, and update any explicit path
+override. Server config remains TOML. See [docs/configuration.md](../../docs/configuration.md) for
+the full reference. Every key is optional; the defaults work against a locally running server.
+`/alexandria` opens the in-Pi auto-recall menu. `limit` and `min_similarity` are a pair read off one
+grid for `all-MiniLM-L6-v2`; change them together (see `recall` in docs/configuration.md).
 
-```toml
-[server]
-url = "http://127.0.0.1:3000/mcp"
-
-[recall]
-enabled = true
-limit = 10
-min_similarity = 0.45
-
-[store]
-enabled = true
-extract_model = "vertex/claude-haiku-4-5"
-extract_timeout_ms = 5000
-
-[reminders]
-enabled = true
-project = "alexandria"
+```json
+{
+  "server": { "url": "http://127.0.0.1:3000/mcp" },
+  "recall": { "enabled": true, "limit": 10, "min_similarity": 0.45 },
+  "store": {
+    "enabled": true,
+    "extract_model": "vertex/claude-haiku-4-5",
+    "extract_timeout_ms": 5000
+  },
+  "reminders": { "enabled": true, "project": "alexandria" }
+}
 ```
 
 Env vars cover the same ground (`ALEXANDRIA_REMINDERS=off`, `ALEXANDRIA_REMINDERS_PROJECT`, …); see
 [`extensions/alexandria/README.md`](extensions/alexandria/README.md) for the full list, the
-`client.toml` shape, and how reminder delivery, project targeting, and overdue escalation work.
+`client.json` shape, and how reminder delivery, project targeting, and overdue escalation work.
 
 ### Failure behavior
 

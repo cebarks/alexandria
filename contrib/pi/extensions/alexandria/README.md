@@ -6,8 +6,9 @@ the conversation or extracts at session end.
 
 Formerly `extensions/alexandria-auto-recall/`. The directory name (and therefore the install path)
 changed, as did the client name and version the extension reports to the server (`alexandria`
-`2.1.0`, which is what shows up in server logs and client-info); `client.toml`, the env vars, and
-the server side did not. If you installed it by copying, remove
+`2.1.0`, which is what shows up in server logs and client-info). The companion config is now
+`client.json` rather than the former `client.toml`; the server and env-var names are unchanged. If
+you installed it by copying, remove
 `~/.pi/agent/extensions/alexandria-auto-recall` before installing the new directory, or pi will load
 both.
 
@@ -19,9 +20,9 @@ in-directory reference for behavior and configuration.
 
 | Layer | Hook | Behavior | Disable with |
 | --- | --- | --- | --- |
-| Auto-recall | `before_agent_start` | Sends the user's prompt to `retrieve_memories` — the *server* embeds it; the extension carries no embedding dependency — and injects hits with `similarity >= recall.min_similarity` (inclusive) as an `alexandria` context message. The injected block tells the agent to verify relevance and to `update_memory` anything stale. | `ALEXANDRIA_AUTO_RECALL=off` or `[recall] enabled = false` |
-| Reminder delivery | `before_agent_start` | Calls `check_reminders` once per prompt, injects whatever is due into the same message and shows a count notification. | `ALEXANDRIA_REMINDERS=off` or `[reminders] enabled = false` |
-| Correction detector | `before_agent_start` | Regex over the prompt for correction-shaped language ("no, use X"). Fires only on unambiguous matches; ambiguous cases are left to the extraction pass. | `ALEXANDRIA_AUTO_STORE=off` or `[store] enabled = false` |
+| Auto-recall | `before_agent_start` | Sends the user's prompt to `retrieve_memories` — the *server* embeds it; the extension carries no embedding dependency — and injects hits with `similarity >= recall.min_similarity` (inclusive) as an `alexandria` context message. The injected block tells the agent to verify relevance and to `update_memory` anything stale. | `/alexandria`, `ALEXANDRIA_AUTO_RECALL=off`, or `recall.enabled = false` |
+| Reminder delivery | `before_agent_start` | Calls `check_reminders` once per prompt, injects whatever is due into the same message and shows a count notification. | `ALEXANDRIA_REMINDERS=off` or `reminders.enabled = false` |
+| Correction detector | `before_agent_start` | Regex over the prompt for correction-shaped language ("no, use X"). Fires only on unambiguous matches; ambiguous cases are left to the extraction pass. | `ALEXANDRIA_AUTO_STORE=off` or `store.enabled = false` |
 | Preference detector | `before_agent_start` | Regex for forward-looking preference/convention statements ("always do X", "never do Y", "don't do Z"). The stored text starts at the trigger word, so a prohibition keeps its negation; a match with a negation earlier in its clause is not stored at all. | as above |
 | Error tracker | `tool_execution_end` → `agent_end` | Pairs a failing tool call with a later success of the same tool and stores the resolution. Errors must contain a recognized signal to be tracked. | as above |
 | Dedup tracker | `tool_result` | Records content from agent-initiated `store_memory` / `update_memory` calls (matched by tool-name suffix, so the MCP prefix doesn't matter) so extraction doesn't re-report them | as above |
@@ -166,34 +167,49 @@ it falls back to the session's own model.
 
 ## Configuration
 
-Config file: `$XDG_CONFIG_HOME/alexandria/client.toml` (`~/Library/Application Support/alexandria/client.toml`
-on macOS), overridable with `ALEXANDRIA_CLIENT_CONFIG`. Environment variables win over the file,
-which wins over defaults. Unparseable TOML warns and falls back to defaults rather than failing.
+Config file: `$XDG_CONFIG_HOME/alexandria/client.json` (`~/Library/Application Support/alexandria/client.json`
+on macOS when `XDG_CONFIG_HOME` is unset), overridable with `ALEXANDRIA_CLIENT_CONFIG`.
+Environment variables win over the selected file, which wins over defaults. Invalid JSON warns and
+falls back to defaults at startup; the menu refuses to overwrite an invalid or unreadable file.
 
-`enabled = false` in the TOML file disables a feature the same way `off` does in the environment,
-except an explicit env var always overrides the file.
+**Breaking change:** the companion no longer reads `client.toml`. Convert an existing client file to
+JSON manually, retaining the same section/key names, and update `ALEXANDRIA_CLIENT_CONFIG` if it
+points to a TOML path. There is no automatic migration. The server's `config.toml` is unchanged.
 
-See [docs/configuration.md](../../../../docs/configuration.md) for the full reference.
+Run `/alexandria` in Pi to view and edit auto-recall's enabled state, limit (1–100), and minimum
+similarity (-1 to 1). Changes are saved to the selected JSON file and apply to subsequent prompts in
+that Pi process. Other running processes keep their loaded settings until reloaded. Each environment
+override is labeled with its effective and saved values; saving does not override the environment.
+The menu follows symlinks, preserves unrelated JSON values and ordinary mode bits, refuses read-only
+files and untrusted directories, and serializes companion writers. It uses no external filesystem
+metadata tools.
+The atomic replacement does **not** preserve ownership, ACLs, extended attributes, special mode
+bits, or inode flags; effective access can change even if the mode bits look unchanged. Edit the
+JSON manually if those attributes matter. Linux menu writes are tested; the macOS path has not been
+tested on a real Mac. Windows menu writes are currently refused.
 
-### Example `client.toml`
+A group-writable temporary file can be changed before publication by someone in its group, which can
+be different from the original file's group. Use an owner-only config mode or directory if that risk
+matters. The lock does not constrain ordinary editors: avoid external edits while a menu save is in
+progress. If a crash leaves a `<config>.lock` file, verify that no other writer is active before removing it.
+Writes are not `fsync`ed, so a successful save does not guarantee survival of sudden power loss.
 
-```toml
-[server]
-url = "http://127.0.0.1:3000/mcp"
+See [docs/configuration.md](../../../../docs/configuration.md) for the full reference, including why
+`limit` and `min_similarity` must be considered together.
 
-[recall]
-enabled = true
-limit = 10
-min_similarity = 0.45   # only valid at limit = 10; see docs/configuration.md [recall]
+### Example `client.json`
 
-[store]
-enabled = true
-extract_model = "vertex/claude-haiku-4-5"
-extract_timeout_ms = 5000
-
-[reminders]
-enabled = true
-project = "alexandria"
+```json
+{
+  "server": { "url": "http://127.0.0.1:3000/mcp" },
+  "recall": { "enabled": true, "limit": 10, "min_similarity": 0.45 },
+  "store": {
+    "enabled": true,
+    "extract_model": "vertex/claude-haiku-4-5",
+    "extract_timeout_ms": 5000
+  },
+  "reminders": { "enabled": true, "project": "alexandria" }
+}
 ```
 
 ### Environment Variables
@@ -203,13 +219,13 @@ project = "alexandria"
 | `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | Alexandria server MCP endpoint |
 | `ALEXANDRIA_AUTO_RECALL` | (enabled) | Set to `off` to disable auto-recall |
 | `ALEXANDRIA_AUTO_RECALL_LIMIT` | `10` | Max memories to retrieve. A recall lever, not just a cap; paired with `MIN_SIMILARITY` |
-| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.45` | Minimum cosine similarity, inclusive (model-dependent; sits above the server-side `[retrieve] min_similarity` floor). A judgement call for `all-MiniLM-L6-v2`, only valid at `LIMIT=10`: see `[recall]` in [`docs/configuration.md`](../../../../docs/configuration.md) |
+| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.45` | Minimum cosine similarity, inclusive (model-dependent; sits above the server-side `[retrieve] min_similarity` floor). The default is calibrated for `all-MiniLM-L6-v2` with `LIMIT=10`: see `recall` in [`docs/configuration.md`](../../../../docs/configuration.md) |
 | `ALEXANDRIA_AUTO_STORE` | (enabled) | Set to `off` to disable all store behavior — detectors and extraction alike |
 | `ALEXANDRIA_EXTRACT_MODEL` | `vertex/claude-haiku-4-5` | Model for the LLM extraction pass |
 | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | `5000` | Extraction timeout in milliseconds |
 | `ALEXANDRIA_REMINDERS` | (enabled) | Set to `off` to disable per-prompt reminder checks |
 | `ALEXANDRIA_REMINDERS_PROJECT` | (git repo dir name) | Project hint sent to `check_reminders`, for exact matching against reminder targets |
-| `ALEXANDRIA_CLIENT_CONFIG` | (XDG default) | Path to an alternate client TOML config |
+| `ALEXANDRIA_CLIENT_CONFIG` | (XDG default) | Path to an alternate client JSON config |
 
 `ALEXANDRIA_AUTO_RECALL` is the original name of the recall toggle and is still the spelling it
 uses; `ALEXANDRIA_REMINDERS` follows the same shape for the reminders feature.

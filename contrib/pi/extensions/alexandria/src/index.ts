@@ -32,7 +32,7 @@
  *   ALEXANDRIA_URL                          default: http://127.0.0.1:3000/mcp
  *   ALEXANDRIA_AUTO_RECALL                  set to "off" to disable recall
  *   ALEXANDRIA_AUTO_RECALL_LIMIT            default: 10 (read with MIN_SIMILARITY; see docs/minilm-test-data.md)
- *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.45 (only valid at LIMIT=10)
+ *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.45 (calibrated for LIMIT=10)
  *   ALEXANDRIA_AUTO_STORE                   set to "off" to disable all store behavior
  *   ALEXANDRIA_EXTRACT_MODEL                default: vertex/claude-haiku-4-5
  *   ALEXANDRIA_EXTRACT_TIMEOUT_MS           default: 5000
@@ -42,7 +42,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { CONFIG } from "./config.js";
+import { CONFIG, RECALL_SETTINGS } from "./config.js";
+import { showRecallSettings } from "./recall-settings.js";
 import {
 	resetClient,
 	closeClient,
@@ -96,20 +97,39 @@ function notifyStoreFailed(
 	);
 }
 
-export default function alexandriaExtension(pi: ExtensionAPI) {
+interface ExtensionDependencies {
+	prewarm: typeof prewarm;
+	retrieveMemories: typeof retrieveMemories;
+	checkReminders: typeof checkReminders;
+}
+
+export default function alexandriaExtension(
+	pi: ExtensionAPI,
+	dependencies: ExtensionDependencies = { prewarm, retrieveMemories, checkReminders },
+) {
 	// Session-scoped state — reset on each session
 	let dedupBuffer = new SessionDedupBuffer();
 	let errorTracker = new ErrorTracker();
 
+	pi.registerCommand("alexandria", {
+		description: "Configure Alexandria auto-recall",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) return;
+			await showRecallSettings(ctx.ui, RECALL_SETTINGS, dependencies.prewarm);
+		},
+	});
+
 	// ── Combined injection dispatcher (recall + reminders) ──────────────
-	if (!CONFIG.recallDisabled || !CONFIG.remindersDisabled) {
+	{
 		// Open the connection now rather than on the first prompt. The cold handshake
 		// is the one window measured to turn a healthy server into a false
 		// `REQUEST_TIMEOUT` when pi's event loop stalls, and this is what takes it off
 		// the prompt path. Not awaited: extension load must not block on the server.
-		prewarm();
+		if (!CONFIG.recallDisabled || !CONFIG.remindersDisabled) dependencies.prewarm();
 
 		pi.on("before_agent_start", async (event, ctx) => {
+			const recallSettings = RECALL_SETTINGS.get().effective;
+			if (!recallSettings.enabled && CONFIG.remindersDisabled) return undefined;
 			const query = event.prompt?.trim();
 			// Diagnostics start before any await so the recorded window covers the
 			// whole handler, including the git probe and any stall of pi's own loop.
@@ -167,13 +187,14 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 			// Settled, not awaited: one feature failing must never suppress the
 			// other's injection or its notification.
 			const recallTask: Promise<FeatureOutcome> =
-				!CONFIG.recallDisabled && query
+				recallSettings.enabled && query
 					? (async () => {
 							try {
-								const { items, error } = await retrieveMemories(
+								const { items, error } = await dependencies.retrieveMemories(
 									query,
 									undefined,
 									budget.signal,
+									recallSettings,
 								);
 								return {
 									block: items.length > 0 ? formatMemoriesBlock(items) : null,
@@ -190,7 +211,7 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 				: (async () => {
 						try {
 							const project = await getProjectHint(ctx.cwd);
-							const { items, error } = await checkReminders(
+							const { items, error } = await dependencies.checkReminders(
 								project,
 								undefined,
 								budget.signal,

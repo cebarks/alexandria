@@ -553,7 +553,7 @@ mod tests {
         assert_ne!(other, cid);
         assert!(
             cluster_repo
-                .get("cluster:never-created-9f2a")
+                .get(&RecordId::new("cluster", "never-created-9f2a").to_sql())
                 .await
                 .unwrap()
                 .is_none()
