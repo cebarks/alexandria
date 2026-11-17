@@ -23,12 +23,17 @@ use alexandria_engine::dreaming::{DEMOTED_CONFIDENCE, Intervals, Job, JobReport,
 use alexandria_engine::heat::{HeatColumns, HeatState as EngineHeatState, projected_heat};
 use alexandria_storage::access::SystemContext;
 use alexandria_storage::models::LiveConfidence;
-use alexandria_storage::models::identity::Partition;
+use alexandria_storage::models::identity::{FactId, OperationId, Partition};
 use alexandria_storage::models::maintenance::MaintenanceBudgetJob;
 use alexandria_storage::models::maintenance::{action, disposition, job as job_name};
+use alexandria_storage::models::mutation::{
+    EdgeKind, FactChange, MaintenanceSummary, PreparedChangeSet, RelationChange, RelationTarget,
+    Visibility, effect,
+};
+use alexandria_storage::models::operation_kind;
 use alexandria_storage::repos::{
     AuditContext, ClusterRepo, EdgeRepo, HeatMaterialise, HeatRepo, IdentityRepo, LogEntry,
-    MaintenanceRepo, MemoryRepo,
+    MaintenanceRepo, MemoryRepo, MutationRepo,
 };
 use alexandria_storage::{Database, RecordId, record_id_to_string, system_config};
 use tokio::task::JoinHandle;
@@ -606,7 +611,8 @@ impl Jobs {
             // conjunctive (cold AND never accessed AND confidence at or below the ceiling), rows
             // created before access recording was armed are skipped not demoted, and the value
             // this job writes exempts itself from the rule so a daily pass cannot keep lowering
-            // the same row. The demotion and its audit row go through the M1 barrier.
+            // the same row. The demotion, journal preimage and linked audit summary share the
+            // mutation kernel's M1 active-account claim.
             //
             // Paging: appraise does NOT move `last_touched`, so the page is resumed after the
             // persisted cursor — without it, a page of ineligible rows (the armed-at
@@ -647,10 +653,6 @@ impl Jobs {
 
                 let mut report = JobReport::new(Job::Appraise);
                 let now = now_secs();
-                let audit = MaintenanceRepo::with_audit(
-                    self.db.inner(),
-                    AuditContext::dreaming(run_id, job_name::APPRAISE),
-                );
                 let mut demotions: Vec<(RecordId, f64)> = Vec::new();
                 for row in &rows {
                     let id = record_id_to_string(&row.memory);
@@ -698,55 +700,58 @@ impl Jobs {
                         exhausted: rows.len() < limit,
                     });
                 }
-                // One transaction for every demotion in this partition: one active-account claim,
-                // every statement the same single-column update the whole-store body issues.
-                let writes: Vec<alexandria_storage::repos::scope::GuardedWrite> = demotions
-                    .iter()
-                    .map(|(fact, _)| {
-                        alexandria_storage::repos::scope::GuardedWrite::new(
-                            "UPDATE $f SET confidence = $c WHERE workspace = $workspace AND \
-                             deleted = false AND quarantined_at = NONE RETURN AFTER;",
-                        )
-                        .id("f", fact.clone())
-                        .value(
-                            "c",
-                            alexandria_storage::repos::scope::Bind::Float(DEMOTED_CONFIDENCE),
-                        )
-                    })
-                    .collect();
-                let written = alexandria_storage::repos::scope::guarded_system_writes::<
-                    alexandria_storage::models::Fact,
-                >(
-                    self.db.inner(), &self.db, &self.system, partition, &writes
-                )
-                .await?;
-                let Some(per_statement) = written else {
-                    return Err(alexandria_storage::error::StorageError::Stale.into());
-                };
-                for (index, (fact, previous)) in demotions.iter().enumerate() {
-                    // A row that acted but failed to log is worse than the reverse: the log write
-                    // is outside the barrier transaction and its failure is warned, not unwound —
-                    // the same discipline the whole-store body keeps.
-                    if per_statement[index].is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = audit
-                        .record(&LogEntry {
+                // Each semantic change, its preimage and its linked maintenance summary commit
+                // atomically through the shared kernel. Journal rows are auxiliary: the pass still
+                // charges the selected heat page below, not these extra records.
+                let mutation = MutationRepo::new(self.db.inner());
+                for (fact, previous) in &demotions {
+                    let fact_id = FactId::try_from(fact.clone())?;
+                    let expected = mutation
+                        .expected_state_system(&self.db, &self.system, partition, &fact_id)
+                        .await?;
+                    let change = PreparedChangeSet::new(operation_kind::APPRAISE)
+                        .effect(effect::CONFIDENCE)
+                        .fact(FactChange::Update {
+                            fact: fact_id,
+                            expected: expected.version,
+                            content: None,
+                            tags: None,
+                            confidence: Some(DEMOTED_CONFIDENCE),
+                            embedding: None,
+                            visibility: None,
+                            scope: None,
+                        })
+                        .summary(MaintenanceSummary {
                             action: action::DEMOTE.to_string(),
                             source_id: record_id_to_string(fact),
                             target_ids: Vec::new(),
                             members_moved: 0,
-                            disposition: Some(disposition::DEMOTE.to_string()),
+                            run_id: run_id.to_string(),
+                            job: job_name::APPRAISE.to_string(),
+                            disposition: disposition::DEMOTE.to_string(),
                             previous_value: Some(*previous),
-                        })
+                        });
+                    let operation = OperationId::new(format!(
+                        "{run_id}:appraise:{}",
+                        record_id_to_string(fact)
+                    ));
+                    match mutation
+                        .apply_system(
+                            &self.db,
+                            &self.system,
+                            partition,
+                            &operation,
+                            &[expected],
+                            &change,
+                        )
                         .await
                     {
-                        tracing::warn!(
-                            "Appraise: cannot log the demotion of {}: {e}",
+                        Ok(_) => report.acted += 1,
+                        Err(error) => tracing::warn!(
+                            "Appraise: cannot demote {}: {error}",
                             record_id_to_string(fact)
-                        );
+                        ),
                     }
-                    report.acted += 1;
                 }
                 Ok(PartitionOutcome {
                     report: alexandria_engine::dreaming::PartitionJobReport {
@@ -759,9 +764,8 @@ impl Jobs {
             }
             // Duplicate retirement, partition-scoped. The grouping sees only this partition's
             // live rows, so a byte-identical row in another account's corpus is never a collapse
-            // partner. The `derived_from` edge is written BEFORE the soft-delete inside ONE
-            // barrier transaction per retirement — reversed, a failure between the two would
-            // leave a dead row with no path back to its survivor. Budget counts retirements.
+            // partner. The `derived_from` edge and soft-delete now commit together through the
+            // semantic mutation kernel, which retains both preimages. Budget counts retirements.
             Job::Collapse => {
                 let limit = row_allowance.unwrap_or(self.max_rows_per_run);
                 let memories = MemoryRepo::new(self.db.inner());
@@ -781,10 +785,6 @@ impl Jobs {
 
                 let mut report = JobReport::new(Job::Collapse);
                 report.examined = rows.len();
-                let audit = MaintenanceRepo::with_audit(
-                    self.db.inner(),
-                    AuditContext::dreaming(run_id, job_name::COLLAPSE),
-                );
                 // The engine groups by display string; the typed ids the scoped read returned are
                 // the authority, so the strings are only keys back into this map. No id is ever
                 // *parsed* from text - that is the type-erasing trap the reminder work removed.
@@ -805,72 +805,63 @@ impl Jobs {
                             continue;
                         };
                         let (from, to) = (from.clone(), to.clone());
-                        // Edge first, delete second, one claim for both.
-                        let writes = vec![
-                            alexandria_storage::repos::scope::GuardedWrite::new(
-                                "RELATE $from->memory_edge->$to SET edge_type = $edge_type, \
-                                 strength = $strength;",
+                        let fact = FactId::try_from(from.clone())?;
+                        let mutation = MutationRepo::new(self.db.inner());
+                        let expected = mutation
+                            .expected_state_system(&self.db, &self.system, partition, &fact)
+                            .await?;
+                        let change = PreparedChangeSet::new(operation_kind::COLLAPSE)
+                            .effect(EdgeKind::Memory("derived_from".to_string()).effect())
+                            .effect(effect::DELETE)
+                            .fact(FactChange::Update {
+                                fact: fact.clone(),
+                                expected: expected.version,
+                                content: None,
+                                tags: None,
+                                confidence: None,
+                                embedding: None,
+                                visibility: Some(Visibility::deleted()),
+                                scope: None,
+                            })
+                            .relate(RelationChange {
+                                kind: EdgeKind::Memory("derived_from".to_string()),
+                                from: RelationTarget::Existing(from.clone()),
+                                to: RelationTarget::Existing(to.clone()),
+                                strength: 1.0,
+                            })
+                            .summary(MaintenanceSummary {
+                                action: action::COLLAPSE.to_string(),
+                                source_id: record_id_to_string(&from),
+                                target_ids: vec![record_id_to_string(&to)],
+                                members_moved: 0,
+                                run_id: run_id.to_string(),
+                                job: job_name::COLLAPSE.to_string(),
+                                disposition: disposition::SOFT_DELETE.to_string(),
+                                previous_value: None,
+                            });
+                        let operation = OperationId::new(format!(
+                            "{run_id}:collapse:{}",
+                            record_id_to_string(&from)
+                        ));
+                        if mutation
+                            .apply_system(
+                                &self.db,
+                                &self.system,
+                                partition,
+                                &operation,
+                                &[expected],
+                                &change,
                             )
-                            .id("from", from.clone())
-                            .id("to", to.clone())
-                            .value(
-                                "edge_type",
-                                alexandria_storage::repos::scope::Bind::Text(
-                                    "derived_from".to_string(),
-                                ),
-                            )
-                            .value(
-                                "strength",
-                                alexandria_storage::repos::scope::Bind::Float(1.0),
-                            ),
-                            alexandria_storage::repos::scope::GuardedWrite::new(
-                                "UPDATE $f SET deleted = true WHERE workspace = $workspace AND \
-                                 deleted = false AND quarantined_at = NONE RETURN AFTER;",
-                            )
-                            .id("f", from.clone()),
-                        ];
-                        // The rows decode as JSON values because the two statements return
-                        // different row shapes: the RELATE yields `memory_edge` records and the
-                        // UPDATE yields `fact` rows, and one type parameter cannot name both.
-                        // Landing is judged by the UPDATE's rows (index 1) alone — the delete is
-                        // the retirement; the edge's own result shape is not a contract.
-                        let written = alexandria_storage::repos::scope::guarded_system_writes::<
-                            serde_json::Value,
-                        >(
-                            self.db.inner(), &self.db, &self.system, partition, &writes
-                        )
-                        .await?;
-                        let Some(per_statement) = written else {
-                            return Err(alexandria_storage::error::StorageError::Stale.into());
-                        };
-                        if per_statement.get(1).is_none_or(|rows| rows.is_empty()) {
-                            // The retirement did not land (a raced row state, most likely):
-                            // counted as skipped, the next pass re-groups whatever is left.
+                            .await
+                            .is_err()
+                        {
                             report.skipped += 1;
                             continue;
                         }
                         retired.push((from, to));
                     }
                 }
-                for (collapsed, survivor) in &retired {
-                    if let Err(e) = audit
-                        .record(&LogEntry {
-                            action: action::COLLAPSE.to_string(),
-                            source_id: record_id_to_string(collapsed),
-                            target_ids: vec![record_id_to_string(survivor)],
-                            members_moved: 0,
-                            disposition: Some(disposition::SOFT_DELETE.to_string()),
-                            previous_value: None,
-                        })
-                        .await
-                    {
-                        tracing::warn!(
-                            "Collapse: cannot log the collapse of {}: {e}",
-                            record_id_to_string(collapsed)
-                        );
-                    }
-                    report.acted += 1;
-                }
+                report.acted = retired.len();
                 Ok(PartitionOutcome {
                     report: alexandria_engine::dreaming::PartitionJobReport {
                         report,
@@ -2589,13 +2580,16 @@ mod tests {
             .check()
             .unwrap();
         // Stamp the fact into the owner's workspace and the personal scope, so the partition's
-        // conjunct (`workspace = $w AND scope = 'personal'`) finds it.
+        // conjunct (`workspace = $w AND scope = 'personal'`) finds it. The account stamp rides
+        // along because that is the production shape: a scoped write stamps account and workspace
+        // together, and the mutation kernel's reads predicate on both.
         db.inner()
             .query(
-                "UPDATE type::record($f) SET workspace = $workspace, scope = 'personal', \
-                 deleted = false;",
+                "UPDATE type::record($f) SET account = $account, workspace = $workspace, \
+                 scope = 'personal', deleted = false;",
             )
             .bind(("f", fact.clone()))
+            .bind(("account", ids.account.as_record_id().clone()))
             .bind(("workspace", ids.workspace.as_record_id().clone()))
             .await
             .unwrap()
@@ -2628,12 +2622,28 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
+        // The account is resolved from the workspace itself — the same owner edge the system
+        // mutation context reads — so this helper keeps taking only a workspace while still
+        // stamping the production shape (account and workspace together).
+        let owner: Vec<alexandria_storage::RecordId> = db
+            .inner()
+            .query("SELECT VALUE owner FROM workspace WHERE id = $workspace LIMIT 1;")
+            .bind(("workspace", workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        let owner = owner
+            .first()
+            .expect("a seeded workspace names its owner")
+            .clone();
         db.inner()
             .query(
-                "UPDATE type::record($f) SET workspace = $workspace, scope = 'personal', \
-                 deleted = false;",
+                "UPDATE type::record($f) SET account = $account, workspace = $workspace, \
+                 scope = 'personal', deleted = false;",
             )
             .bind(("f", fact.clone()))
+            .bind(("account", owner))
             .bind(("workspace", workspace.as_record_id().clone()))
             .await
             .unwrap()

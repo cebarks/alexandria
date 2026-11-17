@@ -240,12 +240,13 @@ impl OwnerContext {
 /// leaves a before-state an owner can read back on the history page. Holding a read context must not be
 /// enough to produce that record, and `OwnerContext` is handed to readers as well as writers.
 ///
-/// The only producer is [`MutationContext::issued_to`], which takes an [`OwnerContext`] — a value nothing
-/// outside this crate can build, deserialize, or assemble from an id. So the type adds no authority: it
-/// *re-names* the authority an admitted request already holds, and in doing so carries the initiator the
-/// journal needs. There is no constructor from an [`AccountId`], no `Default`, no deserialisation, and
-/// **no path from [`AdminCapability`]**: the administrator's role manages accounts and reads content-free
-/// health, and a capability that could be turned into a corpus writer would make that sentence false.
+/// The owner producer is [`MutationContext::issued_to`], which takes an [`OwnerContext`] — a value nothing
+/// outside this crate can build, deserialize, or assemble from an id. The system producer is crate-private
+/// and used only by the M1-guarded maintenance mutation path after it validates the instance authority and
+/// resolves the actor from the selected workspace. Its `initiator` is `NONE`: no credential presented the
+/// system write. There is no public constructor from an [`AccountId`], no `Default`, no deserialisation, and
+/// **no path from [`AdminCapability`]**. The administrator's role manages accounts and reads content-free
+/// health; a capability that could become a corpus writer would make that boundary false.
 ///
 /// ```compile_fail
 /// use alexandria_storage::access::MutationContext;
@@ -262,9 +263,28 @@ impl OwnerContext {
 /// fn requires_deserialize<T: serde::de::DeserializeOwned>() {}
 /// requires_deserialize::<MutationContext>();
 /// ```
+///
+/// ```compile_fail
+/// // Pins the system mint's visibility directly: every argument type-checks, so the only
+/// // reason this fails is that `issued_by_system` is `pub(crate)` — rustc reports the call as
+/// // private on this line alone. If it were ever made `pub`, this doctest would compile and the
+/// // suite would fail — which is the pin. No request payload, account id or AdminCapability can
+/// // become the system variant from outside storage.
+/// use alexandria_storage::access::{MutationContext, SystemContext};
+/// use alexandria_storage::models::identity::{AccountId, WorkspaceId};
+///
+/// fn outside_storage(
+///     system: &SystemContext,
+///     account: AccountId,
+///     workspace: WorkspaceId,
+/// ) -> MutationContext {
+///     MutationContext::issued_by_system(system, account, workspace)
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct MutationContext {
     owner: OwnerContext,
+    system: Option<SystemContext>,
 }
 
 impl MutationContext {
@@ -276,6 +296,27 @@ impl MutationContext {
     pub fn issued_to(owner: &OwnerContext) -> Self {
         Self {
             owner: owner.clone(),
+            system: None,
+        }
+    }
+
+    /// Issue the non-request write variant from the guarded system-maintenance path.
+    ///
+    /// The account and workspace are resolved by storage from the partition's workspace after the M1
+    /// system authority has been checked. This internal owner-shaped data is used only for the kernel's
+    /// workspace predicates; the transactional authority check uses `system`, never its write epoch.
+    pub(crate) fn issued_by_system(
+        system: &SystemContext,
+        account: AccountId,
+        workspace: WorkspaceId,
+    ) -> Self {
+        Self {
+            owner: OwnerContext {
+                account,
+                workspace,
+                write: WriteAuthorization::TrustedLocal { auth_epoch: 0 },
+            },
+            system: Some(system.clone()),
         }
     }
 
@@ -290,6 +331,10 @@ impl MutationContext {
     /// The owner context this write authority was issued from, for the scoped writers that guard on it.
     pub fn owner(&self) -> &OwnerContext {
         &self.owner
+    }
+
+    pub(crate) fn system(&self) -> Option<&SystemContext> {
+        self.system.as_ref()
     }
 
     /// The credential that presented itself, for `semantic_operation.initiator`.

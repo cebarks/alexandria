@@ -543,7 +543,7 @@ impl<T> StatementRun<T> {
 
 /// The system claim's conditional write: the account row that owns this workspace, re-asserted as
 /// active at the moment the data statement is about to run.
-async fn claim_system_for_workspace(
+pub(crate) async fn claim_system_for_workspace(
     tx: &Transaction<Any>,
     workspace: &RecordId,
 ) -> Result<bool, StorageError> {

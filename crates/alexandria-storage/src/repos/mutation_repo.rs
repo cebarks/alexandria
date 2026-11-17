@@ -12,8 +12,8 @@
 //! # The three properties this repo owns
 //!
 //! **Atomicity, or the full semantic before-state remains.** `apply` opens one transaction, re-asserts the
-//! caller's write authorization inside it (the same [`claim_authority`] every scoped writer uses, so a
-//! revocation landing mid-request costs the commit rather than being committed over), verifies every
+//! writer's authority inside it (an admitted owner's credential/epoch claim, or the M1 active-workspace
+//! system claim), verifies every
 //! [`ExpectedState`] against the row *as the transaction finds it*, performs every write, writes the
 //! journal row and its snapshots, and commits. Any refusal cancels the transaction, so the corpus keeps
 //! its previous semantic state and the journal records nothing about the attempt. The failure injection in
@@ -51,10 +51,10 @@
 //! [`StorageError::RetryableBookkeepingConflict`] when derived counters or the numerical population no
 //! longer match, including a compatibility visibility/vector write that changed no counter.
 
-use crate::access::{MutationContext, OwnerContext};
+use crate::access::{MutationContext, OwnerContext, SystemContext};
 use crate::error::StorageError;
 use crate::models::identity::{
-    FactId, MemoryScope, OperationId, Partition, ProjectId, Version, WorkspaceId,
+    AccountId, FactId, MemoryScope, OperationId, Partition, ProjectId, Version, WorkspaceId,
 };
 use crate::models::mutation::{
     AppliedChange, ClassificationApproval, ClusterChange, ClusterPopulationMember, ClusterSnapshot,
@@ -65,7 +65,9 @@ use crate::models::mutation::{
 };
 use crate::models::mutation::{ProvenanceRow, RawDocument};
 use crate::models::{operation_kind, scope_kind, snapshot_kind};
-use crate::repos::scope::{ScopeFilter, claim_authority, is_write_conflict, record_key};
+use crate::repos::scope::{
+    ScopeFilter, claim_authority, claim_system_for_workspace, is_write_conflict, record_key,
+};
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
@@ -97,6 +99,69 @@ pub struct MutationRepo<'a> {
 impl<'a> MutationRepo<'a> {
     pub fn new(db: &'a Surreal<Any>) -> Self {
         Self { db }
+    }
+
+    async fn system_mutation_context(
+        &self,
+        instance: &crate::Database,
+        system: &SystemContext,
+        partition: &Partition,
+    ) -> Result<MutationContext, StorageError> {
+        if !instance.holds_authority(system) {
+            return Err(StorageError::Stale);
+        }
+        let owners: Vec<RecordId> = self
+            .db
+            .query("SELECT VALUE owner FROM workspace WHERE id = $workspace LIMIT 1;")
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        let owner = owners.into_iter().next().ok_or(StorageError::Stale)?;
+        let account = AccountId::try_from(owner)?;
+        Ok(MutationContext::issued_by_system(
+            system,
+            account,
+            partition.workspace.clone(),
+        ))
+    }
+
+    /// Capture the current semantic preimage for a partition-scoped system write.
+    pub async fn expected_state_system(
+        &self,
+        instance: &crate::Database,
+        system: &SystemContext,
+        partition: &Partition,
+        fact: &FactId,
+    ) -> Result<ExpectedState, StorageError> {
+        let access = self
+            .system_mutation_context(instance, system, partition)
+            .await?;
+        let snapshot = self
+            .state(access.owner(), fact)
+            .await?
+            .ok_or(StorageError::NotFound)?;
+        Ok(ExpectedState::of(&snapshot))
+    }
+
+    /// Apply one journaled system mutation under the same M1 active-workspace barrier as the
+    /// partitioned maintenance writers. The initiator is `NONE`: no credential presented this write.
+    pub async fn apply_system(
+        &self,
+        instance: &crate::Database,
+        system: &SystemContext,
+        partition: &Partition,
+        operation: &OperationId,
+        expected: &[ExpectedState],
+        change: &PreparedChangeSet,
+    ) -> Result<AppliedChange, StorageError> {
+        let access = self
+            .system_mutation_context(instance, system, partition)
+            .await?;
+        self.apply(&access, operation, expected, change).await
     }
 
     // -- reading the state a caller must expect ------------------------------------------------------
@@ -363,7 +428,7 @@ impl<'a> MutationRepo<'a> {
 
     // -- the transaction -----------------------------------------------------------------------------
 
-    /// Apply one semantic change atomically, under the caller's own authority.
+    /// Apply one semantic change atomically, under an admitted owner or storage-issued system authority.
     ///
     /// Returns the recorded answer for a duplicate same-key request, and refuses — having written nothing —
     /// for a stale expectation, a lost authority, a key reused across requests, or any engine refusal.
@@ -669,7 +734,12 @@ impl<'a> MutationRepo<'a> {
         let workspace = owner.workspace().as_record_id().clone();
 
         // 1. Authority, asserted as a conditional write on the rows that carry it.
-        if !claim_authority(tx, owner, now).await? {
+        let admitted = if access.system().is_some() {
+            claim_system_for_workspace(tx, owner.workspace().as_record_id()).await?
+        } else {
+            claim_authority(tx, owner, now).await?
+        };
+        if !admitted {
             return Err(StorageError::Stale);
         }
 

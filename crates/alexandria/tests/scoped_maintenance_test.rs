@@ -136,22 +136,20 @@ fn unassigned_unchanged_by_jobs() {
     }
 }
 
-/// DEFERRED FOLLOW-UP WITNESS — the semantic_operation journal routing for maintenance writes.
+/// Journal routing for maintenance writes that act on assigned data.
 ///
-/// The assertions are the ones `unassigned_unchanged_by_jobs` originally carried; they pin the
-/// maintenance-journal-routing scope the owner has explicitly deferred (MutationContext has no
-/// system variant — see the M3c grounded finding and the AGENTS follow-up list). Kept verbatim
-/// and ignored so the contract stays named in the tree instead of silently dropped; unignore
-/// when the routing lands.
+/// Collapse and appraise operate on assigned data, so the active partition supplies the real
+/// workspace and actor required by v009's semantic journal. Legacy-interim cluster/merge bodies
+/// act only on unowned rows and cannot honestly populate those required fields; their
+/// `cluster_change` journal assertion is kept separately as a named deferred witness for the
+/// owned-cluster maintenance lane.
 #[test]
-#[ignore = "deferred follow-up: semantic_operation journal routing for maintenance writes"]
 fn journal_routed_maintenance_writes_use_the_semantic_operation_kernel() {
     let root = tempfile::tempdir().unwrap();
-    let before = fixture(root.path(), "seed-jobs");
+    let _before = fixture(root.path(), "seed-jobs");
     let _output = dream(root.path(), &["--job", "all"]);
     let after = fixture(root.path(), "inspect");
-    let _ = before;
-    for kind in ["cluster_change", "collapse", "appraise"] {
+    for kind in ["collapse", "appraise"] {
         assert!(
             rows(&after, "semantic_operation")
                 .iter()
@@ -162,6 +160,47 @@ fn journal_routed_maintenance_writes_use_the_semantic_operation_kernel() {
     assert!(
         !rows(&after, "semantic_snapshot").is_empty(),
         "journal preimages must be retained"
+    );
+    // The preimage must belong to the journaled operation, not merely exist: the seed-jobs
+    // fixture collapses one of its two `assigned-duplicate` rows (confidence 0.5), so a
+    // fact-kind snapshot carrying that exact pre-state must name the collapse operation's id.
+    let collapse_ids: Vec<&Value> = rows(&after, "semantic_operation")
+        .iter()
+        .filter(|row| row["kind"] == "collapse")
+        .map(|row| &row["id"])
+        .collect();
+    assert!(
+        !collapse_ids.is_empty(),
+        "a collapse journal row must exist for its preimage to name"
+    );
+    assert!(
+        rows(&after, "semantic_snapshot").iter().any(|snapshot| {
+            collapse_ids.contains(&&snapshot["operation"])
+                && snapshot["kind"] == "fact"
+                && snapshot["fact_content"] == "assigned-duplicate"
+                && snapshot["fact_confidence"] == json!(0.5)
+        }),
+        "the collapsed duplicate's pre-state must feed the collapse operation's journal row"
+    );
+}
+
+/// DEFERRED FOLLOW-UP WITNESS — journal routing for whole-store legacy cluster/merge bodies.
+///
+/// The current legacy gate admits only unowned cluster data, which has no honest workspace/account
+/// attribution for v009's journal. Once the owned-cluster maintenance lane replaces those bodies,
+/// cluster split/merge writes must route through the semantic-operation kernel.
+#[test]
+#[ignore = "deferred follow-up: cluster_change journal routing belongs to the owned-cluster maintenance lane"]
+fn owned_cluster_maintenance_writes_use_the_semantic_operation_kernel() {
+    let root = tempfile::tempdir().unwrap();
+    let _before = fixture(root.path(), "seed-jobs");
+    let _output = dream(root.path(), &["--job", "all"]);
+    let after = fixture(root.path(), "inspect");
+    assert!(
+        rows(&after, "semantic_operation")
+            .iter()
+            .any(|row| row["kind"] == "cluster_change"),
+        "owned cluster split/merge writes must use the journal"
     );
 }
 

@@ -549,8 +549,11 @@ mod tests {
                 .take(0)
                 .unwrap();
             held.inner()
-                .query("UPDATE $f SET workspace = $workspace, scope = 'personal';")
+                .query(
+                    "UPDATE $f SET account = $account, workspace = $workspace, scope = 'personal';",
+                )
                 .bind(("f", fact[0].clone()))
+                .bind(("account", owner.account.as_record_id().clone()))
                 .bind(("workspace", owner.workspace.as_record_id().clone()))
                 .await
                 .unwrap()
@@ -752,8 +755,11 @@ mod tests {
                 .take(0)
                 .unwrap();
             db.inner()
-                .query("UPDATE $f SET workspace = $workspace, scope = 'personal';")
+                .query(
+                    "UPDATE $f SET account = $account, workspace = $workspace, scope = 'personal';",
+                )
                 .bind(("f", fact[0].clone()))
+                .bind(("account", owner.account.as_record_id().clone()))
                 .bind(("workspace", owner.workspace.as_record_id().clone()))
                 .await
                 .unwrap()
