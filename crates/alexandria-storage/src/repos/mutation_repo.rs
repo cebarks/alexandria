@@ -249,6 +249,19 @@ impl<'a> MutationRepo<'a> {
     }
 
     /// The caller's cluster guards and one exact live population for BOTH arithmetic and validation.
+    pub async fn cluster_expectation_system(
+        &self,
+        instance: &crate::Database,
+        system: &SystemContext,
+        partition: &Partition,
+        cluster: &RecordId,
+    ) -> Result<ClusterWriteExpectation, StorageError> {
+        let access = self
+            .system_mutation_context(instance, system, partition)
+            .await?;
+        self.cluster_expectation(access.owner(), cluster).await
+    }
+
     pub async fn cluster_expectation(
         &self,
         owner: &OwnerContext,
@@ -259,6 +272,7 @@ impl<'a> MutationRepo<'a> {
             .query(CLUSTER_GUARD_SQL)
             .bind(("key", record_key(cluster)?))
             .bind(("id", cluster.clone()))
+            .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
             .await
             .map_err(internal)?
@@ -271,6 +285,7 @@ impl<'a> MutationRepo<'a> {
             .db
             .query(CLUSTER_POPULATION_SQL)
             .bind(("cluster", cluster.clone()))
+            .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
             .await
             .map_err(internal)?
@@ -795,17 +810,20 @@ impl<'a> MutationRepo<'a> {
         // Validate the preparer's numerical prestate before this request changes any member's vector,
         // scope or visibility. Replays above do not depend on a population that may have moved since.
         for cluster in &change.cluster_changes {
-            let expectation = match cluster {
+            let expectations: Vec<&ClusterWriteExpectation> = match cluster {
                 ClusterChange::Create { .. } => continue,
                 ClusterChange::Guard { expectation }
                 | ClusterChange::Detach { expectation, .. }
-                | ClusterChange::Effect { expectation, .. } => expectation,
+                | ClusterChange::Effect { expectation, .. } => vec![expectation],
+                ClusterChange::Restructure { expectations, .. } => expectations.iter().collect(),
             };
-            self.assert_cluster_population(tx, owner, expectation)
-                .await?;
-            if matches!(cluster, ClusterChange::Guard { .. }) {
-                self.assert_cluster_revisions(tx, owner, expectation)
+            for expectation in expectations {
+                self.assert_cluster_population(tx, owner, expectation)
                     .await?;
+                if matches!(cluster, ClusterChange::Guard { .. }) {
+                    self.assert_cluster_revisions(tx, owner, expectation)
+                        .await?;
+                }
             }
         }
 
@@ -913,10 +931,8 @@ impl<'a> MutationRepo<'a> {
                 continue;
             }
             let (before, after) = self.apply_cluster(tx, owner, cluster, &minted).await?;
-            if let Some(before) = before {
-                preimages.push(before);
-            }
-            postimages.push(after);
+            preimages.extend(before);
+            postimages.extend(after);
         }
 
         // 7. Relations, after the creates they may point at.
@@ -1396,7 +1412,17 @@ impl<'a> MutationRepo<'a> {
         owner: &OwnerContext,
         change: &ClusterChange,
         minted: &[RecordId],
-    ) -> Result<(Option<SemanticSnapshot>, SemanticSnapshot), StorageError> {
+    ) -> Result<(Vec<SemanticSnapshot>, Vec<SemanticSnapshot>), StorageError> {
+        if let ClusterChange::Restructure {
+            partition,
+            expectations,
+            destinations,
+        } = change
+        {
+            return self
+                .apply_restructure(tx, owner, partition, expectations, destinations)
+                .await;
+        }
         // The preimage first: every write below moves the guards, the centroid or the membership, and an
         // image taken after any of them is a postimage wearing an earlier name.
         let before = match change {
@@ -1411,8 +1437,259 @@ impl<'a> MutationRepo<'a> {
                 self.cluster_image_in_tx(tx, owner, &expectation.cluster)
                     .await?,
             ),
+            ClusterChange::Restructure { .. } => unreachable!("handled above"),
         };
         let after = self.write_cluster(tx, owner, change, minted).await?;
+        Ok((before.into_iter().collect(), vec![after]))
+    }
+
+    #[allow(clippy::mutable_key_type)] // Typed Surreal record identities are only transient membership keys here.
+    async fn apply_restructure(
+        &self,
+        tx: &Transaction<Any>,
+        owner: &OwnerContext,
+        scope: &crate::models::MemoryScope,
+        expectations: &[ClusterWriteExpectation],
+        destinations: &[crate::models::ClusterDestination],
+    ) -> Result<(Vec<SemanticSnapshot>, Vec<SemanticSnapshot>), StorageError> {
+        use std::collections::HashSet;
+
+        if expectations.is_empty() || destinations.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "cluster restructuring requires sources and destinations".to_string(),
+            ));
+        }
+        let source_ids: HashSet<RecordId> = expectations
+            .iter()
+            .map(|expectation| expectation.cluster.clone())
+            .collect();
+        if source_ids.len() != expectations.len() {
+            return Err(StorageError::InvalidInput(
+                "cluster restructuring repeated a source".to_string(),
+            ));
+        }
+        let mut retained_ids = HashSet::new();
+        for destination in destinations {
+            if destination.members.is_empty()
+                || destination
+                    .members
+                    .iter()
+                    .any(|member| member.table.as_str() != "fact")
+                || destination.cluster.is_some() == destination.new_id.is_some()
+                || destination
+                    .new_id
+                    .as_ref()
+                    .is_some_and(|id| id.table.as_str() != "cluster")
+                || destination
+                    .cluster
+                    .as_ref()
+                    .is_some_and(|id| !source_ids.contains(id))
+                || destination
+                    .cluster
+                    .as_ref()
+                    .is_some_and(|id| !retained_ids.insert(id.clone()))
+            {
+                return Err(StorageError::InvalidInput(
+                    "cluster restructuring contains an invalid destination".to_string(),
+                ));
+            }
+        }
+        let mut before = Vec::with_capacity(expectations.len());
+        let mut actual_members = Vec::new();
+        let mut partition_members = Vec::new();
+        let mut live_members = Vec::new();
+        let partition = crate::models::Partition {
+            workspace: owner.workspace().clone(),
+            scope: scope.clone(),
+        };
+        let filter = ScopeFilter::for_partition(&partition);
+        for expectation in expectations {
+            before.push(
+                self.cluster_image_in_tx(tx, owner, &expectation.cluster)
+                    .await?,
+            );
+            let rows: Vec<RecordId> = tx
+                .query("SELECT VALUE out FROM contains_memory WHERE in = $cluster ORDER BY out;")
+                .bind(("cluster", expectation.cluster.clone()))
+                .await
+                .map_err(internal)?
+                .check()
+                .map_err(internal)?
+                .take(0)
+                .map_err(internal)?;
+            actual_members.extend(rows);
+            let query = tx.query(
+                "SELECT VALUE id FROM $cluster->contains_memory->(fact WHERE account = $account AND workspace = $scope_workspace AND ((scope = 'personal' AND $scope_personal) OR (scope = 'unassigned' AND $scope_unassigned) OR (scope = 'project' AND project INSIDE $scope_projects))) ORDER BY id;",
+            ).bind(("cluster", expectation.cluster.clone()))
+                .bind(("account", owner.account().as_record_id().clone()));
+            let rows: Vec<RecordId> = filter
+                .apply(query)
+                .await
+                .map_err(internal)?
+                .check()
+                .map_err(internal)?
+                .take(0)
+                .map_err(internal)?;
+            partition_members.extend(rows);
+            let query = tx.query(
+                "SELECT VALUE id FROM $cluster->contains_memory->(fact WHERE deleted = false AND quarantined_at = NONE AND account = $account AND workspace = $scope_workspace AND ((scope = 'personal' AND $scope_personal) OR (scope = 'unassigned' AND $scope_unassigned) OR (scope = 'project' AND project INSIDE $scope_projects))) ORDER BY id;",
+            ).bind(("cluster", expectation.cluster.clone()))
+                .bind(("account", owner.account().as_record_id().clone()));
+            let rows: Vec<RecordId> = filter
+                .apply(query)
+                .await
+                .map_err(internal)?
+                .check()
+                .map_err(internal)?
+                .take(0)
+                .map_err(internal)?;
+            live_members.extend(rows);
+        }
+        actual_members.sort();
+        if actual_members.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StorageError::RetryableBookkeepingConflict);
+        }
+        partition_members.sort();
+        partition_members.dedup();
+        if partition_members != actual_members {
+            return Err(StorageError::RetryableBookkeepingConflict);
+        }
+        let mut output_members: Vec<RecordId> = destinations
+            .iter()
+            .flat_map(|destination| destination.members.iter().cloned())
+            .collect();
+        output_members.sort();
+        if output_members.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StorageError::InvalidInput(
+                "cluster restructuring assigned a member more than once".to_string(),
+            ));
+        }
+        if actual_members != output_members {
+            return Err(StorageError::RetryableBookkeepingConflict);
+        }
+        live_members.sort();
+        live_members.dedup();
+        let expected_live: Vec<RecordId> = expectations
+            .iter()
+            .flat_map(|expectation| {
+                expectation
+                    .population
+                    .iter()
+                    .map(|member| member.id.clone())
+            })
+            .collect();
+        let mut expected_live = expected_live;
+        expected_live.sort();
+        expected_live.dedup();
+        if live_members != expected_live {
+            return Err(StorageError::RetryableBookkeepingConflict);
+        }
+
+        for expectation in expectations {
+            let destination = destinations
+                .iter()
+                .find(|destination| destination.cluster.as_ref() == Some(&expectation.cluster));
+            let mut sets = vec!["membership_revision = $membership_next"];
+            if destination.is_some() {
+                sets.extend(["centroid = $centroid", "centroid_revision = $centroid_next"]);
+            }
+            let sql = format!(
+                "UPDATE type::record('cluster', $key) SET {} WHERE id = $id AND account = $account AND workspace = $workspace AND (membership_revision = $membership OR (membership_revision = NONE AND $membership = 0)) AND (centroid_revision = $centroid_revision OR (centroid_revision = NONE AND $centroid_revision = 0)) AND (member_embedding_revision = $member_embedding OR (member_embedding_revision = NONE AND $member_embedding = 0)) RETURN AFTER;",
+                sets.join(", ")
+            );
+            let mut query = tx
+                .query(sql)
+                .bind(("key", record_key(&expectation.cluster)?))
+                .bind(("id", expectation.cluster.clone()))
+                .bind(("account", owner.account().as_record_id().clone()))
+                .bind(("workspace", owner.workspace().as_record_id().clone()))
+                .bind(("membership", revision(expectation.membership_revision)))
+                .bind((
+                    "membership_next",
+                    revision(expectation.membership_revision) + 1,
+                ))
+                .bind(("centroid_revision", revision(expectation.centroid_revision)))
+                .bind(("centroid_next", revision(expectation.centroid_revision) + 1))
+                .bind((
+                    "member_embedding",
+                    revision(expectation.member_embedding_revision),
+                ));
+            if let Some(destination) = destination {
+                query = query.bind(("centroid", destination.centroid.clone()));
+            }
+            let rows: Vec<ClusterRow> = query
+                .await
+                .map_err(internal)?
+                .check()
+                .map_err(internal)?
+                .take(0)
+                .map_err(internal)?;
+            if rows.is_empty() {
+                return Err(StorageError::RetryableBookkeepingConflict);
+            }
+        }
+
+        for expectation in expectations {
+            tx.query("DELETE contains_memory WHERE in = $cluster;")
+                .bind(("cluster", expectation.cluster.clone()))
+                .await
+                .map_err(internal)?
+                .check()
+                .map_err(internal)?;
+        }
+        let mut destination_ids = Vec::with_capacity(destinations.len());
+        for destination in destinations {
+            let id = if let Some(id) = &destination.cluster {
+                id.clone()
+            } else {
+                let id = destination.new_id.as_ref().ok_or_else(|| {
+                    StorageError::InvalidInput(
+                        "new cluster destination has no typed id".to_string(),
+                    )
+                })?;
+                let rows: Vec<ClusterRow> = tx
+                    .query("CREATE $id SET label = $label, centroid = $centroid, depth = 0, account = $account, workspace = $workspace RETURN AFTER;")
+                    .bind(("id", id.clone()))
+                    .bind(("label", destination.label.clone()))
+                    .bind(("centroid", destination.centroid.clone()))
+                    .bind(("account", owner.account().as_record_id().clone()))
+                    .bind(("workspace", owner.workspace().as_record_id().clone()))
+                    .await
+                    .map_err(internal)?
+                    .check()
+                    .map_err(internal)?
+                    .take(0)
+                    .map_err(internal)?;
+                rows.into_iter()
+                    .next()
+                    .and_then(|row| row.id)
+                    .ok_or_else(|| missing("cluster"))?
+            };
+            for member in &destination.members {
+                tx.query("RELATE $cluster->contains_memory->$member;")
+                    .bind(("cluster", id.clone()))
+                    .bind(("member", member.clone()))
+                    .await
+                    .map_err(internal)?
+                    .check()
+                    .map_err(internal)?;
+            }
+            destination_ids.push(id);
+        }
+        for source in &source_ids {
+            if !retained_ids.contains(source) {
+                tx.query("DELETE $cluster;")
+                    .bind(("cluster", source.clone()))
+                    .await
+                    .map_err(internal)?
+                    .check()
+                    .map_err(internal)?;
+            }
+        }
+        let mut after = Vec::with_capacity(destination_ids.len());
+        for id in destination_ids {
+            after.push(self.cluster_image_in_tx(tx, owner, &id).await?);
+        }
         Ok((before, after))
     }
 
@@ -1432,6 +1709,7 @@ impl<'a> MutationRepo<'a> {
             .query(CLUSTER_IMAGE_SQL)
             .bind(("key", record_key(cluster)?))
             .bind(("id", cluster.clone()))
+            .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
             .await
             .map_err(internal)?
@@ -1462,9 +1740,10 @@ impl<'a> MutationRepo<'a> {
         let rows: Vec<GuardRow> = tx
             .query(
                 "SELECT membership_revision, member_embedding_revision, centroid_revision \
-                 FROM $cluster WHERE workspace = $workspace FOR UPDATE;",
+                 FROM $cluster WHERE account = $account AND workspace = $workspace FOR UPDATE;",
             )
             .bind(("cluster", expected.cluster.clone()))
+            .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
             .await
             .map_err(internal)?
@@ -1494,6 +1773,7 @@ impl<'a> MutationRepo<'a> {
             .query(CLUSTER_GUARD_SQL)
             .bind(("key", record_key(&expected.cluster)?))
             .bind(("id", expected.cluster.clone()))
+            .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
             .await
             .map_err(internal)?
@@ -1509,6 +1789,7 @@ impl<'a> MutationRepo<'a> {
         let members: Vec<RecordId> = tx
             .query(CLUSTER_WORKSPACE_MEMBER_IDS_SQL)
             .bind(("cluster", expected.cluster.clone()))
+            .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
             .await
             .map_err(internal)?
@@ -1538,11 +1819,12 @@ impl<'a> MutationRepo<'a> {
             .map(|index| format!("$member_{index}"))
             .collect();
         let sql = format!(
-            "SELECT id, embedding, deleted, quarantined_at FROM {} WHERE workspace = $workspace FOR UPDATE;",
+            "SELECT id, embedding, deleted, quarantined_at FROM {} WHERE account = $account AND workspace = $workspace FOR UPDATE;",
             targets.join(", ")
         );
         let mut query = tx
             .query(sql)
+            .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()));
         for (index, member) in members.iter().enumerate() {
             query = query.bind((format!("member_{index}"), member.clone()));
@@ -1577,6 +1859,9 @@ impl<'a> MutationRepo<'a> {
         match change {
             ClusterChange::Guard { .. } => Err(StorageError::InvalidInput(
                 "a cluster guard is not a write".to_string(),
+            )),
+            ClusterChange::Restructure { .. } => Err(StorageError::InvalidInput(
+                "cluster restructuring must use its multi-image writer".to_string(),
             )),
             ClusterChange::Create {
                 centroid,
@@ -2506,8 +2791,8 @@ pub const CREATE_CLUSTER_SQL: &str = "CREATE cluster SET label = $label, centroi
      member_embedding_revision = 0, centroid_revision = 0 RETURN AFTER;";
 
 pub const CLUSTER_GUARD_SQL: &str = "SELECT membership_revision, member_embedding_revision, \
-     centroid_revision FROM type::record('cluster', $key) WHERE id = $id AND workspace = $workspace \
-     LIMIT 1;";
+     centroid_revision FROM type::record('cluster', $key) WHERE id = $id AND account = $account \
+     AND workspace = $workspace LIMIT 1;";
 
 pub const CLUSTER_OF_SQL: &str = "SELECT in AS cluster, membership_revision, \
      member_embedding_revision, centroid_revision FROM contains_memory WHERE out = $fact AND in \
@@ -2527,7 +2812,7 @@ pub const CLUSTER_MEMBERS_IN_TX_SQL: &str = "SELECT out AS member FROM contains_
 /// touch is not a diagnostic, it is a leak.
 pub const CLUSTER_IMAGE_SQL: &str = "SELECT id, label, centroid, depth, membership_revision, \
      member_embedding_revision, centroid_revision FROM type::record('cluster', $key) WHERE id = $id \
-     AND workspace = $workspace LIMIT 1;";
+     AND account = $account AND workspace = $workspace LIMIT 1;";
 
 /// One fact row's partition, read inside the mutation transaction.
 ///
@@ -2881,10 +3166,10 @@ struct GuardRow {
 /// Exact eligible workspace population. Arithmetic must consume this same sample, not a second read.
 pub const CLUSTER_POPULATION_SQL: &str = "SELECT id, embedding FROM \
      $cluster->contains_memory->(fact WHERE deleted = false AND quarantined_at = NONE AND \
-     workspace = $workspace);";
+     account = $account AND workspace = $workspace);";
 
 const CLUSTER_WORKSPACE_MEMBER_IDS_SQL: &str = "SELECT VALUE id FROM \
-     $cluster->contains_memory->(fact WHERE workspace = $workspace);";
+     $cluster->contains_memory->(fact WHERE account = $account AND workspace = $workspace);";
 
 #[derive(SurrealValue)]
 struct PopulationRow {

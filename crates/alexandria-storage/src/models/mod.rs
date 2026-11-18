@@ -28,11 +28,12 @@ pub use maintenance::{
 };
 pub use memory::{CollapseCandidate, Fact, LiveConfidence, RawRecord};
 pub use mutation::{
-    AppliedChange, BatchConflict, BatchConflictReason, BatchResult, ClusterChange, ClusterSnapshot,
-    ClusterWriteExpectation, EdgeKind, EdgeSnapshot, EmbeddingSnapshot, ExpectedState, FactChange,
-    FactSnapshot, MaintenanceSummary, OperationDetail, OperationSummary, PreparedChangeSet,
-    ProvenanceRow, RawDocument, RelationChange, RelationExpectation, RelationTarget,
-    ReminderSnapshot, SemanticSnapshot, SessionLink, Visibility, effect,
+    AppliedChange, BatchConflict, BatchConflictReason, BatchResult, ClusterChange,
+    ClusterDestination, ClusterSnapshot, ClusterWriteExpectation, EdgeKind, EdgeSnapshot,
+    EmbeddingSnapshot, ExpectedState, FactChange, FactSnapshot, MaintenanceSummary,
+    OperationDetail, OperationSummary, PreparedChangeSet, ProvenanceRow, RawDocument,
+    RelationChange, RelationExpectation, RelationTarget, ReminderSnapshot, SemanticSnapshot,
+    SessionLink, Visibility, effect,
 };
 pub use provenance::Provenance;
 pub use reminder::{Reminder, schedule_kind};

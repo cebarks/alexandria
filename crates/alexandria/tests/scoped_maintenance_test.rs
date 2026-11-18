@@ -138,18 +138,15 @@ fn unassigned_unchanged_by_jobs() {
 
 /// Journal routing for maintenance writes that act on assigned data.
 ///
-/// Collapse and appraise operate on assigned data, so the active partition supplies the real
-/// workspace and actor required by v009's semantic journal. Legacy-interim cluster/merge bodies
-/// act only on unowned rows and cannot honestly populate those required fields; their
-/// `cluster_change` journal assertion is kept separately as a named deferred witness for the
-/// owned-cluster maintenance lane.
+/// Collapse, appraise, and owned cluster/merge restructuring operate through an active partition,
+/// which supplies the real workspace and actor required by v009's semantic journal.
 #[test]
 fn journal_routed_maintenance_writes_use_the_semantic_operation_kernel() {
     let root = tempfile::tempdir().unwrap();
     let _before = fixture(root.path(), "seed-jobs");
     let _output = dream(root.path(), &["--job", "all"]);
     let after = fixture(root.path(), "inspect");
-    for kind in ["collapse", "appraise"] {
+    for kind in ["collapse", "appraise", "cluster_change"] {
         assert!(
             rows(&after, "semantic_operation")
                 .iter()
@@ -184,13 +181,8 @@ fn journal_routed_maintenance_writes_use_the_semantic_operation_kernel() {
     );
 }
 
-/// DEFERRED FOLLOW-UP WITNESS — journal routing for whole-store legacy cluster/merge bodies.
-///
-/// The current legacy gate admits only unowned cluster data, which has no honest workspace/account
-/// attribution for v009's journal. Once the owned-cluster maintenance lane replaces those bodies,
-/// cluster split/merge writes must route through the semantic-operation kernel.
+/// Journal routing for owned cluster split/merge writes through the semantic-operation kernel.
 #[test]
-#[ignore = "deferred follow-up: cluster_change journal routing belongs to the owned-cluster maintenance lane"]
 fn owned_cluster_maintenance_writes_use_the_semantic_operation_kernel() {
     let root = tempfile::tempdir().unwrap();
     let _before = fixture(root.path(), "seed-jobs");

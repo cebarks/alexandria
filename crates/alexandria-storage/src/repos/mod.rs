@@ -27,7 +27,7 @@ pub use classification_repo::{
     ClassificationCandidate, ClassificationCandidates, ClassificationDestination,
     ClassificationRepo, PendingProposal, PreparedClassificationBatch, ScopeProposalRef,
 };
-pub use cluster_repo::ClusterRepo;
+pub use cluster_repo::{ClusterRepo, ClusterSplit, PartitionCluster};
 pub use edge_repo::EdgeRepo;
 pub use heat_repo::{HeatMaterialise, HeatRepo, HeatUpdate};
 pub use identity_repo::IdentityRepo;

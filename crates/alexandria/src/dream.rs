@@ -4,8 +4,9 @@
 //! actually used was to set all five `*_interval_secs` to `1` (the loader only refuses `0`), restart
 //! with `alexandria::dreaming=debug`, and revert — three mutations to a live service to answer one
 //! question. This runs the same job bodies the scheduler runs, through the same entry point
-//! (capped jobs through `dreaming::Jobs::dispatch_job`, cluster/merge through `run_job`'s
-//! legacy-gated bodies), prints one report line per job and the run id its audit rows carry,
+//! (`dreaming::Jobs::dispatch_job` for all five: the capped jobs as budgeted passes, cluster/merge
+//! as uncapped partition visits that keep the legacy whole-store body once per run), prints one
+//! report line per job and the run id its audit rows carry,
 //! and exits. There is no second implementation of "run a job" to keep in step with the first.
 //!
 //! It is operator tooling, not an MCP tool and not a debug-UI route: a write route under `debug/`
@@ -323,18 +324,15 @@ pub(crate) async fn pass(request: &Request, mut config: Config) -> anyhow::Resul
 
     let mut entries = Vec::with_capacity(request.jobs.len());
     for job in &request.jobs {
-        // The capped jobs run as partitioned passes under the dispatcher (active-account
-        // enumeration, fair rotation, one global allowance per job per pass, persisted progress);
-        // cluster and merge stay on the legacy-gated whole-store bodies by owner decision — the
-        // legacy maintenance gate refuses owned/workspace data by construction, so partitioned
-        // cluster/merge awaits the owned-cluster write paths (named follow-up).
-        let ran = if matches!(job, Job::Cluster | Job::Merge) {
-            jobs.run_job(*job, &run_id).await
-        } else {
-            jobs.dispatch_job(*job, &run_id)
-                .await
-                .map(|pass| pass.report)
-        };
+        // All five jobs run as dispatcher passes. The capped jobs get their budgeted partition
+        // passes; cluster and merge are uncapped, so the dispatcher runs the legacy whole-store
+        // body once (its write gate admits only unowned clusters) and then visits every eligible
+        // partition — the only path that can restructure owned clusters, and the one that journals
+        // those writes through the semantic-operation kernel.
+        let ran = jobs
+            .dispatch_job(*job, &run_id)
+            .await
+            .map(|pass| pass.report);
         let entry = match ran {
             Ok(report) => Entry::Ran(report),
             // The loop's own rule, kept: one job's failure is that job's news, not a reason to

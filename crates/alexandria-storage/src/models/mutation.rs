@@ -738,6 +738,29 @@ pub enum ClusterChange {
         /// embeddings it read. `None` leaves the centroid alone.
         centroid: Option<Vec<f32>>,
     },
+    /// Atomically replace membership across one or more clusters under the full journal kernel.
+    ///
+    /// Every source is guarded against its live embedded population. Destinations name the complete
+    /// final membership: `Some(cluster)` retains and rewrites that cluster, while `None` mints a new
+    /// cluster. Source clusters omitted from destinations are retired. Storage verifies in-transaction
+    /// that destinations contain exactly the existing source membership, so no retained (including
+    /// hidden) member can be lost or imported from outside the restructuring.
+    Restructure {
+        partition: MemoryScope,
+        expectations: Vec<ClusterWriteExpectation>,
+        destinations: Vec<ClusterDestination>,
+    },
+}
+
+/// One final cluster state for a journaled restructuring.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterDestination {
+    pub cluster: Option<RecordId>,
+    /// A storage-minted typed id for a new destination, needed so the linked summary can name it.
+    pub new_id: Option<RecordId>,
+    pub label: Option<String>,
+    pub centroid: Vec<f32>,
+    pub members: Vec<RecordId>,
 }
 
 impl ClusterChange {
@@ -758,6 +781,9 @@ impl ClusterChange {
             Self::Guard { expectation }
             | Self::Detach { expectation, .. }
             | Self::Effect { expectation, .. } => Some(&expectation.cluster),
+            Self::Restructure { expectations, .. } => {
+                expectations.first().map(|item| &item.cluster)
+            }
         }
     }
 
@@ -1221,6 +1247,47 @@ impl PreparedChangeSet {
                     field(&mut hasher, &id_bytes(&expectation.cluster));
                     field(&mut hasher, b"");
                     field(&mut hasher, &id_bytes(member));
+                }
+                ClusterChange::Restructure {
+                    partition,
+                    expectations,
+                    destinations,
+                } => {
+                    field(&mut hasher, format!("{partition:?}").as_bytes());
+                    field(&mut hasher, b"restructure");
+                    let mut sources: Vec<_> =
+                        expectations.iter().map(|item| &item.cluster).collect();
+                    sources.sort();
+                    for source in sources {
+                        field(&mut hasher, &typed_id_bytes(source));
+                    }
+                    for destination in destinations {
+                        field(
+                            &mut hasher,
+                            &destination
+                                .cluster
+                                .as_ref()
+                                .map(typed_id_bytes)
+                                .unwrap_or_default(),
+                        );
+                        field(
+                            &mut hasher,
+                            &destination
+                                .new_id
+                                .as_ref()
+                                .map(typed_id_bytes)
+                                .unwrap_or_default(),
+                        );
+                        field(
+                            &mut hasher,
+                            destination.label.as_deref().unwrap_or("").as_bytes(),
+                        );
+                        let mut members: Vec<_> = destination.members.iter().collect();
+                        members.sort();
+                        for member in members {
+                            field(&mut hasher, &typed_id_bytes(member));
+                        }
+                    }
                 }
             }
         }

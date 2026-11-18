@@ -32,8 +32,8 @@ use alexandria_storage::models::mutation::{
 };
 use alexandria_storage::models::operation_kind;
 use alexandria_storage::repos::{
-    AuditContext, ClusterRepo, EdgeRepo, HeatMaterialise, HeatRepo, IdentityRepo, LogEntry,
-    MaintenanceRepo, MemoryRepo, MutationRepo,
+    AuditContext, ClusterRepo, ClusterSplit, EdgeRepo, HeatMaterialise, HeatRepo, IdentityRepo,
+    LogEntry, MaintenanceRepo, MemoryRepo, MutationRepo,
 };
 use alexandria_storage::{Database, RecordId, record_id_to_string, system_config};
 use tokio::task::JoinHandle;
@@ -261,8 +261,10 @@ pub(crate) async fn supervise<F, Fut>(
 /// `supervise` is a module-level function: it is generic over the attempt, and putting it inside the
 /// impl would tie a testable policy function to the type it restarts.
 impl Jobs {
-    /// Run exactly one job, once, under `run_id`. This is the only entry to the five bodies: the
-    /// scheduler's loop and `alexandria dream` both come through here, so there is no second
+    /// Run exactly one job's whole-store body, once, under `run_id`. The scheduler's loop and
+    /// `alexandria dream` come through [`Self::dispatch_job`], which wraps this: the capped jobs
+    /// replace these bodies with their partitioned passes, and the uncapped cluster/merge keep
+    /// this legacy body once per run beside their partition visits — so there is no second
     /// implementation of "run a job now" to keep in step with the first.
     pub(crate) async fn run_job(&self, job: Job, run_id: &str) -> anyhow::Result<JobReport> {
         match job {
@@ -274,12 +276,12 @@ impl Jobs {
         }
     }
 
-    /// One capped job's pass over every eligible partition, under one pass-wide row allowance.
+    /// One job's pass over its eligible partitions, under a pass-wide row allowance when capped.
     ///
-    /// The dispatcher is real and the job *bodies* are not yet partitioned (see
-    /// [`Self::run_partitioned`]): enumeration, fair planning, budget accounting and progress
-    /// persistence are the contracts this method owns, and the witnesses below pin them against
-    /// whatever the body currently does.
+    /// Every job body now has a partitioned form under [`Self::run_partitioned`]; the capped jobs
+    /// run only that form, while the uncapped cluster/merge keep one legacy whole-store body per
+    /// run beside their partition visits. Enumeration, fair planning, budget accounting and
+    /// progress persistence are the contracts this method owns, and the witnesses below pin them.
     ///
     /// The pass shape, in order: enumerate the partitions the store says are eligible (active
     /// accounts only — a suspended account's workspace is absent before any write is attempted);
@@ -291,17 +293,7 @@ impl Jobs {
     /// persist the advanced progress under the M1 CAS.
     pub(crate) async fn dispatch_job(&self, job: Job, run_id: &str) -> anyhow::Result<PassReport> {
         let Some(budget_job) = capped(job) else {
-            // Cluster and merge are not row-budgeted; their bodies stay global until M3 gives
-            // them partitioned reads, and the old entry keeps working in the meantime.
-            let report = self.run_job(job, run_id).await?;
-            return Ok(PassReport {
-                report,
-                visited: 0,
-                refused: 0,
-                failed: 0,
-                budget_used: 0,
-                last_error: None,
-            });
+            return self.dispatch_uncapped_partitioned(job, run_id).await;
         };
 
         let partitions =
@@ -503,15 +495,64 @@ impl Jobs {
         })
     }
 
+    async fn dispatch_uncapped_partitioned(
+        &self,
+        job: Job,
+        run_id: &str,
+    ) -> anyhow::Result<PassReport> {
+        // Keep the whole-store legacy body once per run. Its write gate admits only unowned clusters;
+        // the following per-partition visits are the only path that can restructure owned clusters.
+        let mut report = self.run_job(job, run_id).await?;
+        let partitions =
+            IdentityRepo::maintenance_partitions(self.db.inner(), &self.db, &self.system).await?;
+        let mut visited = 0;
+        let mut failed = 0;
+        let mut refused = 0;
+        let mut last_error = None;
+        for partition in &partitions {
+            match self
+                .run_partitioned(job, partition, run_id, None, None)
+                .await
+            {
+                Ok(outcome) => {
+                    report.examined += outcome.report.report.examined;
+                    report.acted += outcome.report.report.acted;
+                    report.skipped += outcome.report.report.skipped;
+                    visited += 1;
+                }
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<alexandria_storage::error::StorageError>(),
+                        Some(alexandria_storage::error::StorageError::Stale)
+                    ) =>
+                {
+                    refused += 1
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        job = job.as_str(),
+                        "uncapped partition dispatch failed: {error}"
+                    );
+                    failed += 1;
+                    last_error = Some(error.to_string());
+                }
+            }
+        }
+        Ok(PassReport {
+            report,
+            visited,
+            refused,
+            failed,
+            budget_used: 0,
+            last_error,
+        })
+    }
+
     /// One job over one partition, under the slice of a pass's row allowance.
     ///
-    /// SCAFFOLD: the bodies are not partitioned yet. This runs the job's existing whole-store body
-    /// and ignores `partition` and `row_allowance` — the honest intermediate state, because a fake
-    /// partition filter here would make the witnesses below pass for the wrong reason. M3 replaces
-    /// the body: per-partition reads through scoped repos and writes through the M1 guarded system
-    /// barrier, reporting the partition's own `budget_used`.
+    /// Capped jobs report the selected page size as `budget_used`. Cluster and merge are uncapped,
+    /// receive no row allowance, and report zero because they charge operations rather than rows.
     ///
-    // TODO(debt): partitioned body — M3 of the Task-12 plan.
     async fn run_partitioned(
         &self,
         job: Job,
@@ -874,12 +915,12 @@ impl Jobs {
                     exhausted: false,
                 })
             }
-            // SCAFFOLD, still: cluster and merge (the uncapped pair) keep their whole-store bodies
-            // until their partition-scoped cluster reads land (M3c); they take no row allowance.
-            //
-            // TODO(debt): partitioned cluster/merge bodies — M3c.
+            // These two are uncapped and receive `None` from the dispatcher. Their scoped bodies
+            // read only this partition; the legacy whole-store pass runs once outside this arm.
             Job::Cluster | Job::Merge => {
-                let report = self.run_job(job, run_id).await?;
+                let report = self
+                    .run_partitioned_clusters(job, partition, run_id)
+                    .await?;
                 Ok(PartitionOutcome {
                     report: alexandria_engine::dreaming::PartitionJobReport {
                         report,
@@ -897,6 +938,132 @@ impl Jobs {
     /// nothing to resume after.
     fn page_cursor(rows: &[alexandria_storage::models::HeatState]) -> Option<RecordId> {
         rows.last().and_then(|row| row.id.clone())
+    }
+
+    async fn run_partitioned_clusters(
+        &self,
+        job: Job,
+        partition: &Partition,
+        run_id: &str,
+    ) -> anyhow::Result<JobReport> {
+        let audit_job = match job {
+            Job::Cluster => job_name::CLUSTER,
+            Job::Merge => job_name::MERGE,
+            _ => anyhow::bail!("partitioned cluster runner received a non-cluster job"),
+        };
+        let repo =
+            ClusterRepo::with_audit(self.db.inner(), AuditContext::dreaming(run_id, audit_job));
+        let mut report = JobReport::new(job);
+        if job == Job::Cluster {
+            let clusters = repo.partition_clusters(partition).await?;
+            report.examined = clusters.len();
+            for entry in &clusters {
+                let id = entry
+                    .cluster
+                    .id
+                    .as_ref()
+                    .expect("listed cluster has a typed id");
+                let display = record_id_to_string(id);
+                let embeddings: Vec<Vec<f32>> = entry
+                    .members
+                    .iter()
+                    .map(|fact| fact.embedding.clone())
+                    .collect();
+                if let MaintenanceAction::Split {
+                    group_a,
+                    group_b,
+                    centroid_a,
+                    centroid_b,
+                    ..
+                } = check_cohesion(
+                    &display,
+                    &entry.cluster.centroid,
+                    &embeddings,
+                    self.cohesion_floor,
+                ) {
+                    repo.execute_partitioned_split(
+                        &self.db,
+                        &self.system,
+                        partition,
+                        entry,
+                        &ClusterSplit {
+                            group_a,
+                            group_b,
+                            centroid_a,
+                            centroid_b,
+                        },
+                    )
+                    .await?;
+                    report.acted += 1;
+                }
+            }
+            return Ok(report);
+        }
+
+        loop {
+            let clusters = repo.partition_clusters(partition).await?;
+            report.examined += clusters.len();
+            let infos: Vec<(String, Vec<f32>, usize)> = clusters
+                .iter()
+                .map(|entry| {
+                    let id = entry
+                        .cluster
+                        .id
+                        .as_ref()
+                        .expect("listed cluster has a typed id");
+                    (
+                        record_id_to_string(id),
+                        entry.cluster.centroid.clone(),
+                        entry.members.len(),
+                    )
+                })
+                .collect();
+            let index: HashMap<&str, usize> = infos
+                .iter()
+                .enumerate()
+                .map(|(index, info)| (info.0.as_str(), index))
+                .collect();
+            let mut merged = false;
+            'scan: for left in 0..infos.len() {
+                for right in (left + 1)..infos.len() {
+                    if let MergeCheck::Merge {
+                        keep_id,
+                        remove_id,
+                        merged_centroid,
+                    } = check_merge(
+                        &infos[left].0,
+                        &infos[left].1,
+                        infos[left].2,
+                        &infos[right].0,
+                        &infos[right].1,
+                        infos[right].2,
+                        self.merge_threshold,
+                    ) {
+                        let (Some(&keep), Some(&remove)) =
+                            (index.get(keep_id.as_str()), index.get(remove_id.as_str()))
+                        else {
+                            anyhow::bail!("merge verdict named an unlisted cluster");
+                        };
+                        repo.execute_partitioned_merge(
+                            &self.db,
+                            &self.system,
+                            partition,
+                            &clusters[keep],
+                            &clusters[remove],
+                            &merged_centroid,
+                        )
+                        .await?;
+                        report.acted += 1;
+                        merged = true;
+                        break 'scan;
+                    }
+                }
+            }
+            if !merged {
+                break;
+            }
+        }
+        Ok(report)
     }
 
     /// Heat materialisation: project every row's decay to now and store the result, oldest anchor
@@ -1468,30 +1635,25 @@ pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
         // it is one event, not two.
         let run_id = tick_run_id(now, tick);
         for job in due {
-            // The capped jobs run as partitioned passes under the dispatcher (enumeration, fair
-            // shares, pass-wide budget, persisted rotation); the uncapped cluster/merge keep their
-            // whole-store bodies until their partitioned reads land. This is the loop half of the
-            // Task-12 wiring; `alexandria dream` joins it when its CLI witness turns green.
-            let ran = if capped(job).is_some() {
-                jobs.dispatch_job(job, &run_id).await.map(|pass| {
-                    // The pass's own observability, at the same debug level a single
-                    // JobReport gets: which partitions ran, which were refused by the
-                    // barrier or failed and advanced, and what the pass charged against
-                    // its global allowance.
-                    tracing::debug!(
-                        job = pass.report.job.as_str(),
-                        visited = pass.visited,
-                        refused = pass.refused,
-                        failed = pass.failed,
-                        budget_used = pass.budget_used,
-                        last_error = ?pass.last_error,
-                        "dreaming pass finished"
-                    );
-                    pass.report
-                })
-            } else {
-                jobs.run_job(job, &run_id).await
-            };
+            // Every job runs as a dispatcher pass: the capped jobs as budgeted partition passes,
+            // and the uncapped cluster/merge as one legacy whole-store body plus per-partition
+            // visits — the owned-cluster write path the semantic journal records.
+            let ran = jobs.dispatch_job(job, &run_id).await.map(|pass| {
+                // The pass's own observability, at the same debug level a single
+                // JobReport gets: which partitions ran, which were refused by the
+                // barrier or failed and advanced, and what the pass charged against
+                // its global allowance.
+                tracing::debug!(
+                    job = pass.report.job.as_str(),
+                    visited = pass.visited,
+                    refused = pass.refused,
+                    failed = pass.failed,
+                    budget_used = pass.budget_used,
+                    last_error = ?pass.last_error,
+                    "dreaming pass finished"
+                );
+                pass.report
+            });
             match ran {
                 Ok(report) => tracing::debug!(
                     job = report.job.as_str(),
@@ -1536,6 +1698,184 @@ mod tests {
             .claim_system_authority()
             .expect("a fresh embedded store has an unclaimed system authority");
         (Arc::new(db), system)
+    }
+
+    async fn seed_owned_cluster(
+        db: &Database,
+        owner: &str,
+        cluster_key: &str,
+        vectors: &[[f32; 2]],
+        centroid: [f32; 2],
+    ) -> Partition {
+        let identity = IdentityRepo::new(db.inner())
+            .bootstrap_owner(
+                owner,
+                "digest-owned-cluster-maintenance-test",
+                &OperationId::new(format!("op-{owner}")),
+            )
+            .await
+            .unwrap();
+        let partition = Partition {
+            workspace: identity.workspace,
+            scope: alexandria_storage::models::identity::MemoryScope::Personal,
+        };
+        seed_cluster_in_partition(
+            db,
+            &partition,
+            identity.account.as_record_id(),
+            cluster_key,
+            vectors,
+            centroid,
+        )
+        .await;
+        partition
+    }
+
+    async fn seed_cluster_in_partition(
+        db: &Database,
+        partition: &Partition,
+        account: &RecordId,
+        cluster_key: &str,
+        vectors: &[[f32; 2]],
+        centroid: [f32; 2],
+    ) {
+        // The fact's scope stamps are derived from the partition the caller named, so a cluster
+        // seeded "in" a partition really is in it: the same (scope, project) pair the scope filter
+        // and the mutation kernel read back.
+        let (scope, project) = match &partition.scope {
+            alexandria_storage::models::identity::MemoryScope::Personal => ("personal", None),
+            alexandria_storage::models::identity::MemoryScope::Unassigned => ("unassigned", None),
+            alexandria_storage::models::identity::MemoryScope::Project(project) => {
+                ("project", Some(project.as_record_id().clone()))
+            }
+        };
+        let cluster = RecordId::new("cluster", cluster_key);
+        db.inner()
+            .query("CREATE $id SET label = $label, centroid = $centroid, account = $account, workspace = $workspace;")
+            .bind(("id", cluster.clone()))
+            .bind(("label", cluster_key.to_string()))
+            .bind(("centroid", centroid.to_vec()))
+            .bind(("account", account.clone()))
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        for (index, vector) in vectors.iter().enumerate() {
+            let member = RecordId::new("fact", format!("{cluster_key}-{index}"));
+            db.inner()
+                .query("CREATE $id SET content = $content, confidence = 0.5, embedding = $embedding, tags = [], deleted = false, account = $account, workspace = $workspace, scope = $scope, project = $project;")
+                .bind(("id", member.clone()))
+                .bind(("content", format!("{cluster_key}-{index}")))
+                .bind(("embedding", vector.to_vec()))
+                .bind(("account", account.clone()))
+                .bind(("workspace", partition.workspace.as_record_id().clone()))
+                .bind(("scope", scope))
+                .bind(("project", project.clone()))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            db.inner()
+                .query("RELATE $cluster->contains_memory->$member;")
+                .bind(("cluster", cluster.clone()))
+                .bind(("member", member))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+    }
+
+    /// One project row in the owner's workspace, in the production shape: workspace-qualified with
+    /// a normalized alias, the same row `IdentityRepo::maintenance_partitions` enumerates into a
+    /// project partition.
+    async fn seed_project(
+        db: &Database,
+        workspace: &alexandria_storage::models::identity::WorkspaceId,
+        key: &str,
+    ) -> alexandria_storage::models::identity::ProjectId {
+        let id = RecordId::new("project", key);
+        db.inner()
+            .query("CREATE $id SET workspace = $workspace, normalized_alias = $alias;")
+            .bind(("id", id.clone()))
+            .bind(("workspace", workspace.as_record_id().clone()))
+            .bind(("alias", key.to_lowercase()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        alexandria_storage::models::identity::ProjectId::try_from(id).unwrap()
+    }
+
+    /// Clusters whose live membership lies in one project's population — the per-project count
+    /// inside a workspace the cross-workspace `owned_cluster_count` cannot express.
+    async fn project_cluster_count(db: &Database, partition: &Partition) -> usize {
+        let alexandria_storage::models::identity::MemoryScope::Project(project) = &partition.scope
+        else {
+            panic!("project_cluster_count takes a project partition");
+        };
+        let rows: Vec<RecordId> = db
+            .inner()
+            .query(
+                "SELECT VALUE id FROM cluster WHERE workspace = $workspace AND \
+                 (->contains_memory->(fact WHERE deleted = false AND quarantined_at = NONE AND project = $project)).len() > 0;",
+            )
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .bind(("project", project.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        rows.len()
+    }
+
+    /// One seeded cluster's live member count — the half of "untouched" a membership leak moves.
+    async fn cluster_live_member_count(db: &Database, cluster: &RecordId) -> i64 {
+        let rows: Vec<i64> = db
+            .inner()
+            .query(
+                "SELECT VALUE (->contains_memory->(fact WHERE deleted = false AND quarantined_at = NONE)).len() FROM $cluster;",
+            )
+            .bind(("cluster", cluster.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        rows[0]
+    }
+
+    /// One seeded cluster's centroid — the half of "untouched" a restructure would rewrite.
+    async fn cluster_centroid(db: &Database, cluster: &RecordId) -> Vec<f32> {
+        let rows: Vec<Vec<f32>> = db
+            .inner()
+            .query("SELECT VALUE centroid FROM $cluster;")
+            .bind(("cluster", cluster.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        rows[0].clone()
+    }
+
+    async fn owned_cluster_count(db: &Database, partition: &Partition) -> usize {
+        let rows: Vec<RecordId> = db
+            .inner()
+            .query("SELECT VALUE id FROM cluster WHERE workspace = $workspace;")
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        rows.len()
     }
 
     /// A heat row with an old decay anchor and a known access history, so the sweep has something to
@@ -3318,5 +3658,248 @@ mod tests {
             "an empty population did nothing: {pass:?}"
         );
         assert_eq!(pass.visited, 1, "the empty partition was visited once");
+    }
+
+    #[tokio::test]
+    async fn owned_partition_cluster_split_stays_within_its_partition() {
+        let (db, system) = migrated_db().await;
+        let partition = seed_owned_cluster(
+            &db,
+            "owned-split",
+            "owned-wide",
+            &[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]],
+            [1.0, 0.0],
+        )
+        .await;
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        let outcome = jobs
+            .run_partitioned(Job::Cluster, &partition, "run-owned-split", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(owned_cluster_count(&db, &partition).await, 2);
+        assert!(outcome.report.report.acted > 0, "the owned cluster split");
+        let centroids: Vec<Vec<f32>> = db
+            .inner()
+            .query("SELECT VALUE centroid FROM cluster WHERE workspace = $workspace;")
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert!(centroids.contains(&vec![1.0, 0.0]));
+        assert!(centroids.contains(&vec![0.0, 1.0]));
+        let operations: Vec<RecordId> = db
+            .inner()
+            .query("SELECT VALUE id FROM semantic_operation WHERE kind = 'cluster_change';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert!(
+            !operations.is_empty(),
+            "split is journaled as cluster_change"
+        );
+        let linked: Vec<RecordId> = db
+            .inner()
+            .query("SELECT VALUE operation FROM maintenance_log WHERE job = 'cluster' AND actor = 'system:dreaming' AND action = 'split';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert!(
+            linked
+                .iter()
+                .any(|operation| operations.contains(operation))
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_partition_merge_drains_same_partition_only() {
+        let (db, system) = migrated_db().await;
+        let identity = IdentityRepo::new(db.inner())
+            .bootstrap_owner(
+                "owned-merge",
+                "digest-owned-merge-maintenance-test",
+                &OperationId::new("op-owned-merge"),
+            )
+            .await
+            .unwrap();
+        let partition = Partition {
+            workspace: identity.workspace,
+            scope: alexandria_storage::models::identity::MemoryScope::Personal,
+        };
+        for key in ["owned-merge-a", "owned-merge-b", "owned-merge-c"] {
+            seed_cluster_in_partition(
+                &db,
+                &partition,
+                identity.account.as_record_id(),
+                key,
+                &[[1.0, 0.0]],
+                [1.0, 0.0],
+            )
+            .await;
+        }
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        let outcome = jobs
+            .run_partitioned(Job::Merge, &partition, "run-owned-merge", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(owned_cluster_count(&db, &partition).await, 1);
+        assert!(
+            outcome.report.report.acted >= 2,
+            "merge drains eligible pairs"
+        );
+        let centroids: Vec<Vec<f32>> = db
+            .inner()
+            .query("SELECT VALUE centroid FROM cluster WHERE workspace = $workspace;")
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(centroids, vec![vec![1.0, 0.0]]);
+        let logs: Vec<RecordId> = db
+            .inner()
+            .query("SELECT VALUE operation FROM maintenance_log WHERE job = 'merge' AND actor = 'system:dreaming';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        let operations: Vec<RecordId> = db
+            .inner()
+            .query("SELECT VALUE id FROM semantic_operation WHERE kind = 'cluster_change';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert!(logs.iter().any(|operation| operations.contains(operation)));
+    }
+
+    #[tokio::test]
+    async fn owned_partition_cluster_visit_isolates_other_partition() {
+        let (db, system) = migrated_db().await;
+        let visited = seed_owned_cluster(
+            &db,
+            "owned-visited",
+            "visited-wide",
+            &[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]],
+            [1.0, 0.0],
+        )
+        .await;
+        let untouched = seed_owned_cluster(
+            &db,
+            "owned-unvisited",
+            "unvisited-wide",
+            &[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]],
+            [1.0, 0.0],
+        )
+        .await;
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        jobs.run_partitioned(Job::Cluster, &visited, "run-one-partition", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(owned_cluster_count(&db, &visited).await, 2);
+        assert_eq!(
+            owned_cluster_count(&db, &untouched).await,
+            1,
+            "a partition visit cannot restructure another workspace"
+        );
+    }
+
+    /// Same workspace, two projects: a visit restructures only the visited project's partition.
+    ///
+    /// The cross-workspace witness above cannot catch a leak between two scopes of ONE workspace —
+    /// both projects' clusters share the account and workspace stamps, so only the scope filter
+    /// separates them. An eligible split candidate sits in each project; one partition is visited;
+    /// the other project's cluster must keep its membership and centroid.
+    #[tokio::test]
+    async fn owned_partition_cluster_visit_isolates_other_scope_in_one_workspace() {
+        let (db, system) = migrated_db().await;
+        let identity = IdentityRepo::new(db.inner())
+            .bootstrap_owner(
+                "owned-scope",
+                "digest-owned-scope-isolation-test",
+                &OperationId::new("op-owned-scope"),
+            )
+            .await
+            .unwrap();
+        let visited = seed_project(&db, &identity.workspace, "scope-visited").await;
+        let untouched = seed_project(&db, &identity.workspace, "scope-untouched").await;
+        let visited_partition = Partition {
+            workspace: identity.workspace.clone(),
+            scope: alexandria_storage::models::identity::MemoryScope::Project(visited),
+        };
+        let untouched_partition = Partition {
+            workspace: identity.workspace.clone(),
+            scope: alexandria_storage::models::identity::MemoryScope::Project(untouched),
+        };
+        seed_cluster_in_partition(
+            &db,
+            &visited_partition,
+            identity.account.as_record_id(),
+            "scope-visited-wide",
+            &[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]],
+            [1.0, 0.0],
+        )
+        .await;
+        seed_cluster_in_partition(
+            &db,
+            &untouched_partition,
+            identity.account.as_record_id(),
+            "scope-untouched-wide",
+            &[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]],
+            [1.0, 0.0],
+        )
+        .await;
+        let untouched_id = RecordId::new("cluster", "scope-untouched-wide");
+        let before = (
+            cluster_live_member_count(&db, &untouched_id).await,
+            cluster_centroid(&db, &untouched_id).await,
+        );
+
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        jobs.run_partitioned(
+            Job::Cluster,
+            &visited_partition,
+            "run-one-scope",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            project_cluster_count(&db, &visited_partition).await,
+            2,
+            "the visited project's cluster split"
+        );
+        assert_eq!(
+            project_cluster_count(&db, &untouched_partition).await,
+            1,
+            "a visit to one project's partition restructured another project's cluster"
+        );
+        assert_eq!(
+            (
+                cluster_live_member_count(&db, &untouched_id).await,
+                cluster_centroid(&db, &untouched_id).await
+            ),
+            before,
+            "a visit to one project's partition changed another project's cluster membership or centroid"
+        );
     }
 }

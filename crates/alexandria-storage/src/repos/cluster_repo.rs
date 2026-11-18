@@ -1,14 +1,46 @@
 use anyhow::{Result, ensure};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, RecordIdKeyRange, SurrealValue};
 use tracing::warn;
 
+use crate::Database;
+use crate::access::SystemContext;
+use crate::models::identity::{OperationId, Partition};
+use crate::models::maintenance::job as job_name;
+use crate::models::mutation::{
+    ClusterChange, ClusterDestination, MaintenanceSummary, PreparedChangeSet, effect,
+};
+use crate::models::operation_kind;
 use crate::models::{Cluster, Fact};
 #[cfg(test)]
 use crate::record_id_to_string;
+use crate::repos::MutationRepo;
 use crate::repos::maintenance_repo::AuditContext;
+use crate::repos::scope::ScopeFilter;
+
+#[derive(Debug, Clone)]
+pub struct PartitionCluster {
+    pub cluster: Cluster,
+    pub members: Vec<Fact>,
+}
+
+/// One prepared split verdict for an owned cluster: how the live members group, and the two
+/// centroids those groups imply.
+///
+/// The grouping is the engine's arithmetic, so it arrives as data — storage ranks nothing. The
+/// indices address the source's live member list in the order the partition read returned it,
+/// which is the same list [`ClusterRepo::partition_clusters`] handed the caller; the transaction
+/// re-verifies that the two groups exactly partition the live population before anything moves.
+#[derive(Debug, Clone)]
+pub struct ClusterSplit {
+    pub group_a: Vec<usize>,
+    pub group_b: Vec<usize>,
+    pub centroid_a: Vec<f32>,
+    pub centroid_b: Vec<f32>,
+}
 
 pub struct ClusterRepo<'a> {
     db: &'a Surreal<Any>,
@@ -99,6 +131,262 @@ impl<'a> ClusterRepo<'a> {
             .await?;
         let members: Vec<Fact> = response.take(0)?;
         Ok(members)
+    }
+
+    /// Read clusters whose complete live workspace population belongs to this partition.
+    pub async fn partition_clusters(&self, partition: &Partition) -> Result<Vec<PartitionCluster>> {
+        let filter = ScopeFilter::for_partition(partition);
+        let mut response = self
+            .db
+            .query("SELECT VALUE owner FROM workspace WHERE id = $workspace LIMIT 1;")
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .await?;
+        let owners: Vec<RecordId> = response.take(0)?;
+        let Some(account) = owners.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let mut response = self
+            .db
+            .query("SELECT * FROM cluster WHERE workspace = $workspace AND account = $account ORDER BY id;")
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .bind(("account", account.clone()))
+            .await?;
+        let clusters: Vec<Cluster> = response.take(0)?;
+        let mut selected = Vec::new();
+        for cluster in clusters {
+            let Some(id) = cluster.id.clone() else {
+                continue;
+            };
+            let query = self.db.query(
+                "SELECT * FROM $cluster->contains_memory->(fact WHERE deleted = false AND quarantined_at = NONE AND account = $account AND workspace = $scope_workspace AND ((scope = 'personal' AND $scope_personal) OR (scope = 'unassigned' AND $scope_unassigned) OR (scope = 'project' AND project INSIDE $scope_projects)))",
+            ).bind(("cluster", id.clone())).bind(("account", account.clone()));
+            let mut response = filter.apply(query).await?;
+            let members: Vec<Fact> = response.take(0)?;
+            if members.is_empty() {
+                continue;
+            }
+            let query = self.db.query(
+                "SELECT * FROM $cluster->contains_memory->(fact WHERE account = $account AND workspace = $scope_workspace AND ((scope = 'personal' AND $scope_personal) OR (scope = 'unassigned' AND $scope_unassigned) OR (scope = 'project' AND project INSIDE $scope_projects)))",
+            ).bind(("cluster", id.clone())).bind(("account", account.clone()));
+            let mut response = filter.apply(query).await?;
+            let partition_members: Vec<Fact> = response.take(0)?;
+            let mut partition_ids: Vec<RecordId> = partition_members
+                .into_iter()
+                .filter_map(|fact| fact.id)
+                .collect();
+            let mut all_ids = self.get_member_ids(&id).await?;
+            partition_ids.sort();
+            all_ids.sort();
+            if partition_ids == all_ids {
+                selected.push(PartitionCluster { cluster, members });
+            }
+        }
+        Ok(selected)
+    }
+
+    pub async fn execute_partitioned_split(
+        &self,
+        instance: &Database,
+        system: &SystemContext,
+        partition: &Partition,
+        source: &PartitionCluster,
+        split: &ClusterSplit,
+    ) -> Result<()> {
+        let (run_id, job) = self.audit_for(job_name::CLUSTER)?;
+        let source_id = source
+            .cluster
+            .id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("split source has no id"))?;
+        let live: Vec<RecordId> = source
+            .members
+            .iter()
+            .map(|member| {
+                member
+                    .id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("split member has no id"))
+            })
+            .collect::<Result<_>>()?;
+        let mut a = split
+            .group_a
+            .iter()
+            .map(|index| {
+                live.get(*index)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("split group index is out of range"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let b = split
+            .group_b
+            .iter()
+            .map(|index| {
+                live.get(*index)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("split group index is out of range"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut assigned = a.iter().chain(&b).cloned().collect::<Vec<_>>();
+        assigned.sort();
+        let mut live_sorted = live.clone();
+        live_sorted.sort();
+        ensure!(
+            assigned == live_sorted,
+            "split groups do not partition the live members"
+        );
+        let all_members = self.get_member_ids(source_id).await?;
+        let mut hidden: Vec<_> = all_members
+            .into_iter()
+            .filter(|id| !live.contains(id))
+            .collect();
+        a.append(&mut hidden);
+
+        let seed = format!("{run_id}:{}", crate::record_id_to_string(source_id));
+        let digest = Sha256::digest(seed.as_bytes());
+        let key: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let new_id = RecordId::new("cluster", format!("owned_{key}"));
+        let mutation = MutationRepo::new(self.db);
+        let expectation = mutation
+            .cluster_expectation_system(instance, system, partition, source_id)
+            .await?;
+        let change = PreparedChangeSet::new(operation_kind::CLUSTER_CHANGE)
+            .effect(effect::CLUSTER_MEMBERSHIP)
+            .effect(effect::CLUSTER_CENTROID)
+            .cluster(ClusterChange::Restructure {
+                partition: partition.scope.clone(),
+                expectations: vec![expectation],
+                destinations: vec![
+                    ClusterDestination {
+                        cluster: Some(source_id.clone()),
+                        new_id: None,
+                        label: source.cluster.label.clone(),
+                        centroid: split.centroid_a.clone(),
+                        members: a,
+                    },
+                    ClusterDestination {
+                        cluster: None,
+                        new_id: Some(new_id.clone()),
+                        label: source.cluster.label.clone(),
+                        centroid: split.centroid_b.clone(),
+                        members: b,
+                    },
+                ],
+            })
+            .summary(MaintenanceSummary {
+                action: "split".to_string(),
+                source_id: crate::record_id_to_string(source_id),
+                target_ids: vec![
+                    crate::record_id_to_string(source_id),
+                    crate::record_id_to_string(&new_id),
+                ],
+                members_moved: split.group_b.len() as i64,
+                run_id: run_id.clone(),
+                job,
+                disposition: "split".to_string(),
+                previous_value: None,
+            });
+        mutation
+            .apply_system(
+                instance,
+                system,
+                partition,
+                &OperationId::new(format!(
+                    "cluster-split:{run_id}:{}",
+                    crate::record_id_to_string(source_id)
+                )),
+                &[],
+                &change,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn execute_partitioned_merge(
+        &self,
+        instance: &Database,
+        system: &SystemContext,
+        partition: &Partition,
+        keep: &PartitionCluster,
+        remove: &PartitionCluster,
+        merged_centroid: &[f32],
+    ) -> Result<()> {
+        let (run_id, job) = self.audit_for(job_name::MERGE)?;
+        let keep_id = keep
+            .cluster
+            .id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("merge survivor has no id"))?;
+        let remove_id = remove
+            .cluster
+            .id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("merge source has no id"))?;
+        ensure!(keep_id != remove_id, "cannot merge a cluster into itself");
+        let mut members = self.get_member_ids(keep_id).await?;
+        let moved = self.get_member_ids(remove_id).await?;
+        members.extend(moved.iter().cloned());
+        members.sort();
+        members.dedup();
+        let mutation = MutationRepo::new(self.db);
+        let expectations = vec![
+            mutation
+                .cluster_expectation_system(instance, system, partition, keep_id)
+                .await?,
+            mutation
+                .cluster_expectation_system(instance, system, partition, remove_id)
+                .await?,
+        ];
+        let change = PreparedChangeSet::new(operation_kind::CLUSTER_CHANGE)
+            .effect(effect::CLUSTER_MEMBERSHIP)
+            .effect(effect::CLUSTER_CENTROID)
+            .cluster(ClusterChange::Restructure {
+                partition: partition.scope.clone(),
+                expectations,
+                destinations: vec![ClusterDestination {
+                    cluster: Some(keep_id.clone()),
+                    new_id: None,
+                    label: keep.cluster.label.clone(),
+                    centroid: merged_centroid.to_vec(),
+                    members,
+                }],
+            })
+            .summary(MaintenanceSummary {
+                action: "merge".to_string(),
+                source_id: crate::record_id_to_string(remove_id),
+                target_ids: vec![crate::record_id_to_string(keep_id)],
+                members_moved: moved.len() as i64,
+                run_id: run_id.clone(),
+                job,
+                disposition: "merge".to_string(),
+                previous_value: None,
+            });
+        mutation
+            .apply_system(
+                instance,
+                system,
+                partition,
+                &OperationId::new(format!(
+                    "cluster-merge:{run_id}:{}:{}",
+                    crate::record_id_to_string(keep_id),
+                    crate::record_id_to_string(remove_id)
+                )),
+                &[],
+                &change,
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn audit_for(&self, expected_job: &str) -> Result<(String, String)> {
+        let (run_id, job, actor) = self.audit_binds();
+        ensure!(
+            actor.as_deref() == Some("system:dreaming") && job.as_deref() == Some(expected_job),
+            "partitioned cluster maintenance requires the matching system audit context"
+        );
+        Ok((
+            run_id.ok_or_else(|| anyhow::anyhow!("missing audit run id"))?,
+            job.ok_or_else(|| anyhow::anyhow!("missing audit job"))?,
+        ))
     }
 
     /// Owned migration population: live members first, otherwise only retained
