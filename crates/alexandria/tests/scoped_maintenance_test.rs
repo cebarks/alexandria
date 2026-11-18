@@ -61,6 +61,44 @@ fn fact<'a>(snapshot: &'a Value, content: &str) -> &'a Value {
 }
 
 #[test]
+fn mixed_ownership_cluster_unchanged_by_jobs() {
+    let root = tempfile::tempdir().unwrap();
+    let before = fixture(root.path(), "seed-jobs");
+    let cluster = &before["mixed_cluster"]["cluster"];
+    let members = &before["mixed_cluster"]["facts"];
+    assert_eq!(members.as_array().unwrap().len(), 2);
+    assert!(
+        members
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|fact| fact["content"] == "mixed-owned" && !fact["account"].is_null())
+    );
+    assert!(
+        members
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|fact| fact["content"] == "mixed-unowned" && fact["account"].is_null())
+    );
+    assert_eq!(
+        before["mixed_cluster"]["members"].as_array().unwrap().len(),
+        2
+    );
+
+    dream(root.path(), &["--job", "all"]);
+    let after = fixture(root.path(), "inspect");
+    assert_eq!(
+        after["mixed_cluster"], before["mixed_cluster"],
+        "mixed-owned/unowned cluster, member facts, centroid and membership must remain unchanged"
+    );
+    assert_eq!(
+        cluster["centroid"],
+        after["mixed_cluster"]["cluster"]["centroid"]
+    );
+}
+
+#[test]
 fn unassigned_unchanged_by_jobs() {
     let root = tempfile::tempdir().unwrap();
     let before = fixture(root.path(), "seed-jobs");
@@ -462,6 +500,32 @@ async fn snapshot(db: &Database) -> Value {
         unassigned[name] = json!(values);
     }
     result["unassigned"] = unassigned;
+    let mixed_cluster = result["cluster"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|cluster| cluster["label"] == "mixed-ownership")
+        .cloned();
+    if let Some(cluster) = mixed_cluster {
+        let cluster_id = &cluster["id"];
+        result["mixed_cluster"] = json!({
+            "cluster": cluster,
+            "members": result["contains_memory"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|edge| &edge["in"] == cluster_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+            "facts": result["fact"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|fact| fact["content"] == "mixed-owned" || fact["content"] == "mixed-unowned")
+                .cloned()
+                .collect::<Vec<_>>(),
+        });
+    }
     result
 }
 
@@ -483,6 +547,22 @@ async fn maintenance_fixture_child() {
         seed_owner(&db, "bobby").await;
         seed_unassigned(&db).await;
         if mode == "seed-jobs" {
+            seed_project(&db, "alice", "mixed").await;
+            seed_fact(
+                &db,
+                "alice",
+                Some("mixed"),
+                "mixed-owned",
+                "mixed-owned",
+                [1.0, 0.0],
+            )
+            .await;
+            execute(&db, "UPDATE fact:`mixed-owned` SET confidence = 1.0;").await;
+            execute(
+                &db,
+                "CREATE fact:`mixed-unowned` SET content = 'mixed-unowned', confidence = 0.5, embedding = [1.0, 0.0], tags = [], deleted = false; CREATE cluster:`mixed-ownership` SET label = 'mixed-ownership', centroid = [1.0, 0.0]; RELATE cluster:`mixed-ownership`->contains_memory->fact:`mixed-owned`; RELATE cluster:`mixed-ownership`->contains_memory->fact:`mixed-unowned`;",
+            )
+            .await;
             for project in ["duplicates", "split", "merge", "cold"] {
                 seed_project(&db, "alice", project).await;
             }

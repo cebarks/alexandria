@@ -255,7 +255,7 @@ job is due rather than waking on a fixed tick.
 | `merge_interval_secs` | u64 | `300` | Merge cadence, seconds. Split from `cluster` because merge is the expensive half — an operator who wants merges rarer should not pay for it in slower splits. |
 | `collapse_interval_secs` | u64 | `86400` | Duplicate-collapse cadence, seconds. |
 | `appraise_interval_secs` | u64 | `86400` | Demotion cadence, seconds. |
-| `max_rows_per_run` | u64 | `500` | Rows one **capped** job (`sweep`, `collapse`, `appraise`) may write per pass — one allowance **per job per pass across all eligible partitions**, not per partition: the dispatcher enumerates active accounts' assigned partitions, rotates fairly across them, and shares this allowance out, persisting its rotation cursor in `maintenance_progress` so the next pass (including a restarted CLI invocation) continues where the last stopped. Not a bound on reads: `collapse` reads every live fact in the partition it is visiting to group duplicates, and `appraise` reads every live fact's confidence while paging only this many heat rows. `examined` in the job's trace line is what was read, so `examined: 12000, acted: 3` is a normal collapse. `cluster` and `merge` are uncapped and still run their legacy-gated whole-store bodies (they refuse owned/workspace data by construction; partitioned owned-cluster maintenance is named follow-up work). Must be ≥ 1. |
+| `max_rows_per_run` | u64 | `500` | One allowance per capped job (`sweep`, `collapse`, `appraise`) per pass across all active-account assigned partitions, not per partition. The dispatcher rotates fairly and persists progress, so a restarted CLI pass resumes the walk. `appraise` also persists an advancing row cursor and wraps it after exhausting the current cycle. This is not a read or runtime bound: `collapse` can inspect every live fact in a visited partition, and `examined` reports reads (`examined: 12000, acted: 3` can be normal). `cluster` and `merge` are uncapped: each runs its legacy whole-store body once per pass for workspace-less clusters and visits active-account partitions using the owned, partition-scoped maintenance path. Must be ≥ 1. |
 | `cold_heat_floor` | f64 | `0.05` | Projected heat at or below which a memory counts as cold. **Provisional**: a fraction of the `1.0` a fresh access writes, not a number derived from retrieval measurements. |
 | `demote_confidence_ceiling` | f64 | `0.5` | Stored confidence at or below which a cold, never-accessed memory is demotable. Defaults to the confidence `store_memory` writes when the caller supplies none, so the rule reaches only memories nobody asserted more strongly AND nobody retrieved while recording was armed. Must be above `0.2`, the value demoted memories are written at. **Provisional**, as above. |
 
@@ -277,9 +277,14 @@ a complete set would answer. `dreaming` is not the only section in that position
 is the complete list of what the server reads from the environment, not an excerpt of a scheme that
 covers every section.
 
+All five jobs dispatch over active-account assigned partitions; Unassigned data is intentionally outside maintenance. Mixed-membership clusters (members spanning owned and physically unowned records) are not restructured by either path: they remain surfaced for owner classification rather than being treated as personal data or silently repaired.
+
 Job runs are logged at `debug` with `examined` and `acted` counts. `cluster`, `merge`, `collapse` and
 `appraise` each write a row to `maintenance_log` — visible at `/debug/maintenance` — and `sweep`
-deliberately does not.
+deliberately does not. `appraise`, `collapse` and semantic `cluster_change` writes pass through the
+mutation kernel and create `semantic_operation` rows with preimages; system operations use the
+schema's `initiator = NONE`, with readable `system:dreaming` attribution on the linked maintenance
+summary. Sweep materializes heat only and deliberately writes neither journal rows nor audit rows.
 
 **Running a job on demand: `alexandria dream`.** You do not need to touch this section to make a job
 run now. `alexandria dream --job NAME` (or with no `--job`, all five) runs the same job bodies the
