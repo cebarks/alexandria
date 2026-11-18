@@ -41,6 +41,17 @@ impl Database {
         true // embedded connection is always valid after construction
     }
 
+    /// Liveness probe: one trivial round trip through the engine. The HTTP `/health`
+    /// endpoint uses this so a wedged or closed database reports unhealthy instead of
+    /// answering 200 from process state alone.
+    pub async fn ping(&self) -> Result<()> {
+        // `SELECT 1` alone does not parse on 3.3 (FROM is required); `FROM 1` is the
+        // schema-free literal form — no table needs to exist, so the probe works on a
+        // fresh store as well as a migrated one.
+        self.db.query("SELECT * FROM 1").await?.check()?;
+        Ok(())
+    }
+
     pub fn inner(&self) -> &Surreal<Any> {
         &self.db
     }
