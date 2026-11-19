@@ -1,3 +1,7 @@
+mod refinement;
+
+pub use refinement::RefinementConfig;
+
 use std::path::PathBuf;
 
 use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
@@ -33,6 +37,8 @@ pub struct Config {
     pub retrieve: RetrieveConfig,
     pub reminders: RemindersConfig,
     pub auth: AuthConfig,
+    #[serde(deserialize_with = "refinement::deserialize")]
+    pub refinement: RefinementConfig,
 }
 
 /// `[auth]` — the trusted-local identity, and deliberately nothing else.
@@ -556,7 +562,14 @@ impl Config {
             // for a breaking change — the operator's tuned value stops applying and nothing says
             // so. The warning names the replacements, so grepping the service log for the old key
             // finds the migration path.
-            let raw: toml::Value = toml::from_str(&contents)?;
+            // TOML syntax errors may quote the submitted line, including accidental secret values.
+            let raw: toml::Value = toml::from_str(&contents).map_err(|error| {
+                let path = config_path.display();
+                match error.span() {
+                    Some(span) => anyhow::anyhow!("invalid TOML in {path} at byte {}", span.start),
+                    None => anyhow::anyhow!("invalid TOML in {path}"),
+                }
+            })?;
             for warning in removed_key_warnings(&raw) {
                 tracing::warn!("{warning}");
             }
@@ -621,6 +634,7 @@ impl Config {
             "embedding.batch_size must be between 1 and 4096"
         );
         validate_max_tokens(&config.embedding.model, config.embedding.max_tokens)?;
+        config.refinement.resolve()?;
         // The scheduler's own arithmetic treats a zero interval as "due on every tick", so a typo
         // here would turn a daily pass into a hot loop that never sleeps. Refusing to start says
         // which key is wrong instead of burning a core.

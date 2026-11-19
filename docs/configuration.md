@@ -326,6 +326,30 @@ one-shot CLI would mean something false. So `appraise` on a store that has never
 demotes nothing and logs why, which is the fail-closed gate above working rather than the command
 failing.
 
+### `[refinement]`
+
+Refinement has no routes by default. Only the operator can configure destinations and the approval ceiling. Startup must reconcile the configured policy with the store before serving; removing the proposer disables refinement without deleting prior consent. Setting a route does **not** grant consent for any account, start inference, or enable automatic application. This build prepares the policy and disclosure only; it has no live refinement worker.
+
+```toml
+[refinement]
+approval_mode_ceiling = "human"  # default; "secondary_llm" permits an owner to select that mode
+
+[refinement.proposer]
+protocol = "open_ai_chat_completions"  # or "anthropic_messages"
+api_prefix = "https://inference.example.com/gateway/v1"
+model = "proposer-model"
+credential_ref = "ALEXANDRIA_REFINEMENT_PRIMARY_KEY"  # environment variable name, not its value
+output_limit_field = "max_completion_tokens"         # optional protocol-specific override
+
+# Optional custom headers also take environment variable names, never literal values.
+[refinement.proposer.header_refs]
+x-gateway-key = "ALEXANDRIA_REFINEMENT_GATEWAY_KEY"
+```
+
+A route requires `protocol`, `api_prefix`, and a nonblank `model`. The HTTP(S) URL keeps its gateway path prefix; userinfo, query strings, and fragments are refused. `credential_ref` and each `header_refs` value, if present, must be a name matching `[A-Za-z_][A-Za-z0-9_]*`. Startup does not read the referenced values. To use a different reviewer, supply a complete `[refinement.reviewer]` route with its own references. Omit it to inherit the proposer route, including its model and references; a reviewer without a proposer is invalid.
+
+Consent is per account and covers the disclosed destinations (protocol, origin, and API prefix). A destination change requires a fresh grant. Changing only the model does not require consent renewal, but it changes the inference policy ID; the current model is shown in disclosure. Credential rotation alone changes neither the destination nor the policy ID.
+
 ### `[retrieve]`
 
 Controls server-side filtering of `retrieve_memories` results.

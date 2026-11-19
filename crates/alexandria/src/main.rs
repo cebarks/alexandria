@@ -4,11 +4,16 @@ mod dream;
 mod dreaming;
 mod embedding_migration;
 mod ownership;
+#[cfg(test)]
+mod refinement_boot_tests;
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
+use alexandria_engine::refinement::policy::InferencePolicyInputs;
 use alexandria_mcp::AlexandriaServer;
+use alexandria_mcp::refinement::ReconciledRefinement;
 use alexandria_pipeline::embedding::load_provider;
+use alexandria_storage::access::SystemContext;
 use alexandria_storage::ownership_migration::check_ownership_ready;
 use alexandria_storage::{Database, schema, system_config};
 use anyhow::Context;
@@ -170,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
             config.database.data_dir.display()
         )
     })?;
+    let _refinement = reconcile_refinement_at_boot(&db, &system, &config.refinement).await?;
     let db = Arc::new(db);
 
     // 4. Create MCP server
@@ -313,6 +319,31 @@ async fn migrate_embeddings(force: bool) -> anyhow::Result<()> {
  * surface will want these keys to mean something specific, and a startup that had quietly ignored one
  * would have to be re-explained to whoever set it.
  */
+async fn reconcile_refinement_at_boot(
+    db: &Database,
+    system: &SystemContext,
+    config: &config::RefinementConfig,
+) -> anyhow::Result<Option<ReconciledRefinement>> {
+    // This build has no inference prompt or operation schema. A build that can execute inference
+    // must fingerprint the concrete inputs instead, which fences this pre-inference policy ID.
+    let settings = BTreeMap::new();
+    let inputs = InferencePolicyInputs {
+        prompt_template: b"",
+        prompt_template_version: "not-installed",
+        operation_schema_version: "not-installed",
+        settings: &settings,
+    };
+    ReconciledRefinement::reconcile(
+        db,
+        system,
+        config.resolve()?,
+        &inputs,
+        config.approval_mode_ceiling,
+    )
+    .await
+    .context("could not reconcile refinement policy at startup")
+}
+
 fn validate_auth_config(config: &Config) -> anyhow::Result<()> {
     // An unknown transport is refused first, before either arm below reads the config as one of the two
     // known kinds — and before a store is opened or a model is loaded.
