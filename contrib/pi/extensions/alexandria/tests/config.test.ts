@@ -34,6 +34,8 @@ const MANAGED_ENV = [
 	"ALEXANDRIA_REMINDERS",
 	"ALEXANDRIA_REMINDERS_PROJECT",
 	"ALEXANDRIA_CLIENT_CONFIG",
+	"ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS",
+	"ALEXANDRIA_PROMPT_BUDGET_MS",
 	"ANTHROPIC_API_KEY",
 ];
 
@@ -111,6 +113,42 @@ test("no env and no file: every feature is on, and the defaults hold", async () 
 	assert.equal(config.recallLimit, 10);
 	assert.equal(config.recallMinSimilarity, 0.45);
 	assert.equal(config.remindersProject, undefined);
+	assert.equal(config.promptCallTimeoutMs, 5000);
+	assert.equal(config.promptBudgetMs, 10000);
+});
+
+test("transport timeouts load from client.toml and environment overrides", async () => {
+	const transportToml = join(workspace, "transport.toml");
+	await writeFile(
+		transportToml,
+		"[transport]\nprompt_call_timeout_ms = 1200\nprompt_budget_ms = 4000\n",
+		"utf8",
+	);
+	const fromFile = await configWith({ ALEXANDRIA_CLIENT_CONFIG: transportToml });
+	assert.equal(fromFile.promptCallTimeoutMs, 1200);
+	assert.equal(fromFile.promptBudgetMs, 4000);
+	const fromEnv = await configWith({
+		ALEXANDRIA_CLIENT_CONFIG: transportToml,
+		ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS: "2500",
+		ALEXANDRIA_PROMPT_BUDGET_MS: "8000",
+	});
+	assert.equal(fromEnv.promptCallTimeoutMs, 2500);
+	assert.equal(fromEnv.promptBudgetMs, 8000);
+});
+
+test("transport timeout configuration rejects invalid bounds instead of clamping", async () => {
+	const invalidConfigs: Record<string, string>[] = [
+		{ ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS: "0" },
+		{ ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS: "Infinity" },
+		{ ALEXANDRIA_PROMPT_BUDGET_MS: "120001" },
+		{ ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS: "6000", ALEXANDRIA_PROMPT_BUDGET_MS: "5000" },
+	];
+	for (const env of invalidConfigs) {
+		await assert.rejects(
+			configWith({ ALEXANDRIA_CLIENT_CONFIG: absentToml, ...env }),
+			/transport.*(positive|finite|120000|less than or equal)/i,
+		);
+	}
 });
 
 test("legacy ALEXANDRIA_AUTO_RECALL=off disables recall alone", async () => {

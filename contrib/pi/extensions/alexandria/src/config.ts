@@ -12,6 +12,7 @@ interface ClientToml {
 		extract_timeout_ms?: number;
 	};
 	reminders?: { enabled?: boolean; project?: string };
+	transport?: { prompt_call_timeout_ms?: number; prompt_budget_ms?: number };
 }
 
 /**
@@ -92,6 +93,40 @@ const envNum = (key: string, fallback: number): number => {
 	return n;
 };
 
+function transportTimeouts(): { promptCallTimeoutMs: number; promptBudgetMs: number } {
+	const configured = (envKey: string, fileValue: number | undefined, fallback: number): number => {
+		const rawEnv = process.env[envKey];
+		const value = rawEnv !== undefined ? Number(rawEnv.trim()) : (fileValue ?? fallback);
+		if (!Number.isFinite(value) || value <= 0) {
+			throw new Error(
+				`Alexandria config error: transport ${envKey} must be a positive finite number of milliseconds.`,
+			);
+		}
+		return value;
+	};
+	const promptCallTimeoutMs = configured(
+		"ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS",
+		toml.transport?.prompt_call_timeout_ms,
+		5000,
+	);
+	const promptBudgetMs = configured(
+		"ALEXANDRIA_PROMPT_BUDGET_MS",
+		toml.transport?.prompt_budget_ms,
+		10000,
+	);
+	if (promptBudgetMs > 120000) {
+		throw new Error("Alexandria config error: transport prompt_budget_ms must be at most 120000 ms.");
+	}
+	if (promptCallTimeoutMs > promptBudgetMs) {
+		throw new Error(
+			"Alexandria config error: transport prompt_call_timeout_ms must be less than or equal to prompt_budget_ms.",
+		);
+	}
+	return { promptCallTimeoutMs, promptBudgetMs };
+}
+
+const transport = transportTimeouts();
+
 /** Trimmed at the boundary: a set-but-blank or whitespace-only override must fall
  *  through to the file (and then to the git probe) rather than being sent verbatim,
  *  because the server matches the target exactly and an untrimmed value degrades
@@ -147,4 +182,7 @@ export const CONFIG = {
 	// project name (git worktrees, copied checkouts).
 	remindersProject:
 		env("ALEXANDRIA_REMINDERS_PROJECT") ?? toml.reminders?.project?.trim() ?? undefined,
+
+	promptCallTimeoutMs: transport.promptCallTimeoutMs,
+	promptBudgetMs: transport.promptBudgetMs,
 } as const;

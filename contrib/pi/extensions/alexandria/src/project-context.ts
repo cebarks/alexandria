@@ -1,7 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { CONFIG } from "./config.js";
-import { extractTextContent, type AuthenticatedServer } from "./mcp-client.js";
+import {
+	extractTextContent,
+	PROMPT_CALL_TIMEOUT_MS,
+	type AuthenticatedServer,
+} from "./mcp-client.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const execFileAsync = promisify(execFile);
@@ -66,15 +70,17 @@ function sanitizedGitEnv(): NodeJS.ProcessEnv {
 	return env;
 }
 
-async function originRemote(cwd: string): Promise<string | undefined> {
+async function originRemote(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
 	try {
 		const { stdout } = await execFileAsync("git", ["remote", "get-url", "origin"], {
 			cwd,
 			timeout: 2000,
 			env: sanitizedGitEnv(),
+			...(signal ? { signal } : {}),
 		});
 		return stdout.trim() || undefined;
 	} catch (err) {
+		if (signal?.aborted) throw signal.reason ?? new Error("Project resolution aborted");
 		if ((err as { killed?: boolean }).killed) throw new Error("git origin lookup timed out");
 		return undefined;
 	}
@@ -118,7 +124,7 @@ export async function getProjectContext(
 	const generation = cacheGeneration;
 	const cwd = ctx.cwd || process.cwd();
 	const override = CONFIG.projectId;
-	const remote = override ? undefined : await originRemote(cwd);
+	const remote = override ? undefined : await originRemote(cwd, signal);
 	const descriptor = remote ? sanitizeRemote(remote) : undefined;
 	const source = override ? "override" : descriptor ? "git-remote" : "personal-only";
 	const descriptorKey = override
@@ -133,7 +139,12 @@ export async function getProjectContext(
 	const pending = (async (): Promise<ProjectContext> => {
 		if (!override && !descriptor) return { source };
 		const args = override ? { project: override } : { remote: descriptor };
-		const result = await authenticatedServer.callTool("resolve_project", args, 5000, signal);
+		const result = await authenticatedServer.callTool(
+			"resolve_project",
+			args,
+			PROMPT_CALL_TIMEOUT_MS,
+			signal,
+		);
 		return { projectId: projectIdFromResult(result), source };
 	})();
 	if (generation === cacheGeneration) cache.set(key, pending);

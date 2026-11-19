@@ -70,7 +70,8 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 			};
 
 			// One deadline for the whole prompt path, not one per attempt. Each call
-			// is already bounded (5 s) but they stack — git probe, handshake, call, and
+			// is already bounded by its configured per-call limit but they stack — git probe,
+			// handshake, call, and
 			// a reconnect retry — and pi waits for this handler before the turn starts,
 			// so the number a user actually experiences is the sum. Aborting also stops
 			// spending a socket on a prompt that is no longer wanted.
@@ -79,9 +80,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 				() => budget.abort(new Error(`Alexandria prompt budget (${PROMPT_BUDGET_MS} ms) exceeded`)),
 				PROMPT_BUDGET_MS,
 			);
-			ctx.signal?.addEventListener("abort", () => budget.abort(ctx.signal?.reason), {
-				once: true,
-			});
+			const abortFromPi = () => budget.abort(ctx.signal?.reason);
+			if (ctx.signal?.aborted) abortFromPi();
+			else ctx.signal?.addEventListener("abort", abortFromPi, { once: true });
 
 			/**
 			 * Which abort source fired, read at catch time — both signals are still
@@ -158,6 +159,7 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 				projectContextTask,
 			]);
 			clearTimeout(timer);
+			ctx.signal?.removeEventListener("abort", abortFromPi);
 			// Stopped here rather than at the record below, so the probe cannot outlive
 			// the awaits it measures: everything after this point is synchronous, and a
 			// throw in it would otherwise leak one interval per prompt. The window that

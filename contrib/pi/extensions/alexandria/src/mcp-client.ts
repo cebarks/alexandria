@@ -73,18 +73,18 @@ export function connectionsEstablished(): number {
  * instead. Explicit store_memory calls use the configured/native MCP path, not
  * this automatic prompt dispatcher.
  */
-export const PROMPT_CALL_TIMEOUT_MS = 5000;
+export const PROMPT_CALL_TIMEOUT_MS = CONFIG.promptCallTimeoutMs;
 
 /**
  * Ceiling on the whole per-prompt path, as one abort deadline.
  *
  * The per-call budget above is exactly that — per call — and the prompt path
- * stacks several: a git probe (2 s), a handshake (5 s) and a call (5 s), with one
- * reconnect retry on top. Pi waits for `before_agent_start` before the turn
- * starts, so the wait a user actually experiences is the sum, not the 5 s a single
- * constant suggests. This is the number to quote in the docs.
+ * stacks several: a git probe (2 s), a handshake (5 s) and tool calls, with one
+ * reconnect retry on top. Pi waits for `before_agent_start` before the turn starts,
+ * so the wait a user experiences is bounded by this shared deadline, not the sum of
+ * each stage's individual timeout.
  */
-export const PROMPT_BUDGET_MS = 10_000;
+export const PROMPT_BUDGET_MS = CONFIG.promptBudgetMs;
 
 async function connect(): Promise<Client> {
 	let url: URL;
@@ -114,7 +114,30 @@ async function connect(): Promise<Client> {
 	return client;
 }
 
-export async function getClient(): Promise<Client> {
+function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Prompt path aborted"));
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			signal.removeEventListener("abort", onAbort);
+			reject(signal.reason ?? new Error("Prompt path aborted"));
+		};
+		const settle = (fn: (value: T) => void, value: T) => {
+			signal.removeEventListener("abort", onAbort);
+			fn(value);
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => settle(resolve, value),
+			(error) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+	});
+}
+
+export async function getClient(signal?: AbortSignal): Promise<Client> {
 	const identity = identityKey();
 	if (clientIdentity !== null && clientIdentity !== identity) resetClient();
 	clientIdentity = identity;
@@ -130,7 +153,7 @@ export async function getClient(): Promise<Client> {
 			if (clientPromise === attempt) clientPromise = null;
 		});
 	}
-	return clientPromise;
+	return awaitWithSignal(clientPromise, signal);
 }
 
 /**
@@ -230,12 +253,12 @@ export async function callToolWithRetry(
 		...(signal === undefined ? {} : { signal }),
 	};
 	try {
-		const client = await getClient();
+		const client = await getClient(signal);
 		return await client.callTool({ name, arguments: args }, options);
 	} catch (err) {
 		if (isStaleSessionError(err)) {
 			resetClient();
-			const client = await getClient();
+			const client = await getClient(signal);
 			return await client.callTool({ name, arguments: args }, options);
 		}
 		throw err;
