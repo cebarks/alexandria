@@ -217,7 +217,6 @@ impl<'a> MutationRepo<'a> {
         let rows: Vec<FactRow> = self
             .db
             .query(FACT_READ_SQL)
-            .bind(("key", record_key(fact.as_record_id())?))
             .bind(("fact", fact.as_record_id().clone()))
             .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
@@ -1328,7 +1327,6 @@ impl<'a> MutationRepo<'a> {
     ) -> Result<Option<FactSnapshot>, StorageError> {
         let rows: Vec<FactRow> = tx
             .query(FACT_READ_SQL)
-            .bind(("key", record_key(fact.as_record_id())?))
             .bind(("fact", fact.as_record_id().clone()))
             .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
@@ -1664,14 +1662,13 @@ impl<'a> MutationRepo<'a> {
         // The revision is both guard and increment in one statement: the `WHERE` compares what the caller
         // read and the `SET` writes `+ 1`, so an update that loses the race loses the row, not the winner.
         let sql = format!(
-            "UPDATE type::record('fact', $key) SET {}, semantic_revision = $version + 1 WHERE id \
+            "UPDATE $id SET {}, semantic_revision = $version + 1 WHERE id \
              = $id AND account = $account AND workspace = $workspace AND semantic_revision = \
              $version RETURN AFTER;",
             sets.join(", ")
         );
         let mut query = tx
             .query(sql)
-            .bind(("key", record_key(fact.as_record_id())?))
             .bind(("id", fact.as_record_id().clone()))
             .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
@@ -2404,7 +2401,6 @@ impl<'a> MutationRepo<'a> {
         let member = resolve_member(member, minted)?;
         let rows: Vec<MemberPartitionRow> = tx
             .query(FACT_PARTITION_SQL)
-            .bind(("key", record_key(&member)?))
             .bind(("id", member.clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
             .await
@@ -3090,7 +3086,7 @@ fn digest_of(snapshots: &[SemanticSnapshot]) -> String {
 /// columns; the account and workspace predicates in the `WHERE` are the other — they are what make a
 /// foreign handle indistinguishable from an absent one.
 pub const FACT_READ_SQL: &str = "SELECT id, content, confidence, embedding, tags, deleted, \
-     quarantined_at, semantic_revision, workspace, scope, project FROM type::record('fact', $key) \
+     quarantined_at, semantic_revision, workspace, scope, project FROM $fact \
      WHERE id = $fact AND account = $account AND workspace = $workspace LIMIT 1;";
 
 pub const MEMORY_EDGE_READ_SQL: &str = "SELECT id, in, out, edge_type, strength FROM memory_edge \
@@ -3175,7 +3171,7 @@ pub const CLUSTER_IMAGE_SQL: &str = "SELECT id, label, centroid, depth, membersh
 /// `scope`/`project` are the stored pair, and [`read_scope`] is the same translation the journal's fact
 /// snapshots use, so the partition a join is checked against is the partition the rest of the system will
 /// read back from the same row.
-pub const FACT_PARTITION_SQL: &str = "SELECT scope, project FROM type::record('fact', $key) WHERE id \
+pub const FACT_PARTITION_SQL: &str = "SELECT scope, project FROM $id WHERE id \
      = $id AND workspace = $workspace LIMIT 1;";
 
 #[derive(SurrealValue)]

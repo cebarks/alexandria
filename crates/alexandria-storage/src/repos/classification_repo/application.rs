@@ -760,10 +760,9 @@ impl ClassificationRepo<'_> {
         let mut response = self
             .db
             .query(
-                "SELECT VALUE semantic_revision FROM type::record('fact', $key) WHERE id = $fact \
+                "SELECT VALUE semantic_revision FROM $fact WHERE id = $fact \
                  AND account = $account AND workspace = $workspace;",
             )
-            .bind(("key", record_key(approval.fact.as_record_id())?))
             .bind(("fact", approval.fact.as_record_id().clone()))
             .bind(("account", self.account()))
             .bind(("workspace", self.workspace()))

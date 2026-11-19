@@ -281,7 +281,6 @@ impl<'a> ClassificationRepo<'a> {
         let sql = insert_sql(project_bound, destination.kind);
         let mut write = GuardedWrite::new(sql)
             .id("fact", fact.as_record_id().clone())
-            .value("key", Bind::Text(record_key(fact.as_record_id())?))
             .value("destination_kind", Bind::Text(destination.kind.to_string()))
             .value(
                 "destination_project",
@@ -396,10 +395,9 @@ impl<'a> ClassificationRepo<'a> {
         let mut response = self
             .db
             .query(
-                "SELECT semantic_revision FROM type::record('fact', $key) WHERE id = $fact AND \
+                "SELECT semantic_revision FROM $fact WHERE id = $fact AND \
                  account = $account AND workspace = $workspace AND deleted = false LIMIT 1;",
             )
-            .bind(("key", record_key(fact)?))
             .bind(("fact", fact.clone()))
             .bind(("account", self.account()))
             .bind(("workspace", self.workspace()))
@@ -719,7 +717,7 @@ fn insert_sql(project_bound: bool, kind: &str) -> String {
                $destination_kind AS destination_kind, {project_column} AS destination_project, \
                $expected AS source_revision, 0 AS revision, '{pending}' AS state, \
                $reason AS reason \
-         FROM type::record('fact', $key) \
+         FROM $fact \
          WHERE id = $fact AND account = $account AND workspace = $workspace AND deleted = false \
            AND semantic_revision = $expected AND \
            array::len((SELECT id FROM classification_proposal WHERE account = $account AND \

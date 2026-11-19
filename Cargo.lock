@@ -124,6 +124,7 @@ dependencies = [
  "chrono-tz",
  "dirs 7.0.0",
  "iana-time-zone",
+ "reqwest 0.13.5",
  "rmcp",
  "serde",
  "serde_json",

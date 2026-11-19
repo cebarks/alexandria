@@ -25,6 +25,8 @@ impl RefinementRepo<'_> {
     ) -> Result<Vec<ExpectedState>, StorageError> {
         let mutation = MutationRepo::new(self.db.inner());
         let partition = &evidence.focal.partition;
+        let selected_unassigned = partition.scope == MemoryScope::Unassigned
+            && evidence.coverage.selection == EvidenceSelectionKind::OwnerSelected;
         let access = mutation
             .system_mutation_context(self.db, system, partition)
             .await?;
@@ -40,7 +42,7 @@ impl RefinementRepo<'_> {
                 || snapshot.content != candidate.complete_content
                 || snapshot.tags != candidate.tags
                 || snapshot.visibility.deleted
-                || snapshot.visibility.quarantined_at.is_some()
+                || (!selected_unassigned && snapshot.visibility.quarantined_at.is_some())
             {
                 return Err(StorageError::Stale);
             }
@@ -394,6 +396,11 @@ async fn plan_quality(
     prepared: &PreparedChangeSet,
     change: &mut PreparedChangeSet,
 ) -> Result<(), StorageError> {
+    // Rewrite leaves visibility unchanged and archives the old text as deleted. Do not
+    // let operations that can create live descendants consume a quarantined source.
+    let quarantined_rewrite = proposal.partition.scope == MemoryScope::Unassigned
+        && proposal.evidence.coverage.selection == EvidenceSelectionKind::OwnerSelected
+        && matches!(&proposal.proposed, QualityOperation::Rewrite { .. });
     let mut rows: Vec<(FactId, FactSnapshot)> = Vec::new();
     let candidates = std::iter::once(&proposal.evidence.focal).chain(&proposal.evidence.related);
     for candidate in candidates {
@@ -411,7 +418,7 @@ async fn plan_quality(
         if ExpectedState::of(&state) != *expected
             || state.scope != proposal.partition.scope
             || state.visibility.deleted
-            || state.visibility.quarantined_at.is_some()
+            || (!quarantined_rewrite && state.visibility.quarantined_at.is_some())
         {
             return Err(StorageError::Stale);
         }

@@ -1,0 +1,3 @@
+{"case_id":"REF-EVAL-003","workspace_scope":"project:widget-api","action":"consolidate","replacements":["On desktop Linux, widget-cli v2.3.x opens a browser automatically."]}
+{"case_id":"REF-EVAL-004","workspace_scope":"personal","action":"supersede","replacements":["Prefer spaces over tabs."]}
+{"case_id":"REF-EVAL-008","workspace_scope":"project:widget-api","action":"consolidate"}

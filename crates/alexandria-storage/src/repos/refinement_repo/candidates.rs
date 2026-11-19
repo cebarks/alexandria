@@ -25,6 +25,8 @@ const MAX_EVIDENCE_BYTES: usize = 32 * 1024;
 const PROVENANCE_PROBE_LIMIT: usize = 33;
 const LIVE_PARTITION: &str = "account = $account AND workspace = $workspace AND scope = $scope \
     AND project = $project AND deleted = false AND quarantined_at = NONE";
+const UNASSIGNED_REVIEW_PARTITION: &str = "account = $account AND workspace = $workspace \
+    AND scope = 'unassigned' AND project = $project AND deleted = false";
 
 /// A checkpointable position in one partition. `after` is the exclusive lower bound of
 /// the next typed fact-key range; it is not a display handle or an offset.
@@ -367,9 +369,16 @@ impl Population<'_> {
     ) -> Result<Option<SizedCandidate>, StorageError> {
         // Length in SQL is a cheap prefilter. The UTF-8/metadata budget below is exact for the
         // projected payload, and does not depend on SurrealQL's string length units.
+        // The only Unassigned population is the owner-selected review context. Assigned
+        // candidates must still exclude quarantine, regardless of how they were selected.
+        let predicate = if self.partition.scope == MemoryScope::Unassigned {
+            UNASSIGNED_REVIEW_PARTITION
+        } else {
+            LIVE_PARTITION
+        };
         let rows: Vec<CandidateRow> = rows(
             self.query(format!(
-                "SELECT id, content, tags, semantic_revision FROM $fact WHERE {LIVE_PARTITION} \
+                "SELECT id, content, tags, semantic_revision FROM $fact WHERE {predicate} \
              AND string::len(content) <= $budget AND array::len(tags) <= 256"
             ))
             .bind(("fact", id.as_record_id().clone()))
@@ -407,7 +416,7 @@ impl Population<'_> {
         let records: Vec<_> = ids.iter().map(|id| id.as_record_id().clone()).collect();
         let found = fact_ids(
             self.query(format!(
-                "SELECT VALUE id FROM $facts WHERE {LIVE_PARTITION}"
+                "SELECT VALUE id FROM $facts WHERE {UNASSIGNED_REVIEW_PARTITION}"
             ))
             .bind(("facts", records)),
         )

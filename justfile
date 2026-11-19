@@ -49,6 +49,17 @@ artifact-ci: artifact-fmt artifact-lint artifact-test artifact-deny
 eval-test:
     python3 -m unittest discover -s tools/granite-evaluation
 
+# Offline refinement scoring against the human-reviewed Task 1 cases.
+refinement-eval-test:
+    python3 -I -B -c 'import sys, unittest; sys.exit(not unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover("tools/refinement-evaluation")).wasSuccessful())'
+
+refinement-eval:
+    python3 -I -B tools/refinement-evaluation/score.py tools/refinement-evaluation/fixtures/cases.jsonl tools/refinement-evaluation/fixtures/deterministic-proposals.jsonl
+
+# Disposable loopback review UI. The example does not read Alexandria configuration.
+review-fixture:
+    cargo run --locked -p alexandria-mcp --example review_fixture
+
 # Type-check and test the pi companion (node:test over tsx, hermetic)
 ext-test:
     cd contrib/pi/extensions/alexandria && npm run typecheck && npm test
