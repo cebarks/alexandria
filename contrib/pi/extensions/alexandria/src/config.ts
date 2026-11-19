@@ -63,6 +63,20 @@ const toml = loadToml();
  */
 const env = (key: string): string | undefined => process.env[key]?.trim() || undefined;
 
+const obsoleteExtractionSettings = [
+	...(process.env.ALEXANDRIA_AUTO_STORE !== undefined ? ["ALEXANDRIA_AUTO_STORE"] : []),
+	...(process.env.ALEXANDRIA_EXTRACT_MODEL !== undefined ? ["ALEXANDRIA_EXTRACT_MODEL"] : []),
+	...(process.env.ALEXANDRIA_EXTRACT_TIMEOUT_MS !== undefined ? ["ALEXANDRIA_EXTRACT_TIMEOUT_MS"] : []),
+	...(toml.store?.enabled !== undefined ? ["store.enabled in client.toml"] : []),
+	...(toml.store?.extract_model !== undefined ? ["store.extract_model in client.toml"] : []),
+	...(toml.store?.extract_timeout_ms !== undefined ? ["store.extract_timeout_ms in client.toml"] : []),
+];
+if (obsoleteExtractionSettings.length > 0) {
+	console.warn(
+		`Alexandria: automatic observation storage was removed; ignoring obsolete setting(s) ${obsoleteExtractionSettings.join(", ")}. Remove them and use the authenticated store_memory tool or the Alexandria memory skill to save memories explicitly.`,
+	);
+}
+
 /** A numeric override, or the fallback. A blank or unparseable value falls back
  *  rather than becoming `0` or `NaN`: `Number("")` is `0`, which would silence
  *  recall entirely, and `NaN` compares false against every similarity, which
@@ -122,20 +136,6 @@ export const CONFIG = {
 			// because the limit is 10; at 5 it was dominated by 0.50.
 			// See docs/minilm-test-data.md "Result limit".
 			0.45,
-	),
-
-	storeDisabled:
-		env("ALEXANDRIA_AUTO_STORE") === "off" ||
-		(toml.store?.enabled === false && env("ALEXANDRIA_AUTO_STORE") === undefined),
-
-	extractModel:
-		env("ALEXANDRIA_EXTRACT_MODEL") ??
-		toml.store?.extract_model ??
-		"vertex/claude-haiku-4-5",
-
-	extractTimeoutMs: envNum(
-		"ALEXANDRIA_EXTRACT_TIMEOUT_MS",
-		toml.store?.extract_timeout_ms ?? 5000,
 	),
 
 	remindersDisabled:

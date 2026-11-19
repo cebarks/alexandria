@@ -13,7 +13,6 @@ import {
 } from "@modelcontextprotocol/client";
 import { createHash } from "node:crypto";
 import { CONFIG } from "./config.js";
-import type { SessionArgs } from "./session-args.js";
 
 let clientPromise: Promise<Client> | null = null;
 let clientIdentity: string | null = null;
@@ -71,8 +70,8 @@ export function connectionsEstablished(): number {
  * Budget for the calls made on the prompt path (`retrieve_memories`,
  * `check_reminders`). The SDK waits 60 s per request by default; both injections
  * block the turn and both are best-effort, so they give up early and warn
- * instead. Store calls keep the SDK default — they are fire-and-forget, and a
- * store that embeds a long document legitimately takes a while.
+ * instead. Explicit store_memory calls use the configured/native MCP path, not
+ * this automatic prompt dispatcher.
  */
 export const PROMPT_CALL_TIMEOUT_MS = 5000;
 
@@ -293,14 +292,4 @@ export function toolErrorMessage(result: { content?: unknown; isError?: boolean 
 		/* not JSON: the text is the message */
 	}
 	return text;
-}
-
-export async function storeMemory(
-	content: string,
-	tags: string[],
-	session: SessionArgs,
-): Promise<void> {
-	const result = await callToolWithRetry("store_memory", { content, tags, ...session });
-	const err = toolErrorMessage(result);
-	if (err) throw new Error(err);
 }

@@ -107,12 +107,9 @@ test("no env and no file: every feature is on, and the defaults hold", async () 
 	assert.equal(config.apiToken, undefined);
 	assert.equal(config.projectId, undefined);
 	assert.equal(config.recallDisabled, false);
-	assert.equal(config.storeDisabled, false);
 	assert.equal(config.remindersDisabled, false);
 	assert.equal(config.recallLimit, 10);
 	assert.equal(config.recallMinSimilarity, 0.45);
-	assert.equal(config.extractModel, "vertex/claude-haiku-4-5");
-	assert.equal(config.extractTimeoutMs, 5000);
 	assert.equal(config.remindersProject, undefined);
 });
 
@@ -122,18 +119,31 @@ test("legacy ALEXANDRIA_AUTO_RECALL=off disables recall alone", async () => {
 		ALEXANDRIA_AUTO_RECALL: "off",
 	});
 	assert.equal(config.recallDisabled, true);
-	assert.equal(config.storeDisabled, false);
 	assert.equal(config.remindersDisabled, false);
 });
 
-test("ALEXANDRIA_AUTO_STORE=off disables store alone", async () => {
-	const config = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: absentToml,
-		ALEXANDRIA_AUTO_STORE: "off",
-	});
-	assert.equal(config.storeDisabled, true);
-	assert.equal(config.recallDisabled, false);
-	assert.equal(config.remindersDisabled, false);
+test("obsolete extraction environment settings are ignored with upgrade guidance", async () => {
+	const warnings: string[] = [];
+	const originalWarn = console.warn;
+	console.warn = (message?: unknown) => warnings.push(String(message));
+	try {
+		const config = await configWith({
+			ALEXANDRIA_CLIENT_CONFIG: absentToml,
+			ALEXANDRIA_AUTO_STORE: "off",
+			ALEXANDRIA_EXTRACT_MODEL: "legacy/model",
+			ALEXANDRIA_EXTRACT_TIMEOUT_MS: "1234",
+		});
+		assert.equal(config.recallDisabled, false);
+		assert.equal(config.remindersDisabled, false);
+		assert.doesNotMatch(JSON.stringify(config), /legacy\/model|1234/);
+	} finally {
+		console.warn = originalWarn;
+	}
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /ALEXANDRIA_AUTO_STORE/);
+	assert.match(warnings[0], /ALEXANDRIA_EXTRACT_MODEL/);
+	assert.match(warnings[0], /ALEXANDRIA_EXTRACT_TIMEOUT_MS/);
+	assert.match(warnings[0], /store_memory.*explicitly/i);
 });
 
 test("ALEXANDRIA_REMINDERS=off disables reminders alone", async () => {
@@ -143,19 +153,27 @@ test("ALEXANDRIA_REMINDERS=off disables reminders alone", async () => {
 	});
 	assert.equal(config.remindersDisabled, true);
 	assert.equal(config.recallDisabled, false);
-	assert.equal(config.storeDisabled, false);
 });
 
-test("client.toml drives every field when no env is set", async () => {
-	const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: fullToml });
+test("client.toml drives active fields but stale extraction keys do not disable behavior", async () => {
+	const warnings: string[] = [];
+	const originalWarn = console.warn;
+	console.warn = (message?: unknown) => warnings.push(String(message));
+	let config: typeof import("../src/config.js").CONFIG;
+	try {
+		config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: fullToml });
+	} finally {
+		console.warn = originalWarn;
+	}
 	assert.equal(config.serverUrl, "http://127.0.0.1:9999/mcp");
 	assert.equal(config.recallDisabled, true);
-	assert.equal(config.storeDisabled, true);
 	assert.equal(config.remindersDisabled, true);
 	assert.equal(config.recallLimit, 7);
 	assert.equal(config.recallMinSimilarity, 0.42);
-	assert.equal(config.extractModel, "test/extract-model");
-	assert.equal(config.extractTimeoutMs, 1234);
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /store.enabled/);
+	assert.match(warnings[0], /store.extract_model/);
+	assert.match(warnings[0], /store.extract_timeout_ms/);
 	// The target the server matches is trimmed on the way in, not sent padded.
 	assert.equal(config.remindersProject, "from-toml");
 });
@@ -167,21 +185,15 @@ test("explicit env beats client.toml in both directions", async () => {
 		// Not "off": any set value counts as an explicit choice, so the file's
 		// `enabled = false` cannot leave a feature dead after the user opts back in.
 		ALEXANDRIA_AUTO_RECALL: "on",
-		ALEXANDRIA_AUTO_STORE: "on",
 		ALEXANDRIA_REMINDERS: "on",
 		ALEXANDRIA_AUTO_RECALL_LIMIT: "3",
 		ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY: "0.1",
-		ALEXANDRIA_EXTRACT_MODEL: "env/model",
-		ALEXANDRIA_EXTRACT_TIMEOUT_MS: "4321",
 	});
 	assert.equal(config.serverUrl, "http://127.0.0.1:4000/mcp");
 	assert.equal(config.recallDisabled, false);
-	assert.equal(config.storeDisabled, false);
 	assert.equal(config.remindersDisabled, false);
 	assert.equal(config.recallLimit, 3);
 	assert.equal(config.recallMinSimilarity, 0.1);
-	assert.equal(config.extractModel, "env/model");
-	assert.equal(config.extractTimeoutMs, 4321);
 });
 
 test("API token and project ID are dedicated environment settings", async () => {
@@ -193,7 +205,6 @@ test("API token and project ID are dedicated environment settings", async () => 
 	});
 	assert.equal(config.apiToken, "companion-token");
 	assert.equal(config.projectId, "project:owned");
-	assert.equal(config.extractModel, "vertex/claude-haiku-4-5");
 });
 
 test("ALEXANDRIA_REMINDERS_PROJECT beats client.toml and arrives trimmed", async () => {
@@ -232,7 +243,6 @@ test("a set-but-blank toggle does not re-enable what client.toml disabled", asyn
 	// per-prompt check_reminders call back on with no signal.
 	for (const [key, field] of [
 		["ALEXANDRIA_AUTO_RECALL", "recallDisabled"],
-		["ALEXANDRIA_AUTO_STORE", "storeDisabled"],
 		["ALEXANDRIA_REMINDERS", "remindersDisabled"],
 	] as const) {
 		for (const blank of ["", "   "]) {
@@ -241,7 +251,7 @@ test("a set-but-blank toggle does not re-enable what client.toml disabled", asyn
 				[key]: blank,
 			});
 			assert.equal(
-				config[field as "recallDisabled" | "storeDisabled" | "remindersDisabled"],
+				config[field],
 				true,
 				`${key}=${JSON.stringify(blank)} overrode the file's enabled=false`,
 			);
@@ -270,7 +280,6 @@ test("a blank or unparseable numeric override falls back instead of becoming 0 o
 	for (const key of [
 		"ALEXANDRIA_AUTO_RECALL_LIMIT",
 		"ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY",
-		"ALEXANDRIA_EXTRACT_TIMEOUT_MS",
 	]) {
 		for (const junk of ["", "  ", "ten", "1e999"]) {
 			const config = await configWith({
@@ -278,11 +287,7 @@ test("a blank or unparseable numeric override falls back instead of becoming 0 o
 				[key]: junk,
 			});
 			const value =
-				key === "ALEXANDRIA_AUTO_RECALL_LIMIT"
-					? config.recallLimit
-					: key === "ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY"
-						? config.recallMinSimilarity
-						: config.extractTimeoutMs;
+				key === "ALEXANDRIA_AUTO_RECALL_LIMIT" ? config.recallLimit : config.recallMinSimilarity;
 			assert.ok(Number.isFinite(value), `${key}=${JSON.stringify(junk)} -> ${value}`);
 			assert.ok(value > 0, `${key}=${JSON.stringify(junk)} -> ${value}`);
 		}
