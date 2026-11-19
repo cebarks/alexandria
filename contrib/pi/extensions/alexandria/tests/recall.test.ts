@@ -61,6 +61,16 @@ test("a payload problem comes back as an error, not as silence", async () => {
 	assert.match(errored.error ?? "", /index unavailable/);
 });
 
+test("resolved project IDs scope automatic recall", async () => {
+	let seen: Record<string, unknown> | undefined;
+	const spy: CallTool = async (_name, args) => {
+		seen = args;
+		return { content: [{ type: "text", text: '{"results":[]}' }] };
+	};
+	await retrieveMemories("q", spy, undefined, "project:owned");
+	assert.deepEqual(seen, { query: "q", limit: 10, project: "project:owned" });
+});
+
 test("a usable result set still filters by the configured floor", async () => {
 	const { items, error } = await retrieveMemories(
 		"q",

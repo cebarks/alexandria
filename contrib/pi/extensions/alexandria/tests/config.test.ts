@@ -23,6 +23,8 @@ const CONFIG_MODULE = new URL("../src/config.ts", import.meta.url);
 /** Every variable `src/config.ts` reads, so no case inherits state from the shell. */
 const MANAGED_ENV = [
 	"ALEXANDRIA_URL",
+	"ALEXANDRIA_API_TOKEN",
+	"ALEXANDRIA_PROJECT_ID",
 	"ALEXANDRIA_AUTO_RECALL",
 	"ALEXANDRIA_AUTO_RECALL_LIMIT",
 	"ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY",
@@ -32,6 +34,7 @@ const MANAGED_ENV = [
 	"ALEXANDRIA_REMINDERS",
 	"ALEXANDRIA_REMINDERS_PROJECT",
 	"ALEXANDRIA_CLIENT_CONFIG",
+	"ANTHROPIC_API_KEY",
 ];
 
 /** A file that turns every knob off or to a non-default value, including a
@@ -87,7 +90,7 @@ async function configWith(
 		const loaded = (await import(
 			`${CONFIG_MODULE.href}?case=${instances++}`
 		)) as typeof import("../src/config.js");
-		return loaded.CONFIG;
+		return { ...loaded.CONFIG } as typeof loaded.CONFIG;
 	} finally {
 		// Leave no trace: a leaked variable would mislead every later case in this
 		// file, and the runner starts from the developer's own shell environment.
@@ -101,6 +104,8 @@ async function configWith(
 test("no env and no file: every feature is on, and the defaults hold", async () => {
 	const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: absentToml });
 	assert.equal(config.serverUrl, "http://127.0.0.1:3000/mcp");
+	assert.equal(config.apiToken, undefined);
+	assert.equal(config.projectId, undefined);
 	assert.equal(config.recallDisabled, false);
 	assert.equal(config.storeDisabled, false);
 	assert.equal(config.remindersDisabled, false);
@@ -177,6 +182,18 @@ test("explicit env beats client.toml in both directions", async () => {
 	assert.equal(config.recallMinSimilarity, 0.1);
 	assert.equal(config.extractModel, "env/model");
 	assert.equal(config.extractTimeoutMs, 4321);
+});
+
+test("API token and project ID are dedicated environment settings", async () => {
+	const config = await configWith({
+		ALEXANDRIA_CLIENT_CONFIG: absentToml,
+		ALEXANDRIA_API_TOKEN: "companion-token",
+		ALEXANDRIA_PROJECT_ID: " project:owned ",
+		ANTHROPIC_API_KEY: "provider-token",
+	});
+	assert.equal(config.apiToken, "companion-token");
+	assert.equal(config.projectId, "project:owned");
+	assert.equal(config.extractModel, "vertex/claude-haiku-4-5");
 });
 
 test("ALEXANDRIA_REMINDERS_PROJECT beats client.toml and arrives trimmed", async () => {

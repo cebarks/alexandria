@@ -84,7 +84,20 @@ const envNum = (key: string, fallback: number): number => {
  *  project delivery to escalation-only with no signal.
  *  Centralized configuration — TOML file with env var overrides. */
 export const CONFIG = {
-	serverUrl: env("ALEXANDRIA_URL") ?? toml.server?.url ?? "http://127.0.0.1:3000/mcp",
+	get serverUrl(): string {
+		return env("ALEXANDRIA_URL") ?? toml.server?.url ?? "http://127.0.0.1:3000/mcp";
+	},
+
+	// Companion auth is intentionally independent of pi's/model providers' credentials.
+	get apiToken(): string | undefined {
+		return env("ALEXANDRIA_API_TOKEN");
+	},
+
+	// Read at call time so a live env change is seen without routing credentials
+	// through any model-provider configuration.
+	get projectId(): string | undefined {
+		return env("ALEXANDRIA_PROJECT_ID");
+	},
 
 	recallDisabled:
 		env("ALEXANDRIA_AUTO_RECALL") === "off" ||

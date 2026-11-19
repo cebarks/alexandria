@@ -54,9 +54,9 @@ test("the project hint is passed through, and omitted when there is none", async
     seen.push(args);
     return { content: [{ type: "text", text: '{"delivered":[]}' }] };
   };
-  await checkReminders("alexandria", spy);
+  await checkReminders("project:owned", spy);
   await checkReminders(undefined, spy);
-  assert.deepEqual(seen, [{ project: "alexandria" }, {}]);
+  assert.deepEqual(seen, [{ project: "project:owned" }, {}]);
 });
 
 test("an error-shaped response is reported, not rendered as 'nothing due'", async () => {

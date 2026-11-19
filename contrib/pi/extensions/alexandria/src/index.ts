@@ -17,14 +17,12 @@
  *
  *   Disable all store behavior: ALEXANDRIA_AUTO_STORE=off
  *
- * Reminders (before_agent_start, alongside recall):
- *   Attempts check_reminders once per prompt with the configured string or git basename.
- *   The authenticated server requires an existing owned issued project ID, copied from
- *   resolve_project/list_projects; the unchanged basename default is unsupported.
- *   An explicit owned-ID override is passed through, not resolved or granted authority.
- *   No automatic handle discovery/mapping is implemented. Delivery and escalation stay
- *   within the reminder owner's account. Accepted due rows are injected into context
- *   and announced; consuming a fire advances its recurring schedule.
+ * Project context, recall, and reminders (before_agent_start):
+ *   Resolves the session cwd's sanitized origin through resolve_project, or uses the
+ *   explicit ALEXANDRIA_PROJECT_ID override. No origin means Personal-only, never a
+ *   guessed basename. The issued ID scopes recall and reminder checks and is included
+ *   in the agent-visible context. Delivery and escalation stay within the account.
+ *   Accepted due rows are injected and announced; consuming a fire advances its schedule.
  *   Disable: ALEXANDRIA_REMINDERS=off
  *
  * Recall and reminders share a single before_agent_start handler: both blocks
@@ -52,9 +50,11 @@ import {
 	closeClient,
 	storeMemory,
 	extractTextContent,
+	authenticatedServer,
 } from "./mcp-client.js";
 import { retrieveMemories, formatMemoriesBlock } from "./recall.js";
-import { getProjectHint, checkReminders, formatDueBlock } from "./reminders.js";
+import { checkReminders, formatDueBlock } from "./reminders.js";
+import { getProjectContext } from "./project-context.js";
 import { buildInjection, type FeatureOutcome } from "./injection.js";
 import { asFailure } from "./failure.js";
 import { SessionDedupBuffer } from "./detectors/types.js";
@@ -168,16 +168,24 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 				return { aborted, budgetExceeded: budget.signal.aborted && !aborted };
 			};
 
+			// One authenticated project context feeds both tool calls and the injection;
+			// if resolution fails, neither feature is allowed to widen to an unscoped read.
+			const projectContextTask = Promise.resolve().then(() =>
+				getProjectContext(ctx, authenticatedServer(), budget.signal),
+			);
+
 			// Settled, not awaited: one feature failing must never suppress the
 			// other's injection or its notification.
 			const recallTask: Promise<FeatureOutcome> =
 				!CONFIG.recallDisabled && query
 					? (async () => {
 							try {
+								const projectContext = await projectContextTask;
 								const { items, error } = await retrieveMemories(
 									query,
 									undefined,
 									budget.signal,
+									projectContext.projectId,
 								);
 								return {
 									block: items.length > 0 ? formatMemoriesBlock(items) : null,
@@ -193,9 +201,9 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 				? Promise.resolve({ block: null, count: 0 })
 				: (async () => {
 						try {
-							const project = await getProjectHint(ctx.cwd);
+							const projectContext = await projectContextTask;
 							const { items, error } = await checkReminders(
-								project,
+								projectContext.projectId,
 								undefined,
 								budget.signal,
 							);
@@ -209,9 +217,10 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 						}
 					})();
 
-			const [recallRes, remindersRes] = await Promise.allSettled([
+			const [recallRes, remindersRes, projectContextRes] = await Promise.allSettled([
 				recallTask,
 				remindersTask,
+				projectContextTask,
 			]);
 			clearTimeout(timer);
 			// Stopped here rather than at the record below, so the probe cannot outlive
@@ -225,7 +234,11 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 			// for each failure mode all live in `buildInjection` — extracted so the
 			// cross-product of settled outcomes is testable without a server, which
 			// is the claim this dispatcher exists to make.
-			const injection = buildInjection(recallRes, remindersRes);
+			const injection = buildInjection(
+				recallRes,
+				remindersRes,
+				projectContextRes.status === "fulfilled" ? projectContextRes.value : undefined,
+			);
 			if (injection.resetClient) {
 				// Only a failure that implicates the connection reaches here —
 				// `buildInjection` has already excluded cancellations and prompt-budget

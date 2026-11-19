@@ -34,13 +34,14 @@ export async function retrieveMemories(
 	query: string,
 	call: CallTool = callToolWithRetry,
 	signal?: AbortSignal,
+	projectId?: string,
 ): Promise<RecallCheck> {
 	// Bounded: this awaits before the turn starts, so a hung server must not be
 	// able to spend a minute of it. A timeout costs one prompt of recall, not a
 	// blocked turn.
 	const result = await call(
 		"retrieve_memories",
-		{ query, limit: CONFIG.recallLimit },
+		{ query, limit: CONFIG.recallLimit, ...(projectId ? { project: projectId } : {}) },
 		PROMPT_CALL_TIMEOUT_MS,
 		signal,
 	);

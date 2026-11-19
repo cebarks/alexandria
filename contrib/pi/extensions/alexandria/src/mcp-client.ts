@@ -11,10 +11,34 @@ import {
 	Client,
 	StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
+import { createHash } from "node:crypto";
 import { CONFIG } from "./config.js";
 import type { SessionArgs } from "./session-args.js";
 
 let clientPromise: Promise<Client> | null = null;
+let clientIdentity: string | null = null;
+
+const UPGRADE_GUIDANCE =
+	"Alexandria server is incompatible: upgrade it to a build with resolve_project support and bearer authentication.";
+
+/** Headers for this companion only; pi's native MCP client has its own transport/configuration. */
+export function authorizationHeaders(token = CONFIG.apiToken): Record<string, string> {
+	if (!token) {
+		throw new Error(`${UPGRADE_GUIDANCE} Configure ALEXANDRIA_API_TOKEN for the companion.`);
+	}
+	return { Authorization: `Bearer ${token}` };
+}
+
+export function assertProjectResolutionSupported(toolNames: string[]): void {
+	if (!toolNames.includes("resolve_project")) throw new Error(UPGRADE_GUIDANCE);
+}
+
+function identityKey(): string {
+	const account = CONFIG.apiToken
+		? createHash("sha256").update(CONFIG.apiToken).digest("hex")
+		: "missing-token";
+	return `${CONFIG.serverUrl}\u0000${account}`;
+}
 
 /**
  * Budget for the connect handshake: a single cheap round trip, so a server that
@@ -68,19 +92,33 @@ async function connect(): Promise<Client> {
 	try {
 		url = new URL(CONFIG.serverUrl);
 	} catch {
-		throw new Error(`Invalid ALEXANDRIA_URL: ${CONFIG.serverUrl}`);
+		throw new Error("Invalid ALEXANDRIA_URL format");
 	}
 	const client = new Client({
 		name: "alexandria",
 		version: "2.1.0",
 	});
-	const transport = new StreamableHTTPClientTransport(url);
-	await client.connect(transport, { timeout: HANDSHAKE_TIMEOUT_MS });
+	const transport = new StreamableHTTPClientTransport(url, {
+		requestInit: { headers: authorizationHeaders() },
+	});
+	try {
+		await client.connect(transport, { timeout: HANDSHAKE_TIMEOUT_MS });
+		const { tools } = await client.listTools();
+		assertProjectResolutionSupported(tools.map((tool) => tool.name));
+	} catch (err) {
+		if (/401|unauthori[sz]ed/i.test(err instanceof Error ? err.message : String(err))) {
+			throw new Error(`${UPGRADE_GUIDANCE} Check ALEXANDRIA_API_TOKEN and the server auth configuration.`);
+		}
+		throw err;
+	}
 	connectionGeneration++;
 	return client;
 }
 
 export async function getClient(): Promise<Client> {
+	const identity = identityKey();
+	if (clientIdentity !== null && clientIdentity !== identity) resetClient();
+	clientIdentity = identity;
 	if (!clientPromise) {
 		const attempt = connect();
 		clientPromise = attempt;
@@ -152,6 +190,7 @@ export async function closeClient(): Promise<void> {
 		}
 		clientPromise = null;
 	}
+	clientIdentity = null;
 }
 
 /** The transport the prompt-path modules speak through, as a type so they can take
@@ -202,6 +241,23 @@ export async function callToolWithRetry(
 		}
 		throw err;
 	}
+}
+
+export interface AuthenticatedServer {
+	serverKey: string;
+	accountKey: string;
+	callTool: CallTool;
+}
+
+/** Identity and call surface shared with context resolution, never the bearer secret itself. */
+export function authenticatedServer(): AuthenticatedServer {
+	const token = CONFIG.apiToken;
+	if (!token) authorizationHeaders(token);
+	return {
+		serverKey: CONFIG.serverUrl,
+		accountKey: createHash("sha256").update(token!).digest("hex"),
+		callTool: callToolWithRetry,
+	};
 }
 
 export function extractTextContent(content: unknown): string | undefined {
