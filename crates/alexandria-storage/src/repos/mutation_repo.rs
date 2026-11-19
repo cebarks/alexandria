@@ -69,11 +69,12 @@ use crate::repos::scope::{
     ScopeFilter, claim_authority, claim_system_for_workspace, is_write_conflict, record_key,
 };
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::method::Query;
 use surrealdb::method::Transaction;
-use surrealdb::types::{RecordId, SurrealValue, Value};
+use surrealdb::types::{RecordId, SurrealValue, ToSql, Value};
 
 /// The largest history page the journal answers with. The caller's own operations are the population, so
 /// this is a page bound rather than a privacy bound — and it is the figure the scope listings publish.
@@ -90,6 +91,26 @@ pub(crate) struct PassRequest<'a> {
     expected: &'a [ExpectedState],
     change: &'a PreparedChangeSet,
     now: DateTime<Utc>,
+}
+
+#[derive(SurrealValue)]
+struct ReminderMappingRow {
+    id: RecordId,
+    account: Option<RecordId>,
+    message: String,
+    target_project: Option<String>,
+    legacy_target_project: Option<String>,
+    project: Option<RecordId>,
+    migration_hold: Option<bool>,
+    semantic_revision: Option<i64>,
+    schedule_kind: String,
+}
+
+struct ReminderMappingDecision<'a> {
+    reminder_id: &'a RecordId,
+    expected_revision: i64,
+    target: Option<&'a ProjectId>,
+    operation: &'a OperationId,
 }
 
 pub struct MutationRepo<'a> {
@@ -442,6 +463,204 @@ impl<'a> MutationRepo<'a> {
     }
 
     // -- the transaction -----------------------------------------------------------------------------
+
+    /// Release a held legacy reminder mapping with the same owner claim and private semantic journal
+    /// used for memory changes. The schedule and delivery clock are deliberately absent from the images.
+    pub(crate) async fn release_reminder_mapping(
+        &self,
+        owner: &OwnerContext,
+        reminder_id: &RecordId,
+        expected: Version,
+        target: Option<ProjectId>,
+        operation: &OperationId,
+    ) -> Result<(), StorageError> {
+        let revision = i64::try_from(expected.get()).map_err(|_| {
+            StorageError::InvalidInput("reminder revision is not representable".to_string())
+        })?;
+        let fingerprint = reminder_mapping_fingerprint(reminder_id, revision, target.as_ref());
+        let decision = ReminderMappingDecision {
+            reminder_id,
+            expected_revision: revision,
+            target: target.as_ref(),
+            operation,
+        };
+        let now = Utc::now();
+        let tx = self.db.clone().begin().await.map_err(internal)?;
+        let result = self
+            .release_reminder_mapping_in_tx(&tx, owner, &decision, &fingerprint, now)
+            .await;
+        match result {
+            Ok(()) => Self::commit(tx).await,
+            Err(error) => {
+                tx.cancel().await.map_err(internal)?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn release_reminder_mapping_in_tx(
+        &self,
+        tx: &Transaction<Any>,
+        owner: &OwnerContext,
+        decision: &ReminderMappingDecision<'_>,
+        fingerprint: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let reminder_id = decision.reminder_id;
+        let expected = decision.expected_revision;
+        let target = decision.target;
+        let operation = decision.operation;
+        if !claim_authority(tx, owner, now).await? {
+            return Err(StorageError::Stale);
+        }
+        let workspace = owner.workspace().as_record_id().clone();
+        let existing: Vec<JournalRow> = tx
+            .query(OPERATION_SQL)
+            .bind(("workspace", workspace.clone()))
+            .bind(("key", operation.as_str().to_string()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        if let Some(recorded) = existing.into_iter().next() {
+            return if recorded.request_fingerprint == fingerprint {
+                Ok(())
+            } else {
+                Err(StorageError::InvalidInput(
+                    "this operation key already recorded a different request".to_string(),
+                ))
+            };
+        }
+
+        if let Some(project) = target {
+            let projects: Vec<IdRow> = tx
+                .query("SELECT id FROM project WHERE id = $project AND workspace = $workspace LIMIT 1;")
+                .bind(("project", project.as_record_id().clone()))
+                .bind(("workspace", workspace.clone()))
+                .await
+                .map_err(internal)?
+                .check()
+                .map_err(internal)?
+                .take(0)
+                .map_err(internal)?;
+            if projects.is_empty() {
+                return Err(StorageError::NotFound);
+            }
+        }
+
+        let rows: Vec<ReminderMappingRow> = tx
+            .query(
+                "SELECT id, account, message, target_project, legacy_target_project, project, \
+                 migration_hold, semantic_revision, schedule_kind FROM type::record($id) \
+                 WHERE id = $id AND account = $account LIMIT 1;",
+            )
+            .bind(("id", reminder_id.clone()))
+            .bind(("account", owner.account().as_record_id().clone()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        let before = rows.into_iter().next().ok_or(StorageError::NotFound)?;
+        if before.migration_hold != Some(true) || before.semantic_revision.unwrap_or(0) != expected
+        {
+            return Err(StorageError::Stale);
+        }
+        let after_revision = expected.checked_add(1).ok_or_else(|| {
+            StorageError::InvalidInput("reminder revision is exhausted".to_string())
+        })?;
+
+        let effects = vec!["reminder:map".to_string()];
+        let scope_kinds = vec![
+            if target.is_some() {
+                "project"
+            } else {
+                "personal"
+            }
+            .to_string(),
+        ];
+        let projects = target
+            .map(|project| vec![project.as_record_id().clone()])
+            .unwrap_or_default();
+        let journal_rows: Vec<IdRow> = tx
+            .query(CREATE_OPERATION_SQL)
+            .bind(("workspace", workspace.clone()))
+            .bind(("actor", owner.account().as_record_id().clone()))
+            .bind(("initiator", MutationContext::issued_to(owner).initiator()))
+            .bind(("kind", operation_kind::REMINDER_MAP.to_string()))
+            .bind(("key", operation.as_str().to_string()))
+            .bind(("fingerprint", fingerprint.to_string()))
+            .bind(("effects", effects.clone()))
+            .bind(("kinds", scope_kinds))
+            .bind(("projects", projects))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        let journal_id = journal_rows
+            .into_iter()
+            .next()
+            .map(|row| row.id)
+            .ok_or_else(|| missing("semantic_operation"))?;
+
+        let before_snapshot = reminder_mapping_snapshot(before)?;
+        let before_image = SemanticSnapshot::Reminder(before_snapshot);
+        let preimage_id = self
+            .write_snapshot(tx, &before_image, &journal_id, &workspace)
+            .await?;
+        let update = tx
+            .query(
+                "UPDATE type::record($id) SET project = $project, migration_hold = false, \
+                 semantic_revision = $next WHERE id = $id AND account = $account \
+                 AND migration_hold = true AND (semantic_revision = $expected OR \
+                 (semantic_revision = NONE AND $expected = 0)) RETURN AFTER;",
+            )
+            .bind(("id", reminder_id.clone()))
+            .bind(("account", owner.account().as_record_id().clone()))
+            .bind((
+                "project",
+                target.map(|project| project.as_record_id().clone()),
+            ))
+            .bind(("expected", expected))
+            .bind(("next", after_revision));
+        let updated: Vec<ReminderMappingRow> = update
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        let after = updated.into_iter().next().ok_or(StorageError::Stale)?;
+        let after_image = SemanticSnapshot::Reminder(reminder_mapping_snapshot(after)?);
+        let postimage_id = self
+            .write_snapshot(tx, &after_image, &journal_id, &workspace)
+            .await?;
+        tx.query(FINISH_OPERATION_SQL)
+            .bind(("key", record_key(&journal_id)?))
+            .bind(("preimages", vec![preimage_id]))
+            .bind(("postimages", vec![postimage_id]))
+            .bind(("affected", vec![reminder_id.clone()]))
+            .bind((
+                "preimage_hash",
+                digest_of(std::slice::from_ref(&before_image)),
+            ))
+            .bind((
+                "postimage_hash",
+                digest_of(std::slice::from_ref(&after_image)),
+            ))
+            .bind(("actual", effects))
+            .bind(("now", now))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?;
+        Ok(())
+    }
 
     /// Apply one semantic change atomically, under an admitted owner or storage-issued system authority.
     ///
@@ -2683,6 +2902,50 @@ fn resolve_member(target: &RelationTarget, minted: &[RecordId]) -> Result<Record
             "a cluster member must be a fact, not {other:?}"
         ))),
     }
+}
+
+fn reminder_mapping_snapshot(row: ReminderMappingRow) -> Result<ReminderSnapshot, StorageError> {
+    let account = row.account.ok_or(StorageError::NotFound)?;
+    let semantic_revision = row.semantic_revision.unwrap_or(0);
+    let semantic_revision = u64::try_from(semantic_revision).map_err(|_| {
+        StorageError::Internal(anyhow::anyhow!("reminder has a negative semantic revision"))
+    })?;
+    Ok(ReminderSnapshot {
+        id: row.id,
+        account,
+        message: row.message,
+        target_project: row.target_project,
+        legacy_target_project: row.legacy_target_project,
+        project: row.project.map(ProjectId::try_from).transpose()?,
+        migration_hold: row.migration_hold,
+        semantic_revision: Version::new(semantic_revision),
+        schedule_kind: Some(row.schedule_kind),
+    })
+}
+
+fn reminder_mapping_fingerprint(
+    reminder_id: &RecordId,
+    expected: i64,
+    target: Option<&ProjectId>,
+) -> String {
+    let mut hasher = Sha256::new();
+    let reminder = reminder_id.to_sql().into_bytes();
+    let target = target.map(|project| project.as_record_id().to_sql().into_bytes());
+    let expected = expected.to_le_bytes();
+    for field in [
+        b"reminder-map-v1".as_slice(),
+        reminder.as_slice(),
+        expected.as_slice(),
+        target.as_deref().unwrap_or(b"personal"),
+    ] {
+        hasher.update((field.len() as u32).to_be_bytes());
+        hasher.update(field);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn internal(error: impl std::error::Error + Send + Sync + 'static) -> StorageError {

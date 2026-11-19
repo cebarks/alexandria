@@ -175,6 +175,74 @@ impl OfflineStoreGuard {
     }
 }
 
+/// A private, disposable engine input. Recovery may write to this directory,
+/// never to the backup whose bytes were attested by the operator's receipt.
+pub(crate) struct VerifiedBackupCopy(PathBuf);
+
+impl VerifiedBackupCopy {
+    pub(crate) fn stage(backup: &Path, receipt: &SourceManifest) -> Result<Self> {
+        ensure!(
+            cfg!(target_os = "linux"),
+            "Backup verification is supported on Linux only"
+        );
+        let backup = resolve_destination(backup)?;
+        ensure!(
+            read_source_manifest(&backup).context("Read backup receipt")? == *receipt,
+            "Backup receipt SHA256 changed since it was read"
+        );
+        // An original offline copy has no LOCK. If somebody opened it since
+        // then, require the same read-only lock used by offline copying.
+        let _guard = match fs::symlink_metadata(backup.join("LOCK")) {
+            Ok(_) => Some(OfflineStoreGuard::acquire(&backup).context("Lock backup")?),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err).context("Inspect backup LOCK"),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "alexandria-ownership-check-{}",
+            uuid::Uuid::new_v4()
+        ));
+        create_private_directory(&path).context("Stage backup snapshot")?;
+        let stage = Self(path);
+        let mut files = Vec::new();
+        catalog(&backup, &backup, stage.path(), &mut files).context("Catalog backup payload")?;
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        ensure!(
+            files.len() == receipt.files.len() && !files.is_empty(),
+            "Backup file manifest differs from its receipt"
+        );
+        let mut buffer = [0u8; 64 * 1024];
+        for (actual, expected) in files.iter().zip(&receipt.files) {
+            ensure!(
+                actual.path == expected.path && actual.size == expected.size,
+                "Backup payload path or size differs from its receipt"
+            );
+            let digest = copy_file(
+                &backup.join(&actual.path),
+                &stage.path().join(&actual.path),
+                expected.size,
+                &mut buffer,
+            )
+            .context("Copy backup payload for digest verification")?;
+            ensure!(digest == expected.sha256, "Backup payload SHA256 mismatch");
+        }
+        Ok(stage)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for VerifiedBackupCopy {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_dir_all(self.path())
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.path().display(), %err, "Could not remove private backup verification copy");
+        }
+    }
+}
+
 /// Read-only path/receipt admission before provider provisioning or engine opens.
 /// Fresh outputs must be absent/empty; resume admits only an existing target with
 /// a regular validated receipt and LOCK. The caller must still verify its journal.

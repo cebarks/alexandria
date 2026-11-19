@@ -10,6 +10,7 @@ pub mod maintenance;
 pub mod memories;
 pub mod operations;
 pub mod query;
+pub mod reminder_mapping;
 pub mod sessions;
 pub mod web;
 
@@ -174,6 +175,11 @@ fn build(server: AlexandriaServer, ctx: Option<DebugContext>, state: guard::Guar
         .route("/debug/graph/{id}", get(graph::page))
         .route("/debug/api/graph/{id}", get(graph::api_graph))
         .route("/debug/maintenance", get(maintenance::list))
+        .route("/debug/reminder-mapping", get(reminder_mapping::list))
+        .route(
+            "/debug/reminder-mapping/release",
+            post(reminder_mapping::release),
+        )
         // Owner's private journal: the exact before/after of every change this account made. Both routes
         // resolve through `MutationRepo`, which authorises the operation row *and each snapshot it names*, so
         // a forged or foreign link answers as an absent one.

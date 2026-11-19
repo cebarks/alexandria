@@ -14,7 +14,7 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 - **Document import** — Chunk by heading, paragraph, or fixed size with batch tracking and `extracted_from` lineage
 - **Reminders** — One-shot and recurring follow-ups delivered on the next interaction, with project targeting and overdue escalation
 - **Persistent storage** — SurrealKV on disk, survives restarts
-- **Debug web UI** — Browser for memories, clusters, sessions, graph neighborhoods, cluster maintenance history, and a live query tester. Read-only apart from one disclosed heat write (see [Debug Web UI](#debug-web-ui))
+- **Debug web UI** — Browser for memories, clusters, sessions, graph neighborhoods, reminder migration holds, cluster maintenance history, and a live query tester. Its two disclosed writes are retrieval heat activation and owner-authorized reminder mapping (see [Debug Web UI](#debug-web-ui))
 - **Schema migrations** — Versioned `.surql` files with forward-only migration runner
 
 ## Quick Start
@@ -157,7 +157,10 @@ A valid project target overdue by at least `[reminders].escalation_hours` escala
 account. A historical unresolved text target or `migration_hold` row stays pending and suppressed,
 including from the read-only due sample; escalation never turns it into a global reminder. No automatic
 legacy-name mapping is performed. Unfiltered `list_reminders` still exposes owned held/unresolved
-history for inspection (`target: null` for unresolved text, with separate legacy fields).
+history for inspection (`target: null` for unresolved text, with separate legacy fields). The owner can
+review held rows, their original target text and an exact outstanding count at `/debug/reminder-mapping`,
+then release each with a revision-checked choice of Personal or an owned project. The journal records the
+mapping while preserving the legacy text and schedule/delivery history.
 Overdue eligible items are surfaced read-only, capped and oldest-due first, in the `due_reminders`
 array of `retrieve_memories` and `recall` responses. Targets there and in delivery responses are
 `global` or a single typed `project:<opaque-id>` handle, never a doubled prefix.
@@ -204,10 +207,11 @@ for what they are and how to install them.
 
 When `transport = "http"`, a debug web UI is served alongside the MCP endpoint at
 `http://<host>:<port>/debug`. It is **authenticated**: every page and every JSON endpoint belongs to the
-signed-in account, and shows only that account's own memories, sessions, clusters, graph and query
-results. It is **read-only except for one disclosed exception**: the Query Tester's non-dry `retrieve`
-run performs spreading activation, so it writes heat exactly as a real `retrieve_memories` call does.
-Tick **Dry run** for a strictly read-only probe that writes nothing.
+signed-in account, and shows only that account's own memories, sessions, clusters, graph, reminders and
+query results. It has two disclosed write paths: the Query Tester's non-dry `retrieve` run performs
+spreading activation, so it writes heat exactly as a real `retrieve_memories` call does; and the owner
+may release a held legacy reminder mapping on `/debug/reminder-mapping`. Tick **Dry run** for a strictly
+read-only retrieval probe that writes nothing.
 
 ### Signing in, and what an account can see
 
@@ -218,8 +222,9 @@ session. Signing in sets two cookies: `alexandria_session` (the credential) and 
 (the value every mutation must echo back). Both are `HttpOnly`, `SameSite=Lax`, `Path=/`, and `Secure`
 unless the deployment is running under the explicit loopback-development exception below.
 
-**Every mutation on this server requires the CSRF pair** — the Query Tester's run, sign-out, token
-issue and revoke, invitation creation (administrators) and recovery creation, and suspension. The guard,
+**Every mutation on this server requires the CSRF pair** — the Query Tester's run, reminder mapping
+release, sign-out, token issue and revoke, invitation creation (administrators) and recovery creation,
+and suspension. The guard,
 not the handler, is the single authority for that, and it is what the paragraph below used to lean on
 `Sec-Fetch-Site` alone for. An account can also mint and revoke its own agent tokens from
 `/debug/account`, which is the same credential surface the MCP `Authorization` header consumes.
@@ -300,6 +305,9 @@ Two consequences of that boundary are deliberate and worth stating before they s
   those rows name records belonging to accounts that were never given an operator role, and the rows
   written before attribution carries a `NONE` run id that cannot be shown to one owner without showing
   it to all. An owner asking *why did my memory move* is answered by the operation journal, not here
+- **Reminder mapping** (`/debug/reminder-mapping`) — owner-only review of every held legacy target, including
+  original free-text target and an exact hold count. Releasing a hold requires a revision-current choice
+  of Personal or an owned project; it does not rewrite the historical target or reset schedule/delivery state.
 - **Query Tester** (`/debug/query`, `POST /debug/query/run`) — run `retrieve_memories`/`recall` live
   against the real embedding model to sanity-check retrieval quality, from inside the signed-in
   account's own population, with optional `session_id` scoping and a **Dry run** checkbox. Results

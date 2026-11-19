@@ -876,11 +876,13 @@ fn private_routes() -> Vec<(&'static str, &'static str)> {
         ("GET", "/debug/graph/fact%3Aprobe"),
         ("GET", "/debug/api/graph/fact%3Aprobe"),
         ("GET", "/debug/maintenance"),
+        ("GET", "/debug/reminder-mapping"),
+        ("POST", "/debug/reminder-mapping/release"),
         ("GET", "/debug/query"),
         ("GET", "/debug/account"),
         ("GET", "/debug/admin"),
-        // Task 10/11: the private journal and the owner's collections/classification surface. Each is
-        // listed here as well as in `guard.rs`'s matrices because this walk proves something the guard's
+        // Task 10/11/14: the private journal, collections/classification surface and reminder mapping.
+        // Each is listed here as well as in `guard.rs`'s matrices because this walk proves something the guard's
         // own unit test cannot — that the **unauthenticated build** refuses them at the boundary rather
         // than rendering a page that then fails to find a session.
         ("GET", "/debug/operations"),
@@ -974,6 +976,7 @@ async fn the_secured_router_serves_the_same_reads_to_a_signed_in_owner() {
         "/debug/memories",
         "/debug/clusters",
         "/debug/sessions",
+        "/debug/reminder-mapping",
         "/debug/query",
         "/debug/account",
     ] {

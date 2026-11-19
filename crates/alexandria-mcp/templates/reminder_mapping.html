@@ -1,0 +1,19 @@
+{% extends "layout.html" %}
+{% block title %}Reminder target mapping{% endblock %}
+{% block body %}<h1>Reminder target mapping</h1>
+<p class="badge"><strong>Outstanding migration holds: {{ outstanding_holds }}</strong></p>
+<p>These reminders keep their original target text and remain pending until you select an owned destination.</p>
+<table>
+<tr><th>Message</th><th>Original target</th><th>Schedule</th><th>Release mapping</th></tr>
+{% if rows.is_empty() %}<tr><td colspan="4" class="empty">No reminders are awaiting a target mapping.</td></tr>{% endif %}
+{% for row in rows %}<tr><td>{{ row.message }}</td><td><code>{{ row.legacy_target }}</code></td><td>{{ row.schedule }}</td><td>
+<form method="post" action="/debug/reminder-mapping/release">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="id" value="{{ row.id }}">
+<input type="hidden" name="revision" value="{{ row.revision }}">
+<label>Destination <select name="target"><option value="personal">Personal</option>{% for project in projects %}<option value="{{ project.handle }}">{{ project.label }}</option>{% endfor %}</select></label>
+<button type="submit">Release hold</button>
+</form>
+</td></tr>{% endfor %}
+</table>
+{% endblock %}

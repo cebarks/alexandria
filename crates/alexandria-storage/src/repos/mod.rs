@@ -50,7 +50,7 @@ pub use scoped_memory::{
 pub use scoped_project::{
     Established, ProjectEntry, ProjectPage, ResolvedProject, ScopedProjectRepo,
 };
-pub use scoped_reminder::ScopedReminderRepo;
+pub use scoped_reminder::{HeldReminder, ScopedReminderRepo};
 pub use scoped_session::{
     ScopedSessionRepo, SessionArchiveEntry, SessionPageQuery, SessionProjection,
 };

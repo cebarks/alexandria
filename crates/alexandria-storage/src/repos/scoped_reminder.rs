@@ -43,12 +43,13 @@
 
 use crate::access::OwnerContext;
 use crate::error::StorageError;
+use crate::models::identity::{OperationId, Version};
 use crate::models::{ProjectId, Reminder};
 use crate::repos::scope::{Bind, GuardedWrite, guarded_run};
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::RecordId;
+use surrealdb::types::{RecordId, SurrealValue};
 
 use super::ScopedProjectRepo;
 use super::reminder_repo::{NewReminder, ReminderRepo};
@@ -58,6 +59,26 @@ use super::reminder_repo::{NewReminder, ReminderRepo};
 const DELIVERABLE: &str = "(migration_hold = NONE OR migration_hold != true) AND \
     (project != NONE OR (target_project = NONE AND legacy_target_project = NONE)) AND \
     (project = NONE OR project.workspace = $workspace)";
+
+/// Owner-visible fields for one reminder blocked on a migration decision.
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct HeldReminder {
+    pub id: RecordId,
+    pub message: String,
+    pub legacy_target_project: Option<String>,
+    pub schedule_kind: String,
+    pub freq: Option<String>,
+    pub time_of_day: Option<String>,
+    pub weekdays: Vec<String>,
+    pub day_of_month: Option<i64>,
+    pub cron_expr: Option<String>,
+    pub semantic_revision: Option<i64>,
+}
+
+#[derive(SurrealValue)]
+struct HoldCountRow {
+    count: i64,
+}
 
 pub struct ScopedReminderRepo<'a> {
     inner: ReminderRepo<'a>,
@@ -209,6 +230,47 @@ impl<'a> ScopedReminderRepo<'a> {
             .check()
             .map_err(internal)?;
         response.take(0).map_err(internal)
+    }
+
+    /// All reminders this owner must resolve, plus their exact outstanding count.
+    ///
+    /// The list is intentionally not a due-time sample: every held row must remain visible until the
+    /// owner maps it, and the count is computed in SQL rather than inferred from a page.
+    pub async fn migration_holds(&self) -> Result<(i64, Vec<HeldReminder>), StorageError> {
+        let mut response = self
+            .owner_db()
+            .query("SELECT count() AS count FROM reminder WHERE account = $account AND migration_hold = true GROUP ALL;")
+            .bind(("account", self.account()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?;
+        let count_rows: Vec<HoldCountRow> = response.take(0).map_err(internal)?;
+        let count = count_rows.first().map_or(0, |row| row.count);
+
+        let mut response = self
+            .owner_db()
+            .query("SELECT id, message, legacy_target_project, schedule_kind, freq, time_of_day, weekdays, day_of_month, cron_expr, semantic_revision FROM reminder WHERE account = $account AND migration_hold = true ORDER BY id ASC;")
+            .bind(("account", self.account()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?;
+        let rows: Vec<HeldReminder> = response.take(0).map_err(internal)?;
+        Ok((count, rows))
+    }
+
+    /// Releases an owner-reviewed legacy mapping through the bound account's guarded write path.
+    pub async fn release_migration_hold(
+        &self,
+        reminder_id: &str,
+        expected: Version,
+        target: Option<ProjectId>,
+        operation: &OperationId,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .release_migration_hold(&self.owner, reminder_id, expected, target, operation)
+            .await
     }
 
     /// A page of the bound account's reminders, plus whether more exist.

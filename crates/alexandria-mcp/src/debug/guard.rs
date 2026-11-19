@@ -398,6 +398,7 @@ mod tests {
         "/debug/graph/fact%3Aguard",
         "/debug/api/graph/fact%3Aguard",
         "/debug/maintenance",
+        "/debug/reminder-mapping",
         "/debug/operations",
         // A braced mount is covered only by a concrete sample below its head (`matrix_covers`), so the
         // history detail page needs its own entry just as the memories detail page does.
@@ -420,6 +421,7 @@ mod tests {
     /// differently, and a new one escaping the CSRF half is the failure this list exists to catch.
     const GUARDED_MUTATIONS: &[&str] = &[
         "/debug/query/run",
+        "/debug/reminder-mapping/release",
         "/debug/collections/edit",
         "/debug/collections/move",
         "/debug/classification/decide",

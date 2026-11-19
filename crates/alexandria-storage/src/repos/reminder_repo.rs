@@ -1,3 +1,6 @@
+use crate::access::OwnerContext;
+use crate::error::StorageError;
+use crate::models::identity::{OperationId, ProjectId, Version};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
@@ -82,6 +85,28 @@ impl<'a> ReminderRepo<'a> {
             .id
             .ok_or_else(|| anyhow::anyhow!("Created reminder has no id"))?;
         Ok(crate::record_id_to_string(&id))
+    }
+
+    /// Release an owner-reviewed legacy target mapping through the same transaction and semantic
+    /// journal used by other owner mutations. The record ID is parsed as one complete typed record
+    /// literal before the mutation repository sees it.
+    pub async fn release_migration_hold(
+        &self,
+        owner: &OwnerContext,
+        reminder_id: &str,
+        expected: Version,
+        target: Option<ProjectId>,
+        operation: &OperationId,
+    ) -> std::result::Result<(), StorageError> {
+        let reminder_id = crate::parse_record_id(reminder_id)?;
+        if reminder_id.table.as_str() != "reminder" {
+            return Err(StorageError::InvalidInput(
+                "malformed reminder id".to_string(),
+            ));
+        }
+        super::MutationRepo::new(self.db)
+            .release_reminder_mapping(owner, &reminder_id, expected, target, operation)
+            .await
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Reminder>> {

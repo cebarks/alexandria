@@ -5,6 +5,7 @@ pub mod embedding_validation;
 pub mod error;
 pub mod models;
 pub mod offline_copy;
+pub mod ownership_migration;
 pub mod project_handle;
 pub mod repos;
 pub mod schema;
