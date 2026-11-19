@@ -31,6 +31,10 @@ impl ReconciledRefinement {
         &self.policy
     }
 
+    pub(super) fn routes(&self) -> &RoutePair {
+        &self.routes
+    }
+
     pub async fn reconcile(
         db: &Database,
         system: &SystemContext,

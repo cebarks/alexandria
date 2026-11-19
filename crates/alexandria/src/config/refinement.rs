@@ -1,7 +1,16 @@
 use std::{collections::BTreeMap, fmt};
 
-use alexandria_engine::refinement::policy::{HeaderValue, Protocol, Route, RoutePair};
+use alexandria_engine::refinement::policy::{
+    HeaderValue, InferencePolicyInputs, Protocol, Route, RoutePair,
+};
 use alexandria_engine::refinement::schedule::DEFAULT_INTERVAL_SECS;
+use alexandria_mcp::refinement::ReconciledRefinement;
+use alexandria_mcp::refinement::provider::{
+    OPERATION_SCHEMA_VERSION, PROMPT_VERSION, prompt_template,
+};
+use alexandria_mcp::refinement::worker::WorkerSettings;
+use alexandria_storage::Database;
+use alexandria_storage::access::SystemContext;
 use alexandria_storage::models::refinement::ApprovalMode;
 use anyhow::Context;
 use axum::http::HeaderName;
@@ -69,6 +78,45 @@ impl RefinementConfig {
             .transpose()?;
         Ok(Some(RoutePair::resolve(proposer, reviewer)?))
     }
+}
+
+/// Boot and offline commands must publish identical policy revisions for the same routes.
+pub(crate) async fn reconcile_refinement_policy(
+    db: &Database,
+    system: &SystemContext,
+    config: &RefinementConfig,
+) -> anyhow::Result<Option<ReconciledRefinement>> {
+    let limits = WorkerSettings::default();
+    let settings = BTreeMap::from([
+        (
+            "max_request_bytes".into(),
+            limits.max_request_bytes.to_string(),
+        ),
+        (
+            "max_response_bytes".into(),
+            limits.max_response_bytes.to_string(),
+        ),
+        (
+            "max_output_tokens".into(),
+            limits.max_output_tokens.to_string(),
+        ),
+    ]);
+    let prompt = prompt_template();
+    let inputs = InferencePolicyInputs {
+        prompt_template: prompt.as_bytes(),
+        prompt_template_version: PROMPT_VERSION,
+        operation_schema_version: OPERATION_SCHEMA_VERSION,
+        settings: &settings,
+    };
+    ReconciledRefinement::reconcile(
+        db,
+        system,
+        config.resolve()?,
+        &inputs,
+        config.approval_mode_ceiling,
+    )
+    .await
+    .context("could not reconcile refinement policy")
 }
 
 #[derive(Clone, Deserialize)]

@@ -3,6 +3,7 @@
 mod anthropic;
 pub mod inference;
 mod openai;
+pub mod provider;
 pub mod service;
 pub mod worker;
 

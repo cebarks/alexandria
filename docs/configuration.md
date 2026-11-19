@@ -287,7 +287,7 @@ schema's `initiator = NONE`, with readable `system:dreaming` attribution on the 
 summary. Sweep materializes heat only and deliberately writes neither journal rows nor audit rows.
 
 **Running a job on demand: `alexandria dream`.** You do not need to touch this section to make a job
-run now. `alexandria dream --job NAME` (or with no `--job`, all five) runs the same job bodies the
+run now. `alexandria dream --job NAME` (or with no `--job` or `--job all`, all five housekeeping jobs) runs the same job bodies the
 scheduler runs, once, and prints one `job=… examined=… acted=… skipped=…` line per job — the same
 counters the log line carries, plus `skipped`, which the loop does not log — then the run id and how
 many audit rows were found under it. The old workaround was to set all five `*_interval_secs` to `1`
@@ -302,8 +302,8 @@ what that key switches off is the background clock, not the jobs' legitimacy.
 
 > SurrealKV is single-writer, so `alexandria dream` refuses while the service holds the data dir: one
 > line naming the directory, exit status non-zero, and no job examined or wrote anything. Stop the
-> service first, or set `ALEXANDRIA_DATA_DIR` to a copy of the directory and run it against that. It
-> loads no embedding model and needs no HNSW index. Before schema or job writes it reads stored
+> service first, or set `ALEXANDRIA_DATA_DIR` to a copy of the directory and run it against that. The
+> five housekeeping jobs load no embedding model and need no HNSW index. Before schema or job writes it reads stored
 > embedding readiness/identity and refuses unfinished or corrupt migration targets. It does not
 > provision artifacts, stamp an embedding lock or require the configured model to match stored
 > vectors; a fresh store without an identity table remains valid for a model-free pass.
@@ -328,7 +328,7 @@ failing.
 
 ### `[refinement]`
 
-Refinement has no routes by default. Only the operator can configure destinations and the approval ceiling. Startup must reconcile the configured policy with the store before serving; removing the proposer disables refinement without deleting prior consent. Setting a route does **not** grant consent for any account, start inference, or enable automatic application. This build prepares the policy and disclosure only; it has no live refinement worker.
+Refinement has no routes by default. Only the operator can configure destinations and the approval ceiling. Startup must reconcile the configured policy with the store before serving; removing the proposer disables refinement without deleting prior consent. Setting a route does **not** grant consent for any account, start inference, or enable automatic application. The background scheduler does not run inference; an explicit offline pass uses the shared worker for one selected scope.
 
 ```toml
 [refinement]
@@ -349,6 +349,29 @@ x-gateway-key = "ALEXANDRIA_REFINEMENT_GATEWAY_KEY"
 A route requires `protocol`, `api_prefix`, and a nonblank `model`. The HTTP(S) URL keeps its gateway path prefix; userinfo, query strings, and fragments are refused. `credential_ref` and each `header_refs` value, if present, must be a name matching `[A-Za-z_][A-Za-z0-9_]*`. Startup does not read the referenced values. To use a different reviewer, supply a complete `[refinement.reviewer]` route with its own references. Omit it to inherit the proposer route, including its model and references; a reviewer without a proposer is invalid.
 
 Consent is per account and covers the disclosed destinations (protocol, origin, and API prefix). A destination change requires a fresh grant. Changing only the model does not require consent renewal, but it changes the inference policy ID; the current model is shown in disclosure. Credential rotation alone changes neither the destination nor the policy ID.
+
+**Trusted-local commands (Linux, stopped persistent store).** Configure `[auth] stdio_account`
+with an active enrolled account. These commands never accept an account override and do not load
+models or contact providers:
+
+- `alexandria refinement routes` prints the effective endpoints and models, the egress disclosure,
+  `policy_revision` and `consent_revision`. Review these before granting consent; a local route can
+  still receive full selected memory text.
+- `alexandria refinement consent grant --policy-revision N --consent-revision N` requires the two
+  displayed revisions. `alexandria refinement consent revoke --consent-revision N` revokes that
+  revision. Re-run `routes` after a stale refusal; an old grant does not revive if an old URL returns.
+- `alexandria refinement approval human|secondary-llm` changes the local account's preference.
+  Human is the default; selecting `secondary-llm` requires the operator ceiling to allow it.
+
+`alexandria dream --job refine --workspace WORKSPACE_ID --scope personal` (or `--scope project:ID`,
+for example `project:7`) is explicit-only. It needs the trusted-local account's administrator role,
+its own workspace, a ready owned store with matching embedding identity, and current consent.
+It cannot be combined with other jobs or `--max-rows`, never uses Unassigned, and is never part of
+bare `dream` or `--job all`. It loads the locked embedding provider, then runs one bounded worker
+turn and reports an operation ID, a durable attempt ID, and any pending proposal. A continuation
+uses the saved cursor on the next explicit pass. Even an exact secondary approval remains pending
+for review here: the offline pass does not apply changes to the corpus. The command checks an
+existing `LOCK` read-only before the engine open; keep other openers stopped through that handoff.
 
 ### `[retrieve]`
 

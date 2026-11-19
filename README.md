@@ -83,7 +83,9 @@ that run once and exit.
 | `alexandria migrate-embeddings --output-data-dir PATH [--resume] [--force]` | Copy a stopped persistent source into a separate, nonoverlapping target, then rewrite and verify it. Logs go to stderr and the completed JSON report to stdout. Resume requires the original adjacent receipt and matching journal/configuration; `--force` does not bypass ownership or replay a completed target. No automatic cutover, deletion, swap or restart. |
 | `alexandria bench-retrieval` | Measure how well the configured model separates a correct answer from the rest of the corpus, and print the score distributions and the limit × threshold grid that the `retrieve.min_similarity` floor and the client recall defaults are judged against — see [docs/minilm-test-data.md](docs/minilm-test-data.md). |
 | `alexandria dream [--job NAME]... [--max-rows N]` | Run one or more of the five housekeeping jobs **once, now**, and print what each did (`job=… examined=… acted=… skipped=…`) plus the run id its audit rows carry, so `/debug/maintenance?run=<id>` shows exactly what that pass changed. With no `--job` it runs all five. The way to answer "why did my corpus change" or "run the collapse now" without editing `[dreaming]` cadences and restarting the service — see [docs/configuration.md](docs/configuration.md). |
-| `alexandria --help` | Print the same list. |
+| `alexandria refinement --help` | Inspect routes, grant or revoke disclosed destination consent, or set an approval preference for the configured trusted-local account. See the [refinement configuration](docs/configuration.md#refinement). |
+| `alexandria dream --job refine --workspace ID --scope personal` | Run one explicit offline refinement turn for the trusted-local administrator's own workspace with current consent. `--scope project:ID` selects one project instead. Results remain pending for review; this is not a sixth housekeeping job. |
+| `alexandria --help` | Print the command summary. |
 
 The legacy in-place command, benchmark and `dream` open the data dir directly, and SurrealKV
 is single-writer, so the server has to be stopped first. `alexandria dream` refuses a held
@@ -94,7 +96,7 @@ Linux only. Keep the adjacent source-manifest receipt with the target, especiall
 unfinished. `bench-retrieval` can instead run against a copy of the data dir via
 `ALEXANDRIA_DATA_DIR`, which keeps the server down only for a `cp`. It is not read-only: like
 server boot it checks the embedding-model lock (refusing on a mismatch) and defines the HNSW
-index if it is missing. `alexandria dream` needs neither the model nor the index — it reads the
+index if it is missing. The five housekeeping jobs need neither the model nor the index — they read the
 stored vectors, heat and confidence. It validates stored embedding readiness/identity before
 schema or job writes and refuses unfinished or corrupt migration targets, without loading a
 provider or requiring the configured model to match. The cap is one allowance per capped job per pass **across all eligible partitions** — the dispatcher enumerates active accounts' partitions, rotates fairly with a persisted cursor, and shares the allowance, so one account's many projects cannot take every turn and a suspended account's workspace is neither enumerated nor written. `cluster` and `merge` are not partitioned yet: they remain legacy-gated whole-store jobs (they refuse owned/workspace data by construction), with partitioned owned-cluster maintenance as named follow-up work. `--max-rows N` overrides `dreaming.max_rows_per_run`

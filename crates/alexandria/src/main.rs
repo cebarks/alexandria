@@ -4,21 +4,20 @@ mod dream;
 mod dreaming;
 mod embedding_migration;
 mod ownership;
+mod refinement;
 #[cfg(test)]
 mod refinement_boot_tests;
 
-use std::{collections::BTreeMap, sync::Arc};
-
-use alexandria_engine::refinement::policy::InferencePolicyInputs;
 use alexandria_mcp::AlexandriaServer;
 use alexandria_mcp::refinement::ReconciledRefinement;
 use alexandria_pipeline::embedding::load_provider;
-use alexandria_storage::access::SystemContext;
+use alexandria_storage::access::{Principal, SystemContext};
 use alexandria_storage::ownership_migration::check_ownership_ready;
 use alexandria_storage::{Database, schema, system_config};
 use anyhow::Context;
 use config::Config;
 use rmcp::ServiceExt;
+use std::sync::Arc;
 
 /// Hours that still fit in the duration `do_check_reminders` builds (`i64::MAX`
 /// seconds). Past it the window is unrepresentable, and the delivery path holds
@@ -34,10 +33,16 @@ const MAX_PRACTICAL_ESCALATION_HOURS: u64 = 24 * 365 * 10;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(
-        args.first().map(String::as_str),
-        Some("migrate-embeddings" | "bootstrap-owner")
-    ) {
+    let explicit_refine = args.first().is_some_and(|command| command == "dream")
+        && args
+            .windows(2)
+            .any(|pair| pair[0] == "--job" && pair[1] == "refine");
+    if explicit_refine
+        || matches!(
+            args.first().map(String::as_str),
+            Some("migrate-embeddings" | "bootstrap-owner" | "refinement")
+        )
+    {
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .init();
@@ -45,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt::init();
     }
 
-    const USAGE: &str = "Usage: alexandria [bootstrap-owner --help | migrate-embeddings [--force] [--output-data-dir PATH [--resume]] | bench-retrieval | dream [--job NAME]... [--max-rows N] | --help]\nGranite requires --output-data-dir; legacy no-output mode remains in-place. Cutover/rollback is manual: change model and data_dir together, never automatically swap or delete stores.";
+    const USAGE: &str = "Usage: alexandria [bootstrap-owner --help | migrate-embeddings [--force] [--output-data-dir PATH [--resume]] | bench-retrieval | dream [--job NAME]... [--max-rows N] | refinement --help | --help]\nGranite requires --output-data-dir; legacy no-output mode remains in-place. Cutover/rollback is manual: change model and data_dir together, never automatically swap or delete stores.";
     if args.first().is_some_and(|first| first == "dream") {
         let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
         return dream::run(&rest).await;
@@ -68,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         ["bootstrap-owner", ..] => return ownership::run(&args[1..]).await,
+        ["refinement", ref rest @ ..] => return refinement::run(rest).await,
         ["bench-retrieval"] => return bench::run().await,
         ["--help"] | ["-h"] => {
             println!("{USAGE}");
@@ -324,24 +330,7 @@ async fn reconcile_refinement_at_boot(
     system: &SystemContext,
     config: &config::RefinementConfig,
 ) -> anyhow::Result<Option<ReconciledRefinement>> {
-    // This build has no inference prompt or operation schema. A build that can execute inference
-    // must fingerprint the concrete inputs instead, which fences this pre-inference policy ID.
-    let settings = BTreeMap::new();
-    let inputs = InferencePolicyInputs {
-        prompt_template: b"",
-        prompt_template_version: "not-installed",
-        operation_schema_version: "not-installed",
-        settings: &settings,
-    };
-    ReconciledRefinement::reconcile(
-        db,
-        system,
-        config.resolve()?,
-        &inputs,
-        config.approval_mode_ceiling,
-    )
-    .await
-    .context("could not reconcile refinement policy at startup")
+    config::reconcile_refinement_policy(db, system, config).await
 }
 
 fn validate_auth_config(config: &Config) -> anyhow::Result<()> {
@@ -395,9 +384,20 @@ fn validate_auth_config(config: &Config) -> anyhow::Result<()> {
  */
 async fn trusted_local_identity(
     db: &Arc<Database>,
-    system: &alexandria_storage::access::SystemContext,
+    system: &SystemContext,
     config: &Config,
 ) -> anyhow::Result<Option<alexandria_mcp::auth::StdioIdentity>> {
+    Ok(configured_local_principal(db, system, config)
+        .await?
+        .map(alexandria_mcp::auth::StdioIdentity::issued))
+}
+
+/// Shared by stdio and explicitly opted-in offline commands, never by request handlers.
+async fn configured_local_principal(
+    db: &Database,
+    system: &SystemContext,
+    config: &Config,
+) -> anyhow::Result<Option<Principal>> {
     let login = config.auth.stdio_account.trim();
     if login.is_empty() {
         return Ok(None);
@@ -412,15 +412,20 @@ async fn trusted_local_identity(
                  To enrol an owner offline, use `alexandria bootstrap-owner --help`; startup does not create accounts"
             )
         })?;
+    anyhow::ensure!(
+        account.is_active(),
+        "the configured trusted-local account is not active"
+    );
+    let account_id = account.account_id()?;
     let principal = alexandria_storage::access::AccessRepo::new(db)
-        .local_principal(system, &account.account_id()?)
+        .local_principal(system, &account_id)
         .await
         .map_err(|error| {
             anyhow::anyhow!(
                 "could not issue the trusted-local identity for `[auth] stdio_account`: {error:#}"
             )
         })?;
-    Ok(Some(alexandria_mcp::auth::StdioIdentity::issued(principal)))
+    Ok(Some(principal))
 }
 
 async fn serve_http(

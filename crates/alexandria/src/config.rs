@@ -1,6 +1,7 @@
 mod refinement;
 
 pub use refinement::RefinementConfig;
+pub(crate) use refinement::reconcile_refinement_policy;
 
 use std::path::PathBuf;
 

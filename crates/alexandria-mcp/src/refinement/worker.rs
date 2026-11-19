@@ -24,8 +24,9 @@ use alexandria_storage::models::refinement::{
 use alexandria_storage::record_id_to_string;
 use alexandria_storage::repos::RefinementRepo;
 use alexandria_storage::repos::refinement_repo::{
-    AttemptId, AttemptState, BudgetRepo, CallLimits, EvidenceOutcome, PassId, QueuedWork,
-    Reservation, WorkKind, WorkSelection, admission, current_authority,
+    AttemptId, AttemptState, BudgetRepo, CallLimits, CandidateCheckpoint, CandidateCursor,
+    EvidenceOutcome, PassId, QueuedWork, Reservation, WorkKind, WorkSelection, admission,
+    current_authority,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Deserialize;
@@ -111,9 +112,7 @@ pub trait WorkerProvider: Send + Sync {
 pub struct AutomaticCandidate {
     generation: u64,
     authority: Authority,
-    /// Carried for Task 20's transactional consumer; nothing in this task is allowed to
-    /// spend it, so nothing here reads it.
-    #[allow(dead_code)] // read by the Task 20 application consumer
+    /// Without a transactional consumer this can only be staged for owner review.
     proposal: ProposalRevision,
 }
 
@@ -207,6 +206,68 @@ impl<'a> Worker<'a> {
         dispatch
     }
 
+    /// Run one explicit, assigned assessment turn. No other account, partition or work class
+    /// can be selected, even if this attempt is no longer runnable.
+    pub async fn step_assigned_attempt(
+        &self,
+        owner: OwnerContext,
+        partition: Partition,
+        attempt: AttemptId,
+        now: DateTime<Utc>,
+        provider: &dyn WorkerProvider,
+    ) -> Result<Dispatch, ServiceError> {
+        if self.in_flight.swap(true, Ordering::SeqCst) {
+            return Ok(Dispatch::Busy);
+        }
+        let result = self
+            .dispatch_assigned(&owner, &partition, &attempt, now, provider)
+            .await;
+        self.in_flight.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn dispatch_assigned(
+        &self,
+        owner: &OwnerContext,
+        partition: &Partition,
+        attempt: &AttemptId,
+        now: DateTime<Utc>,
+        provider: &dyn WorkerProvider,
+    ) -> Result<Dispatch, ServiceError> {
+        let repo = RefinementRepo::new(self.db);
+        let Some(work) = repo
+            .queued_assessment_at(self.system, owner, partition, attempt)
+            .await?
+        else {
+            return Ok(Dispatch::Idle);
+        };
+        if !matches!(&work.selection, WorkSelection::Scheduled) {
+            return Err(ServiceError::InvalidInput(
+                "expected an assigned scheduled assessment".into(),
+            ));
+        }
+        let expected = self.expected_policy();
+        let ctx = DispatchCtx {
+            repo: &repo,
+            work: &work,
+            expected: &expected,
+            now,
+            provider,
+        };
+        if !self.claim_dispatch(&ctx).await? {
+            return Ok(Dispatch::Denied);
+        }
+        let result = run_assigned_turn(self, &ctx, owner.clone()).await;
+        if result.is_err() {
+            // No supervisor is waiting to settle this claim. Preserve the original error and
+            // never overwrite a state the work already settled.
+            let _ = repo
+                .finish_work(self.system, &work.id, AttemptState::Failed)
+                .await;
+        }
+        result
+    }
+
     /// Whether an automatic-application candidate may still be spent: its worker generation
     /// is the current one and the authority that produced it is still the account's binding
     /// authority. A replaced policy (even an A→B→A return) or a rolled generation refuses.
@@ -268,18 +329,6 @@ impl<'a> Worker<'a> {
             .unwrap_or(0);
         queue.rotate_left(start);
         for work in queue {
-            // Account status, consent and the configured policy id are checked before
-            // selection, before any reservation, and the stored authority snapshot must still
-            // be the account's binding authority. Withdrawn authority cancels queued work.
-            if admission(self.db, &work.account, &expected).await.is_err()
-                || !authority_is_current(self.db, &work.authority).await?
-            {
-                repo.cancel_queued(self.system, &work.id).await?;
-                continue;
-            }
-            if !repo.claim_work(self.system, &work.id).await? {
-                continue;
-            }
             let ctx = DispatchCtx {
                 repo: &repo,
                 work: &work,
@@ -287,14 +336,30 @@ impl<'a> Worker<'a> {
                 now,
                 provider,
             };
-            let dispatch = self.run_work(&ctx).await?;
-            self.last_served
-                .lock()
-                .expect("refinement fairness cursor")
-                .replace(work.fairness_key());
-            return Ok(dispatch);
+            if self.claim_dispatch(&ctx).await? {
+                let dispatch = self.run_work(&ctx).await?;
+                self.last_served
+                    .lock()
+                    .expect("refinement fairness cursor")
+                    .replace(work.fairness_key());
+                return Ok(dispatch);
+            }
         }
         Ok(Dispatch::Idle)
+    }
+
+    async fn claim_dispatch(&self, ctx: &DispatchCtx<'_>) -> Result<bool, ServiceError> {
+        // The targeted offline entry and the fair supervisor share the same admission and claim.
+        let work = ctx.work;
+        if admission(self.db, &work.account, ctx.expected)
+            .await
+            .is_err()
+            || !authority_is_current(self.db, &work.authority).await?
+        {
+            ctx.repo.cancel_queued(self.system, &work.id).await?;
+            return Ok(false);
+        }
+        Ok(ctx.repo.claim_work(self.system, &work.id).await?)
     }
 
     async fn run_work(&self, ctx: &DispatchCtx<'_>) -> Result<Dispatch, ServiceError> {
@@ -311,29 +376,9 @@ impl<'a> Worker<'a> {
     async fn run_scheduled(&self, ctx: &DispatchCtx<'_>) -> Result<Dispatch, ServiceError> {
         let repo = ctx.repo;
         let work = ctx.work;
-        let now = ctx.now;
-        let checkpoint = repo
-            .candidate_checkpoint(self.system, &work.partition)
+        let (checkpoint, next, turn) = self
+            .scheduled_turn(ctx, self.settings.max_focals_per_pass)
             .await?;
-        let eligible_before = now - TimeDelta::seconds(budget::REASSESS_AFTER_SECS as i64);
-        let page = repo
-            .page_candidates(
-                &work.partition,
-                checkpoint.position.as_ref(),
-                self.settings.max_focals_per_pass,
-                eligible_before,
-            )
-            .await?;
-        let turn = match page
-            .outcomes
-            .iter()
-            .find(|outcome| matches!(outcome, EvidenceOutcome::Ready(_)))
-        {
-            Some(EvidenceOutcome::Ready(bundle)) => {
-                Some(self.assess_bundle(ctx, bundle, true).await?)
-            }
-            _ => None,
-        };
         // Progress is preserved whatever happened: quota exhaustion leaves the walk where it
         // stopped, and an exhausted walk closes the checkpoint for the next cycle. A `Stale`
         // from this save is not a cursor conflict — with one in-flight worker there is no
@@ -348,7 +393,7 @@ impl<'a> Worker<'a> {
                 self.system,
                 &work.partition,
                 checkpoint.revision,
-                page.next.as_ref(),
+                next.as_ref(),
             )
             .await
         {
@@ -363,7 +408,7 @@ impl<'a> Worker<'a> {
         match turn {
             Some(Turn::Denied) => Ok(Dispatch::Denied),
             Some(Turn::Completed(output)) => {
-                if page.next.is_none() {
+                if next.is_none() {
                     repo.finish_work(self.system, &work.id, AttemptState::Completed)
                         .await?;
                 }
@@ -379,6 +424,67 @@ impl<'a> Worker<'a> {
                 Ok(Dispatch::Idle)
             }
         }
+    }
+
+    async fn scheduled_turn(
+        &self,
+        ctx: &DispatchCtx<'_>,
+        focal_limit: usize,
+    ) -> Result<(CandidateCheckpoint, Option<CandidateCursor>, Option<Turn>), ServiceError> {
+        let partition = &ctx.work.partition;
+        let checkpoint = ctx
+            .repo
+            .candidate_checkpoint(self.system, partition)
+            .await?;
+        let eligible_before = ctx.now - TimeDelta::seconds(budget::REASSESS_AFTER_SECS as i64);
+        let page = ctx
+            .repo
+            .page_candidates(
+                partition,
+                checkpoint.position.as_ref(),
+                focal_limit,
+                eligible_before,
+            )
+            .await?;
+        let turn = match page
+            .outcomes
+            .iter()
+            .find(|outcome| matches!(outcome, EvidenceOutcome::Ready(_)))
+        {
+            Some(EvidenceOutcome::Ready(bundle)) => {
+                Some(self.assess_bundle(ctx, bundle, true).await?)
+            }
+            _ => None,
+        };
+        Ok((checkpoint, page.next, turn))
+    }
+
+    async fn stage_offline_assessment(
+        &self,
+        ctx: &DispatchCtx<'_>,
+        owner: OwnerContext,
+        output: WorkerOutput,
+    ) -> Result<ProposalRevision, ServiceError> {
+        if !authority_is_current(self.db, &ctx.work.authority).await? {
+            return Err(ServiceError::Stale);
+        }
+        let proposal = match output {
+            WorkerOutput::Proposal(proposal) => proposal,
+            WorkerOutput::Automatic(candidate) => {
+                if !self.authorize_application(&candidate).await? {
+                    return Err(ServiceError::Stale);
+                }
+                // There is no transactional secondary application consumer on this branch.
+                // Preserve an exact approval as a pending owner-review proposal, not a write.
+                candidate.proposal
+            }
+            WorkerOutput::Opinion(_) => {
+                return Err(ServiceError::Internal("offline assessment output"));
+            }
+        };
+        // Durably publish before acknowledging the cursor. Persistence coalesces an identical
+        // evidence replay if the process dies between these two steps.
+        Ok(ctx.repo.persist_proposal(&owner, proposal).await?)
     }
 
     /// Owner-selected Unassigned evidence, read through the same owner-review door a human
@@ -662,6 +768,43 @@ impl<'a> Worker<'a> {
             .await
             .map_err(ServiceError::from)
     }
+}
+
+// Keep the one-shot publication future outside the future used by the fair worker.
+async fn run_assigned_turn(
+    worker: &Worker<'_>,
+    ctx: &DispatchCtx<'_>,
+    owner: OwnerContext,
+) -> Result<Dispatch, ServiceError> {
+    // A one-focal page cannot acknowledge a record this turn never examined.
+    let (checkpoint, next, turn) = worker.scheduled_turn(ctx, 1).await?;
+    let work = ctx.work;
+    let output = match turn {
+        Some(Turn::Completed(reply)) => {
+            Some(worker.stage_offline_assessment(ctx, owner, *reply).await?)
+        }
+        Some(Turn::Denied) => return Ok(Dispatch::Denied),
+        None => None,
+    };
+    ctx.repo
+        .save_candidate_checkpoint(
+            worker.system,
+            &work.partition,
+            checkpoint.revision,
+            next.as_ref(),
+        )
+        .await?;
+    ctx.repo
+        .finish_work(worker.system, &work.id, AttemptState::Completed)
+        .await?;
+    Ok(match output {
+        Some(proposal) => Dispatch::Completed {
+            attempt: work.id.clone(),
+            pass: pass_id(work),
+            output: WorkerOutput::Proposal(proposal),
+        },
+        None => Dispatch::Idle,
+    })
 }
 
 fn pass_id(work: &QueuedWork) -> PassId {

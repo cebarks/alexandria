@@ -1,4 +1,4 @@
-//! `alexandria dream`: run one or more of the five dreaming jobs once, on demand.
+//! `alexandria dream`: run one or more of the five housekeeping jobs, or explicitly refine one partition.
 //!
 //! Before this there was no way to ask "run that job now" without editing config. The workaround we
 //! actually used was to set all five `*_interval_secs` to `1` (the loader only refuses `0`), restart
@@ -12,7 +12,7 @@
 //! It is operator tooling, not an MCP tool and not a debug-UI route: a write route under `debug/`
 //! would break the read-only posture the debug UI's no-auth stance rests on.
 //!
-//! Two things this command deliberately does **not** do:
+//! Two things the five housekeeping jobs deliberately do **not** do:
 //!
 //! - **Arm access recording.** `system_config::arm_access_recording` is a boot step, and the stamp
 //!   means "this build started counting retrievals here"; a one-shot CLI writing it would make
@@ -28,14 +28,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use alexandria_engine::dreaming::{ALL_JOBS, Job, JobReport};
+use alexandria_storage::models::{MemoryScope, Partition, ProjectId, WorkspaceId};
 use alexandria_storage::repos::ClusterRepo;
-use alexandria_storage::{Database, schema, system_config};
+use alexandria_storage::{Database, parse_record_id, schema, system_config};
 use anyhow::anyhow;
 
 use crate::config::Config;
 use crate::dreaming;
 
-const USAGE: &str = "Usage: alexandria dream [--job NAME]... [--max-rows N] | --help";
+const USAGE: &str = "Usage: alexandria dream [--job NAME]... [--max-rows N]\n       alexandria dream --job refine --workspace ID --scope personal|project:ID\n       alexandria dream --help";
 
 /// What the operator sees. The five job names and the single-writer constraint are both stated here
 /// rather than left to `--help` of some other command, and
@@ -45,12 +46,18 @@ const HELP: &str = "\
 alexandria dream - run dreaming jobs once, on demand
 
 Usage: alexandria dream [--job NAME]... [--max-rows N]
+       alexandria dream --job refine --workspace ID --scope personal|project:ID
        alexandria dream --help
 
-Runs the jobs named, once each, then exits. With no --job it runs all five. They run in the
-scheduler's own order - sweep, cluster, merge, collapse, appraise - whichever order you name
+Runs the jobs named, once each, then exits. With no --job or with --job all it runs all five.
+They run in the scheduler's own order - sweep, cluster, merge, collapse, appraise - whichever order you name
 them, and duplicates are ignored. The [dreaming] cadences are neither consulted nor changed:
 this answers \"run that job now\" without editing a live service's config and restarting it.
+
+refine is explicit-only. Select one workspace record ID and Personal or a project record ID
+(e.g. project:7). The configured trusted-local principal needs administrative capability and
+its own current consent for the disclosed routes. Do not combine refine with other jobs,
+--job all or --max-rows. See `alexandria refinement --help` for consent commands.
 
 Options:
   --job NAME       all, sweep, cluster, merge, collapse or appraise (repeatable)
@@ -71,11 +78,12 @@ on the last line with the number of rows found under it, so /debug/maintenance?r
 shows exactly what one invocation did. `sweep` writes no audit rows by design, so a pass whose
 only job was sweep legitimately reports zero.";
 
-/// What the command line asked for: print the help, or run this set of jobs.
+/// What the command line asked for: help, housekeeping, or one explicit refinement partition.
 #[derive(Debug)]
 pub(crate) enum Invocation {
     Help,
     Run(Request),
+    Refine(alexandria_storage::models::Partition),
 }
 
 /// A parsed `alexandria dream` command line.
@@ -143,18 +151,20 @@ impl Outcome {
     }
 }
 
-/// The names an operator may type: the five jobs, plus `all`.
+/// The names an operator may type, distinguishing refinement from the housekeeping jobs.
 fn valid_names() -> String {
     let mut names: Vec<&str> = ALL_JOBS.into_iter().map(Job::as_str).collect();
-    names.push("all");
+    names.extend(["all", "refine (explicit-only)"]);
     names.join(", ")
 }
 
 /// Hand-rolled, like the binary's other subcommands (`main.rs` matches argument slices). There is no
 /// clap here and adding one for two flags would be a new dependency for nothing.
 fn parse(args: &[&str]) -> anyhow::Result<Invocation> {
-    let mut named: Vec<Job> = Vec::new();
-    let mut max_rows: Option<usize> = None;
+    let mut named = Vec::new();
+    let mut workspace = None;
+    let mut scope = None;
+    let mut max_rows = None;
     let mut index = 0;
 
     while index < args.len() {
@@ -162,19 +172,16 @@ fn parse(args: &[&str]) -> anyhow::Result<Invocation> {
         index += 1;
         match option {
             "--help" | "-h" => return Ok(Invocation::Help),
-            "--job" => {
-                let value = take_value(args, &mut index, option)?;
-                if value == "all" {
-                    named.extend(ALL_JOBS);
-                    continue;
-                }
-                named.push(Job::from_name(value).ok_or_else(|| {
-                    anyhow!(
-                        "unknown job `{value}` (valid names: {}). {USAGE}",
-                        valid_names()
-                    )
-                })?);
+            "--workspace" | "--scope" => {
+                let target = if option == "--workspace" {
+                    &mut workspace
+                } else {
+                    &mut scope
+                };
+                anyhow::ensure!(target.is_none(), "specify `{option}` only once. {USAGE}");
+                *target = Some(take_value(args, &mut index, option)?);
             }
+            "--job" => named.push(take_value(args, &mut index, option)?),
             "--max-rows" => {
                 let value = take_value(args, &mut index, option)?;
                 let rows: usize = value.parse().map_err(|_| {
@@ -198,19 +205,66 @@ fn parse(args: &[&str]) -> anyhow::Result<Invocation> {
         }
     }
 
-    // Fixed order and one of each, whatever the command line said. Same reasoning as the loop's
-    // `due`: a run's effects have to be reproducible, and `--job collapse --job sweep` naming the
-    // same work in the opposite order must not do something different.
-    let jobs = if named.is_empty() {
-        ALL_JOBS.to_vec()
-    } else {
-        ALL_JOBS
-            .iter()
-            .copied()
-            .filter(|job| named.contains(job))
-            .collect()
+    if named.contains(&"refine") {
+        anyhow::ensure!(
+            named == ["refine"],
+            "`--job refine` must be the only job selection. {USAGE}"
+        );
+        anyhow::ensure!(
+            max_rows.is_none(),
+            "`--max-rows` is for housekeeping only. {USAGE}"
+        );
+        return parse_partition(workspace, scope).map(Invocation::Refine);
+    }
+    anyhow::ensure!(
+        workspace.is_none() && scope.is_none(),
+        "`--workspace` and `--scope` require `--job refine`. {USAGE}"
+    );
+    Ok(Invocation::Run(Request {
+        jobs: housekeeping_jobs(&named)?,
+        max_rows,
+    }))
+}
+
+fn parse_partition(workspace: Option<&str>, scope: Option<&str>) -> anyhow::Result<Partition> {
+    let workspace =
+        workspace.ok_or_else(|| anyhow!("`--job refine` requires `--workspace ID`. {USAGE}"))?;
+    let workspace = parse_record_id(workspace)
+        .and_then(WorkspaceId::try_from)
+        .map_err(|_| anyhow!("`--workspace` must be a workspace record ID. {USAGE}"))?;
+    let invalid_scope =
+        || anyhow!("`--job refine` requires `--scope personal|project:ID`. {USAGE}");
+    let scope = match scope {
+        Some("personal") => MemoryScope::Personal,
+        Some(project) if project.starts_with("project:") => MemoryScope::Project(
+            parse_record_id(project)
+                .and_then(ProjectId::try_from)
+                .map_err(|_| invalid_scope())?,
+        ),
+        _ => return Err(invalid_scope()),
     };
-    Ok(Invocation::Run(Request { jobs, max_rows }))
+    Ok(Partition { workspace, scope })
+}
+
+fn housekeeping_jobs(named: &[&str]) -> anyhow::Result<Vec<Job>> {
+    let mut selected = Vec::new();
+    for &name in named {
+        if name == "all" {
+            selected.extend(ALL_JOBS);
+        } else {
+            selected.push(Job::from_name(name).ok_or_else(|| {
+                anyhow!(
+                    "unknown job `{name}` (valid names: {}). {USAGE}",
+                    valid_names()
+                )
+            })?);
+        }
+    }
+    // The scheduler fixes the order, regardless of operator ordering and duplicates.
+    Ok(ALL_JOBS
+        .into_iter()
+        .filter(|job| named.is_empty() || selected.contains(job))
+        .collect())
 }
 
 /// The value of an option that takes one, or a usage error naming the option that lost it.
@@ -267,6 +321,7 @@ pub(crate) async fn run(args: &[&str]) -> anyhow::Result<()> {
             return Ok(());
         }
         Invocation::Run(request) => request,
+        Invocation::Refine(partition) => return crate::refinement::run_dream(partition).await,
     };
 
     let config = Config::load()?;
@@ -382,7 +437,7 @@ mod tests {
     fn request(args: &[&str]) -> Request {
         match parse(args) {
             Ok(Invocation::Run(request)) => request,
-            Ok(Invocation::Help) => panic!("`{args:?}` is not a help request"),
+            Ok(other) => panic!("`{args:?}` is not a housekeeping request: {other:?}"),
             Err(e) => panic!("`{args:?}` must parse: {e}"),
         }
     }
@@ -417,8 +472,122 @@ mod tests {
         assert_eq!(
             names(&request(&["--job", "all", "--job", "sweep"])),
             vec!["sweep", "cluster", "merge", "collapse", "appraise"],
-            "`all` plus anything else is still everything"
+            "`all` plus a legacy job is still exactly the five housekeeping jobs"
         );
+        assert!(Job::from_name("refine").is_none());
+        assert!(!ALL_JOBS.into_iter().any(|job| job.as_str() == "refine"));
+    }
+
+    #[test]
+    fn explicit_refine_parses_outside_all_jobs() {
+        use alexandria_storage::{models::MemoryScope, parse_record_id};
+
+        for scope in ["personal", "project:7"] {
+            let args = [
+                "--scope",
+                scope,
+                "--job",
+                "refine",
+                "--workspace",
+                "workspace:9",
+            ];
+            let Invocation::Refine(request) = parse(&args).expect("explicit refine must parse")
+            else {
+                panic!("explicit refine must not dispatch a housekeeping job");
+            };
+            assert_eq!(
+                request.workspace.as_record_id(),
+                &parse_record_id("workspace:9").unwrap()
+            );
+            if scope == "personal" {
+                assert_eq!(request.scope, MemoryScope::Personal);
+            } else {
+                let MemoryScope::Project(id) = request.scope else {
+                    panic!("project scope must retain its typed ID");
+                };
+                assert_eq!(id.as_record_id(), &parse_record_id(scope).unwrap());
+            }
+        }
+        for (args, expected) in [
+            (
+                &["--job", "refine", "--scope", "personal"][..],
+                "--workspace",
+            ),
+            (
+                &["--job", "refine", "--workspace", "workspace:9"][..],
+                "--scope",
+            ),
+            (
+                &[
+                    "--job",
+                    "refine",
+                    "--workspace",
+                    "account:9",
+                    "--scope",
+                    "personal",
+                ][..],
+                "workspace",
+            ),
+            (
+                &[
+                    "--job",
+                    "refine",
+                    "--workspace",
+                    "workspace:9",
+                    "--scope",
+                    "unassigned",
+                ][..],
+                "personal|project:ID",
+            ),
+            (
+                &["--workspace", "workspace:9", "--scope", "personal"][..],
+                "--job refine",
+            ),
+            (
+                &[
+                    "--job",
+                    "refine",
+                    "--workspace",
+                    "workspace:9",
+                    "--scope",
+                    "personal",
+                    "--max-rows",
+                    "1",
+                ][..],
+                "--max-rows",
+            ),
+        ] {
+            let error = parse(args).unwrap_err().to_string();
+            assert!(
+                error.contains(expected) && error.contains("Usage:"),
+                "{args:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_refine_and_legacy_selection_is_rejected() {
+        for job in ["all", "sweep", "refine"] {
+            for (first, second) in [("refine", job), (job, "refine")] {
+                let args = [
+                    "--job",
+                    first,
+                    "--job",
+                    second,
+                    "--workspace",
+                    "workspace:9",
+                    "--scope",
+                    "personal",
+                ];
+                let error = parse(&args).unwrap_err().to_string();
+                assert!(
+                    error.contains("--job refine")
+                        && error.contains("only")
+                        && error.contains("Usage:"),
+                    "{args:?}: {error}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -429,6 +598,7 @@ mod tests {
             assert!(error.contains(name), "{name} must be listed: {error}");
         }
         assert!(error.contains("all"), "`all` must be listed: {error}");
+        assert!(error.contains("refine (explicit-only)"), "{error}");
         assert!(error.contains("Usage:"), "{error}");
 
         // Exact spelling: the names written to `maintenance_log.job` are these, byte for byte, so
@@ -493,11 +663,14 @@ mod tests {
     /// hitting it, and the job list is the only place they learn the names. Both are assertions
     /// here because both are prose in a string literal that nothing else compiles against.
     #[test]
-    fn the_dream_help_names_every_job_and_the_single_writer_constraint() {
+    fn the_help_names_every_job_and_the_single_writer_constraint() {
         for name in ALL_JOBS.into_iter().map(Job::as_str) {
             assert!(HELP.contains(name), "help must name {name}");
         }
         assert!(HELP.contains("all"), "help must offer `all`");
+        assert!(HELP.contains("sweep, cluster, merge, collapse, appraise"));
+        assert!(HELP.contains("refine is explicit-only"));
+        assert!(HELP.contains("--job refine --workspace ID --scope personal|project:ID"));
         assert!(
             HELP.contains("SINGLE WRITER") && HELP.contains("single-writer"),
             "help must state the constraint the refusal exists for"

@@ -380,6 +380,32 @@ impl RefinementRepo<'_> {
         rows.into_iter().map(queued_work).collect()
     }
 
+    /// Look up one explicit assigned attempt without scanning the server's queue.
+    pub async fn queued_assessment_at(
+        &self,
+        system: &SystemContext,
+        owner: &OwnerContext,
+        partition: &Partition,
+        id: &AttemptId,
+    ) -> Result<Option<QueuedWork>, StorageError> {
+        self.require_system(system)?;
+        if &partition.workspace != owner.workspace() || partition.scope == MemoryScope::Unassigned {
+            return Err(StorageError::NotFound);
+        }
+        let (scope, project) = scope_fields(&partition.scope);
+        let rows: Vec<AttemptRow> = self.db.inner().query(
+            "SELECT * FROM $id WHERE state = 'queued' AND kind = 'assess' \
+             AND account = $account AND workspace = $workspace AND scope = $scope AND project = $project",
+        )
+        .bind(("id", id.0.clone()))
+        .bind(("account", owner.account().as_record_id().clone()))
+        .bind(("workspace", partition.workspace.as_record_id().clone()))
+        .bind(("scope", scope))
+        .bind(("project", project))
+        .await.map_err(internal)?.check().map_err(internal)?.take(0).map_err(internal)?;
+        rows.into_iter().next().map(queued_work).transpose()
+    }
+
     /// Atomically lease one attempt for dispatch. `false` means somebody else claimed it first.
     pub async fn claim_work(
         &self,
