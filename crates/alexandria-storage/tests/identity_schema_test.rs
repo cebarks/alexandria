@@ -237,15 +237,14 @@ async fn typed_id(db: &Database, id_sql: &str) -> RecordId {
 /// the registry rather than a literal — every other migration test asserts against `LATEST_VERSION`, so
 /// a head that is written but not registered is a silent mismatch.
 ///
-/// Asserted by *name* against `MIGRATIONS.last()` rather than against a hard-coded v009: this gate's job
-/// is "the file and the registry agree", and pinning a specific version number would make it a second
-/// place to remember the head.
+/// Update this name and diagnostic when registering a new head. The numeric version still comes
+/// from the registry, so a registered older migration cannot silently stand in for the newest file.
 #[tokio::test]
 async fn the_head_migration_is_registered_and_advances_the_stamped_version() {
     let (head_version, head_name, _) = schema::MIGRATIONS.last().unwrap();
     assert_eq!(
-        *head_name, "refinement_proposals",
-        "the head migration must be v012_refinement_proposals.surql"
+        *head_name, "refinement_candidate_progress",
+        "the head migration must be v013_refinement_candidate_progress.surql"
     );
     assert_eq!(schema::LATEST_VERSION, *head_version);
 
@@ -261,7 +260,7 @@ async fn the_head_migration_is_registered_and_advances_the_stamped_version() {
     );
 }
 
-/// The failure this pins: a migration that "cleans up" while it defines. Replaying v009 over a
+/// The failure this pins: a migration that "cleans up" while it defines. Replaying the head over a
 /// populated ownership schema must be a pure definition pass — an account keeps its status, its
 /// authentication epoch, its credential and its project alias, byte-identical. A `DEFINE FIELD` with
 /// an `UPDATE … SET` backfill beside it would silently reset an owner's state on exactly the
@@ -304,22 +303,22 @@ async fn migration_replay_preserves_accounts() {
     assert_eq!(
         row(&db, &alice).await,
         before,
-        "replaying v009 rewrote account state"
+        "replaying the head rewrote account state"
     );
     assert_eq!(
         row(&db, &credential).await,
         before_credential,
-        "replaying v009 rewrote a credential row"
+        "replaying the head rewrote a credential row"
     );
     assert_eq!(
         row(&db, &alias_project).await,
         before_project,
-        "replaying v009 rewrote a project row"
+        "replaying the head rewrote a project row"
     );
     assert_eq!(
         row(&db, &alice_workspace).await,
         before_workspace,
-        "replaying v009 rewrote a workspace row"
+        "replaying the head rewrote a workspace row"
     );
     assert_eq!(count_rows(&db, "account").await, 1);
     assert_eq!(count_rows(&db, "workspace").await, 1);

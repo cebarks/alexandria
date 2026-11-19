@@ -1,4 +1,4 @@
-//! Account-bound refinement policy persistence and admission. No inference or corpus writes.
+//! Account-bound refinement policy, proposal persistence and scoped evidence reads. No inference.
 
 use std::collections::BTreeSet;
 use std::ops::AsyncFn;
@@ -21,6 +21,12 @@ use crate::models::refinement::{
     Consent, ConsentChoice, EffectivePolicy, EvidenceBundle, EvidenceSelectionKind,
     InferencePolicyId, PolicyRevision, PolicyVersion, ProposalCategory, ProposalRevision,
     ProposalState, QualityOperation, RouteDestinationId,
+};
+
+mod candidates;
+
+pub use candidates::{
+    CandidateCheckpoint, CandidateCursor, CandidatePage, EvidenceOutcome, EvidenceSelection,
 };
 
 pub struct RefinementRepo<'a> {
