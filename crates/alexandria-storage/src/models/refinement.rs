@@ -8,7 +8,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
-use super::identity::AccountId;
+use super::identity::{AccountId, FactId, OperationId, Partition, Version};
+use super::mutation::ExpectedState;
+use super::provenance::Provenance;
+use surrealdb::types::RecordId;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, SurrealValue,
@@ -131,4 +134,129 @@ pub enum ProposalState {
     Dismissed,
     Stale,
     Reverted,
+}
+
+/// Complete, partition-bound input record. Content is never truncated in an actionable bundle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidate {
+    pub id: FactId,
+    pub partition: Partition,
+    pub version: Version,
+    pub complete_content: String,
+    pub tags: Vec<String>,
+    pub provenance: Vec<Provenance>,
+    pub semantic_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSelectionKind {
+    Scheduled,
+    OwnerSelected,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OmittedNeighbor {
+    pub id: FactId,
+    pub reason: OmissionReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OmissionReason {
+    OutsideSelection,
+    NeighborLimit,
+    ByteLimit,
+    Ineligible,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvidenceCoverage {
+    pub focal_text_complete: bool,
+    pub omitted_neighbors: Vec<OmittedNeighbor>,
+    pub selection: EvidenceSelectionKind,
+}
+
+/// All members are captured as complete text in one authorized partition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvidenceBundle {
+    pub focal: Candidate,
+    pub related: Vec<Candidate>,
+    pub coverage: EvidenceCoverage,
+    pub inference_policy: InferencePolicyId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalCategory {
+    Rewrite,
+    Consolidate,
+    Contradiction,
+    Noise,
+    Supersede,
+    Split,
+}
+
+/// Closed operation vocabulary; there is no caller-provided patch, SQL, or selector field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualityOperation {
+    Rewrite {
+        source: FactId,
+        content: String,
+    },
+    Consolidate {
+        canonical: FactId,
+        sources: Vec<FactId>,
+    },
+    Contradiction {
+        sources: Vec<FactId>,
+    },
+    Noise {
+        source: FactId,
+    },
+    Supersede {
+        source: FactId,
+        replacement: FactId,
+    },
+    Split {
+        source: FactId,
+        parts: Vec<String>,
+    },
+    NoSafeChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecondaryVerdict {
+    ApproveExact,
+    Reject,
+    Uncertain,
+    NeedsContext,
+}
+
+/// Relationship effects are enumerated and name only typed evidence IDs or operation-local slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovedRelationshipEffect {
+    RemoveSourceMembership { source: FactId, cluster: RecordId },
+    AddSourceMembership { source: FactId, cluster: RecordId },
+    LinkSourceToSource { source: FactId, target: FactId },
+    GeneratedEndpoint { operation: OperationId, slot: u16 },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProposalRevision {
+    pub id: RecordId,
+    pub revision: Version,
+    pub partition: Partition,
+    pub sources: Vec<ExpectedState>,
+    pub evidence: EvidenceBundle,
+    pub category: ProposalCategory,
+    pub proposed: QualityOperation,
+    pub approved_relationship_effects: Vec<ApprovedRelationshipEffect>,
+    pub rationale: String,
+    pub uncertainty: String,
+    pub origin_policy: Authority,
+    pub state: ProposalState,
+    pub needs_human: bool,
+    pub deferred: bool,
 }

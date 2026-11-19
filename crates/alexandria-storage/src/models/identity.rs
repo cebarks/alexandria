@@ -21,7 +21,7 @@
 //! resolves a request, and adding it there cannot weaken a typed ID.
 
 use crate::error::StorageError;
-use surrealdb::types::RecordId;
+pub use surrealdb::types::{RecordId, ToSql};
 
 /// Defines one opaque typed record ID: a wrapper that can only be built from a `RecordId` whose
 /// table it recognises. All five ID types in this module come from here, which is why one

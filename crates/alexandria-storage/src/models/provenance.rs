@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use surrealdb::types::{RecordId, SurrealValue, Value};
 
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SurrealValue)]
 pub struct Provenance {
     pub id: Option<RecordId>,
     pub kind: String,

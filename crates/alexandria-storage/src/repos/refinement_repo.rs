@@ -4,19 +4,23 @@ use std::collections::BTreeSet;
 use std::ops::AsyncFn;
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use surrealdb::engine::any::Any;
 use surrealdb::method::Transaction;
-use surrealdb::types::{AlreadyExistsError, RecordId, SurrealValue, Value};
+use surrealdb::types::{AlreadyExistsError, RecordId, SurrealValue, ToSql, Value};
 
 use super::scope::{GUARD_CONFLICT_ATTEMPTS, claim_authority, is_write_conflict};
 use crate::Database;
 use crate::access::{OwnerContext, SystemContext, WriteAuthorization, credential_entitles_read};
 use crate::error::StorageError;
 use crate::models::auth::{Account, Credential};
-use crate::models::identity::AccountId;
+use crate::models::identity::{AccountId, FactId, MemoryScope, OperationId, Partition, Version};
+use crate::models::mutation::{EdgeKind, ExpectedState, RelationExpectation};
 use crate::models::refinement::{
-    ApprovalMode, ApprovalSetting, ConfiguredPolicy, Consent, ConsentChoice, EffectivePolicy,
-    InferencePolicyId, PolicyRevision, PolicyVersion, RouteDestinationId,
+    ApprovalMode, ApprovalSetting, ApprovedRelationshipEffect, Candidate, ConfiguredPolicy,
+    Consent, ConsentChoice, EffectivePolicy, EvidenceBundle, EvidenceSelectionKind,
+    InferencePolicyId, PolicyRevision, PolicyVersion, ProposalCategory, ProposalRevision,
+    ProposalState, QualityOperation, RouteDestinationId,
 };
 
 pub struct RefinementRepo<'a> {
@@ -26,6 +30,135 @@ pub struct RefinementRepo<'a> {
 impl<'a> RefinementRepo<'a> {
     pub fn new(db: &'a Database) -> Self {
         Self { db }
+    }
+
+    /// Persist a pending proposal, reusing an existing identical evidence assessment.
+    pub async fn persist_proposal(
+        &self,
+        owner: &OwnerContext,
+        proposal: ProposalRevision,
+    ) -> Result<ProposalRevision, StorageError> {
+        self.persist(owner, proposal, false).await
+    }
+
+    pub async fn persist_proposal_revision(
+        &self,
+        owner: &OwnerContext,
+        proposal: ProposalRevision,
+    ) -> Result<ProposalRevision, StorageError> {
+        self.persist_proposal(owner, proposal).await
+    }
+
+    async fn persist(
+        &self,
+        owner: &OwnerContext,
+        proposal: ProposalRevision,
+        force_revision: bool,
+    ) -> Result<ProposalRevision, StorageError> {
+        validate_proposal(owner, &proposal)?;
+        let evidence_fingerprint = evidence_fingerprint(&proposal.evidence)?;
+        let source_fingerprint = source_fingerprint(&proposal)?;
+        let proposal_payload = proposal_payload(&proposal)?;
+        self.write(async |tx| {
+            claim_owner(tx, owner).await?;
+            let matching: Vec<StoredProposal> = tx
+                .query("SELECT * FROM refinement_proposal WHERE account = $account AND evidence_fingerprint = $evidence AND source_fingerprint = $sources ORDER BY revision DESC LIMIT 1")
+                .bind(("account", owner.account().as_record_id().clone()))
+                .bind(("evidence", evidence_fingerprint.clone()))
+                .bind(("sources", source_fingerprint.clone()))
+                .await.map_err(internal)?.check().map_err(internal)?.take(0).map_err(internal)?;
+            if !force_revision && let Some(existing) = matching.first() {
+                let mut result = proposal.clone();
+                result.id = existing.id.clone().ok_or_else(|| {
+                    StorageError::Internal(anyhow::anyhow!("proposal row is missing its record id"))
+                })?;
+                result.revision = Version::new(existing.revision);
+                result.state = existing.state;
+                result.needs_human = existing.needs_human;
+                result.deferred = existing.deferred;
+                return Ok(result);
+            }
+            let revision = if force_revision {
+                next_revision(matching.first().ok_or(StorageError::NotFound)?.revision)?
+            } else {
+                1
+            };
+            let mut stored_proposal = proposal.clone();
+            stored_proposal.revision = Version::new(revision);
+            stored_proposal.state = ProposalState::Pending;
+            stored_proposal.needs_human = true;
+            stored_proposal.deferred = false;
+            let existing_evidence = matching.first().map(|row| row.evidence.clone());
+            let evidence_id = existing_evidence.clone().unwrap_or_else(|| {
+                let evidence_key = sha256(format!("{}:{}:{}", owner.account().as_record_id().to_sql(), evidence_fingerprint, source_fingerprint).as_bytes());
+                RecordId::new("refinement_evidence", evidence_key)
+            });
+            let record = proposal_record(owner, &stored_proposal, evidence_id.clone(), evidence_fingerprint.clone(), source_fingerprint.clone(), proposal_payload.clone());
+            if existing_evidence.is_none() {
+                let evidence_row = evidence_row(owner, &stored_proposal)?;
+                tx.query("CREATE $evidence_id CONTENT $evidence")
+                    .bind(("evidence_id", evidence_id))
+                    .bind(("evidence", evidence_row.into_value()))
+                    .await.map_err(internal)?.check().map_err(internal)?;
+            }
+            tx.query("CREATE $id CONTENT $record")
+                .bind(("id", stored_proposal.id.clone()))
+                .bind(("record", record.into_value()))
+                .await.map_err(internal)?.check().map_err(internal)?;
+            Ok(stored_proposal)
+        }).await
+    }
+
+    /// Dismiss only the cited pending revision; terminal decisions cannot be overwritten.
+    pub async fn dismiss_proposal_revision(
+        &self,
+        owner: &OwnerContext,
+        id: &RecordId,
+        revision: Version,
+    ) -> Result<(), StorageError> {
+        if id.table.as_str() != "refinement_proposal" {
+            return Err(StorageError::NotFound);
+        }
+        let revision = i64::try_from(revision.get())
+            .map_err(|_| StorageError::InvalidInput("proposal revision is out of range".into()))?;
+        self.write(async |tx| {
+            claim_owner(tx, owner).await?;
+            let rows: Vec<Value> = tx.query("UPDATE $id SET state = 'dismissed' WHERE account = $account AND revision = $revision AND state = 'pending' RETURN AFTER")
+                .bind(("id", id.clone())).bind(("account", owner.account().as_record_id().clone())).bind(("revision", revision))
+                .await.map_err(internal)?.check().map_err(internal)?.take(0).map_err(internal)?;
+            if rows.len() == 1 { Ok(()) } else { Err(StorageError::Stale) }
+        }).await
+    }
+
+    /// A reviewer alternative is stored as a new pending revision, never as approval.
+    pub async fn create_review_alternative(
+        &self,
+        owner: &OwnerContext,
+        id: &RecordId,
+        revision: Version,
+        mut alternative: ProposalRevision,
+    ) -> Result<ProposalRevision, StorageError> {
+        if id.table.as_str() != "refinement_proposal" {
+            return Err(StorageError::NotFound);
+        }
+        let revision_i64 = i64::try_from(revision.get())
+            .map_err(|_| StorageError::InvalidInput("proposal revision is out of range".into()))?;
+        let rows: Vec<StoredProposal> = self.db.inner().query("SELECT * FROM $id WHERE account = $account AND revision = $revision AND state = 'pending'")
+            .bind(("id", id.clone())).bind(("account", owner.account().as_record_id().clone())).bind(("revision", revision_i64))
+            .await.map_err(internal)?.check().map_err(internal)?.take(0).map_err(internal)?;
+        let base = rows.into_iter().next().ok_or(StorageError::Stale)?;
+        if alternative.id.table.as_str() != "refinement_proposal"
+            || alternative.partition.workspace != *owner.workspace()
+        {
+            return Err(StorageError::InvalidInput(
+                "review alternative is outside the owner partition".into(),
+            ));
+        }
+        alternative.revision = Version::new(next_revision(base.revision)?);
+        alternative.state = ProposalState::Pending;
+        alternative.needs_human = true;
+        alternative.deferred = false;
+        self.persist(owner, alternative, true).await
     }
 
     /// Publish operator configuration. A disable is durable but does not delete the last
@@ -229,6 +362,56 @@ impl<'a> RefinementRepo<'a> {
         }
         Err(StorageError::RetryableBookkeepingConflict)
     }
+}
+
+#[derive(Clone, SurrealValue)]
+struct ProposalRecord {
+    account: RecordId,
+    workspace: RecordId,
+    project: Option<RecordId>,
+    scope: String,
+    proposal_key: String,
+    revision: u64,
+    state: ProposalState,
+    needs_human: bool,
+    deferred: bool,
+    evidence: RecordId,
+    origin_policy: AuthorityRecord,
+    evidence_fingerprint: String,
+    source_fingerprint: String,
+    proposal_payload: String,
+}
+
+#[derive(Clone, SurrealValue)]
+struct StoredProposal {
+    id: Option<RecordId>,
+    revision: u64,
+    state: ProposalState,
+    needs_human: bool,
+    deferred: bool,
+    evidence: RecordId,
+}
+
+#[derive(Clone, SurrealValue)]
+struct AuthorityRecord {
+    account: RecordId,
+    consent_revision: u64,
+    owner_mode_revision: u64,
+    inference_policy_id: String,
+    configured_revision: u64,
+    mode: ApprovalMode,
+}
+
+#[derive(Clone, SurrealValue)]
+struct EvidenceRecord {
+    account: RecordId,
+    workspace: RecordId,
+    project: Option<RecordId>,
+    scope: String,
+    focal: RecordId,
+    related: Vec<RecordId>,
+    inference_policy_id: String,
+    payload: String,
 }
 
 #[derive(Clone, Default, SurrealValue)]
@@ -515,6 +698,485 @@ async fn write_record(
         Ok(())
     } else {
         Err(StorageError::Stale)
+    }
+}
+
+fn operation_is_grounded(
+    category: crate::models::refinement::ProposalCategory,
+    operation: &QualityOperation,
+    visible: &[FactId],
+    focal: &FactId,
+) -> bool {
+    use crate::models::refinement::ProposalCategory as Category;
+    use QualityOperation::*;
+    match (category, operation) {
+        (Category::Rewrite, Rewrite { source, content }) => {
+            source == focal && !content.trim().is_empty()
+        }
+        (Category::Consolidate, Consolidate { canonical, sources }) => {
+            let mut unique = sources.clone();
+            unique.sort();
+            unique.dedup();
+            visible.contains(canonical)
+                && !sources.is_empty()
+                && unique.len() == sources.len()
+                && sources
+                    .iter()
+                    .all(|source| visible.contains(source) && source != canonical)
+        }
+        (Category::Contradiction, Contradiction { sources }) => {
+            let mut unique = sources.clone();
+            unique.sort();
+            unique.dedup();
+            sources.len() >= 2
+                && unique.len() == sources.len()
+                && sources.iter().all(|source| visible.contains(source))
+        }
+        (Category::Contradiction, NoSafeChange) => true,
+        (Category::Noise, Noise { source }) => source == focal,
+        (
+            Category::Supersede,
+            Supersede {
+                source,
+                replacement,
+            },
+        ) => source == focal && replacement != focal && visible.contains(replacement),
+        (Category::Split, Split { source, parts }) => {
+            source == focal && parts.len() >= 2 && parts.iter().all(|part| !part.trim().is_empty())
+        }
+        _ => false,
+    }
+}
+
+fn validate_proposal(
+    owner: &OwnerContext,
+    proposal: &ProposalRevision,
+) -> Result<(), StorageError> {
+    if proposal.id.table.as_str() != "refinement_proposal"
+        || proposal.partition.workspace != *owner.workspace()
+        || proposal.origin_policy.account != *owner.account()
+        || proposal.state != ProposalState::Pending
+        || proposal.origin_policy.consent_revision == 0
+        || proposal.origin_policy.configured_revision == 0
+        || proposal.origin_policy.inference_policy_id != proposal.evidence.inference_policy
+        || !proposal.evidence.coverage.focal_text_complete
+        || proposal.evidence.focal.complete_content.len() > 32 * 1024
+        || (matches!(&proposal.partition.scope, MemoryScope::Unassigned)
+            && proposal.evidence.coverage.selection != EvidenceSelectionKind::OwnerSelected)
+        || proposal.rationale.trim().is_empty()
+        || proposal.rationale.len() > 4096
+        || proposal.uncertainty.len() > 4096
+    {
+        return Err(StorageError::InvalidInput(
+            "proposal is outside the owner or is not pending".into(),
+        ));
+    }
+    if proposal.evidence.focal.partition != proposal.partition
+        || proposal
+            .evidence
+            .related
+            .iter()
+            .any(|candidate| candidate.partition != proposal.partition)
+        || proposal.sources.iter().any(|source| {
+            source.workspace != proposal.partition.workspace
+                || source.scope != proposal.partition.scope
+        })
+    {
+        return Err(StorageError::InvalidInput(
+            "proposal evidence crosses its authorized partition".into(),
+        ));
+    }
+    let mut visible: Vec<FactId> = std::iter::once(&proposal.evidence.focal)
+        .chain(proposal.evidence.related.iter())
+        .map(|candidate| candidate.id.clone())
+        .collect();
+    visible.sort();
+    visible.dedup();
+    if !operation_is_grounded(
+        proposal.category,
+        &proposal.proposed,
+        &visible,
+        &proposal.evidence.focal.id,
+    ) {
+        return Err(StorageError::InvalidInput(
+            "proposal operation is unsupported or names unseen evidence".into(),
+        ));
+    }
+    let mut omitted = BTreeSet::new();
+    let omitted_invalid = proposal
+        .evidence
+        .coverage
+        .omitted_neighbors
+        .iter()
+        .any(|neighbor| {
+            let id = neighbor.id.as_record_id().to_sql();
+            visible
+                .iter()
+                .any(|seen| seen.as_record_id().to_sql() == id)
+                || !omitted.insert(id)
+        });
+    if visible.len() != proposal.evidence.related.len() + 1
+        || omitted_invalid
+        || proposal
+            .sources
+            .iter()
+            .any(|source| !visible.contains(&source.fact))
+    {
+        return Err(StorageError::InvalidInput(
+            "proposal sources are not uniquely present in its evidence".into(),
+        ));
+    }
+    let mut generated = BTreeSet::new();
+    let mut unique_effects = BTreeSet::new();
+    for effect in &proposal.approved_relationship_effects {
+        if !unique_effects.insert(format!("{effect:?}")) {
+            return Err(StorageError::InvalidInput(
+                "relationship effect is duplicated".into(),
+            ));
+        }
+        match effect {
+            ApprovedRelationshipEffect::LinkSourceToSource { source, target } => {
+                if !visible.contains(source) || !visible.contains(target) || source == target {
+                    return Err(StorageError::InvalidInput(
+                        "relationship effect names an unseen source".into(),
+                    ));
+                }
+            }
+            ApprovedRelationshipEffect::RemoveSourceMembership { source, cluster }
+            | ApprovedRelationshipEffect::AddSourceMembership { source, cluster } => {
+                if !visible.contains(source)
+                    || cluster.table.as_str() != "cluster"
+                    || !cluster_is_in_source_graph(&proposal.sources, source, cluster)
+                {
+                    return Err(StorageError::InvalidInput(
+                        "membership effect names an unseen endpoint".into(),
+                    ));
+                }
+            }
+            ApprovedRelationshipEffect::GeneratedEndpoint { operation, slot } => {
+                if operation.as_str().trim().is_empty()
+                    || !generated.insert((operation.as_str().to_owned(), *slot))
+                {
+                    return Err(StorageError::InvalidInput(
+                        "generated relationship slot is duplicated".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cluster_is_in_source_graph(
+    sources: &[ExpectedState],
+    source_id: &FactId,
+    cluster: &RecordId,
+) -> bool {
+    sources.iter().any(|source| {
+        source.graph.iter().any(|relation| {
+            let (kind, from, to) = match relation {
+                RelationExpectation::Present { kind, from, to, .. }
+                | RelationExpectation::Absent { kind, from, to } => (kind, from, to),
+            };
+            matches!(kind, EdgeKind::ClusterMembership)
+                && ((from == source_id.as_record_id() && to == cluster)
+                    || (to == source_id.as_record_id() && from == cluster))
+        })
+    })
+}
+
+fn evidence_fingerprint(evidence: &EvidenceBundle) -> Result<String, StorageError> {
+    let mut related = evidence
+        .related
+        .iter()
+        .map(candidate_payload)
+        .collect::<Result<Vec<_>, _>>()?;
+    related.sort_by_key(|candidate| candidate["id"].as_str().unwrap_or_default().to_owned());
+    let mut omitted = evidence.coverage.omitted_neighbors.iter().map(|item| {
+        serde_json::json!({ "id": item.id.as_record_id().to_sql(), "reason": omission_name(item.reason) })
+    }).collect::<Vec<_>>();
+    omitted.sort_by_key(|item| item["id"].as_str().unwrap_or_default().to_owned());
+    let value = serde_json::json!({
+        "focal": candidate_payload(&evidence.focal)?,
+        "related": related,
+        "focal_text_complete": evidence.coverage.focal_text_complete,
+        "omitted": omitted,
+        "selection": selection_name(evidence.coverage.selection),
+        "inference_policy": evidence.inference_policy.0,
+    });
+    Ok(sha256(&serde_json::to_vec(&value).map_err(|error| {
+        StorageError::Internal(anyhow::Error::new(error))
+    })?))
+}
+
+fn source_fingerprint(proposal: &ProposalRevision) -> Result<String, StorageError> {
+    let mut sources = proposal
+        .sources
+        .iter()
+        .map(|source| {
+            serde_json::json!({
+                "fact": source.fact.as_record_id().to_sql(),
+                "workspace": source.workspace.as_record_id().to_sql(),
+                "scope": scope_value(&source.scope),
+                "version": source.version.get(),
+                "semantic_hash": source.semantic_hash,
+                "graph": source.graph.iter().map(relation_value).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    sources.sort_by_key(|source| source["fact"].as_str().unwrap_or_default().to_owned());
+    let value = serde_json::json!({ "partition": partition_value(&proposal.partition), "sources": sources });
+    Ok(sha256(&serde_json::to_vec(&value).map_err(|error| {
+        StorageError::Internal(anyhow::Error::new(error))
+    })?))
+}
+
+fn candidate_payload(candidate: &Candidate) -> Result<serde_json::Value, StorageError> {
+    Ok(serde_json::json!({
+        "id": candidate.id.as_record_id().to_sql(),
+        "partition": partition_value(&candidate.partition),
+        "version": candidate.version.get(),
+        "complete_content": candidate.complete_content,
+        "tags": candidate.tags,
+        "provenance": candidate.provenance,
+        "semantic_hash": candidate.semantic_hash,
+    }))
+}
+
+fn proposal_payload(proposal: &ProposalRevision) -> Result<String, StorageError> {
+    let value = serde_json::json!({
+        "category": category_name(proposal.category),
+        "operation": operation_value(&proposal.proposed),
+        "sources": proposal.sources.iter().map(source_value).collect::<Vec<_>>(),
+        "evidence": {
+            "focal": candidate_payload(&proposal.evidence.focal)?,
+            "related": proposal.evidence.related.iter().map(candidate_payload).collect::<Result<Vec<_>, _>>()?,
+            "coverage": {
+                "complete": proposal.evidence.coverage.focal_text_complete,
+                "selection": selection_name(proposal.evidence.coverage.selection),
+                "omitted": proposal.evidence.coverage.omitted_neighbors.iter().map(|item| serde_json::json!({"id": item.id.as_record_id().to_sql(), "reason": omission_name(item.reason)})).collect::<Vec<_>>(),
+            },
+            "inference_policy": proposal.evidence.inference_policy.0,
+        },
+        "relationship_effects": proposal.approved_relationship_effects.iter().map(|effect| effect_value(effect, &proposal.partition.workspace.as_record_id().to_sql())).collect::<Vec<_>>(),
+        "rationale": proposal.rationale,
+        "uncertainty": proposal.uncertainty,
+        "origin_policy": {
+            "account": proposal.origin_policy.account.as_record_id().to_sql(),
+            "consent_revision": proposal.origin_policy.consent_revision,
+            "owner_mode_revision": proposal.origin_policy.owner_mode_revision,
+            "inference_policy_id": proposal.origin_policy.inference_policy_id.0,
+            "configured_revision": proposal.origin_policy.configured_revision,
+            "mode": format!("{:?}", proposal.origin_policy.mode),
+        },
+    });
+    serde_json::to_string(&value).map_err(|error| StorageError::Internal(anyhow::Error::new(error)))
+}
+
+fn category_name(category: ProposalCategory) -> &'static str {
+    match category {
+        ProposalCategory::Rewrite => "rewrite",
+        ProposalCategory::Consolidate => "consolidate",
+        ProposalCategory::Contradiction => "contradiction",
+        ProposalCategory::Noise => "noise",
+        ProposalCategory::Supersede => "supersede",
+        ProposalCategory::Split => "split",
+    }
+}
+
+fn source_value(source: &ExpectedState) -> serde_json::Value {
+    serde_json::json!({
+        "fact": source.fact.as_record_id().to_sql(),
+        "workspace": source.workspace.as_record_id().to_sql(),
+        "scope": scope_value(&source.scope),
+        "version": source.version.get(),
+        "semantic_hash": source.semantic_hash,
+        "graph": source.graph.iter().map(relation_value).collect::<Vec<_>>(),
+    })
+}
+
+fn relation_value(relation: &RelationExpectation) -> serde_json::Value {
+    let (kind, from, to, edge, present) = match relation {
+        RelationExpectation::Present {
+            kind,
+            from,
+            to,
+            edge,
+        } => (kind, from, to, edge.as_ref(), true),
+        RelationExpectation::Absent { kind, from, to } => (kind, from, to, None, false),
+    };
+    serde_json::json!({
+        "kind": kind.effect(),
+        "from": from.to_sql(),
+        "to": to.to_sql(),
+        "edge": edge.map(|id| id.to_sql()),
+        "present": present,
+    })
+}
+
+fn operation_value(operation: &QualityOperation) -> serde_json::Value {
+    use QualityOperation::*;
+    match operation {
+        Rewrite { source, content } => {
+            serde_json::json!({"kind":"rewrite","source":source.as_record_id().to_sql(),"content":content})
+        }
+        Consolidate { canonical, sources } => {
+            serde_json::json!({"kind":"consolidate","canonical":canonical.as_record_id().to_sql(),"sources":sources.iter().map(|id| id.as_record_id().to_sql()).collect::<Vec<_>>()})
+        }
+        Contradiction { sources } => {
+            serde_json::json!({"kind":"contradiction","sources":sources.iter().map(|id| id.as_record_id().to_sql()).collect::<Vec<_>>()})
+        }
+        Noise { source } => {
+            serde_json::json!({"kind":"noise","source":source.as_record_id().to_sql()})
+        }
+        Supersede {
+            source,
+            replacement,
+        } => {
+            serde_json::json!({"kind":"supersede","source":source.as_record_id().to_sql(),"replacement":replacement.as_record_id().to_sql()})
+        }
+        Split { source, parts } => {
+            serde_json::json!({"kind":"split","source":source.as_record_id().to_sql(),"parts":parts})
+        }
+        NoSafeChange => serde_json::json!({"kind":"no_safe_change"}),
+    }
+}
+
+fn effect_value(effect: &ApprovedRelationshipEffect, workspace: &str) -> serde_json::Value {
+    use ApprovedRelationshipEffect::*;
+    match effect {
+        LinkSourceToSource { source, target } => {
+            serde_json::json!({"kind":"link_source_to_source","source":source.as_record_id().to_sql(),"target":target.as_record_id().to_sql()})
+        }
+        RemoveSourceMembership { source, cluster } => {
+            serde_json::json!({"kind":"remove_source_membership","source":source.as_record_id().to_sql(),"cluster":cluster.to_sql()})
+        }
+        AddSourceMembership { source, cluster } => {
+            serde_json::json!({"kind":"add_source_membership","source":source.as_record_id().to_sql(),"cluster":cluster.to_sql()})
+        }
+        GeneratedEndpoint { operation, slot } => {
+            serde_json::json!({"kind":"generated_endpoint","operation":operation.as_str(),"slot":slot,"endpoint":generated_endpoint_id(operation, *slot, workspace).to_sql()})
+        }
+    }
+}
+
+fn generated_endpoint_id(operation: &OperationId, slot: u16, workspace: &str) -> RecordId {
+    let material = format!("{workspace}:{}:{slot}", operation.as_str());
+    let digest = sha256(material.as_bytes());
+    RecordId::new("fact", format!("refinement-{}", &digest[..32]))
+}
+
+fn partition_value(partition: &Partition) -> serde_json::Value {
+    serde_json::json!({
+        "workspace": partition.workspace.as_record_id().to_sql(),
+        "scope": scope_value(&partition.scope),
+    })
+}
+
+fn selection_name(selection: EvidenceSelectionKind) -> &'static str {
+    match selection {
+        EvidenceSelectionKind::Scheduled => "scheduled",
+        EvidenceSelectionKind::OwnerSelected => "owner_selected",
+    }
+}
+
+fn omission_name(reason: crate::models::refinement::OmissionReason) -> &'static str {
+    use crate::models::refinement::OmissionReason::*;
+    match reason {
+        OutsideSelection => "outside_selection",
+        NeighborLimit => "neighbor_limit",
+        ByteLimit => "byte_limit",
+        Ineligible => "ineligible",
+    }
+}
+
+fn scope_value(scope: &MemoryScope) -> serde_json::Value {
+    match scope {
+        MemoryScope::Personal => serde_json::json!({"kind":"personal"}),
+        MemoryScope::Project(project) => {
+            serde_json::json!({"kind":"project","project":project.as_record_id().to_sql()})
+        }
+        MemoryScope::Unassigned => serde_json::json!({"kind":"unassigned"}),
+    }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn evidence_row(
+    owner: &OwnerContext,
+    proposal: &ProposalRevision,
+) -> Result<EvidenceRecord, StorageError> {
+    let (scope, project) = scope_fields(&proposal.partition.scope);
+    let payload = serde_json::json!({
+        "focal": candidate_payload(&proposal.evidence.focal)?,
+        "related": proposal.evidence.related.iter().map(candidate_payload).collect::<Result<Vec<_>, _>>()?,
+        "coverage": {
+            "focal_text_complete": proposal.evidence.coverage.focal_text_complete,
+            "selection": format!("{:?}", proposal.evidence.coverage.selection),
+            "omitted": proposal.evidence.coverage.omitted_neighbors.iter().map(|item| serde_json::json!({"id":item.id.as_record_id().to_sql(),"reason":format!("{:?}",item.reason)})).collect::<Vec<_>>(),
+        },
+    });
+    let payload = serde_json::to_string(&payload)
+        .map_err(|error| StorageError::Internal(anyhow::Error::new(error)))?;
+    Ok(EvidenceRecord {
+        account: owner.account().as_record_id().clone(),
+        workspace: owner.workspace().as_record_id().clone(),
+        project,
+        scope,
+        focal: proposal.evidence.focal.id.as_record_id().clone(),
+        related: proposal
+            .evidence
+            .related
+            .iter()
+            .map(|candidate| candidate.id.as_record_id().clone())
+            .collect(),
+        inference_policy_id: proposal.evidence.inference_policy.0.clone(),
+        payload,
+    })
+}
+
+fn proposal_record(
+    owner: &OwnerContext,
+    proposal: &ProposalRevision,
+    evidence: RecordId,
+    evidence_fingerprint: String,
+    source_fingerprint: String,
+    proposal_payload: String,
+) -> ProposalRecord {
+    let (scope, project) = scope_fields(&proposal.partition.scope);
+    let proposal_key = sha256(format!("{evidence_fingerprint}:{source_fingerprint}").as_bytes());
+    ProposalRecord {
+        account: owner.account().as_record_id().clone(),
+        workspace: owner.workspace().as_record_id().clone(),
+        project,
+        scope,
+        proposal_key,
+        revision: proposal.revision.get(),
+        state: proposal.state,
+        needs_human: proposal.needs_human,
+        deferred: proposal.deferred,
+        evidence,
+        origin_policy: AuthorityRecord {
+            account: proposal.origin_policy.account.as_record_id().clone(),
+            consent_revision: proposal.origin_policy.consent_revision,
+            owner_mode_revision: proposal.origin_policy.owner_mode_revision,
+            inference_policy_id: proposal.origin_policy.inference_policy_id.0.clone(),
+            configured_revision: proposal.origin_policy.configured_revision,
+            mode: proposal.origin_policy.mode,
+        },
+        evidence_fingerprint,
+        source_fingerprint,
+        proposal_payload,
+    }
+}
+
+fn scope_fields(scope: &MemoryScope) -> (String, Option<RecordId>) {
+    match scope {
+        MemoryScope::Personal => ("personal".into(), None),
+        MemoryScope::Project(project) => ("project".into(), Some(project.as_record_id().clone())),
+        MemoryScope::Unassigned => ("unassigned".into(), None),
     }
 }
 

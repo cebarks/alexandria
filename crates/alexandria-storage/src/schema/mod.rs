@@ -38,6 +38,11 @@ pub const MIGRATIONS: &[(u32, &str, &str)] = &[
         include_str!("v010_scoped_sessions.surql"),
     ),
     (11, "refinement", include_str!("v011_refinement.surql")),
+    (
+        12,
+        "refinement_proposals",
+        include_str!("v012_refinement_proposals.surql"),
+    ),
 ];
 
 /// Version a fully migrated database reports in `system_config.schema_version`.
