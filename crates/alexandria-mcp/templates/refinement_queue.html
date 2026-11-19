@@ -1,0 +1,43 @@
+{% extends "layout.html" %}
+{% block title %}Refinement queue{% endblock %}
+{% block body %}
+<h1>Quality refinement</h1>
+<p>{{ message }}</p>
+<p>{{ approval_mode }}. Opening or filtering this page never queues an attempt or applies a proposal.</p>
+<p class="warning">Quarantined Unassigned records remain quarantined when classified. Classification can make pending quality work stale; reload and review the proposal afterward.</p>
+<p>For quarantined Unassigned records, assess → apply → classify, or classify first and request a fresh assessment.</p>
+<p>Each proposal names all selected records in its source column and detail view; review one proposal at a time.</p>
+<form method="get" action="/debug/refinement">
+  <label for="scope-filter">Filter proposals by scope</label>
+  <select id="scope-filter" name="scope">
+    <option value="all" {% if filter_scope == "all" %}selected{% endif %}>All scopes</option>
+    <option value="personal" {% if filter_scope == "personal" %}selected{% endif %}>Personal</option>
+    <option value="project" {% if filter_scope == "project" %}selected{% endif %}>Projects</option>
+    <option value="unassigned" {% if filter_scope == "unassigned" %}selected{% endif %}>Unassigned</option>
+  </select>
+  <button type="submit">Filter</button>
+</form>
+<p>Attempt and quota status: {{ attempt_status }}. The queue does not imply an inference call was made.</p>
+<table>
+  <thead><tr><th>Proposal</th><th>State</th><th>Scope</th><th>Selected records</th><th>Changes and rationale</th><th>Uncertainty</th><th>Model disclosure</th></tr></thead>
+  <tbody>
+  {% if rows.is_empty() %}
+    <tr><td colspan="7" class="empty">No proposals match this scope filter.</td></tr>
+  {% else %}
+    {% for row in rows %}
+    <tr>
+      <td><a href="/debug/refinement/proposals/{{ row.id|urlencode }}">{{ row.id }} · revision {{ row.revision }}</a>{% if row.needs_human %}<span class="badge">human review</span>{% endif %}{% if row.deferred %}<span class="badge">deferred</span>{% endif %}</td>
+      <td>{{ row.state }}</td>
+      <td>{% if row.scope == "unassigned" %}<strong>Unassigned</strong> <span class="badge-quarantined">quarantined review scope</span>{% else %}{{ row.scope }}{% endif %}</td>
+      <td>{{ row.sources }}</td>
+      <td>{{ row.changes }}<br>{{ row.rationale }}</td>
+      <td>{{ row.uncertainty }}</td>
+      <td>{{ row.model_disclosure }}</td>
+    </tr>
+    {% endfor %}
+  {% endif %}
+  </tbody>
+</table>
+<p class="note">Worker quota and attempt controls are unavailable until the refinement worker service is integrated; no counts are inferred or fabricated here.</p>
+<p><a href="/debug/refinement/settings">Consent and review settings</a></p>
+{% endblock %}

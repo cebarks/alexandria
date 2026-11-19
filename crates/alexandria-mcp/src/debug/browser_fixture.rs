@@ -239,6 +239,14 @@ async fn owner_browser_fixture() {
                     "scopes": mixed,
                     "expect": "session prose appears only there, and this session is labelled mixed"
                 },
+                "refinement_owner_controls": {
+                    "queue": "/debug/refinement",
+                    "settings": "/debug/refinement/settings",
+                    "expect": "owner-only queue and destination disclosure; human approval is default; consent and mode forms require the rendered CSRF token and expected revisions; GET does not enqueue or apply"
+                },
+                "private_refinement_history": {
+                    "expect": "proposal detail shows only this owner's source, changes, rationale, uncertainty, linked operation and exact private before/after history; operator health contains no proposal rows"
+                },
                 "foreign_visibility": {
                     "bob_row": foreign,
                     "expect": "Alice's pages never show Bob's content"

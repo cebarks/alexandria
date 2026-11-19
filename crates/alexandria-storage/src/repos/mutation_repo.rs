@@ -3120,16 +3120,16 @@ pub const FINISH_OPERATION_SQL: &str = "UPDATE type::record('semantic_operation'
      $now RETURN AFTER;";
 
 pub const HISTORY_SQL: &str = "SELECT id, kind, operation_key, actor, committed_at, \
-     expected_effects, actual_effects, request_fingerprint, preimages, postimages FROM \
+     expected_effects, actual_effects, request_fingerprint, preimages, postimages, reverts, reverted_by FROM \
      semantic_operation WHERE workspace = $workspace ORDER BY created_at DESC, id DESC LIMIT \
      $limit;";
 
 pub const OPERATION_SQL: &str = "SELECT id, kind, operation_key, actor, committed_at, \
-     expected_effects, actual_effects, request_fingerprint, preimages, postimages FROM \
+     expected_effects, actual_effects, request_fingerprint, preimages, postimages, reverts, reverted_by FROM \
      semantic_operation WHERE workspace = $workspace AND operation_key = $key LIMIT 1;";
 
 pub const OPERATION_BY_ID_SQL: &str = "SELECT id, kind, operation_key, actor, committed_at, \
-     expected_effects, actual_effects, request_fingerprint, preimages, postimages FROM \
+     expected_effects, actual_effects, request_fingerprint, preimages, postimages, reverts, reverted_by FROM \
      type::record('semantic_operation', $key) WHERE id = $id AND workspace = $workspace LIMIT 1;";
 
 pub const SNAPSHOT_READ_SQL: &str = "SELECT * FROM type::record('semantic_snapshot', $key) WHERE \
@@ -3485,6 +3485,8 @@ struct JournalRow {
     request_fingerprint: String,
     preimages: Vec<RecordId>,
     postimages: Vec<RecordId>,
+    reverts: Option<RecordId>,
+    reverted_by: Option<RecordId>,
 }
 
 impl JournalRow {
@@ -3539,6 +3541,8 @@ impl JournalRow {
             operation_key: self.operation_key,
             actor,
             committed_at: self.committed_at,
+            reverts: self.reverts.as_ref().map(crate::record_id_to_string),
+            reverted_by: self.reverted_by.as_ref().map(crate::record_id_to_string),
             expected_effects: self.expected_effects,
             actual_effects: self.actual_effects.unwrap_or_default(),
             preimages,

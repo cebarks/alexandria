@@ -10,6 +10,7 @@ pub mod maintenance;
 pub mod memories;
 pub mod operations;
 pub mod query;
+pub mod refinement;
 pub mod reminder_mapping;
 pub mod sessions;
 pub mod web;
@@ -183,6 +184,29 @@ fn build(server: AlexandriaServer, ctx: Option<DebugContext>, state: guard::Guar
         // Owner's private journal: the exact before/after of every change this account made. Both routes
         // resolve through `MutationRepo`, which authorises the operation row *and each snapshot it names*, so
         // a forged or foreign link answers as an absent one.
+        .route("/debug/refinement", get(refinement::queue))
+        .route("/debug/refinement/proposals/{id}", get(refinement::detail))
+        .route("/debug/refinement/settings", get(refinement::settings))
+        .route("/debug/refinement/consent", post(refinement::consent))
+        .route("/debug/refinement/mode", post(refinement::mode))
+        .route("/debug/refinement/enqueue", post(refinement::enqueue))
+        .route(
+            "/debug/refinement/proposals/{id}/approve",
+            post(refinement::approve),
+        )
+        .route(
+            "/debug/refinement/proposals/{id}/dismiss",
+            post(refinement::dismiss),
+        )
+        .route(
+            "/debug/refinement/proposals/{id}/defer",
+            post(refinement::defer),
+        )
+        .route(
+            "/debug/refinement/proposals/{id}/revert",
+            post(refinement::revert),
+        )
+        .route("/debug/refinement/attempts/{id}", get(refinement::attempt))
         .route("/debug/operations", get(operations::list))
         .route("/debug/operations/{id}", get(operations::detail))
         // Task 11's owner surface. Every route here is one line on purpose: the route matrix finds mounts

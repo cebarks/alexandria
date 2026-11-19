@@ -1,10 +1,12 @@
 //! Account-bound refinement policy, proposal persistence and scoped evidence reads. No inference.
 
 use std::collections::BTreeSet;
-use std::ops::AsyncFn;
+use std::future::Future;
+use std::ops::AsyncFnMut;
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::method::Transaction;
 use surrealdb::types::{AlreadyExistsError, RecordId, SurrealValue, ToSql, Value};
@@ -19,19 +21,30 @@ use crate::models::mutation::{EdgeKind, ExpectedState, RelationExpectation};
 use crate::models::refinement::{
     ApprovalMode, ApprovalSetting, ApprovedRelationshipEffect, Candidate, ConfiguredPolicy,
     Consent, ConsentChoice, EffectivePolicy, EvidenceBundle, EvidenceSelectionKind,
-    InferencePolicyId, PolicyRevision, PolicyVersion, ProposalCategory, ProposalRevision,
-    ProposalState, QualityOperation, RouteDestinationId,
+    InferencePolicyId, PolicyRevision, PolicyVersion, ProposalCategory, ProposalDisplay,
+    ProposalRevision, ProposalState, QualityOperation, RouteDestinationId,
 };
 
 mod candidates;
+mod work;
 
 pub use candidates::{
     CandidateCheckpoint, CandidateCursor, CandidatePage, EvidenceOutcome, EvidenceSelection,
+};
+pub use work::{
+    AttemptId, AttemptState, AttemptView, BudgetDenial, BudgetRepo, CallLimits, EnqueueRequest,
+    PassId, QueuedWork, Reservation, Usage, WorkKind, WorkSelection, admission, current_authority,
 };
 
 pub struct RefinementRepo<'a> {
     db: &'a Database,
 }
+
+pub const MAX_OWNER_PROPOSALS: usize = 100;
+
+const OWNER_PROPOSALS_SQL: &str = "SELECT id, revision, state, needs_human, deferred, scope, project, proposal_payload, origin_policy, operation, created_at FROM refinement_proposal WHERE account = $account AND workspace = $workspace ORDER BY created_at DESC, id DESC LIMIT $limit";
+const OWNER_PROPOSALS_SCOPE_SQL: &str = "SELECT id, revision, state, needs_human, deferred, scope, project, proposal_payload, origin_policy, operation, created_at FROM refinement_proposal WHERE account = $account AND workspace = $workspace AND scope = $scope ORDER BY created_at DESC, id DESC LIMIT $limit";
+const OWNER_PROPOSAL_SQL: &str = "SELECT id, revision, state, needs_human, deferred, scope, project, proposal_payload, origin_policy, operation, created_at FROM refinement_proposal WHERE id = $id AND account = $account AND workspace = $workspace LIMIT 1";
 
 impl<'a> RefinementRepo<'a> {
     pub fn new(db: &'a Database) -> Self {
@@ -167,6 +180,70 @@ impl<'a> RefinementRepo<'a> {
         self.persist(owner, alternative, true).await
     }
 
+    /// List this owner's proposal revisions, optionally restricted to one scope family.
+    pub async fn owner_proposals(
+        &self,
+        owner: &OwnerContext,
+        scope: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ProposalDisplay>, StorageError> {
+        if scope.is_some_and(|scope| !matches!(scope, "personal" | "project" | "unassigned")) {
+            return Err(StorageError::InvalidInput(
+                "unknown refinement scope".into(),
+            ));
+        }
+        let limit = limit.clamp(1, MAX_OWNER_PROPOSALS) as i64;
+        let mut query = match scope {
+            Some(_) => self.db.inner().query(OWNER_PROPOSALS_SCOPE_SQL),
+            None => self.db.inner().query(OWNER_PROPOSALS_SQL),
+        }
+        .bind(("account", owner.account().as_record_id().clone()))
+        .bind(("workspace", owner.workspace().as_record_id().clone()))
+        .bind(("limit", limit));
+        if let Some(scope) = scope {
+            query = query.bind(("scope", scope.to_string()));
+        }
+        let rows: Vec<ProposalDisplayRow> = query
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        Ok(rows
+            .into_iter()
+            .map(ProposalDisplayRow::into_display)
+            .collect())
+    }
+
+    /// Resolve one proposal only inside the signed-in owner's workspace and account.
+    pub async fn owner_proposal(
+        &self,
+        owner: &OwnerContext,
+        id: &RecordId,
+    ) -> Result<Option<ProposalDisplay>, StorageError> {
+        if id.table.as_str() != "refinement_proposal" {
+            return Ok(None);
+        }
+        let rows: Vec<ProposalDisplayRow> = self
+            .db
+            .inner()
+            .query(OWNER_PROPOSAL_SQL)
+            .bind(("id", id.clone()))
+            .bind(("account", owner.account().as_record_id().clone()))
+            .bind(("workspace", owner.workspace().as_record_id().clone()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(ProposalDisplayRow::into_display))
+    }
+
     /// Publish operator configuration. A disable is durable but does not delete the last
     /// destinations, consent, or evidence. Even an A -> B -> A transition advances the generation.
     pub async fn reconcile_policy(
@@ -205,8 +282,9 @@ impl<'a> RefinementRepo<'a> {
         choice: ConsentChoice,
         now: DateTime<Utc>,
     ) -> Result<Consent, StorageError> {
-        self.write(async |tx| {
-            claim_owner(tx, owner).await?;
+        let owner = owner.clone();
+        self.write(async move |tx| {
+            claim_owner(tx, &owner).await?;
             let account = owner.account();
             let id = owned_id("refinement_consent", account);
             let previous: Option<ConsentRow> = select_record(tx, id.clone()).await?;
@@ -263,12 +341,14 @@ impl<'a> RefinementRepo<'a> {
         expected_policy: &PolicyVersion,
         mode: ApprovalMode,
     ) -> Result<ApprovalSetting, StorageError> {
-        self.write(async |tx| {
-            claim_owner(tx, owner).await?;
+        let owner = owner.clone();
+        let expected_policy = *expected_policy;
+        self.write(async move |tx| {
+            claim_owner(tx, &owner).await?;
             let account = owner.account();
             let snapshot = PolicySnapshot::read(tx, account).await?;
             let effective = snapshot.effective()?;
-            if effective.version() != *expected_policy {
+            if effective.version() != expected_policy {
                 return Err(StorageError::Stale);
             }
             if mode == ApprovalMode::SecondaryLlm
@@ -304,20 +384,28 @@ impl<'a> RefinementRepo<'a> {
         .await
     }
 
-    pub async fn effective_policy(
+    pub fn effective_policy(
         &self,
         owner: &OwnerContext,
-    ) -> Result<EffectivePolicy, StorageError> {
-        self.resolve(owner.account(), Some(owner)).await
+    ) -> impl Future<Output = Result<EffectivePolicy, StorageError>> + Send + 'static {
+        let db = self.db.inner().clone();
+        let account = owner.account().clone();
+        let owner = owner.clone();
+        async move { Self::resolve(db, account, Some(owner)).await }
     }
 
-    pub async fn scheduled_policy(
+    pub fn scheduled_policy(
         &self,
         system: &SystemContext,
         account: &AccountId,
-    ) -> Result<EffectivePolicy, StorageError> {
-        self.require_system(system)?;
-        self.resolve(account, None).await
+    ) -> impl Future<Output = Result<EffectivePolicy, StorageError>> + Send + 'static {
+        let authority = self.require_system(system);
+        let db = self.db.inner().clone();
+        let account = account.clone();
+        async move {
+            authority?;
+            Self::resolve(db, account, None).await
+        }
     }
 
     fn require_system(&self, system: &SystemContext) -> Result<(), StorageError> {
@@ -329,23 +417,23 @@ impl<'a> RefinementRepo<'a> {
     }
 
     async fn resolve(
-        &self,
-        account: &AccountId,
-        owner: Option<&OwnerContext>,
+        db: Surreal<Any>,
+        account: AccountId,
+        owner: Option<OwnerContext>,
     ) -> Result<EffectivePolicy, StorageError> {
-        let tx = self.db.inner().clone().begin().await.map_err(internal)?;
+        let tx = db.begin().await.map_err(internal)?;
         let result = async {
-            require_active(&tx, account, owner).await?;
-            PolicySnapshot::read(&tx, account).await?.effective()
+            require_active(&tx, &account, owner.as_ref()).await?;
+            PolicySnapshot::read(&tx, &account).await?.effective()
         }
         .await;
         tx.cancel().await.map_err(internal)?;
         result
     }
 
-    async fn write<T>(
+    async fn write<T: Send>(
         &self,
-        action: impl AsyncFn(&Transaction<Any>) -> Result<T, StorageError>,
+        mut action: impl AsyncFnMut(&Transaction<Any>) -> Result<T, StorageError> + Send,
     ) -> Result<T, StorageError> {
         for _ in 0..GUARD_CONFLICT_ATTEMPTS {
             let tx = self.db.inner().clone().begin().await.map_err(internal)?;
@@ -386,6 +474,39 @@ struct ProposalRecord {
     evidence_fingerprint: String,
     source_fingerprint: String,
     proposal_payload: String,
+}
+
+#[derive(SurrealValue)]
+struct ProposalDisplayRow {
+    id: RecordId,
+    revision: u64,
+    state: ProposalState,
+    needs_human: bool,
+    deferred: bool,
+    scope: String,
+    project: Option<RecordId>,
+    proposal_payload: String,
+    origin_policy: AuthorityRecord,
+    operation: Option<RecordId>,
+    created_at: DateTime<Utc>,
+}
+
+impl ProposalDisplayRow {
+    fn into_display(self) -> ProposalDisplay {
+        ProposalDisplay {
+            id: self.id,
+            revision: self.revision,
+            state: self.state,
+            needs_human: self.needs_human,
+            deferred: self.deferred,
+            scope: self.scope,
+            project: self.project,
+            proposal_payload: self.proposal_payload,
+            origin_inference_policy_id: self.origin_policy.inference_policy_id,
+            operation: self.operation,
+            created_at: self.created_at,
+        }
+    }
 }
 
 #[derive(Clone, SurrealValue)]
@@ -1238,10 +1359,25 @@ fn can_retry(error: &StorageError) -> bool {
         && let Some(error) = cause.downcast_ref::<surrealdb::Error>()
     {
         return is_write_conflict(error)
+            || is_commit_conflict(error)
             || matches!(
                 error.already_exists_details(),
                 Some(AlreadyExistsError::Record { .. })
             );
     }
     false
+}
+
+/// A commit-time transaction conflict, as the pinned embedded engine reports it.
+///
+/// The local engine converts commit failures with `Error::internal(error.to_string())`
+/// (`surrealdb-engine-local` 3.3.0, `std_error_to_types_error`), so the kvs layer's retryable
+/// `TransactionConflict` reaches the SDK as a message-only internal error: the structured
+/// `QueryError::TransactionConflict` details that [`is_write_conflict`] reads only survive
+/// the statement-execution path, never the commit path. The engine is pinned `=3.3.0` — a
+/// storage-format decision — so the prefix its own `Display` produces is a pinned contract,
+/// not a moving string. The details guard keeps this a fallback for exactly the shape the
+/// typed channel cannot carry.
+fn is_commit_conflict(error: &surrealdb::Error) -> bool {
+    error.query_details().is_none() && error.to_string().starts_with("Transaction conflict:")
 }

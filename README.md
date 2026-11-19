@@ -308,6 +308,14 @@ Two consequences of that boundary are deliberate and worth stating before they s
 - **Reminder mapping** (`/debug/reminder-mapping`) — owner-only review of every held legacy target, including
   original free-text target and an exact hold count. Releasing a hold requires a revision-current choice
   of Personal or an owned project; it does not rewrite the historical target or reset schedule/delivery state.
+- **Refinement** (`/debug/refinement`) — owner/workspace-filtered proposal queue and detail pages, with selected
+  source records, proposed changes, rationale, uncertainty, model-policy comparison and linked private
+  application pre/postimages/revert status. The settings page discloses endpoints and model names (never
+  credentials), exposes revision-checked consent/revocation and review-mode controls, and makes human review
+  the default. Unassigned proposals are marked and filterable; classification may stale pending work.
+  Enqueue/attempt polling and proposal decision/apply/revert actions remain unavailable until the durable
+  Task 19/20 worker and application services are integrated, so opening a page never starts inference or
+  applies a proposal. Queue quota/attempt counts are explicitly unavailable rather than estimated.
 - **Query Tester** (`/debug/query`, `POST /debug/query/run`) — run `retrieve_memories`/`recall` live
   against the real embedding model to sanity-check retrieval quality, from inside the signed-in
   account's own population, with optional `session_id` scoping and a **Dry run** checkbox. Results

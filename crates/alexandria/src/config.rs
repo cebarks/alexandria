@@ -994,7 +994,49 @@ loopback_development = true
     }
 
     #[test]
+    fn dreaming_refinement_interval_must_be_positive_even_without_routes() {
+        let default = Config::from_toml("").unwrap();
+        assert_eq!(default.refinement.interval_secs, 86_400);
+        let custom = Config::from_toml("[refinement]\ninterval_secs = 123\n").unwrap();
+        assert_eq!(custom.refinement.interval_secs, 123);
+        assert!(custom.refinement.resolve().is_ok());
+        let zero = Config::from_toml("[refinement]\ninterval_secs = 0\n");
+        assert!(
+            zero.and_then(|config| config.refinement.resolve()).is_err(),
+            "a zero interval would hot-loop the refinement enqueue tick"
+        );
+    }
+
+    #[test]
     fn test_server_fallback_defaults_match_config_defaults() {
+        use alexandria_engine::refinement::{budget, schedule};
+        use alexandria_mcp::refinement::worker::WorkerSettings;
+
+        assert_eq!(
+            RefinementConfig::default().interval_secs,
+            schedule::DEFAULT_INTERVAL_SECS
+        );
+        let refinement = WorkerSettings::default();
+        assert_eq!(refinement.calls.pass, budget::MAX_ATTEMPTS_PER_PASS);
+        assert_eq!(refinement.calls.account, budget::MAX_ATTEMPTS_PER_ACCOUNT);
+        assert_eq!(
+            refinement.calls.interactive,
+            budget::MAX_INTERACTIVE_ATTEMPTS_PER_ACCOUNT
+        );
+        assert_eq!(refinement.calls.global, budget::MAX_GLOBAL_ATTEMPTS);
+        assert_eq!(refinement.max_focals_per_pass, budget::MAX_FOCALS_PER_PASS);
+        assert_eq!(
+            refinement.max_neighbors_per_focal,
+            budget::MAX_NEIGHBORS_PER_FOCAL
+        );
+        assert_eq!(refinement.max_request_bytes, budget::MAX_REQUEST_BYTES);
+        assert_eq!(refinement.max_response_bytes, budget::MAX_RESPONSE_BYTES);
+        assert_eq!(refinement.max_output_tokens, budget::MAX_OUTPUT_TOKENS);
+        assert_eq!(
+            refinement.request_deadline_secs,
+            budget::REQUEST_DEADLINE_SECS
+        );
+        assert_eq!(refinement.pass_active_secs, budget::PASS_ACTIVE_SECS);
         assert_eq!(
             RetrieveConfig::default().min_similarity,
             alexandria_engine::search::DEFAULT_MIN_SIMILARITY

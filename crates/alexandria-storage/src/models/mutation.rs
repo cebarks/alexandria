@@ -1507,6 +1507,8 @@ pub struct OperationDetail {
     pub operation_key: String,
     pub actor: String,
     pub committed_at: Option<DateTime<Utc>>,
+    pub reverts: Option<String>,
+    pub reverted_by: Option<String>,
     pub expected_effects: Vec<String>,
     pub actual_effects: Vec<String>,
     pub preimages: Vec<SemanticSnapshot>,

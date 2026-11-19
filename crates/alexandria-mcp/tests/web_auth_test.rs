@@ -892,6 +892,35 @@ fn private_routes() -> Vec<(&'static str, &'static str)> {
         // own prose, so it is enumerated exactly like the pages that withhold it.
         ("GET", "/debug/collections/archive"),
         ("GET", "/debug/classification"),
+        ("GET", "/debug/refinement"),
+        ("GET", "/debug/refinement/settings"),
+        (
+            "GET",
+            "/debug/refinement/proposals/refinement_proposal%3Aprobe",
+        ),
+        (
+            "GET",
+            "/debug/refinement/attempts/refinement_attempt%3Aprobe",
+        ),
+        ("POST", "/debug/refinement/consent"),
+        ("POST", "/debug/refinement/mode"),
+        ("POST", "/debug/refinement/enqueue"),
+        (
+            "POST",
+            "/debug/refinement/proposals/refinement_proposal%3Aprobe/approve",
+        ),
+        (
+            "POST",
+            "/debug/refinement/proposals/refinement_proposal%3Aprobe/dismiss",
+        ),
+        (
+            "POST",
+            "/debug/refinement/proposals/refinement_proposal%3Aprobe/defer",
+        ),
+        (
+            "POST",
+            "/debug/refinement/proposals/refinement_proposal%3Aprobe/revert",
+        ),
         ("POST", "/debug/query/run"),
         ("POST", "/debug/logout"),
         ("POST", "/debug/account/tokens"),

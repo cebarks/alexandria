@@ -260,3 +260,19 @@ pub struct ProposalRevision {
     pub needs_human: bool,
     pub deferred: bool,
 }
+
+/// Owner-authorized, read-only projection for the refinement queue and detail page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalDisplay {
+    pub id: RecordId,
+    pub revision: u64,
+    pub state: ProposalState,
+    pub needs_human: bool,
+    pub deferred: bool,
+    pub scope: String,
+    pub project: Option<RecordId>,
+    pub proposal_payload: String,
+    pub origin_inference_policy_id: String,
+    pub operation: Option<RecordId>,
+    pub created_at: DateTime<Utc>,
+}

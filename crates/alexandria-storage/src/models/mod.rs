@@ -39,8 +39,8 @@ pub use mutation::{
 pub use provenance::Provenance;
 pub use refinement::{
     ApprovedRelationshipEffect, Candidate, EvidenceBundle, EvidenceCoverage, EvidenceSelectionKind,
-    OmissionReason, OmittedNeighbor, ProposalCategory, ProposalRevision, ProposalState,
-    QualityOperation, SecondaryVerdict,
+    OmissionReason, OmittedNeighbor, ProposalCategory, ProposalDisplay, ProposalRevision,
+    ProposalState, QualityOperation, SecondaryVerdict,
 };
 pub use reminder::{Reminder, schedule_kind};
 pub use session::{Session, SessionListItem};

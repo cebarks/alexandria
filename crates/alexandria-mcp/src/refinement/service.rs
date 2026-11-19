@@ -5,10 +5,13 @@ use alexandria_storage::Database;
 use alexandria_storage::access::{OwnerContext, SystemContext};
 use alexandria_storage::models::refinement::{
     ApprovalMode, ApprovalSetting, ConfiguredPolicy, Consent, ConsentChoice, EffectivePolicy,
-    InferencePolicyId, PolicyRevision, PolicyVersion, Protocol, RouteDestinationId,
+    InferencePolicyId, PolicyRevision, PolicyVersion, ProposalDisplay, Protocol,
+    RouteDestinationId,
 };
 use alexandria_storage::repos::RefinementRepo;
+use alexandria_storage::repos::refinement_repo::{AttemptId, AttemptView, EnqueueRequest};
 use chrono::Utc;
+use surrealdb::types::RecordId;
 
 use crate::error::ServiceError;
 
@@ -22,6 +25,12 @@ pub struct ReconciledRefinement {
 }
 
 impl ReconciledRefinement {
+    /// The published policy revision this runtime serves under. The worker compares it against
+    /// the store's current configuration before any selection, reservation or call.
+    pub fn policy(&self) -> &PolicyRevision {
+        &self.policy
+    }
+
     pub async fn reconcile(
         db: &Database,
         system: &SystemContext,
@@ -89,6 +98,52 @@ impl<'a> RefinementService<'a> {
         }
     }
 
+    pub async fn enqueue(
+        &self,
+        owner: &OwnerContext,
+        request: EnqueueRequest,
+    ) -> Result<AttemptId, ServiceError> {
+        self.repo
+            .enqueue(owner, request)
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    pub async fn attempt(
+        &self,
+        owner: &OwnerContext,
+        id: &AttemptId,
+    ) -> Result<AttemptView, ServiceError> {
+        self.repo
+            .attempt(owner, id)
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    /// List proposal revisions visible to this owner, scoped in storage by account and workspace.
+    pub async fn owner_proposals(
+        &self,
+        owner: &OwnerContext,
+        scope: Option<&str>,
+    ) -> Result<Vec<ProposalDisplay>, ServiceError> {
+        self.repo
+            .owner_proposals(owner, scope, alexandria_storage::repos::MAX_OWNER_PROPOSALS)
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    /// Resolve a proposal under the same owner/workspace predicate used by the queue.
+    pub async fn owner_proposal(
+        &self,
+        owner: &OwnerContext,
+        id: &RecordId,
+    ) -> Result<Option<ProposalDisplay>, ServiceError> {
+        self.repo
+            .owner_proposal(owner, id)
+            .await
+            .map_err(ServiceError::from)
+    }
+
     /// Compare the displayed consent revision, plus the displayed operator revision in a grant.
     pub async fn consent(
         &self,
@@ -96,11 +151,12 @@ impl<'a> RefinementService<'a> {
         disclosed_revision: u64,
         choice: ConsentChoice,
     ) -> Result<Consent, ServiceError> {
+        let owner = owner.clone();
         if let ConsentChoice::Grant {
             disclosed_policy_revision,
         } = choice
         {
-            let current = self.repo.effective_policy(owner).await?;
+            let current = self.repo.effective_policy(&owner).await?;
             if !self
                 .current_configuration(&current)
                 .is_some_and(|config| config.policy.revision == disclosed_policy_revision)
@@ -110,7 +166,7 @@ impl<'a> RefinementService<'a> {
         }
         // Storage rechecks both revisions and the owner's authority in the write transaction.
         self.repo
-            .set_consent(owner, disclosed_revision, choice, Utc::now())
+            .set_consent(&owner, disclosed_revision, choice, Utc::now())
             .await
             .map_err(ServiceError::from)
     }
@@ -121,16 +177,18 @@ impl<'a> RefinementService<'a> {
         expected_policy: &PolicyVersion,
         mode: ApprovalMode,
     ) -> Result<ApprovalSetting, ServiceError> {
+        let owner = owner.clone();
+        let expected_policy = *expected_policy;
         if mode == ApprovalMode::SecondaryLlm {
-            let current = self.repo.effective_policy(owner).await?;
-            if current.version() != *expected_policy
+            let current = self.repo.effective_policy(&owner).await?;
+            if current.version() != expected_policy
                 || (current.configured.is_some() && self.current_configuration(&current).is_none())
             {
                 return Err(ServiceError::Stale);
             }
         }
         self.repo
-            .set_approval_mode(owner, expected_policy, mode)
+            .set_approval_mode(&owner, &expected_policy, mode)
             .await
             .map_err(ServiceError::from)
     }
@@ -139,7 +197,8 @@ impl<'a> RefinementService<'a> {
         &self,
         owner: &OwnerContext,
     ) -> Result<EffectiveRefinementPolicy, ServiceError> {
-        let mut policy = self.repo.effective_policy(owner).await?;
+        let owner = owner.clone();
+        let mut policy = self.repo.effective_policy(&owner).await?;
         let configured = self.current_configuration(&policy);
         let routes = configured.map(|config| config.routes.disclosure());
         let approval_mode =

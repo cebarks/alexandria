@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fmt};
 
 use alexandria_engine::refinement::policy::{HeaderValue, Protocol, Route, RoutePair};
+use alexandria_engine::refinement::schedule::DEFAULT_INTERVAL_SECS;
 use alexandria_storage::models::refinement::ApprovalMode;
 use anyhow::Context;
 use axum::http::HeaderName;
@@ -13,6 +14,7 @@ mod tests;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RefinementConfig {
+    pub interval_secs: u64,
     pub approval_mode_ceiling: ApprovalMode,
     pub proposer: Option<RouteConfig>,
     pub reviewer: Option<RouteConfig>,
@@ -21,6 +23,7 @@ pub struct RefinementConfig {
 impl Default for RefinementConfig {
     fn default() -> Self {
         Self {
+            interval_secs: DEFAULT_INTERVAL_SECS,
             approval_mode_ceiling: ApprovalMode::Human,
             proposer: None,
             reviewer: None,
@@ -44,6 +47,13 @@ where
 
 impl RefinementConfig {
     pub fn resolve(&self) -> anyhow::Result<Option<RoutePair>> {
+        // Positive even when no routes are configured: a zero interval would make the loop's
+        // separate refinement deadline permanently due, the same hot loop the dreaming loader
+        // refuses to start on for a zero housekeeping interval.
+        anyhow::ensure!(
+            self.interval_secs > 0,
+            "refinement.interval_secs must be positive"
+        );
         let Some(proposer) = &self.proposer else {
             anyhow::ensure!(
                 self.reviewer.is_none(),

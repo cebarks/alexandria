@@ -243,8 +243,8 @@ async fn typed_id(db: &Database, id_sql: &str) -> RecordId {
 async fn the_head_migration_is_registered_and_advances_the_stamped_version() {
     let (head_version, head_name, _) = schema::MIGRATIONS.last().unwrap();
     assert_eq!(
-        *head_name, "refinement_candidate_progress",
-        "the head migration must be v013_refinement_candidate_progress.surql"
+        *head_name, "refinement_work",
+        "the head migration must be v014_refinement_work.surql"
     );
     assert_eq!(schema::LATEST_VERSION, *head_version);
 

@@ -38,7 +38,7 @@ pub use memory_repo::{
 };
 pub use mutation_repo::{MAX_HISTORY_PAGE, MutationRepo};
 pub use mutation_retry::{MAX_PREPARATIONS, commit_prepared};
-pub use refinement_repo::RefinementRepo;
+pub use refinement_repo::{MAX_OWNER_PROPOSALS, RefinementRepo};
 pub use reminder_repo::{NewReminder, ReminderRepo};
 pub use scope::ScopeFilter;
 pub use scoped_activation::{

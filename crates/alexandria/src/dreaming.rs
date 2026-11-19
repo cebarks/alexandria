@@ -33,7 +33,7 @@ use alexandria_storage::models::mutation::{
 use alexandria_storage::models::operation_kind;
 use alexandria_storage::repos::{
     AuditContext, ClusterRepo, ClusterSplit, EdgeRepo, HeatMaterialise, HeatRepo, IdentityRepo,
-    LogEntry, MaintenanceRepo, MemoryRepo, MutationRepo,
+    LogEntry, MaintenanceRepo, MemoryRepo, MutationRepo, RefinementRepo,
 };
 use alexandria_storage::{Database, RecordId, record_id_to_string, system_config};
 use tokio::task::JoinHandle;
@@ -98,6 +98,10 @@ pub(crate) struct Jobs {
     max_rows_per_run: usize,
     cold_heat_floor: f64,
     demote_confidence_ceiling: f64,
+    /// The operator's `[refinement]` section, captured so the loop's separate enqueue cadence
+    /// reads the interval and route state the scheduler was started with, never config at
+    /// call time. The tick itself is a stamp, not inference.
+    refinement: crate::config::RefinementConfig,
 }
 
 impl Jobs {
@@ -117,6 +121,7 @@ impl Jobs {
             max_rows_per_run: config.dreaming.max_rows_per_run,
             cold_heat_floor: config.dreaming.cold_heat_floor,
             demote_confidence_ceiling: config.dreaming.demote_confidence_ceiling,
+            refinement: config.refinement.clone(),
         }
     }
 
@@ -1530,6 +1535,84 @@ pub(crate) fn summary(config: &crate::config::DreamingConfig) -> String {
     )
 }
 
+// The separate refinement enqueue cadence. This is not a sixth housekeeping job: it has no
+// `Job` variant, writes no `maintenance_log` row, and never runs inference inside the loop.
+// The tick only issues (or coalesces onto) one short, durable, idempotent request for a
+// refinement pass; the worker that consumes requests is enabled with Task 20's transactional
+// application consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RefinementEnqueueProgress {
+    last_requested_at: u64,
+    last_completed_at: Option<u64>,
+}
+
+impl Jobs {
+    /// Issue the due refinement enqueue request, if any. `Some` means this tick issued exactly
+    /// one new request; a stamp that is not yet due, and a tick that lost the race to a
+    /// concurrent one, return `None`. Downtime coalesces: any number of missed intervals is one
+    /// request, not a replay per interval.
+    async fn refinement_tick(
+        &self,
+        config: &crate::config::RefinementConfig,
+        now: u64,
+    ) -> anyhow::Result<Option<RefinementEnqueueProgress>> {
+        if config.resolve()?.is_none() {
+            // No routes configured: refinement is off, and this tick is a no-op rather than an
+            // error, exactly like an absent `[refinement]` section.
+            return Ok(None);
+        }
+        let issued = RefinementRepo::new(&self.db)
+            .refinement_enqueue_request(&self.system, config.interval_secs, now)
+            .await?;
+        Ok(
+            issued.map(|(requested, completed)| RefinementEnqueueProgress {
+                last_requested_at: requested,
+                last_completed_at: completed,
+            }),
+        )
+    }
+
+    /// Whether the configured routes enable the refinement cadence at all.
+    fn refinement_enabled(&self) -> bool {
+        matches!(self.refinement.resolve(), Ok(Some(_)))
+    }
+
+    async fn read_refinement_progress(&self) -> anyhow::Result<RefinementEnqueueProgress> {
+        let (requested, completed) = RefinementRepo::new(&self.db)
+            .refinement_progress(&self.system)
+            .await?;
+        Ok(RefinementEnqueueProgress {
+            last_requested_at: requested,
+            last_completed_at: completed,
+        })
+    }
+}
+
+fn refinement_enqueue_summary(progress: RefinementEnqueueProgress) -> String {
+    let requested = progress.last_requested_at;
+    match progress.last_completed_at {
+        Some(completed) if completed == requested => {
+            format!("refinement: request at {requested}s completed")
+        }
+        Some(completed) => {
+            format!("refinement: request at {requested}s queued, last completed at {completed}s")
+        }
+        None => format!("refinement: request at {requested}s queued, never completed"),
+    }
+}
+
+/// The earlier of the housekeeping wait and the refinement deadline. `None` (refinement
+/// disabled) keeps the loop's sleep exactly what it was before the cadence existed.
+fn next_scheduler_wait(housekeeping_wait: u64, refinement_due: Option<u64>, now: u64) -> u64 {
+    let Some(due) = refinement_due else {
+        return housekeeping_wait;
+    };
+    if due <= now {
+        return 0;
+    }
+    (due - now).min(housekeeping_wait)
+}
+
 /// Whether one partition's persisted cursor marks it exhausted. A free function rather than a
 /// closure so the pass can mutate the progress it reads between calls — the cycle wrap resets the
 /// flags this predicate tests.
@@ -1603,6 +1686,20 @@ pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
     // an hour (sweep's cadence) and is read during that sleep would report `NotStarted`, which is a
     // different statement than the truth.
     jobs.liveness.note_start(now_secs());
+    // The refinement enqueue cadence keeps its own deadline, separate from the five jobs'. The
+    // stamp is durable, so a restart or three intervals of downtime still coalesces to one
+    // request; an unreadable stamp disables the branch for this boot rather than guessing.
+    let mut refinement = if jobs.refinement_enabled() {
+        match jobs.read_refinement_progress().await {
+            Ok(progress) => Some(progress),
+            Err(e) => {
+                tracing::warn!("refinement enqueue progress unreadable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     tracing::info!(
         "dreaming scheduler started: sweep {}s, cluster {}s, merge {}s, collapse {}s, appraise {}s",
         jobs.intervals.sweep_secs,
@@ -1613,7 +1710,15 @@ pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
     );
 
     loop {
-        let wait = schedule.next_wait_secs(now_secs());
+        let now = now_secs();
+        let refinement_due = refinement.as_ref().map(|progress| {
+            alexandria_engine::refinement::schedule::next_enqueue_due(
+                Some(progress.last_requested_at),
+                jobs.refinement.interval_secs,
+                now,
+            )
+        });
+        let wait = next_scheduler_wait(schedule.next_wait_secs(now), refinement_due, now);
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
             _ = cancel.cancelled() => break,
@@ -1626,51 +1731,78 @@ pub(crate) async fn run(jobs: Arc<Jobs>, cancel: CancellationToken) {
         // to distinguish from a dead loop.
         jobs.liveness.note_tick(now);
         let due = schedule.due(now);
-        if due.is_empty() {
+        let refinement_due = refinement.as_ref().is_some_and(|progress| {
+            alexandria_engine::refinement::schedule::next_enqueue_due(
+                Some(progress.last_requested_at),
+                jobs.refinement.interval_secs,
+                now,
+            ) <= now
+        });
+        if due.is_empty() && !refinement_due {
             continue;
         }
-        tick += 1;
-        // One id for the whole tick, shared by every job that runs in it. `run_id` is the unit an
-        // operator would reverse, and a tick that split a cluster and then collapsed duplicates into
-        // it is one event, not two.
-        let run_id = tick_run_id(now, tick);
-        for job in due {
-            // Every job runs as a dispatcher pass: the capped jobs as budgeted partition passes,
-            // and the uncapped cluster/merge as one legacy whole-store body plus per-partition
-            // visits — the owned-cluster write path the semantic journal records.
-            let ran = jobs.dispatch_job(job, &run_id).await.map(|pass| {
-                // The pass's own observability, at the same debug level a single
-                // JobReport gets: which partitions ran, which were refused by the
-                // barrier or failed and advanced, and what the pass charged against
-                // its global allowance.
-                tracing::debug!(
-                    job = pass.report.job.as_str(),
-                    visited = pass.visited,
-                    refused = pass.refused,
-                    failed = pass.failed,
-                    budget_used = pass.budget_used,
-                    last_error = ?pass.last_error,
-                    "dreaming pass finished"
-                );
-                pass.report
-            });
-            match ran {
-                Ok(report) => tracing::debug!(
-                    job = report.job.as_str(),
-                    examined = report.examined,
-                    acted = report.acted,
-                    "dreaming job finished"
-                ),
-                Err(e) => tracing::warn!(job = job.as_str(), "dreaming job failed: {e}"),
+        if !due.is_empty() {
+            tick += 1;
+            // One id for the whole tick, shared by every job that runs in it. `run_id` is the unit an
+            // operator would reverse, and a tick that split a cluster and then collapsed duplicates into
+            // it is one event, not two.
+            let run_id = tick_run_id(now, tick);
+            for job in due {
+                // Every job runs as a dispatcher pass: the capped jobs as budgeted partition passes,
+                // and the uncapped cluster/merge as one legacy whole-store body plus per-partition
+                // visits — the owned-cluster write path the semantic journal records.
+                let ran = jobs.dispatch_job(job, &run_id).await.map(|pass| {
+                    // The pass's own observability, at the same debug level a single
+                    // JobReport gets: which partitions ran, which were refused by the
+                    // barrier or failed and advanced, and what the pass charged against
+                    // its global allowance.
+                    tracing::debug!(
+                        job = pass.report.job.as_str(),
+                        visited = pass.visited,
+                        refused = pass.refused,
+                        failed = pass.failed,
+                        budget_used = pass.budget_used,
+                        last_error = ?pass.last_error,
+                        "dreaming pass finished"
+                    );
+                    pass.report
+                });
+                match ran {
+                    Ok(report) => tracing::debug!(
+                        job = report.job.as_str(),
+                        examined = report.examined,
+                        acted = report.acted,
+                        "dreaming job finished"
+                    ),
+                    Err(e) => tracing::warn!(job = job.as_str(), "dreaming job failed: {e}"),
+                }
+                // Stamp with a clock read *after* the job, not the tick's start. `is_due` compares against
+                // this value, so a stamp taken before a job that outlived its own interval leaves it due
+                // again the moment the loop recomputes — `next_wait_secs` returns 0, `sleep(0)` returns
+                // immediately, and the job runs back-to-back with no rest for as long as the overrun
+                // lasts. Every job in the due set shared that one stale stamp, so one slow job also
+                // cancelled the wait of every shorter interval in the tick: precisely the hot loop the
+                // loader refuses to start on for a zero interval.
+                schedule.mark_run(job, now_secs());
             }
-            // Stamp with a clock read *after* the job, not the tick's start. `is_due` compares against
-            // this value, so a stamp taken before a job that outlived its own interval leaves it due
-            // again the moment the loop recomputes — `next_wait_secs` returns 0, `sleep(0)` returns
-            // immediately, and the job runs back-to-back with no rest for as long as the overrun
-            // lasts. Every job in the due set shared that one stale stamp, so one slow job also
-            // cancelled the wait of every shorter interval in the tick: precisely the hot loop the
-            // loader refuses to start on for a zero interval.
-            schedule.mark_run(job, now_secs());
+        }
+        // The separate refinement branch: a short, idempotent enqueue, then continue. No
+        // inference runs here — the worker that consumes these requests is enabled with Task
+        // 20's application consumer — and nothing about it touches the five-job schedule above.
+        if refinement_due {
+            match jobs.refinement_tick(&jobs.refinement, now_secs()).await {
+                Ok(Some(progress)) => {
+                    tracing::debug!(
+                        summary = refinement_enqueue_summary(progress),
+                        "refinement enqueue requested"
+                    );
+                    if let Some(current) = refinement.as_mut() {
+                        *current = progress;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("refinement enqueue failed: {e}"),
+            }
         }
     }
     tracing::debug!("dreaming scheduler stopped");
@@ -1698,6 +1830,187 @@ mod tests {
             .claim_system_authority()
             .expect("a fresh embedded store has an unclaimed system authority");
         (Arc::new(db), system)
+    }
+
+    #[tokio::test]
+    async fn refinement_tick_only_enqueues_and_leaves_five_job_schedule_unchanged() {
+        use alexandria_engine::dreaming::ALL_JOBS;
+
+        let (db, system) = migrated_db().await;
+        let config = configured_refinement(&db, &system).await;
+        let jobs = Jobs::new(Arc::clone(&db), system, &config);
+        let expected = [
+            Job::Sweep,
+            Job::Cluster,
+            Job::Merge,
+            Job::Collapse,
+            Job::Appraise,
+        ];
+        assert_eq!(ALL_JOBS, expected);
+        let schedule = jobs.intervals.initial_schedule(100);
+        let due = schedule.due(100);
+
+        let queued = jobs.refinement_tick(&config.refinement, 100).await.unwrap();
+        assert_eq!(
+            queued,
+            Some(RefinementEnqueueProgress {
+                last_requested_at: 100,
+                last_completed_at: None,
+            })
+        );
+        assert_eq!(
+            schedule.due(100),
+            due,
+            "enqueue must not mark a housekeeping job as run"
+        );
+        let logs = ClusterRepo::new(db.inner())
+            .list_maintenance_logs(10, 0, None)
+            .await
+            .unwrap();
+        assert!(
+            logs.is_empty(),
+            "an enqueue must not produce a maintenance audit row"
+        );
+    }
+
+    #[tokio::test]
+    async fn refinement_downtime_coalesces_one_enqueue() {
+        let (db, system) = migrated_db().await;
+        let config = configured_refinement(&db, &system).await;
+        let jobs = Jobs::new(Arc::clone(&db), system.clone(), &config);
+        assert_eq!(
+            jobs.refinement_tick(&config.refinement, 100)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_requested_at,
+            100
+        );
+        drop(jobs);
+
+        let restart = Jobs::new(Arc::clone(&db), system, &config);
+        let resume_at = 100 + 7 * config.refinement.interval_secs;
+        let (a, b) = tokio::join!(
+            restart.refinement_tick(&config.refinement, resume_at),
+            restart.refinement_tick(&config.refinement, resume_at),
+        );
+        let enqueued: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
+        assert_eq!(
+            enqueued,
+            [RefinementEnqueueProgress {
+                last_requested_at: resume_at,
+                last_completed_at: None,
+            }],
+            "one short request after seven missed ticks, not seven replays"
+        );
+        assert_eq!(
+            restart
+                .refinement_tick(&config.refinement, resume_at + 1)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn refinement_wake_and_housekeeping_use_the_earlier_deadline() {
+        let mut schedule = Intervals::default().initial_schedule(100);
+        for job in schedule.due(100) {
+            schedule.mark_run(job, 100);
+        }
+        let wait = schedule.next_wait_secs(130);
+        assert!(wait > 15);
+        assert_eq!(next_scheduler_wait(wait, None, 130), wait);
+        assert_eq!(next_scheduler_wait(wait, Some(145), 130), 15);
+        assert_eq!(next_scheduler_wait(wait, Some(1000), 130), wait);
+        assert_eq!(next_scheduler_wait(wait, Some(129), 130), 0);
+    }
+
+    #[test]
+    fn refinement_summary_distinguishes_queued_from_completed() {
+        let pending = refinement_enqueue_summary(RefinementEnqueueProgress {
+            last_requested_at: 200,
+            last_completed_at: Some(100),
+        });
+        assert!(pending.contains("queued") && pending.contains("200"));
+        assert!(pending.contains("completed") && pending.contains("100"));
+        let done = refinement_enqueue_summary(RefinementEnqueueProgress {
+            last_requested_at: 200,
+            last_completed_at: Some(200),
+        });
+        assert!(done.contains("completed") && done.contains("200"));
+        assert!(!done.contains("queued"));
+    }
+
+    async fn configured_refinement(db: &Database, system: &SystemContext) -> Config {
+        use std::collections::BTreeMap;
+
+        use alexandria_engine::refinement::policy::InferencePolicyInputs;
+        use alexandria_mcp::refinement::{ReconciledRefinement, RefinementService};
+        use alexandria_storage::access::AccessRepo;
+        use alexandria_storage::models::refinement::{ApprovalMode, ConsentChoice};
+        use alexandria_storage::repos::RefinementRepo;
+
+        let config = Config::from_toml(
+            r#"
+[refinement]
+interval_secs = 120
+[refinement.proposer]
+protocol = "open_ai_chat_completions"
+api_prefix = "https://inference.example/v1"
+model = "scheduler-fixture"
+"#,
+        )
+        .unwrap();
+        let configured = ReconciledRefinement::reconcile(
+            db,
+            system,
+            config.refinement.resolve().unwrap(),
+            &InferencePolicyInputs {
+                prompt_template: b"scheduler fixture",
+                prompt_template_version: "1",
+                operation_schema_version: "1",
+                settings: &BTreeMap::new(),
+            },
+            ApprovalMode::Human,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let identity = IdentityRepo::new(db.inner())
+            .bootstrap_owner(
+                "refinement-scheduler-owner",
+                "digest-refinement-scheduler-test",
+                &OperationId::new("refinement-scheduler-fixture"),
+            )
+            .await
+            .unwrap();
+        let access = AccessRepo::new(db);
+        let principal = access
+            .local_principal(system, &identity.account)
+            .await
+            .unwrap();
+        let owner = access.authorize(&principal).await.unwrap();
+        let service = RefinementService::new(db, Some(&configured));
+        let policy = service
+            .effective_policy(&owner)
+            .await
+            .unwrap()
+            .policy
+            .configured
+            .unwrap();
+        RefinementRepo::new(db)
+            .set_consent(
+                &owner,
+                0,
+                ConsentChoice::Grant {
+                    disclosed_policy_revision: policy.revision,
+                },
+                chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            )
+            .await
+            .unwrap();
+        config
     }
 
     async fn seed_owned_cluster(
