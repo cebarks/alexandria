@@ -3,12 +3,15 @@ mod config;
 mod dream;
 mod dreaming;
 mod embedding_migration;
+mod ownership;
 
 use std::sync::Arc;
 
 use alexandria_mcp::AlexandriaServer;
 use alexandria_pipeline::embedding::load_provider;
+use alexandria_storage::ownership_migration::check_ownership_ready;
 use alexandria_storage::{Database, schema, system_config};
+use anyhow::Context;
 use config::Config;
 use rmcp::ServiceExt;
 
@@ -26,7 +29,10 @@ const MAX_PRACTICAL_ESCALATION_HOURS: u64 = 24 * 365 * 10;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("migrate-embeddings") {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("migrate-embeddings" | "bootstrap-owner")
+    ) {
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .init();
@@ -34,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt::init();
     }
 
-    const USAGE: &str = "Usage: alexandria [migrate-embeddings [--force] [--output-data-dir PATH [--resume]] | bench-retrieval | dream [--job NAME]... [--max-rows N] | --help]\nGranite requires --output-data-dir; legacy no-output mode remains in-place. Cutover/rollback is manual: change model and data_dir together, never automatically swap or delete stores.";
+    const USAGE: &str = "Usage: alexandria [bootstrap-owner --help | migrate-embeddings [--force] [--output-data-dir PATH [--resume]] | bench-retrieval | dream [--job NAME]... [--max-rows N] | --help]\nGranite requires --output-data-dir; legacy no-output mode remains in-place. Cutover/rollback is manual: change model and data_dir together, never automatically swap or delete stores.";
     if args.first().is_some_and(|first| first == "dream") {
         let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
         return dream::run(&rest).await;
@@ -56,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
+        ["bootstrap-owner", ..] => return ownership::run(&args[1..]).await,
         ["bench-retrieval"] => return bench::run().await,
         ["--help"] | ["-h"] => {
             println!("{USAGE}");
@@ -98,9 +105,15 @@ async fn main() -> anyhow::Result<()> {
         config.embedding.max_tokens,
     )
     .await
-    .map_err(|error| {
-        anyhow::anyhow!(
-            "Refused startup for data_dir={}: {error:#}",
+    .with_context(|| {
+        format!(
+            "Refused startup for data_dir={}. To resume an interrupted owned embedding target, stop the service and run `alexandria migrate-embeddings --output-data-dir PATH --resume` with the original source configured and PATH set to that target",
+            config.database.data_dir.display()
+        )
+    })?;
+    check_ownership_ready(db.inner()).await.with_context(|| {
+        format!(
+            "Refused startup for data_dir={}. For offline legacy ownership migration, stop the service and run `alexandria bootstrap-owner --login LOGIN --backup-data-dir PATH` with the nominated login and verified backup directory (and `--password-file FILE` for a new account)",
             config.database.data_dir.display()
         )
     })?;
@@ -364,9 +377,8 @@ async fn trusted_local_identity(
         .map_err(|error| anyhow::anyhow!("could not read `[auth] stdio_account`: {error:#}"))?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "`[auth] stdio_account` names an account this store does not have; enrol it first \
-                 (invitations are Task 9's surface, and the local enrollment path deliberately does not \
-                 run as a side effect of starting the server)"
+                "`[auth] stdio_account` names an account this store does not have; enrol it first. \
+                 To enrol an owner offline, use `alexandria bootstrap-owner --help`; startup does not create accounts"
             )
         })?;
     let principal = alexandria_storage::access::AccessRepo::new(db)
