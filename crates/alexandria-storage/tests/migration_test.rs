@@ -172,18 +172,13 @@ async fn test_replaying_a_completed_migration_is_not_an_error() {
 #[tokio::test]
 async fn test_upgrade_from_v008_adds_ownership_columns_without_touching_rows() {
     let db = Database::connect_embedded().await.unwrap();
+    let previous = ACCOUNTS_SCOPES_VERSION - 1;
     for (_, _, sql) in schema::MIGRATIONS
         .iter()
-        .filter(|(version, _, _)| *version < schema::LATEST_VERSION)
+        .filter(|(version, _, _)| *version <= previous)
     {
         db.inner().query(*sql).await.unwrap().check().unwrap();
     }
-    let previous = schema::MIGRATIONS
-        .iter()
-        .map(|(version, _, _)| *version)
-        .max()
-        .unwrap()
-        - 1;
     db.inner()
         .query(
             "CREATE system_config SET key = 'schema_version', value = $version, updated_at = time::now();",
@@ -454,23 +449,18 @@ async fn test_v010_swaps_the_global_session_handle_index_for_an_account_local_on
     );
 }
 
-/// The head advances by registering v010, and the head is derived from the registry rather than from
-/// a literal — which is what makes this test fail if the file is written but never registered.
+/// v010 remains a registered migration after the derived head advances.
 #[tokio::test]
-async fn test_v010_is_registered_and_advances_the_derived_head() {
+async fn test_v010_is_registered_and_the_derived_head_is_stamped() {
     let db = Database::connect_embedded().await.unwrap();
     schema::migrate(db.inner()).await.unwrap();
 
-    assert_eq!(
-        schema::LATEST_VERSION,
-        ACCOUNTS_SCOPES_VERSION + 1,
-        "v010 must be the head, and `LATEST_VERSION` derives it from `MIGRATIONS`"
-    );
     let named = schema::MIGRATIONS
         .iter()
-        .find(|(version, _, _)| *version == schema::LATEST_VERSION)
-        .expect("the derived head is a registered entry");
+        .find(|(version, _, _)| *version == ACCOUNTS_SCOPES_VERSION + 1)
+        .expect("v010 is a registered entry");
     assert_eq!(named.1, "scoped_sessions");
+    assert!(schema::LATEST_VERSION >= named.0);
 
     let stamped: Vec<serde_json::Value> = db
         .inner()

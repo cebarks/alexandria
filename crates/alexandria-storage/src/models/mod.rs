@@ -8,6 +8,7 @@ pub mod maintenance;
 pub mod memory;
 pub mod mutation;
 pub mod provenance;
+pub mod refinement;
 pub mod reminder;
 pub mod session;
 

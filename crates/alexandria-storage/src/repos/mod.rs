@@ -9,6 +9,7 @@ pub mod maintenance_repo;
 pub mod memory_repo;
 pub mod mutation_repo;
 pub mod mutation_retry;
+pub mod refinement_repo;
 pub mod reminder_repo;
 pub mod scope;
 pub mod scoped_activation;
@@ -37,6 +38,7 @@ pub use memory_repo::{
 };
 pub use mutation_repo::{MAX_HISTORY_PAGE, MutationRepo};
 pub use mutation_retry::{MAX_PREPARATIONS, commit_prepared};
+pub use refinement_repo::RefinementRepo;
 pub use reminder_repo::{NewReminder, ReminderRepo};
 pub use scope::ScopeFilter;
 pub use scoped_activation::{

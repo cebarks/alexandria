@@ -581,7 +581,8 @@ pub(crate) async fn claim_system_for_workspace(
 ///
 /// The epoch is the one `authorize` read off the live account row — but it is compared against the
 /// account row *again* here, so a recovery that raised the epoch between authorization and this write is
-/// caught even though nothing touched the credential's row.
+/// caught even though nothing touched the credential's row. Each UPDATE binds the complete record
+/// ID so numeric and opaque keys retain their identity.
 ///
 /// `Ok(false)` means the authority is gone and the caller must cancel its transaction; it is not a
 /// permission to proceed.
@@ -600,10 +601,9 @@ pub(crate) async fn claim_authority(
 
     let account_rows: Vec<serde_json::Value> = tx
         .query(
-            "UPDATE type::record('account', $key) SET updated_at = time::now() WHERE id = $id AND \
+            "UPDATE $id SET updated_at = time::now() WHERE id = $id AND \
              status = 'active' AND auth_epoch = $epoch RETURN AFTER;",
         )
-        .bind(("key", record_key(owner.account().as_record_id())?))
         .bind(("id", owner.account().as_record_id().clone()))
         .bind(("epoch", epoch))
         .await
@@ -621,12 +621,11 @@ pub(crate) async fn claim_authority(
     };
     let credential_rows: Vec<serde_json::Value> = tx
         .query(
-            "UPDATE type::record('credential', $key) SET last_used_at = time::now() WHERE id = $id \
+            "UPDATE $id SET last_used_at = time::now() WHERE id = $id \
              AND account = $account AND revoked = false AND consumed = false AND auth_epoch = $epoch \
              AND (expires_at = NONE OR expires_at > $now) AND \
              (absolute_expires_at = NONE OR absolute_expires_at > $now) RETURN AFTER;",
         )
-        .bind(("key", record_key(credential_id.as_record_id())?))
         .bind(("id", credential_id.as_record_id().clone()))
         .bind(("account", owner.account().as_record_id().clone()))
         .bind(("epoch", epoch))
