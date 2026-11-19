@@ -154,10 +154,15 @@ same account, flagged `escalated: true`; it never transfers to another account, 
 checkout basename. Held rows and unresolved historical text targets stay pending and suppressed,
 not global or escalated. There is no automatic historical mapping.
 
-The current Pi companion still defaults to sending a checkout basename. That default is unsupported
-by the typed server contract; no automatic owned-handle discovery is implemented. An explicit
-existing owned-ID override can be passed through as documented in the companion README, but the
-server still validates it for the authenticated account. Do not claim the default has been fixed.
+The Pi companion resolves the session directory's sanitized `origin` remote with
+`mcp__alexandria__resolve_project`, then uses the returned owned project ID for recall and reminder
+checks. Userinfo, query and fragment are discarded before remote identity is sent; absent a usable
+remote and absent `ALEXANDRIA_PROJECT_ID`, the companion sends no project selector and remains
+Personal-only. The explicit override is resolved and validated too. Authentication uses the
+companion's `ALEXANDRIA_API_TOKEN`, independently of model-provider credentials; an incompatible
+server requires upgrade, never an anonymous or unscoped fallback. Automatic observation stores and
+session-end extraction were removed: when a durable fact should be retained, call
+`mcp__alexandria__store_memory` explicitly, or `mcp__alexandria__import_document` for source material.
 
 Delivery happens only when something calls **`mcp__alexandria__check_reminders`** — some client
 integrations do it automatically at the start of each turn; if yours doesn't (check what your client
@@ -172,10 +177,20 @@ typed project handle. Another owned project's entry is informational, not consum
 through a matching or eligible escalated `mcp__alexandria__check_reminders` call. Held/unresolved
 targets are excluded from that sample but remain inspectable in your unfiltered reminder history.
 
+## Project scope and explicit writes
+
+Without an explicit project context, ordinary reads are Personal-only; they do not search every project.
+For project-specific work, call `mcp__alexandria__resolve_project` with the available project identity,
+then use the returned owned ID with the relevant tool's project/context parameter. Do not infer an ID
+from a name or checkout basename. Project writes require an explicit project target; a session ID is
+not a substitute for a scope. The Pi companion can resolve a sanitized git origin automatically, but
+an agent using the tools directly must resolve the project before issuing a project-scoped request.
+
 ## Guidelines
 
-- **Bias toward storing.** Memory writes are cheap and clustering handles rough dedup; losing a
-  decision/rationale is more costly than an extra memory entry.
+- **Store durable information explicitly.** Use `store_memory` for a standalone durable fact,
+  decision, preference, correction, or resolved bug; use `import_document` for reference material.
+  Client integrations do not automatically extract or write observed conversation content.
 - **Write for a stranger.** Assume the reader has zero context from this conversation.
 - **Don't narrate it.** Store/retrieve silently as part of normal work, the same way you'd read
   a file — don't announce "let me check my memory" unless the result changes what you tell the

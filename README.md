@@ -102,6 +102,8 @@ for that invocation only, without touching the config file.
 
 ## MCP Tools
 
+The server exposes **17 MCP tools** (13 memory/session/reminder tools plus four project/classification tools). This table is the current server surface; the companion client additions do not add tools.
+
 | Tool | Description |
 | ------ | ------------- |
 | `store_memory` | Store text with auto-embedding, clustering, and heat initialization; optional `session_id` to group it, plus `scope` (`personal`/`project`) with `project`/`context_project` to choose where it lands — a hosted request that names neither is refused before anything is embedded. Returns `truncated: true` when the text is longer than `embedding.max_tokens`, meaning only its head is searchable, and `scope` to confirm where the row went |
@@ -185,15 +187,14 @@ three levels:
    (Claude Code) document concrete trigger conditions and tool choice guidance, mirroring how other high-usage
    MCP tools ship skills alongside themselves.
 3. **Optional companion extension** — [`contrib/pi/extensions/alexandria/`](contrib/pi/extensions/alexandria/)
-   runs in both directions. On `before_agent_start` it calls `retrieve_memories` for every prompt and
-   injects hits above a similarity threshold, and calls `check_reminders` to deliver whatever is due,
-   so the agent never has to decide to check memory or wait for a timer the server doesn't run. On the
-   write side it adds heuristic detectors (corrections, stated preferences, error→resolution pairs)
-   that store without being asked, plus an LLM extraction pass at `session_shutdown` for durable facts
-   both the agent and the heuristics missed. This trades latency and potential noise for guaranteed
-   recall and much denser capture; recall, store, and reminders each toggle independently. The Claude
-   Code equivalent is the set of `UserPromptSubmit`, `PreToolUse`, and `Stop` hooks at
-   [`contrib/claude/hooks/`](contrib/claude/hooks/).
+   performs prompt-time recall and reminder checks, but has no automatic write side. It resolves
+   project context through a sanitized origin remote (or `ALEXANDRIA_PROJECT_ID`) and requires its
+   independent `ALEXANDRIA_API_TOKEN`.
+   It does not automatically store observed content or extract a session transcript: agents must call
+   `store_memory` or `import_document` explicitly when something should be retained. The Claude Code
+   equivalent is the recall/session hooks at [`contrib/claude/hooks/`](contrib/claude/hooks/); Claude's
+   hook is Personal-only unless `ALEXANDRIA_PROJECT_ID` is set, and it likewise has no automatic
+   observation writer.
 
 Items 2 and 3 are client-side integrations, not part of the MCP server itself — see
 [`contrib/pi/README.md`](contrib/pi/README.md) and [`contrib/claude/README.md`](contrib/claude/README.md)
@@ -464,10 +465,11 @@ Or via stdio (for single-session use):
 #### In Claude Code
 
 ```bash
+# Configure the native MCP client with an authorized bearer credential as required by the server.
 claude mcp add --transport http --scope user alexandria http://127.0.0.1:3000/mcp
-# optional: client-side skill (content-parity with contrib/pi, using Claude Code's mcp__alexandria__<tool> names)
+# Optional: explicit tool-use guidance.
 cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
-# optional: auto-recall hook (see contrib/claude/README.md for the settings.json snippet)
+# Optional: hook recall uses ALEXANDRIA_API_TOKEN; see contrib/claude/README.md.
 cp contrib/claude/hooks/alexandria-recall.sh ~/.claude/hooks/
 ```
 
@@ -481,6 +483,7 @@ Pi 0.99 and later read MCP servers from `~/.pi/agent/mcp.json` (or a trusted pro
   "mcpServers": {
     "alexandria": {
       "url": "http://127.0.0.1:3000/mcp",
+      "headers": { "Authorization": "Bearer ${ALEXANDRIA_API_TOKEN}" },
       "exposure": "direct"
     }
   }
@@ -501,8 +504,9 @@ use OAuth, `pi mcp login <server>`. If a running session does not see a new or e
 `/reload` or start a new session.
 
 Pi names these tools `mcp__<server>__<tool>` — `mcp__alexandria__store_memory`,
-`mcp__alexandria__retrieve_memories`, and so on — which is the form the skill uses. The companion's
-auto-store detectors match on the tool-name *suffix*, so they work with either naming convention.
+`mcp__alexandria__retrieve_memories`, and so on — which is the form the skill uses. The native
+connection above uses pi's standard MCP configuration; the separate companion extension uses
+`ALEXANDRIA_API_TOKEN` and its own prompt-path configuration.
 
 Then optionally add the client-side nudges — see
 [`contrib/pi/README.md`](contrib/pi/README.md).
@@ -515,7 +519,7 @@ Legacy `~/.alexandria/config.toml` is used as a fallback when the XDG config fil
 
 Reminder delivery is configured by the `[reminders]` section: `timezone` (IANA name, empty = system-local) governs naive datetime input and pattern/cron evaluation, and `escalation_hours` controls overdue escalation to global delivery.
 
-The Pi companion extension (recall / store / reminders) has its own config at `$XDG_CONFIG_HOME/alexandria/client.toml`.
+The Pi companion extension (automatic recall and reminder checks; no automatic memory writers) has its own client config at `$XDG_CONFIG_HOME/alexandria/client.toml` or `~/Library/Application Support/alexandria/client.toml` on macOS. `ALEXANDRIA_CLIENT_CONFIG` selects another file; `ALEXANDRIA_API_TOKEN` and `ALEXANDRIA_PROJECT_ID` configure its authentication and project override, and `[transport]` / `ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS` / `ALEXANDRIA_PROMPT_BUDGET_MS` configure its bounded prompt path. These client settings do not change the server configuration.
 
 See [docs/configuration.md](docs/configuration.md) for all options, client config reference, and migration instructions.
 
@@ -529,8 +533,8 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | [docs/granite-test-data.md](docs/granite-test-data.md) | Granite public multi-relevant/unanswerable pilot, native offline evaluation, model-specific cutoff caveats and release gates |
 | [docs/roadmap.md](docs/roadmap.md) | Shipped milestones, known gaps, planned work |
 | [contrib/pi/README.md](contrib/pi/README.md) | pi skill vs. extension: what each does, install, failure behavior |
-| [contrib/pi/extensions/alexandria/README.md](contrib/pi/extensions/alexandria/README.md) | The pi companion extension in detail: recall/store/reminders, configuration, known gaps |
-| [contrib/pi/skills/alexandria-memory/SKILL.md](contrib/pi/skills/alexandria-memory/SKILL.md) | The pi client-side skill (`alexandria_<tool>` names) |
+| [contrib/pi/extensions/alexandria/README.md](contrib/pi/extensions/alexandria/README.md) | The pi companion extension: authenticated recall/reminder behavior, project context, configuration and known gaps |
+| [contrib/pi/skills/alexandria-memory/SKILL.md](contrib/pi/skills/alexandria-memory/SKILL.md) | The pi client-side skill (`mcp__alexandria__<tool>` names) |
 | [contrib/claude/README.md](contrib/claude/README.md) | Claude Code skill and hooks: install, `settings.json`, requirements |
 | [contrib/claude/skills/alexandria-memory/SKILL.md](contrib/claude/skills/alexandria-memory/SKILL.md) | The Claude Code skill (`mcp__alexandria__<tool>` names) |
 | [docs/security-findings.md](docs/security-findings.md) | 2026-09-10 security audit: threat model, the convex-hull paper verdict, findings S1–S6 with current status |

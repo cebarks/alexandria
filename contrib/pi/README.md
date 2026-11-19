@@ -1,86 +1,30 @@
-# pi client-side integrations
+# Alexandria client-side integrations for pi
 
-Optional client-side companions for using Alexandria from
-[pi](https://github.com/earendil-works/pi-mono). They are not part of the MCP server, are not
-shipped with it, and are not required to use Alexandria — they exist purely to make pi agents reach
-for memory more proactively. See the "Getting agents to actually use memory" section in the root
-[README.md](../../README.md) for the full rationale.
+Optional client-side pieces for using Alexandria from [pi](https://github.com/earendil-works/pi-mono). They are not part of the MCP server and do not install automatically. The skill is guidance; the companion extension adds prompt-time recall and reminder delivery. Neither installed path independently writes memories from observed conversation content.
 
-Nothing here auto-installs. Copy what you want into your pi config directory.
+## Choose an integration
 
-## Which one do you want?
-
-| | Skill | Extension |
+| | Skill | Companion extension |
 | --- | --- | --- |
-| What it is | Prose guidance in agent context | TypeScript extension with event hooks |
-| Read side | Tells the agent when to call `retrieve_memories` | Calls it for you on every prompt |
-| Time side | Documents the four reminder tools and when to reach for them | Calls `check_reminders` per prompt, so reminders arrive without the agent having to remember |
-| Write side | Tells the agent when to call `store_memory` | Heuristic detectors + session-end LLM extraction |
-| Cost | Context tokens only | HTTP + embedding round trip per prompt, one LLM call per session |
-| Install | Copy a directory | Copy a directory + a script-free, locked npm install |
+| What it does | Guides the agent on when to call Alexandria tools | Automatically recalls relevant memories and checks due reminders before a prompt |
+| Writes | Agent calls `store_memory` / `import_document` explicitly when appropriate | No automatic observation/extraction writes; explicit agent tool calls remain available |
+| Install | Copy a skill directory | Copy extension directory and install its locked runtime dependencies |
 
-Start with the skill. Add the extension only if agents still aren't checking memory often enough,
-or if you want capture to continue even when the agent forgets to write.
+## Memory skill
 
-## `skills/alexandria-memory/`
-
-A pi [skill](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/skills.md)
-documenting concrete trigger conditions for when an agent should read or write memory and which tool
-to pick. Skills are guidance loaded into the agent's context — no code, no dependencies.
-
-The tool names in the skill are the forms pi's built-in MCP support exposes: `mcp__<server>__<tool>`,
-i.e. `mcp__alexandria__store_memory`, `mcp__alexandria__retrieve_memories`, … — not the bare
-server-side names the MCP server itself reports. On hosts still running the third-party
-`pi-mcp-adapter` extension with `settings.toolPrefix: "server"`, the same tools appear as
-`alexandria_store_memory`; the skill targets the built-in names, and the companion's detector reduces
-either form to the bare tool name and matches that exactly, so both are recognised. Adapter 3.x is
-not: it published neither name, exposing a `mcp` gateway and `mcp__<server>` proxies whose real tool
-sat in `input.tool` with arguments nested under `input.args`.
-
-**Install:**
+The skill gives explicit trigger guidance for reading, updating, importing, and storing durable information. It uses pi's native MCP tool names, `mcp__alexandria__<tool>`.
 
 ```bash
 cp -r contrib/pi/skills/alexandria-memory ~/.pi/agent/skills/
 ```
 
-(Or `.pi/skills/` for a project-local install. See pi's skill docs for all discovery locations.)
+For project-scoped work, resolve the project first with `mcp__alexandria__resolve_project` and use the returned issued project ID. When no project context is established, use Personal scope; do not guess a project from a directory or basename. Automatic capture was removed: if you previously relied on detectors or session-end extraction, call `store_memory` explicitly for each durable item (or `import_document` for a document) using the skill's guidance.
 
-## `extensions/alexandria/`
+## Companion extension
 
-This is a recall, store, **and** reminders companion (package version 2.1) — formerly
-`extensions/alexandria-auto-recall/`. Five things happen:
+The extension does two prompt-time tasks: it retrieves relevant memories and injects them before the agent starts, and it calls `check_reminders` once per prompt. It does not detect corrections/preferences/errors to store and does not run session-end LLM extraction. If you relied on those automatic writers, use the authenticated MCP tools explicitly as directed by the skill.
 
-1. **Auto-recall** — on `before_agent_start`, the user's prompt is embedded and searched; hits at or
-   above `recall.min_similarity` are injected as a custom context message before the agent reasons.
-2. **Reminder delivery** — in the same `before_agent_start` handler, `check_reminders` is called once
-   per prompt and whatever is due is injected alongside the recall hits and shown as a notification.
-   The server runs no timer, so this per-interaction check is how reminders reach the user at all.
-3. **Heuristic detectors** — pattern matching on prompts and tool results, with no LLM in the loop:
-   correction-shaped language ("no, use X"), forward-looking preference statements ("always do X",
-   "never do Y" — stored from the trigger word on, so a prohibition keeps its negation),
-   and error→success pairs per tool, which become "this error resolves this way" memories. Stores are
-   fire-and-forget so they never add latency to the turn.
-4. **Dedup tracking** — correction and preference stores, and every agent-initiated `store_memory` /
-   `update_memory` the extension observes on the way past `tool_result`, are buffered so the
-   extraction pass below can be told what is already saved. Error→success resolutions skip the
-   buffer: `ErrorTracker.flush()` stores them directly at `agent_end`.
-5. **LLM extraction** — on `session_shutdown`, the conversation is serialized and a cheap model
-   (`store.extract_model`) extracts durable facts that layers 3–4 missed. Skipped on `reload`, since
-   that is not a real conversation boundary.
-
-Layers 1–2 share one `before_agent_start` handler and each fail on their own, so a broken reminder
-check never suppresses recall or vice versa. This mirrors the server's own design intent: the skill is
-highest-quality but depends on the agent choosing to act, heuristics are zero-latency but shallow, and
-extraction is thorough but arrives only at the end.
-
-### Requires a dependency install
-
-It depends on `@modelcontextprotocol/client` and `smol-toml`. pi's extension loader (jiti) does not
-alias third-party npm packages the way it does pi's own internal packages, so a bare `.ts` file
-cannot resolve them — this has to be a package-style extension directory with its own
-`node_modules`.
-
-**Install:**
+Install:
 
 ```bash
 cp -r contrib/pi/extensions/alexandria ~/.pi/agent/extensions/
@@ -88,16 +32,17 @@ cd ~/.pi/agent/extensions/alexandria
 npm install --omit=dev --ignore-scripts
 ```
 
-The directory used to be `extensions/alexandria-auto-recall/`. If the old copy is still in
-`~/.pi/agent/extensions/`, delete it after installing the new one, or pi loads both.
+The extension authenticates independently of pi's model-provider credentials. Set `ALEXANDRIA_API_TOKEN` to an Alexandria agent token; it is not read from or sent through provider configuration. The extension also uses `ALEXANDRIA_PROJECT_ID` as an explicit project override. Older/incompatible servers that lack bearer authentication or `resolve_project` are rejected with upgrade guidance; it does not retry without authentication or fall back to an unscoped request.
+
+### Project context
+
+On each prompt, the companion resolves the session directory's `origin` remote (unless `ALEXANDRIA_PROJECT_ID` is set) through `resolve_project`. The client reduces supported HTTPS/SSH remote forms to a descriptor containing host, optional non-default port, and repository path; it removes `.git`, normalizes the host, and discards userinfo, query, and fragment before sending. Git probes run with inherited `GIT_*` overrides removed. The server returns the issued project ID, which scopes recall and reminder checks and is included in the agent-visible prompt context. The resolution cache is keyed by server/account/directory/descriptor and is invalidated when server or account identity changes.
+
+A configured `ALEXANDRIA_PROJECT_ID` is passed to `resolve_project` and must identify an owned project. If no override and no usable origin remote are available, the companion sends no project selector and recall remains Personal-only; it does not infer a project from the checkout basename. Resolution/auth failures fail closed rather than silently widening scope. The Claude hook does not duplicate remote normalization: it supports the explicit project ID override and otherwise stays Personal-only.
 
 ### Configuration
 
-Config file: `$XDG_CONFIG_HOME/alexandria/client.toml`, same precedence as the server
-(defaults → file → `ALEXANDRIA_CLIENT_CONFIG` → individual env vars). See
-[docs/configuration.md](../../docs/configuration.md) for the full reference. Every key is optional;
-the defaults work against a locally running server. `limit` and `min_similarity` are a pair read
-off one grid for `all-MiniLM-L6-v2`; change them together (see `[recall]` in docs/configuration.md).
+The companion reads `$XDG_CONFIG_HOME/alexandria/client.toml` (on macOS, `~/Library/Application Support/alexandria/client.toml` unless `XDG_CONFIG_HOME` is set). `ALEXANDRIA_CLIENT_CONFIG` selects an alternate file. Precedence is defaults → file → individual environment variables. Environment variables override file values.
 
 ```toml
 [server]
@@ -108,45 +53,26 @@ enabled = true
 limit = 10
 min_similarity = 0.45
 
-[store]
-enabled = true
-extract_model = "vertex/claude-haiku-4-5"
-extract_timeout_ms = 5000
-
 [reminders]
 enabled = true
-project = "alexandria"
+
+[transport]
+prompt_call_timeout_ms = 5000
+prompt_budget_ms = 10000
 ```
 
-Env vars cover the same ground (`ALEXANDRIA_REMINDERS=off`, `ALEXANDRIA_REMINDERS_PROJECT`, …); see
-[`extensions/alexandria/README.md`](extensions/alexandria/README.md) for the full list, the
-`client.toml` shape, and how reminder delivery, project targeting, and overdue escalation work.
+| Setting | Default | Environment override | Meaning |
+| --- | ---: | --- | --- |
+| `[server].url` | `http://127.0.0.1:3000/mcp` | `ALEXANDRIA_URL` | MCP endpoint |
+| `[recall].enabled` | `true` | `ALEXANDRIA_AUTO_RECALL=off` | Disable automatic prompt recall |
+| `[recall].limit` | `10` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Retrieval limit |
+| `[recall].min_similarity` | `0.45` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Client-side injection threshold; measured with limit 10 |
+| `[reminders].enabled` | `true` | `ALEXANDRIA_REMINDERS=off` | Disable per-prompt reminder checks |
+| `[transport].prompt_call_timeout_ms` | `5000` ms | `ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS` | Maximum duration of an individual prompt-path MCP call |
+| `[transport].prompt_budget_ms` | `10000` ms | `ALEXANDRIA_PROMPT_BUDGET_MS` | One deadline shared by project resolution, handshake, recall, reminders, and reconnect attempts |
 
-### Failure behavior
+Timeout values must be positive finite numbers; `prompt_call_timeout_ms` must be no greater than `prompt_budget_ms`, and `prompt_budget_ms` must be at most `120000` ms. Invalid values fail configuration rather than being clamped. The whole-path budget is one deadline, not a fresh budget per stage. It applies to automatic prompt work, not explicit native MCP calls. The defaults remain 5 s per call and 10 s for the prompt path.
 
-The extension **fails open** in every path: if the server is unreachable or a call errors, the agent
-turn proceeds normally with a warning notification, and extraction failures are logged and skipped.
-A stopped Alexandria server never blocks a pi session.
+Older extraction settings are ignored with a warning: `ALEXANDRIA_AUTO_STORE`, `ALEXANDRIA_EXTRACT_MODEL`, `ALEXANDRIA_EXTRACT_TIMEOUT_MS`, and the old `[store]` extraction fields (`enabled`, `extract_model`, `extract_timeout_ms`). Remove them; saving memory now requires an explicit `store_memory`/`import_document` call.
 
-Stale Streamable HTTP sessions (typically an Alexandria restart) are recovered transparently — the
-client detects "Session not found", reconnects, and retries once before surfacing an error. The
-reminder check is fail-open the same way: a missing `git`, an unreachable server, or a malformed
-response produces a warning at most, never a blocked turn.
-
-### Limitations worth knowing
-
-- **The extraction prompt is untested.** The suite (`just ext-test`, and `npm test` in
-  `extensions/alexandria/`) covers the config loader, the reminder payload/rendering path, the
-  merged dispatcher's failure isolation, the project-hint probe, the detectors, and the transcript
-  serializer and response parser. The prompt text and its truncation are still outside it.
-- **Sessions are grouped, not finalized.** Every store carries pi's session id, `agent_id = "pi"`
-  and the model, but nothing calls `finalize_session`, so a pi session never gets a summary. See
-  [docs/session-memory.md](../../docs/session-memory.md).
-- **Reworded repeats are stored again.** The regex detectors dedup exact repeats within one process
-  only; near-duplicates are deferred to [#27](https://github.com/cebarks/alexandria/issues/27).
-- **Recall ignores `recall`.** It uses `retrieve_memories`, never the two-phase `recall` tool, so
-  broad "what do we know about X" exploration is not what auto-recall is tuned for.
-- **Reminders need a client to ask.** Nothing fires on its own: with `ALEXANDRIA_REMINDERS=off` (or
-  no companion extension) reminders reach the user only if the agent calls `check_reminders`.
-- **Extraction is end-of-session and best-effort.** It reads the tail of a long conversation (capped
-  by character budget) and can time out; treat it as a safety net, not a transcript index.
+See [docs/configuration.md](../../docs/configuration.md) for server and client configuration context, and the companion [README](extensions/alexandria/README.md) for operational details.
