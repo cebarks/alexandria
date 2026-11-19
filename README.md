@@ -84,7 +84,7 @@ that run once and exit.
 | `alexandria bench-retrieval` | Measure how well the configured model separates a correct answer from the rest of the corpus, and print the score distributions and the limit × threshold grid that the `retrieve.min_similarity` floor and the client recall defaults are judged against — see [docs/minilm-test-data.md](docs/minilm-test-data.md). |
 | `alexandria dream [--job NAME]... [--max-rows N]` | Run one or more of the five housekeeping jobs **once, now**, and print what each did (`job=… examined=… acted=… skipped=…`) plus the run id its audit rows carry, so `/debug/maintenance?run=<id>` shows exactly what that pass changed. With no `--job` it runs all five. The way to answer "why did my corpus change" or "run the collapse now" without editing `[dreaming]` cadences and restarting the service — see [docs/configuration.md](docs/configuration.md). |
 | `alexandria refinement --help` | Inspect routes, grant or revoke disclosed destination consent, or set an approval preference for the configured trusted-local account. See the [refinement configuration](docs/configuration.md#refinement). |
-| `alexandria dream --job refine --workspace ID --scope personal` | Run one explicit offline refinement turn for the trusted-local administrator's own workspace with current consent. `--scope project:ID` selects one project instead. Results remain pending for review; this is not a sixth housekeeping job. |
+| `alexandria dream --job refine --workspace ID --scope personal` | Run one explicit offline refinement turn for the trusted-local administrator's own workspace with current consent. `--scope project:ID` selects one project instead. Human-mode results remain pending for review; a currently authorized exact secondary approval can apply. This is not a sixth housekeeping job. |
 | `alexandria --help` | Print the command summary. |
 
 The legacy in-place command, benchmark and `dream` open the data dir directly, and SurrealKV
@@ -315,9 +315,9 @@ Two consequences of that boundary are deliberate and worth stating before they s
   application pre/postimages/revert status. The settings page discloses endpoints and model names (never
   credentials), exposes revision-checked consent/revocation and review-mode controls, and makes human review
   the default. Unassigned proposals are marked and filterable; classification may stale pending work.
-  Enqueue/attempt polling and proposal decision/apply/revert actions remain unavailable until the durable
-  Task 19/20 worker and application services are integrated, so opening a page never starts inference or
-  applies a proposal. Queue quota/attempt counts are explicitly unavailable rather than estimated.
+  Owners can approve, dismiss, or defer the displayed revision, and can revert an application while its
+  semantic effects and references are unchanged. Opening a page never starts inference or applies a
+  proposal. The owner can check a known attempt ID separately; browser enqueue remains unavailable, and quota and attempt counts on these pages are this account's real rolling counts.
 - **Query Tester** (`/debug/query`, `POST /debug/query/run`) — run `retrieve_memories`/`recall` live
   against the real embedding model to sanity-check retrieval quality, from inside the signed-in
   account's own population, with optional `session_id` scoping and a **Dry run** checkbox. Results

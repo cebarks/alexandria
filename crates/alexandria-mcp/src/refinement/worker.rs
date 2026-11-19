@@ -1,11 +1,10 @@
 //! The fair refinement worker: one in-flight provider call, round-robin across accounts,
 //! partitions and work classes, every charge and authority check at the edge it protects.
 //!
-//! This module never applies anything to the corpus. Primary calls return typed proposals,
-//! owner-requested opinions return typed verdicts, and an exact secondary approval under an
-//! opted-in automatic mode returns an opaque application candidate that Task 20's
-//! transactional consumer — and only it — may spend. Nothing here starts on boot; the live
-//! worker is enabled with that consumer.
+//! Primary calls yield typed proposals; owner-requested opinions yield typed verdicts.
+//! With the local embedding provider attached, the worker publishes human-review proposals
+//! and sends exact automatic verdicts to the transactional refinement service. Without it,
+//! callers can examine an opaque candidate, but dispatch never commits it.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,12 +13,16 @@ use std::time::Duration;
 use alexandria_engine::refinement::budget;
 use alexandria_engine::refinement::proposal::ValidatedProposal;
 use alexandria_engine::refinement::validation::validate_proposal;
+use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::Database;
 use alexandria_storage::access::{AccessRepo, OwnerContext, SystemContext};
 use alexandria_storage::error::StorageError;
-use alexandria_storage::models::identity::{AccountId, Partition, ReadSelection, Version};
+use alexandria_storage::models::identity::{
+    AccountId, OperationId, Partition, ReadSelection, Version,
+};
 use alexandria_storage::models::refinement::{
-    ApprovalMode, Authority, EvidenceBundle, ProposalRevision, ProposalState, SecondaryVerdict,
+    ApprovalMode, Authority, EvidenceBundle, ProposalRevision, ProposalState, QualityOperation,
+    SecondaryVerdict,
 };
 use alexandria_storage::record_id_to_string;
 use alexandria_storage::repos::RefinementRepo;
@@ -35,7 +38,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use super::inference::{AttemptQuota, InferenceError, InferenceReply, QuotaDenied};
-use super::service::ReconciledRefinement;
+use super::service::{ReconciledRefinement, RefinementService};
 use crate::error::ServiceError;
 
 /// How often an in-flight call's authority is re-checked while the provider works. Bounded by
@@ -106,14 +109,13 @@ pub trait WorkerProvider: Send + Sync {
 }
 
 /// An exact secondary approval under an opted-in automatic mode, bound to the worker
-/// generation and the authority that produced it. Opaque on purpose: only Task 20's
-/// transactional consumer may spend it, and only while both bindings are still current.
+/// generation and the authority that produced it. Only the transactional consumer may
+/// spend it, and only while both bindings are current.
 #[derive(Debug)]
 pub struct AutomaticCandidate {
-    generation: u64,
-    authority: Authority,
-    /// Without a transactional consumer this can only be staged for owner review.
-    proposal: ProposalRevision,
+    pub(super) generation: u64,
+    pub(super) authority: Authority,
+    pub(super) proposal: ProposalRevision,
 }
 
 #[derive(Debug)]
@@ -122,6 +124,7 @@ pub enum WorkerOutput {
     Proposal(ProposalRevision),
     Opinion(SecondaryVerdict),
     Automatic(AutomaticCandidate),
+    Applied(RecordId),
 }
 
 #[derive(Debug)]
@@ -141,7 +144,7 @@ pub enum Dispatch {
 /// proposal dwarfs the refusal it sits beside, and `Turn` moves through every stage of a
 /// dispatch on its way to the caller.
 enum Turn {
-    /// A typed result the caller can review or hand to the Task 20 consumer.
+    /// A typed result ready for review or transactional application.
     Completed(Box<WorkerOutput>),
     /// No call produced a result. The attempt is either still queued (a spent budget, with
     /// progress preserved) or already settled (withdrawn authority, a failed call).
@@ -165,6 +168,7 @@ pub struct Worker<'a> {
     system: &'a SystemContext,
     configured: &'a ReconciledRefinement,
     settings: WorkerSettings,
+    embedding: Option<&'a dyn EmbeddingProvider>,
     /// One provider call at a time, process-wide. The claim on the attempt row is the durable
     /// half; this is the in-memory half that answers a concurrent dispatch with `Busy`.
     in_flight: AtomicBool,
@@ -185,9 +189,16 @@ impl<'a> Worker<'a> {
             system,
             configured,
             settings,
+            embedding: None,
             in_flight: AtomicBool::new(false),
             last_served: Mutex::new(None),
         }
+    }
+
+    /// Enable durable publication and transactional application for this runtime.
+    pub fn with_embedding(mut self, embedding: &'a dyn EmbeddingProvider) -> Self {
+        self.embedding = Some(embedding);
+        self
     }
 
     /// Run at most one fair turn: select the next eligible queued unit, lease it, and make at
@@ -337,12 +348,17 @@ impl<'a> Worker<'a> {
                 provider,
             };
             if self.claim_dispatch(&ctx).await? {
-                let dispatch = self.run_work(&ctx).await?;
+                let result = self.run_work(&ctx).await;
+                if result.is_err() {
+                    let _ = repo
+                        .finish_work(self.system, &work.id, AttemptState::Failed)
+                        .await;
+                }
                 self.last_served
                     .lock()
                     .expect("refinement fairness cursor")
                     .replace(work.fairness_key());
-                return Ok(dispatch);
+                return result;
             }
         }
         Ok(Dispatch::Idle)
@@ -366,6 +382,9 @@ impl<'a> Worker<'a> {
         match ctx.work.kind {
             WorkKind::Assess => self.run_scheduled(ctx).await,
             WorkKind::AssessUnassigned => self.run_unassigned(ctx).await,
+            WorkKind::Apply => Err(ServiceError::Internal(
+                "application attempt cannot dispatch",
+            )),
             WorkKind::Opinion | WorkKind::Regenerate => self.run_review(ctx).await,
         }
     }
@@ -377,8 +396,33 @@ impl<'a> Worker<'a> {
         let repo = ctx.repo;
         let work = ctx.work;
         let (checkpoint, next, turn) = self
-            .scheduled_turn(ctx, self.settings.max_focals_per_pass)
+            .scheduled_turn(
+                ctx,
+                if self.embedding.is_some() {
+                    1
+                } else {
+                    self.settings.max_focals_per_pass
+                },
+            )
             .await?;
+        let turn = match turn {
+            Some(Turn::Completed(output)) if self.embedding.is_some() => {
+                let owner = self.owner_context(&work.account).await?;
+                match self.publish_assessment(ctx, owner, *output).await {
+                    Ok(output) => Some(Turn::Completed(Box::new(output))),
+                    Err(ServiceError::Stale) => {
+                        repo.finish_work(self.system, &work.id, AttemptState::Cancelled)
+                            .await?;
+                        return Ok(Dispatch::Denied);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            turn => turn,
+        };
+        if self.embedding.is_some() && matches!(&turn, Some(Turn::Denied)) {
+            return Ok(Dispatch::Denied);
+        }
         // Progress is preserved whatever happened: quota exhaustion leaves the walk where it
         // stopped, and an exhausted walk closes the checkpoint for the next cycle. A `Stale`
         // from this save is not a cursor conflict — with one in-flight worker there is no
@@ -411,6 +455,8 @@ impl<'a> Worker<'a> {
                 if next.is_none() {
                     repo.finish_work(self.system, &work.id, AttemptState::Completed)
                         .await?;
+                } else if self.embedding.is_some() {
+                    repo.requeue_work(self.system, &work.id).await?;
                 }
                 Ok(Dispatch::Completed {
                     attempt: work.id.clone(),
@@ -419,8 +465,12 @@ impl<'a> Worker<'a> {
                 })
             }
             None => {
-                repo.finish_work(self.system, &work.id, AttemptState::Completed)
-                    .await?;
+                if self.embedding.is_some() && next.is_some() {
+                    repo.requeue_work(self.system, &work.id).await?;
+                } else {
+                    repo.finish_work(self.system, &work.id, AttemptState::Completed)
+                        .await?;
+                }
                 Ok(Dispatch::Idle)
             }
         }
@@ -459,32 +509,39 @@ impl<'a> Worker<'a> {
         Ok((checkpoint, page.next, turn))
     }
 
-    async fn stage_offline_assessment(
+    async fn publish_assessment(
         &self,
         ctx: &DispatchCtx<'_>,
         owner: OwnerContext,
         output: WorkerOutput,
-    ) -> Result<ProposalRevision, ServiceError> {
+    ) -> Result<WorkerOutput, ServiceError> {
         if !authority_is_current(self.db, &ctx.work.authority).await? {
             return Err(ServiceError::Stale);
         }
         let proposal = match output {
             WorkerOutput::Proposal(proposal) => proposal,
             WorkerOutput::Automatic(candidate) => {
-                if !self.authorize_application(&candidate).await? {
-                    return Err(ServiceError::Stale);
-                }
-                // There is no transactional secondary application consumer on this branch.
-                // Preserve an exact approval as a pending owner-review proposal, not a write.
-                candidate.proposal
+                let embedding = self.embedding.ok_or(ServiceError::Unavailable)?;
+                let operation = OperationId::new(format!(
+                    "secondary-{}",
+                    record_id_to_string(&candidate.proposal.id)
+                ));
+                let service = RefinementService::new(self.db, Some(self.configured))
+                    .with_embedding(embedding);
+                service
+                    .apply_secondary(self.system, &candidate, &operation)
+                    .await?;
+                return Ok(WorkerOutput::Applied(candidate.proposal.id));
             }
-            WorkerOutput::Opinion(_) => {
+            WorkerOutput::Opinion(_) | WorkerOutput::Applied(_) => {
                 return Err(ServiceError::Internal("offline assessment output"));
             }
         };
         // Durably publish before acknowledging the cursor. Persistence coalesces an identical
         // evidence replay if the process dies between these two steps.
-        Ok(ctx.repo.persist_proposal(&owner, proposal).await?)
+        Ok(WorkerOutput::Proposal(
+            ctx.repo.persist_proposal(&owner, proposal).await?,
+        ))
     }
 
     /// Owner-selected Unassigned evidence, read through the same owner-review door a human
@@ -518,12 +575,17 @@ impl<'a> Worker<'a> {
                 let turn = self.assess_bundle(ctx, &bundle, false).await?;
                 match turn {
                     Turn::Completed(output) => {
+                        let output = if self.embedding.is_some() {
+                            self.publish_assessment(ctx, owner, *output).await?
+                        } else {
+                            *output
+                        };
                         repo.finish_work(self.system, &work.id, AttemptState::Completed)
                             .await?;
                         Ok(Dispatch::Completed {
                             attempt: work.id.clone(),
                             pass: pass_id(work),
-                            output: *output,
+                            output,
                         })
                     }
                     Turn::Denied => Ok(Dispatch::Denied),
@@ -553,6 +615,11 @@ impl<'a> Worker<'a> {
         let (proposal, evidence) = repo
             .proposal_with_evidence(self.system, &proposal_id)
             .await?;
+        let sources = if work.kind == WorkKind::Regenerate {
+            repo.capture_sources(self.system, &evidence).await?
+        } else {
+            Vec::new()
+        };
         let stage = if work.kind == WorkKind::Opinion {
             Stage::Secondary
         } else {
@@ -578,9 +645,9 @@ impl<'a> Worker<'a> {
                     }
                 } else {
                     match validate_proposal(&evidence, &reply.text) {
-                        Ok(validated) => {
-                            WorkerOutput::Proposal(proposal_from(work, &evidence, validated))
-                        }
+                        Ok(validated) => WorkerOutput::Proposal(proposal_from(
+                            work, &evidence, sources, validated,
+                        )),
                         Err(_) => {
                             repo.finish_work(self.system, &work.id, AttemptState::Failed)
                                 .await?;
@@ -615,6 +682,8 @@ impl<'a> Worker<'a> {
     ) -> Result<Turn, ServiceError> {
         let repo = ctx.repo;
         let work = ctx.work;
+        let generation = repo.worker_generation(self.system).await?;
+        let sources = repo.capture_sources(self.system, evidence).await?;
         let reply = self
             .provider_call(
                 ctx,
@@ -638,8 +707,14 @@ impl<'a> Worker<'a> {
                 return Ok(Turn::Denied);
             }
         };
-        let proposal = proposal_from(work, evidence, validated);
-        if automatic_allowed && work.authority.mode == ApprovalMode::SecondaryLlm {
+        let proposal = proposal_from(work, evidence, sources, validated);
+        if automatic_allowed
+            && work.authority.mode == ApprovalMode::SecondaryLlm
+            && !matches!(
+                &proposal.proposed,
+                QualityOperation::Contradiction { .. } | QualityOperation::NoSafeChange
+            )
+        {
             let reply = self
                 .provider_call(
                     ctx,
@@ -662,7 +737,9 @@ impl<'a> Worker<'a> {
                         }
                     };
                     if verdict == SecondaryVerdict::ApproveExact {
-                        let generation = repo.worker_generation(self.system).await?;
+                        if repo.worker_generation(self.system).await? != generation {
+                            return Err(ServiceError::Stale);
+                        }
                         return Ok(Turn::Completed(Box::new(WorkerOutput::Automatic(
                             AutomaticCandidate {
                                 generation,
@@ -780,9 +857,7 @@ async fn run_assigned_turn(
     let (checkpoint, next, turn) = worker.scheduled_turn(ctx, 1).await?;
     let work = ctx.work;
     let output = match turn {
-        Some(Turn::Completed(reply)) => {
-            Some(worker.stage_offline_assessment(ctx, owner, *reply).await?)
-        }
+        Some(Turn::Completed(reply)) => Some(worker.publish_assessment(ctx, owner, *reply).await?),
         Some(Turn::Denied) => return Ok(Dispatch::Denied),
         None => None,
     };
@@ -798,10 +873,10 @@ async fn run_assigned_turn(
         .finish_work(worker.system, &work.id, AttemptState::Completed)
         .await?;
     Ok(match output {
-        Some(proposal) => Dispatch::Completed {
+        Some(output) => Dispatch::Completed {
             attempt: work.id.clone(),
             pass: pass_id(work),
-            output: WorkerOutput::Proposal(proposal),
+            output,
         },
         None => Dispatch::Idle,
     })
@@ -825,6 +900,7 @@ async fn authority_is_current(db: &Database, authority: &Authority) -> Result<bo
 fn proposal_from(
     work: &QueuedWork,
     evidence: &EvidenceBundle,
+    sources: Vec<alexandria_storage::models::mutation::ExpectedState>,
     validated: ValidatedProposal,
 ) -> ProposalRevision {
     ProposalRevision {
@@ -834,7 +910,7 @@ fn proposal_from(
         ),
         revision: Version::new(1),
         partition: evidence.focal.partition.clone(),
-        sources: Vec::new(),
+        sources,
         evidence: evidence.clone(),
         category: validated.category,
         proposed: validated.operation,

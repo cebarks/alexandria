@@ -1,4 +1,4 @@
-use std::ops::{AsyncFn, Bound};
+use std::ops::Bound;
 
 use chrono::{DateTime, Utc};
 use surrealdb::engine::any::Any;
@@ -77,24 +77,10 @@ impl RefinementRepo<'_> {
         eligible_before: DateTime<Utc>,
     ) -> Result<CandidatePage, StorageError> {
         validate_cursor(partition, cursor)?;
-        self.read_projection(async |tx| {
-            let account = assigned_account(tx, partition).await?;
-            let Some(policy) = configured_policy(tx).await? else {
-                return Ok(CandidatePage {
-                    outcomes: vec![],
-                    next: None,
-                });
-            };
-            let population = Population {
-                tx,
-                account: &account,
-                partition,
-            };
-            population
-                .page(cursor, limit, eligible_before, &policy)
-                .await
-        })
-        .await
+        let tx = self.db.inner().clone().begin().await.map_err(internal)?;
+        let result = page_in_tx(&tx, partition, cursor, limit, eligible_before).await;
+        tx.cancel().await.map_err(internal)?;
+        result
     }
 
     /// Read explicitly selected Unassigned facts through the owner's review context only.
@@ -112,33 +98,18 @@ impl RefinementRepo<'_> {
             return Err(StorageError::NotFound);
         }
         let ids = selected_ids(selection)?;
-        self.read_projection(async |tx| {
-            let account = workspace_owner(tx, partition).await?;
-            if &account != owner.account() {
-                return Err(StorageError::NotFound);
-            }
-            require_active(tx, &account, Some(owner)).await?;
-            let population = Population {
-                tx,
-                account: &account,
-                partition,
-            };
-            population.require_selected(&ids).await?;
-            let policy = configured_policy(tx)
-                .await?
-                .ok_or(StorageError::Unavailable)?;
-            population
-                .project(
-                    &selection.focal,
-                    &selection.related,
-                    neighbor_limit,
-                    max_bytes.min(MAX_EVIDENCE_BYTES),
-                    EvidenceSelectionKind::OwnerSelected,
-                    &policy.configuration.inference_policy_id,
-                )
-                .await
-        })
-        .await
+        let tx = self.db.inner().clone().begin().await.map_err(internal)?;
+        let result = evidence_in_tx(
+            &tx,
+            owner,
+            partition,
+            selection,
+            ids,
+            (neighbor_limit, max_bytes),
+        )
+        .await;
+        tx.cancel().await.map_err(internal)?;
+        result
     }
 
     /// Load the durable position for an assigned partition. Only an explicit acknowledgement writes it.
@@ -148,12 +119,10 @@ impl RefinementRepo<'_> {
         partition: &Partition,
     ) -> Result<CandidateCheckpoint, StorageError> {
         self.require_system(system)?;
-        self.read_projection(async |tx| {
-            let account = assigned_account(tx, partition).await?;
-            let (_, checkpoint) = checkpoint(tx, &account, partition).await?;
-            Ok(checkpoint)
-        })
-        .await
+        let tx = self.db.inner().clone().begin().await.map_err(internal)?;
+        let result = load_checkpoint(&tx, partition).await;
+        tx.cancel().await.map_err(internal)?;
+        result
     }
 
     /// Compare-and-swap the caller's last acknowledged position. `None` closes the current walk.
@@ -166,41 +135,116 @@ impl RefinementRepo<'_> {
     ) -> Result<CandidateCheckpoint, StorageError> {
         self.require_system(system)?;
         validate_cursor(partition, position)?;
-        self.write(async |tx| {
-            let account = assigned_account(tx, partition).await?;
-            let (id, previous) = checkpoint(tx, &account, partition).await?;
-            if previous.revision != expected_revision {
-                return Err(StorageError::Stale);
+        let db = self.db.inner().clone();
+        let partition = partition.clone();
+        let position = position.cloned();
+        for _ in 0..super::GUARD_CONFLICT_ATTEMPTS {
+            let tx = db.clone().begin().await.map_err(internal)?;
+            let result =
+                save_checkpoint(&tx, &partition, expected_revision, position.as_ref()).await;
+            match super::finish_write(tx, result.is_ok()).await.and(result) {
+                Ok(checkpoint) => return Ok(checkpoint),
+                Err(error) if super::can_retry(&error) => tokio::task::yield_now().await,
+                Err(error) => return Err(error),
             }
-            let revision = next_revision(previous.revision.get())?;
-            let (scope, project) = scope_fields(&partition.scope);
-            let row = CheckpointRow {
-                account: account.as_record_id().clone(),
-                workspace: partition.workspace.as_record_id().clone(),
-                scope,
-                project,
-                after_fact: position.map(|cursor| cursor.after.as_record_id().clone()),
-                revision,
-            };
-            let seen = (previous.revision != Version::ZERO).then_some(previous.revision.get());
-            write_record(tx, id, row, seen).await?;
-            Ok(CandidateCheckpoint {
-                position: position.cloned(),
-                revision: Version::new(revision),
-            })
-        })
-        .await
+        }
+        Err(StorageError::RetryableBookkeepingConflict)
     }
+}
 
-    async fn read_projection<T>(
-        &self,
-        action: impl AsyncFn(&Transaction<Any>) -> Result<T, StorageError>,
-    ) -> Result<T, StorageError> {
-        let tx = self.db.inner().clone().begin().await.map_err(internal)?;
-        let result = action(&tx).await;
-        tx.cancel().await.map_err(internal)?;
-        result
+async fn page_in_tx(
+    tx: &Transaction<Any>,
+    partition: &Partition,
+    cursor: Option<&CandidateCursor>,
+    limit: usize,
+    eligible_before: DateTime<Utc>,
+) -> Result<CandidatePage, StorageError> {
+    let account = assigned_account(tx, partition).await?;
+    let Some(policy) = configured_policy(tx).await? else {
+        return Ok(CandidatePage {
+            outcomes: vec![],
+            next: None,
+        });
+    };
+    Population {
+        tx,
+        account: &account,
+        partition,
     }
+    .page(cursor, limit, eligible_before, &policy)
+    .await
+}
+
+async fn evidence_in_tx(
+    tx: &Transaction<Any>,
+    owner: &OwnerContext,
+    partition: &Partition,
+    selection: &EvidenceSelection,
+    ids: Vec<FactId>,
+    limits: (usize, usize),
+) -> Result<EvidenceOutcome, StorageError> {
+    let account = workspace_owner(tx, partition).await?;
+    if &account != owner.account() {
+        return Err(StorageError::NotFound);
+    }
+    require_active(tx, &account, Some(owner)).await?;
+    let population = Population {
+        tx,
+        account: &account,
+        partition,
+    };
+    population.require_selected(&ids).await?;
+    let policy = configured_policy(tx)
+        .await?
+        .ok_or(StorageError::Unavailable)?;
+    population
+        .project(
+            &selection.focal,
+            &selection.related,
+            limits.0,
+            limits.1.min(MAX_EVIDENCE_BYTES),
+            EvidenceSelectionKind::OwnerSelected,
+            &policy.configuration.inference_policy_id,
+        )
+        .await
+}
+
+async fn load_checkpoint(
+    tx: &Transaction<Any>,
+    partition: &Partition,
+) -> Result<CandidateCheckpoint, StorageError> {
+    let account = assigned_account(tx, partition).await?;
+    let (_, checkpoint) = checkpoint(tx, &account, partition).await?;
+    Ok(checkpoint)
+}
+
+async fn save_checkpoint(
+    tx: &Transaction<Any>,
+    partition: &Partition,
+    expected_revision: Version,
+    position: Option<&CandidateCursor>,
+) -> Result<CandidateCheckpoint, StorageError> {
+    let account = assigned_account(tx, partition).await?;
+    let (id, previous) = checkpoint(tx, &account, partition).await?;
+    if previous.revision != expected_revision {
+        return Err(StorageError::Stale);
+    }
+    let revision = next_revision(previous.revision.get())?;
+    let (scope, project) = scope_fields(&partition.scope);
+    let row = CheckpointRow {
+        account: account.as_record_id().clone(),
+        workspace: partition.workspace.as_record_id().clone(),
+        scope,
+        project,
+        after_fact: position.map(|cursor| cursor.after.as_record_id().clone()),
+        revision,
+    };
+    let seen = (previous.revision != Version::ZERO).then_some(previous.revision.get());
+    write_record(tx, id, row, seen).await?;
+    Ok(CandidateCheckpoint {
+        position: position.cloned(),
+        revision: Version::new(revision),
+    })
 }
 
 struct Population<'a> {

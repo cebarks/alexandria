@@ -51,6 +51,7 @@ pub enum WorkKind {
     Opinion,
     Regenerate,
     AssessUnassigned,
+    Apply,
 }
 
 impl WorkKind {
@@ -61,6 +62,7 @@ impl WorkKind {
             WorkKind::Opinion => "opinion",
             WorkKind::Regenerate => "regenerate",
             WorkKind::AssessUnassigned => "assess_unassigned",
+            WorkKind::Apply => "apply",
         }
     }
 
@@ -70,6 +72,7 @@ impl WorkKind {
             "opinion" => Ok(WorkKind::Opinion),
             "regenerate" => Ok(WorkKind::Regenerate),
             "assess_unassigned" => Ok(WorkKind::AssessUnassigned),
+            "apply" => Ok(WorkKind::Apply),
             _ => Err(StorageError::Internal(anyhow::anyhow!(
                 "refinement attempt carries an unknown work kind"
             ))),
@@ -87,6 +90,18 @@ impl WorkKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptId(RecordId);
+
+impl TryFrom<RecordId> for AttemptId {
+    type Error = StorageError;
+
+    fn try_from(id: RecordId) -> Result<Self, Self::Error> {
+        if id.table.as_str() == "refinement_attempt" {
+            Ok(Self(id))
+        } else {
+            Err(StorageError::NotFound)
+        }
+    }
+}
 
 impl AttemptId {
     /// The typed row this attempt lives at, for repo-internal updates.
@@ -108,7 +123,7 @@ pub enum AttemptState {
 }
 
 impl AttemptState {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             AttemptState::Queued => "queued",
             AttemptState::Running => "running",
@@ -199,6 +214,14 @@ pub struct Usage {
     pub global: usize,
 }
 
+/// Owner-scoped disclosure counts: this account's rolling charges and queued work only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerUsage {
+    pub account: usize,
+    pub interactive: usize,
+    pub queued: usize,
+}
+
 impl RefinementRepo<'_> {
     /// Admit and persist one unit of refinement work. Idempotent per (owner, key); opinion and
     /// regeneration for one proposal revision coalesce onto the already-queued attempt so no two
@@ -219,6 +242,11 @@ impl RefinementRepo<'_> {
                 "refinement idempotency key is blank or too long".into(),
             ));
         }
+        if request.kind == WorkKind::Apply {
+            return Err(StorageError::InvalidInput(
+                "application is not queueable".into(),
+            ));
+        }
         let interactive = request.kind.is_interactive();
         let record = RecordId::new(
             "refinement_attempt",
@@ -231,103 +259,18 @@ impl RefinementRepo<'_> {
                 .as_bytes(),
             ),
         );
-        self.write(async |tx| {
-            require_active(tx, owner.account(), Some(owner)).await?;
-            let effective = PolicySnapshot::read(tx, owner.account())
-                .await?
-                .effective()?;
-            let authority =
-                bind_authority(owner.account(), &effective).ok_or(StorageError::Unavailable)?;
-            if select_record::<AttemptRow>(tx, record.clone())
-                .await?
-                .is_some()
-            {
-                // A resubmission of the same key is the same work, whatever state it reached.
-                return Ok(AttemptId(record.clone()));
+        let db = self.db.inner().clone();
+        let owner = owner.clone();
+        for _ in 0..GUARD_CONFLICT_ATTEMPTS {
+            let tx = db.clone().begin().await.map_err(internal)?;
+            let result = enqueue_in_tx(&tx, &owner, &request, &record, interactive).await;
+            match super::finish_write(tx, result.is_ok()).await.and(result) {
+                Ok(attempt) => return Ok(attempt),
+                Err(error) if super::can_retry(&error) => tokio::task::yield_now().await,
+                Err(error) => return Err(error),
             }
-            if let WorkSelection::Proposal(proposal) = &request.selection
-                && matches!(request.kind, WorkKind::Opinion | WorkKind::Regenerate)
-            {
-                let queued: Vec<RecordId> = tx
-                    .query(
-                        "SELECT VALUE id FROM refinement_attempt \
-                         WHERE account = $account AND proposal = $proposal AND state = 'queued' \
-                         LIMIT 1",
-                    )
-                    .bind(("account", owner.account().as_record_id().clone()))
-                    .bind(("proposal", proposal.clone()))
-                    .await
-                    .map_err(internal)?
-                    .check()
-                    .map_err(internal)?
-                    .take(0)
-                    .map_err(internal)?;
-                if let Some(id) = queued.into_iter().next() {
-                    return Ok(AttemptId(id));
-                }
-            }
-            if interactive {
-                let queued: Vec<RecordId> = tx
-                    .query(
-                        "SELECT VALUE id FROM refinement_attempt \
-                         WHERE state = 'queued' AND account = $account AND kind IN $kinds",
-                    )
-                    .bind(("account", owner.account().as_record_id().clone()))
-                    .bind((
-                        "kinds",
-                        INTERACTIVE_KINDS
-                            .iter()
-                            .map(|kind| (*kind).to_owned())
-                            .collect::<Vec<_>>(),
-                    ))
-                    .await
-                    .map_err(internal)?
-                    .check()
-                    .map_err(internal)?
-                    .take(0)
-                    .map_err(internal)?;
-                if queued.len() >= MAX_ACCOUNT_INTERACTIVE_QUEUE {
-                    return Err(StorageError::Quota);
-                }
-            }
-            let queued: Vec<RecordId> = tx
-                .query("SELECT VALUE id FROM refinement_attempt WHERE state = 'queued'")
-                .await
-                .map_err(internal)?
-                .check()
-                .map_err(internal)?
-                .take(0)
-                .map_err(internal)?;
-            if queued.len() >= MAX_GLOBAL_QUEUE {
-                return Err(StorageError::Quota);
-            }
-            let (scope, project) = scope_fields(&request.partition.scope);
-            let row = AttemptRecord {
-                account: owner.account().as_record_id().clone(),
-                workspace: request.partition.workspace.as_record_id().clone(),
-                project,
-                scope,
-                kind: request.kind.as_str().to_owned(),
-                idempotency_key: request.idempotency_key.clone(),
-                selection: SelectionRecord::from(&request.selection),
-                source_revision: request.source_revision.map(|version| version.get()),
-                proposal: match &request.selection {
-                    WorkSelection::Proposal(proposal) => Some(proposal.clone()),
-                    _ => None,
-                },
-                state: "queued".to_owned(),
-                authority: AuthorityRecord::from(&authority),
-            };
-            tx.query("CREATE $id CONTENT $row")
-                .bind(("id", record.clone()))
-                .bind(("row", row.into_value()))
-                .await
-                .map_err(internal)?
-                .check()
-                .map_err(internal)?;
-            Ok(AttemptId(record.clone()))
-        })
-        .await
+        }
+        Err(StorageError::RetryableBookkeepingConflict)
     }
 
     /// An owner-scoped read of one attempt. Another owner's id is indistinguishable from a
@@ -528,39 +471,170 @@ impl RefinementRepo<'_> {
         if id.table.as_str() != "refinement_proposal" {
             return Err(StorageError::NotFound);
         }
-        let rows: Vec<ProposalFullRow> = self
-            .db
-            .inner()
-            .query("SELECT * FROM $id")
-            .bind(("id", id.clone()))
-            .await
-            .map_err(internal)?
-            .check()
-            .map_err(internal)?
-            .take(0)
-            .map_err(internal)?;
-        let row = rows.into_iter().next().ok_or(StorageError::NotFound)?;
-        let evidence_rows: Vec<EvidenceRecord> = self
-            .db
-            .inner()
-            .query("SELECT * FROM $evidence")
-            .bind(("evidence", row.evidence.clone()))
-            .await
-            .map_err(internal)?
-            .check()
-            .map_err(internal)?
-            .take(0)
-            .map_err(internal)?;
-        let evidence_row = evidence_rows.into_iter().next().ok_or_else(|| {
-            StorageError::Internal(anyhow::anyhow!("proposal evidence row is missing"))
-        })?;
-        let evidence = decode_evidence(&evidence_row)?;
-        let payload: serde_json::Value = serde_json::from_str(&row.proposal_payload)
-            .map_err(|error| StorageError::Internal(anyhow::Error::new(error)))?;
-        let proposal = decode_proposal(row, payload, evidence.clone())?;
-        Ok((proposal, evidence))
+        read_proposal_evidence(self.db.inner(), id.clone(), None).await
     }
 
+    /// Load the immutable assessment only under the current owner and workspace.
+    pub async fn owner_proposal_revision(
+        &self,
+        owner: &OwnerContext,
+        id: &crate::models::identity::RefinementProposalId,
+    ) -> Result<ProposalRevision, StorageError> {
+        let (proposal, _) = read_proposal_evidence(
+            self.db.inner(),
+            id.as_record_id().clone(),
+            Some(owner.clone()),
+        )
+        .await?;
+        Ok(proposal)
+    }
+}
+
+async fn enqueue_in_tx(
+    tx: &Transaction<Any>,
+    owner: &OwnerContext,
+    request: &EnqueueRequest,
+    record: &RecordId,
+    interactive: bool,
+) -> Result<AttemptId, StorageError> {
+    require_active(tx, owner.account(), Some(owner)).await?;
+    let effective = PolicySnapshot::read(tx, owner.account())
+        .await?
+        .effective()?;
+    let authority = bind_authority(owner.account(), &effective).ok_or(StorageError::Unavailable)?;
+    if select_record::<AttemptRow>(tx, record.clone())
+        .await?
+        .is_some()
+    {
+        // A resubmission of the same key is the same work, whatever state it reached.
+        return Ok(AttemptId(record.clone()));
+    }
+    if let WorkSelection::Proposal(proposal) = &request.selection
+        && matches!(request.kind, WorkKind::Opinion | WorkKind::Regenerate)
+    {
+        let queued: Vec<RecordId> = tx
+            .query(
+                "SELECT VALUE id FROM refinement_attempt \
+                 WHERE account = $account AND proposal = $proposal AND state = 'queued' \
+                 LIMIT 1",
+            )
+            .bind(("account", owner.account().as_record_id().clone()))
+            .bind(("proposal", proposal.clone()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        if let Some(id) = queued.into_iter().next() {
+            return Ok(AttemptId(id));
+        }
+    }
+    if interactive {
+        let queued: Vec<RecordId> = tx
+            .query(
+                "SELECT VALUE id FROM refinement_attempt \
+                 WHERE state = 'queued' AND account = $account AND kind IN $kinds",
+            )
+            .bind(("account", owner.account().as_record_id().clone()))
+            .bind((
+                "kinds",
+                INTERACTIVE_KINDS
+                    .iter()
+                    .map(|kind| (*kind).to_owned())
+                    .collect::<Vec<_>>(),
+            ))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        if queued.len() >= MAX_ACCOUNT_INTERACTIVE_QUEUE {
+            return Err(StorageError::Quota);
+        }
+    }
+    let queued: Vec<RecordId> = tx
+        .query("SELECT VALUE id FROM refinement_attempt WHERE state = 'queued'")
+        .await
+        .map_err(internal)?
+        .check()
+        .map_err(internal)?
+        .take(0)
+        .map_err(internal)?;
+    if queued.len() >= MAX_GLOBAL_QUEUE {
+        return Err(StorageError::Quota);
+    }
+    let (scope, project) = scope_fields(&request.partition.scope);
+    let row = AttemptRecord {
+        account: owner.account().as_record_id().clone(),
+        workspace: request.partition.workspace.as_record_id().clone(),
+        project,
+        scope,
+        kind: request.kind.as_str().to_owned(),
+        idempotency_key: request.idempotency_key.clone(),
+        selection: SelectionRecord::from(&request.selection),
+        source_revision: request.source_revision.map(|version| version.get()),
+        proposal: match &request.selection {
+            WorkSelection::Proposal(proposal) => Some(proposal.clone()),
+            _ => None,
+        },
+        state: "queued".to_owned(),
+        authority: AuthorityRecord::from(&authority),
+    };
+    tx.query("CREATE $id CONTENT $row")
+        .bind(("id", record.clone()))
+        .bind(("row", row.into_value()))
+        .await
+        .map_err(internal)?
+        .check()
+        .map_err(internal)?;
+    Ok(AttemptId(record.clone()))
+}
+
+async fn read_proposal_evidence(
+    db: &Surreal<Any>,
+    id: RecordId,
+    owner: Option<OwnerContext>,
+) -> Result<(ProposalRevision, EvidenceBundle), StorageError> {
+    let mut query = if let Some(owner) = owner {
+        db.query("SELECT * FROM $id WHERE account = $account AND workspace = $workspace")
+            .bind(("account", owner.account().as_record_id().clone()))
+            .bind(("workspace", owner.workspace().as_record_id().clone()))
+    } else {
+        db.query("SELECT * FROM $id")
+    };
+    query = query.bind(("id", id));
+    let rows: Vec<ProposalFullRow> = query
+        .await
+        .map_err(internal)?
+        .check()
+        .map_err(internal)?
+        .take(0)
+        .map_err(internal)?;
+    let row = rows.into_iter().next().ok_or(StorageError::NotFound)?;
+    let evidence_rows: Vec<EvidenceRecord> = db
+        .query("SELECT * FROM $evidence WHERE account = $account AND workspace = $workspace")
+        .bind(("evidence", row.evidence.clone()))
+        .bind(("account", row.account.clone()))
+        .bind(("workspace", row.workspace.clone()))
+        .await
+        .map_err(internal)?
+        .check()
+        .map_err(internal)?
+        .take(0)
+        .map_err(internal)?;
+    let evidence_row = evidence_rows.into_iter().next().ok_or_else(|| {
+        StorageError::Internal(anyhow::anyhow!("proposal evidence row is missing"))
+    })?;
+    let evidence = decode_evidence(&evidence_row)?;
+    let payload: serde_json::Value = serde_json::from_str(&row.proposal_payload)
+        .map_err(|error| StorageError::Internal(anyhow::Error::new(error)))?;
+    let proposal = decode_proposal(row, payload, evidence.clone())?;
+    Ok((proposal, evidence))
+}
+
+impl RefinementRepo<'_> {
     /// The persisted enqueue-request stamp and completed stamp, in whole seconds.
     pub async fn refinement_progress(
         &self,
@@ -625,16 +699,93 @@ impl RefinementRepo<'_> {
         system: &SystemContext,
     ) -> Result<u64, StorageError> {
         self.require_system(system)?;
-        self.write(async |tx| {
-            let current = read_stamp_tx(tx, WORKER_GENERATION_KEY).await?.unwrap_or(0);
-            let next = current.checked_add(1).ok_or_else(|| {
-                StorageError::Internal(anyhow::anyhow!("generation space exhausted"))
-            })?;
-            write_stamp_tx(tx, WORKER_GENERATION_KEY, next).await?;
-            Ok(next)
-        })
-        .await
+        let db = self.db.inner().clone();
+        for _ in 0..GUARD_CONFLICT_ATTEMPTS {
+            let tx = db.clone().begin().await.map_err(internal)?;
+            let result = bump_generation_in_tx(&tx).await;
+            match super::finish_write(tx, result.is_ok()).await.and(result) {
+                Ok(next) => return Ok(next),
+                Err(error) if super::can_retry(&error) => tokio::task::yield_now().await,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(StorageError::RetryableBookkeepingConflict)
     }
+
+    /// Queue one assigned partition under its actual active owner, never an operator principal.
+    pub async fn enqueue_scheduled(
+        &self,
+        system: &SystemContext,
+        partition: Partition,
+        requested: u64,
+    ) -> Result<(), StorageError> {
+        self.require_system(system)?;
+        if partition.scope == MemoryScope::Unassigned {
+            return Err(StorageError::NotFound);
+        }
+        let owners: Vec<RecordId> = self
+            .db
+            .inner()
+            .query("SELECT VALUE owner FROM $workspace")
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        let account =
+            AccountId::try_from(owners.into_iter().next().ok_or(StorageError::NotFound)?)?;
+        if current_authority(self.db, &account).await?.is_none() {
+            return Ok(());
+        }
+        let access = crate::access::AccessRepo::new(self.db);
+        let principal = access.local_principal(system, &account).await?;
+        let owner = access.authorize(&principal).await?;
+        let key = sha256(format!("scheduled:{requested}:{partition:?}").as_bytes());
+        self.enqueue(
+            &owner,
+            EnqueueRequest {
+                owner: account,
+                partition,
+                kind: WorkKind::Assess,
+                source_revision: None,
+                selection: WorkSelection::Scheduled,
+                idempotency_key: key,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Acknowledge a cadence request only after its eligible partitions have been enqueued.
+    pub async fn finish_enqueue_request(
+        &self,
+        system: &SystemContext,
+        requested: u64,
+    ) -> Result<(), StorageError> {
+        self.require_system(system)?;
+        let db = self.db.inner().clone();
+        let tx = db.clone().begin().await.map_err(internal)?;
+        let result = finish_enqueue_in_tx(&tx, requested).await;
+        super::finish_write(tx, result.is_ok()).await.and(result)
+    }
+}
+
+async fn bump_generation_in_tx(tx: &Transaction<Any>) -> Result<u64, StorageError> {
+    let current = read_stamp_tx(tx, WORKER_GENERATION_KEY).await?.unwrap_or(0);
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Internal(anyhow::anyhow!("generation space exhausted")))?;
+    write_stamp_tx(tx, WORKER_GENERATION_KEY, next).await?;
+    Ok(next)
+}
+
+async fn finish_enqueue_in_tx(tx: &Transaction<Any>, requested: u64) -> Result<(), StorageError> {
+    if read_stamp_tx(tx, ENQUEUE_REQUESTED_KEY).await? != Some(requested) {
+        return Err(StorageError::Stale);
+    }
+    write_stamp_tx(tx, ENQUEUE_COMPLETED_KEY, requested).await
 }
 
 /// One enqueue-request attempt inside an open transaction. A plain `async fn` with by-value
@@ -790,6 +941,47 @@ impl<'a> BudgetRepo<'a> {
     }
 }
 
+impl RefinementRepo<'_> {
+    /// The owner's real rolling charge counts and queued depth, for disclosure pages. Only this
+    /// account's buckets are read: the global window is deliberately absent because it would
+    /// disclose other accounts' inference volume to an owner.
+    pub async fn owner_usage(
+        &self,
+        owner: &OwnerContext,
+        now: DateTime<Utc>,
+    ) -> Result<OwnerUsage, StorageError> {
+        let account = rolling_plain(
+            self.db.inner(),
+            "account",
+            Some(owner.account()),
+            false,
+            now,
+        )
+        .await?;
+        let interactive =
+            rolling_plain(self.db.inner(), "account", Some(owner.account()), true, now).await?;
+        let queued: Vec<RecordId> = self
+            .db
+            .inner()
+            .query(
+                "SELECT VALUE id FROM refinement_attempt WHERE account = $account AND state = \
+                 'queued';",
+            )
+            .bind(("account", owner.account().as_record_id().clone()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        Ok(OwnerUsage {
+            account: usize::try_from(account).unwrap_or(usize::MAX),
+            interactive: usize::try_from(interactive).unwrap_or(usize::MAX),
+            queued: queued.len(),
+        })
+    }
+}
+
 /// One reservation attempt inside an open transaction. A plain `async fn`, not a generic
 /// `AsyncFn` action: the retry loop's caller needs a `Send` future, and reference parameters
 /// crossing a higher-ranked closure defeat that proof. Small inputs arrive by value.
@@ -893,7 +1085,7 @@ pub async fn current_authority(
 /// The storage-side binder for the engine's `current_authority`: consent must be this
 /// account's, unrevoked, and for exactly the configured destinations. Mode is clamped by the
 /// configured ceiling, exactly as the engine clamps it.
-fn bind_authority(account: &AccountId, policy: &EffectivePolicy) -> Option<Authority> {
+pub(super) fn bind_authority(account: &AccountId, policy: &EffectivePolicy) -> Option<Authority> {
     let configured = policy.configured.as_ref()?;
     let consent = policy.consent.as_ref()?;
     if &consent.account != account
@@ -1086,6 +1278,7 @@ struct AttemptRow {
 #[derive(Clone, SurrealValue)]
 struct ProposalFullRow {
     id: Option<RecordId>,
+    account: RecordId,
     workspace: RecordId,
     project: Option<RecordId>,
     scope: String,
@@ -1353,6 +1546,16 @@ async fn write_stamp_tx(tx: &Transaction<Any>, key: &str, value: u64) -> Result<
         .map_err(internal)?;
     }
     Ok(())
+}
+
+pub(super) async fn fence_generation(
+    tx: &Transaction<Any>,
+    generation: u64,
+) -> Result<(), StorageError> {
+    if read_stamp_tx(tx, WORKER_GENERATION_KEY).await?.unwrap_or(0) != generation {
+        return Err(StorageError::Stale);
+    }
+    write_stamp_tx(tx, WORKER_GENERATION_KEY, generation).await
 }
 
 // --- Payload decoding: the inverse of the canonical JSON the persist path writes. ---

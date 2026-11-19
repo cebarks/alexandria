@@ -328,7 +328,7 @@ failing.
 
 ### `[refinement]`
 
-Refinement has no routes by default. Only the operator can configure destinations and the approval ceiling. Startup must reconcile the configured policy with the store before serving; removing the proposer disables refinement without deleting prior consent. Setting a route does **not** grant consent for any account, start inference, or enable automatic application. The background scheduler does not run inference; an explicit offline pass uses the shared worker for one selected scope.
+Refinement has no routes by default. Only the operator can configure destinations and the approval ceiling. Startup reconciles the configured policy with the store before serving; removing the proposer disables inference without deleting prior consent. In HTTP mode with routes configured, a worker processes the durable refinement queue separately from housekeeping. The dreaming scheduler requests assigned-scope passes on `interval_secs` when enabled. Configuring routes does **not** grant consent: only currently opted-in accounts may send evidence, and automatic application additionally requires the owner's `secondary_llm` preference, an operator ceiling that permits it, and exact secondary approval. Existing owner-reviewed proposals can still be applied locally after egress is revoked.
 
 ```toml
 [refinement]
@@ -368,10 +368,12 @@ for example `project:7`) is explicit-only. It needs the trusted-local account's 
 its own workspace, a ready owned store with matching embedding identity, and current consent.
 It cannot be combined with other jobs or `--max-rows`, never uses Unassigned, and is never part of
 bare `dream` or `--job all`. It loads the locked embedding provider, then runs one bounded worker
-turn and reports an operation ID, a durable attempt ID, and any pending proposal. A continuation
-uses the saved cursor on the next explicit pass. Even an exact secondary approval remains pending
-for review here: the offline pass does not apply changes to the corpus. The command checks an
-existing `LOCK` read-only before the engine open; keep other openers stopped through that handoff.
+turn and reports a run ID, a durable attempt ID, and any pending or applied proposal. A continuation
+uses the saved cursor on the next explicit pass. Human-mode results remain pending; an exact secondary
+approval under current policy can apply in the same turn. A failed embedding preparation records a failed
+attempt without applying the proposal or leaving reusable automatic approval. Revert refuses if any
+semantic postimage or incident reference changed and does not rewind later access heat. The command checks
+an existing `LOCK` read-only before the engine open; keep other openers stopped through that handoff.
 
 ### `[retrieve]`
 

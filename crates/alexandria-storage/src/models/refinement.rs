@@ -8,8 +8,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
-use super::identity::{AccountId, FactId, OperationId, Partition, Version};
-use super::mutation::ExpectedState;
+use super::identity::{
+    AccountId, FactId, OperationId, Partition, RefinementProposalId, SemanticOperationId, Version,
+};
+use super::mutation::{EmbeddingSnapshot, ExpectedState, RelationTarget};
 use super::provenance::Provenance;
 use surrealdb::types::RecordId;
 
@@ -259,6 +261,40 @@ pub struct ProposalRevision {
     pub state: ProposalState,
     pub needs_human: bool,
     pub deferred: bool,
+}
+
+/// The proposal row and exact revision a quality transaction must decide with its corpus writes.
+/// This identifies a transition; possession is not authority to perform one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityProposalTransition {
+    pub proposal: RefinementProposalId,
+    pub revision: Version,
+}
+
+/// Prepared before opening a transaction. Binding the vector to the exact approved text lets the
+/// storage planner join it to a fact write without letting preparation resolve scope or authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedQualityEmbedding {
+    pub content: String,
+    pub embedding: EmbeddingSnapshot,
+}
+
+/// Storage-planned details; request handlers cannot construct a secondary binding or graph patch.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct QualityDetails {
+    pub(crate) proposal: Option<ProposalRevision>,
+    pub(crate) request_payload_hash: Option<String>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) stable_slots: Vec<FactId>,
+    pub(crate) generated_sessions: Vec<GeneratedSession>,
+    pub(crate) reverts: Option<SemanticOperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GeneratedSession {
+    pub session: RecordId,
+    pub target: RelationTarget,
+    pub source: FactId,
 }
 
 /// Owner-authorized, read-only projection for the refinement queue and detail page.

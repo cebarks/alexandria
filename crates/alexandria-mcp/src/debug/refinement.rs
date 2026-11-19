@@ -1,14 +1,12 @@
 //! Owner-facing refinement queue, proposal review, and destination-consent settings.
 //!
-//! Queue/detail reads are account- and workspace-qualified in storage. Worker actions remain
-//! fail-closed until Task 19 supplies their durable attempt and application services.
-
-use std::sync::Arc;
+//! Reads and decisions are account- and workspace-qualified; GET never applies a change.
 
 use askama::Template;
+use axum::Json;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -17,13 +15,18 @@ use super::web::{self, Boundary, BrowserSession};
 use crate::AlexandriaServer;
 use crate::error::ServiceError;
 use crate::refinement::service::RefinementService;
-use alexandria_storage::Database;
 use alexandria_storage::access::OwnerContext;
+use alexandria_storage::models::identity::{
+    OperationId, RefinementProposalId, SemanticOperationId, Version,
+};
 use alexandria_storage::models::mutation::OperationDetail;
 use alexandria_storage::models::refinement::{
     ApprovalMode, ApprovalSetting, Consent, ConsentChoice, PolicyVersion, ProposalDisplay,
+    ProposalState,
 };
-use alexandria_storage::repos::MutationRepo;
+use alexandria_storage::repos::refinement_repo::AttemptId;
+use alexandria_storage::repos::{MutationRepo, RefinementRepo};
+use surrealdb::types::ToSql;
 
 const NAV: &str = "refinement";
 
@@ -47,7 +50,7 @@ pub(crate) async fn queue(
         "personal" | "project" | "unassigned" => Some(filter_scope.as_str()),
         _ => return bad_request("unknown refinement scope filter"),
     };
-    let service = RefinementService::new(server.db.as_ref(), None);
+    let service = RefinementService::new(server.db.as_ref(), server.refinement.as_deref());
     let proposals = match service.owner_proposals(&owner, scope).await {
         Ok(proposals) => proposals,
         Err(_) => return unavailable(),
@@ -55,6 +58,15 @@ pub(crate) async fn queue(
     let effective = match service.effective_policy(&owner).await {
         Ok(policy) => policy,
         Err(_) => return unavailable(),
+    };
+    let usage = service.owner_usage(&owner).await;
+    let attempt_status = match usage {
+        Ok(usage) => format!(
+            "{} queued refinement attempt(s) for this account; {} provider call(s) charged in the \
+             rolling window",
+            usage.queued, usage.account
+        ),
+        Err(_) => "attempt counts are unavailable".to_string(),
     };
     let current_policy = effective
         .policy
@@ -72,8 +84,7 @@ pub(crate) async fn queue(
             rows.len()
         ),
         approval_mode: approval_mode_label(effective.approval_mode).to_string(),
-        attempt_status: "attempt and quota data unavailable until the worker service is integrated"
-            .to_string(),
+        attempt_status,
         filter_scope,
         rows,
     })
@@ -94,7 +105,7 @@ pub(crate) async fn detail(
     if id.table.as_str() != "refinement_proposal" {
         return not_found();
     }
-    let service = RefinementService::new(server.db.as_ref(), None);
+    let service = RefinementService::new(server.db.as_ref(), server.refinement.as_deref());
     let proposal = match service.owner_proposal(&owner, &id).await {
         Ok(Some(proposal)) => proposal,
         Ok(None) => return not_found(),
@@ -133,6 +144,11 @@ pub(crate) async fn detail(
         proposal_id: alexandria_storage::record_id_to_string(&proposal.id),
         revision: proposal.revision,
         state: format!("{:?}", proposal.state).to_lowercase(),
+        proposal_path: id.to_sql(),
+        csrf: session.csrf().to_string(),
+        decision_key: uuid::Uuid::new_v4().to_string(),
+        can_decide: proposal.state == ProposalState::Pending,
+        can_revert: proposal.state == ProposalState::Applied && proposal.operation.is_some(),
         source: source_summary(&payload),
         selected_records: selected_records(&payload),
         changes: change_summary(&payload),
@@ -157,7 +173,10 @@ pub(crate) async fn settings(
     let Ok((owner, _)) = boundary.corpus(&session).await else {
         return forbidden();
     };
-    match effective_policy(Arc::clone(&server.db), owner).await {
+    match RefinementService::new(&server.db, server.refinement.as_deref())
+        .effective_policy(&owner)
+        .await
+    {
         Ok(effective) => {
             let same_model = effective.routes.as_ref().map_or_else(
                 || "not configured".to_string(),
@@ -169,14 +188,31 @@ pub(crate) async fn settings(
                     }
                 },
             );
+            let usage = RefinementService::new(&server.db, server.refinement.as_deref())
+                .owner_usage(&owner)
+                .await;
+            let (quota_status, attempt_status) = match usage {
+                Ok(usage) => (
+                    format!(
+                        "{} account-window and {} interactive-window provider call(s) in the \
+                         rolling 24-hour window",
+                        usage.account, usage.interactive
+                    ),
+                    format!("{} queued refinement attempt(s)", usage.queued),
+                ),
+                Err(_) => (
+                    "quota counts are unavailable".to_string(),
+                    "attempt counts are unavailable".to_string(),
+                ),
+            };
             private_page(SettingsTemplate {
                 nav: NAV,
                 csrf: session.csrf().to_string(),
                 consent: consent_label(&effective),
                 destination: destination_disclosure(&effective),
                 approval_mode: approval_mode_label(effective.approval_mode).to_string(),
-                quota_status: "Unavailable: worker quota integration is pending".to_string(),
-                attempt_status: "Unavailable: attempt polling is pending".to_string(),
+                quota_status,
+                attempt_status,
                 selected_mode: match effective.approval_mode {
                     ApprovalMode::Human => "human",
                     ApprovalMode::SecondaryLlm => "secondary_llm",
@@ -227,7 +263,7 @@ pub(crate) async fn consent(
         "revoke" => ConsentChoice::Revoke,
         _ => return bad_request("unknown consent choice"),
     };
-    match set_consent(Arc::clone(&server.db), owner, form.revision, choice).await {
+    match set_consent(server, owner, form.revision, choice).await {
         Ok(_) => axum::response::Redirect::to("/debug/refinement/settings").into_response(),
         Err(_) => unavailable(),
     }
@@ -263,59 +299,183 @@ pub(crate) async fn mode(
         consent_revision: form.consent_revision,
         owner_mode_revision: form.mode_revision,
     };
-    match set_mode(Arc::clone(&server.db), owner, expected, mode).await {
+    match set_mode(server, owner, expected, mode).await {
         Ok(_) => axum::response::Redirect::to("/debug/refinement/settings").into_response(),
         Err(_) => unavailable(),
     }
 }
 
-async fn effective_policy(
-    db: Arc<Database>,
-    owner: OwnerContext,
-) -> Result<crate::refinement::service::EffectiveRefinementPolicy, ServiceError> {
-    let service = RefinementService::new(db.as_ref(), None);
-    service.effective_policy(&owner).await
-}
-
 async fn set_consent(
-    db: Arc<Database>,
+    server: AlexandriaServer,
     owner: OwnerContext,
     revision: u64,
     choice: ConsentChoice,
 ) -> Result<Consent, ServiceError> {
-    let service = RefinementService::new(db.as_ref(), None);
+    let service = RefinementService::new(&server.db, server.refinement.as_deref());
     service.consent(&owner, revision, choice).await
 }
 
 async fn set_mode(
-    db: Arc<Database>,
+    server: AlexandriaServer,
     owner: OwnerContext,
     expected: PolicyVersion,
     mode: ApprovalMode,
 ) -> Result<ApprovalSetting, ServiceError> {
-    let service = RefinementService::new(db.as_ref(), None);
+    let service = RefinementService::new(&server.db, server.refinement.as_deref());
     service.set_approval_mode(&owner, &expected, mode).await
 }
 
-// Task 19 supplies durable enqueue/attempt/proposal-action services. These routes remain
-// deliberately unavailable rather than implying work or mutating a proposal without those guards.
 pub(crate) async fn enqueue() -> Response {
     unavailable()
 }
-pub(crate) async fn approve() -> Response {
-    unavailable()
+
+#[derive(Deserialize)]
+pub(crate) struct DecisionForm {
+    revision: u64,
+    decision_key: uuid::Uuid,
 }
-pub(crate) async fn dismiss() -> Response {
-    unavailable()
+
+#[derive(Clone, Copy)]
+enum Decision {
+    Approve,
+    Dismiss,
+    Defer,
+    Revert,
 }
-pub(crate) async fn defer() -> Response {
-    unavailable()
+
+pub(crate) async fn approve(
+    State(server): State<AlexandriaServer>,
+    session: BrowserSession,
+    Path(id): Path<String>,
+    Form(form): Form<DecisionForm>,
+) -> Response {
+    decide(server, session.owner().clone(), id, form, Decision::Approve).await
 }
-pub(crate) async fn revert() -> Response {
-    unavailable()
+
+pub(crate) async fn dismiss(
+    State(server): State<AlexandriaServer>,
+    session: BrowserSession,
+    Path(id): Path<String>,
+    Form(form): Form<DecisionForm>,
+) -> Response {
+    decide(server, session.owner().clone(), id, form, Decision::Dismiss).await
 }
-pub(crate) async fn attempt() -> Response {
-    unavailable()
+
+pub(crate) async fn defer(
+    State(server): State<AlexandriaServer>,
+    session: BrowserSession,
+    Path(id): Path<String>,
+    Form(form): Form<DecisionForm>,
+) -> Response {
+    decide(server, session.owner().clone(), id, form, Decision::Defer).await
+}
+
+pub(crate) async fn revert(
+    State(server): State<AlexandriaServer>,
+    session: BrowserSession,
+    Path(id): Path<String>,
+    Form(form): Form<DecisionForm>,
+) -> Response {
+    decide(server, session.owner().clone(), id, form, Decision::Revert).await
+}
+
+async fn decide(
+    server: AlexandriaServer,
+    owner: OwnerContext,
+    id: String,
+    form: DecisionForm,
+    decision: Decision,
+) -> Response {
+    let Ok(id) = alexandria_storage::parse_record_id(&id).and_then(RefinementProposalId::try_from)
+    else {
+        return not_found();
+    };
+    let result = review(&server, &owner, &id, form, decision).await;
+    let mut response = match result {
+        Ok(()) => Redirect::to("/debug/refinement").into_response(),
+        Err(ServiceError::NotFound) => not_found(),
+        Err(ServiceError::Stale) => {
+            // The live refusal keeps the placeholder's guidance: the decision was refused because
+            // the proposal is stale or moved, so the owner must reload before acting again.
+            let mut response = html::error_page(
+                NAV,
+                "this proposal is stale or was moved; reload the proposal before deciding",
+            );
+            *response.status_mut() = StatusCode::CONFLICT;
+            response
+        }
+        Err(ServiceError::InvalidInput(_)) => {
+            bad_request("This proposal cannot be applied as reviewed.")
+        }
+        Err(_) => unavailable(),
+    };
+    web::no_store(&mut response);
+    response
+}
+
+async fn review(
+    server: &AlexandriaServer,
+    owner: &OwnerContext,
+    id: &RefinementProposalId,
+    form: DecisionForm,
+    decision: Decision,
+) -> Result<(), ServiceError> {
+    let repo = RefinementRepo::new(&server.db);
+    let service =
+        RefinementService::new(&server.db, None).with_embedding(server.embedding.as_ref());
+    let revision = Version::new(form.revision);
+    match decision {
+        Decision::Dismiss => {
+            repo.dismiss_proposal_revision(owner, id.as_record_id(), revision)
+                .await?
+        }
+        Decision::Defer => repo.defer_proposal_revision(owner, id, revision).await?,
+        Decision::Approve => {
+            let proposal = repo.owner_proposal_revision(owner, id).await?;
+            if proposal.revision != revision {
+                return Err(ServiceError::Stale);
+            }
+            let operation = OperationId::new(format!("quality-review-{}", form.decision_key));
+            service.approve(owner, &proposal, &operation).await?;
+        }
+        Decision::Revert => {
+            let proposal = service
+                .owner_proposal(owner, id.as_record_id())
+                .await?
+                .ok_or(ServiceError::NotFound)?;
+            if proposal.revision != form.revision {
+                return Err(ServiceError::Stale);
+            }
+            let applied =
+                SemanticOperationId::try_from(proposal.operation.ok_or(ServiceError::Stale)?)?;
+            let operation = OperationId::new(format!("quality-revert-{}", form.decision_key));
+            service.revert(owner, &applied, &operation).await?;
+        }
+    }
+    Ok(())
+}
+pub(crate) async fn attempt(
+    State(server): State<AlexandriaServer>,
+    session: BrowserSession,
+    Path(id): Path<String>,
+) -> Response {
+    let Ok(id) = alexandria_storage::parse_record_id(&id).and_then(AttemptId::try_from) else {
+        return not_found();
+    };
+    let owner = session.owner().clone();
+    let service = RefinementService::new(&server.db, server.refinement.as_deref());
+    let mut response = match service.attempt(&owner, &id).await {
+        Ok(view) => Json(serde_json::json!({
+            "id": view.id.record().to_sql(),
+            "kind": view.kind.as_str(),
+            "state": view.state.as_str(),
+        }))
+        .into_response(),
+        Err(ServiceError::NotFound) => not_found(),
+        Err(_) => unavailable(),
+    };
+    web::no_store(&mut response);
+    response
 }
 
 fn queue_row(proposal: ProposalDisplay, current_policy: Option<&str>) -> QueueRow {
@@ -330,6 +490,7 @@ fn queue_row(proposal: ProposalDisplay, current_policy: Option<&str>) -> QueueRo
     };
     QueueRow {
         id: alexandria_storage::record_id_to_string(&proposal.id),
+        proposal_path: proposal.id.to_sql(),
         revision: proposal.revision,
         state: format!("{:?}", proposal.state).to_lowercase(),
         scope: proposal.scope,
@@ -592,6 +753,7 @@ struct QueueTemplate {
 
 struct QueueRow {
     id: String,
+    proposal_path: String,
     revision: u64,
     state: String,
     scope: String,
@@ -609,8 +771,13 @@ struct QueueRow {
 struct DetailTemplate {
     nav: &'static str,
     proposal_id: String,
+    proposal_path: String,
     revision: u64,
     state: String,
+    csrf: String,
+    decision_key: String,
+    can_decide: bool,
+    can_revert: bool,
     source: String,
     selected_records: String,
     changes: String,

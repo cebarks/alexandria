@@ -16,7 +16,21 @@
   <pre class="content-block">{{ selected_records }}</pre>
 </section>
 <p>Review is limited to the records named by this proposal. No bulk quality approval is available; selected records are not a bulk-approval control.</p>
-<p class="warning">A stale or moved proposal cannot be applied. reload the proposal before deciding.
+<p class="warning">A stale or moved proposal cannot be applied. Please reload the proposal before deciding.</p>
+{% if can_decide || can_revert %}
+<form method="post" action="/debug/refinement/proposals/{{ proposal_path|urlencode }}/approve">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="revision" value="{{ revision }}">
+  <input type="hidden" name="decision_key" value="{{ decision_key }}">
+  {% if can_decide %}
+  <button type="submit">Approve</button>
+  <button type="submit" formaction="/debug/refinement/proposals/{{ proposal_path|urlencode }}/dismiss">Dismiss</button>
+  <button type="submit" formaction="/debug/refinement/proposals/{{ proposal_path|urlencode }}/defer">Defer</button>
+  {% else %}
+  <button type="submit" formaction="/debug/refinement/proposals/{{ proposal_path|urlencode }}/revert">Revert</button>
+  {% endif %}
+</form>
+{% endif %}
 <section aria-labelledby="application-history-heading">
   <h2 id="application-history-heading">Private application history</h2>
   {% if operation_id.is_empty() %}

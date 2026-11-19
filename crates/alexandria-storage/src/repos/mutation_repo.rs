@@ -80,6 +80,9 @@ use surrealdb::types::{RecordId, SurrealValue, ToSql, Value};
 /// this is a page bound rather than a privacy bound — and it is the figure the scope listings publish.
 pub const MAX_HISTORY_PAGE: usize = 100;
 
+mod quality;
+use super::refinement_repo::application::{guard_quality_decision, guard_secondary, link_decision};
+
 /// Everything one transaction pass needs, bundled because the pass legitimately carries eight values and
 /// the lint bound is seven — and because the group is meaningful: it *is* the request. Holding the
 /// fingerprint beside the change set rather than beside the transaction makes it impossible for a
@@ -122,7 +125,7 @@ impl<'a> MutationRepo<'a> {
         Self { db }
     }
 
-    async fn system_mutation_context(
+    pub(crate) async fn system_mutation_context(
         &self,
         instance: &crate::Database,
         system: &SystemContext,
@@ -846,6 +849,9 @@ impl<'a> MutationRepo<'a> {
             provenance_rows,
             heat_seed,
             classification_approval: _,
+            quality_transition,
+            quality_embeddings,
+            quality_details,
         } = change;
         if *kind != operation_kind::MOVE
             || !edge_additions.is_empty()
@@ -856,6 +862,9 @@ impl<'a> MutationRepo<'a> {
             || !raw_documents.is_empty()
             || !provenance_rows.is_empty()
             || heat_seed.is_some()
+            || quality_transition.is_some()
+            || !quality_embeddings.is_empty()
+            || quality_details.is_some()
         {
             return Err(StorageError::InvalidInput(
                 "a classification approval contains writes outside its placement".to_string(),
@@ -964,6 +973,15 @@ impl<'a> MutationRepo<'a> {
         let expected = request.expected;
         let change = request.change;
         let now = request.now;
+        quality::validate_envelope(change)?;
+        let quality = matches!(
+            change.kind,
+            operation_kind::QUALITY | operation_kind::REVERT
+        );
+        let revert = change
+            .quality_details
+            .as_ref()
+            .and_then(|detail| detail.reverts.as_ref());
         let owner = access.owner();
         let workspace = owner.workspace().as_record_id().clone();
 
@@ -990,6 +1008,15 @@ impl<'a> MutationRepo<'a> {
             .map_err(internal)?;
         if let Some(recorded) = existing.into_iter().next() {
             if recorded.request_fingerprint == fingerprint {
+                if let Some(details) = &change.quality_details
+                    && let Some(generation) = details.generation
+                {
+                    let proposal = details.proposal.as_ref().ok_or(StorageError::Stale)?;
+                    if access.system().is_none() {
+                        return Err(StorageError::Stale);
+                    }
+                    guard_secondary(tx, owner, proposal, generation).await?;
+                }
                 return Ok(recorded.into_replay());
             }
             return Err(StorageError::InvalidInput(
@@ -1024,6 +1051,19 @@ impl<'a> MutationRepo<'a> {
             {
                 approval_subject = Some(actual);
             }
+        }
+
+        if change.quality_transition.is_some() {
+            guard_quality_decision(
+                self,
+                tx,
+                owner,
+                operation,
+                expected,
+                change,
+                access.system().is_some(),
+            )
+            .await?;
         }
 
         // Validate the preparer's numerical prestate before this request changes any member's vector,
@@ -1089,6 +1129,20 @@ impl<'a> MutationRepo<'a> {
         let mut minted: Vec<RecordId> = Vec::new();
         let mut raws: Vec<RecordId> = Vec::new();
         let mut provenances: Vec<RecordId> = Vec::new();
+        if quality {
+            for state in expected {
+                let snapshot = self.quality_state(tx, owner, &state.fact).await?;
+                if !change
+                    .facts
+                    .iter()
+                    .any(|write| write.target() == Some(&state.fact))
+                {
+                    preimages.push(SemanticSnapshot::Fact(snapshot.clone()));
+                    postimages.push(SemanticSnapshot::Fact(snapshot));
+                }
+            }
+            self.guard_quality_relations(tx, change, expected).await?;
+        }
 
         for document in &change.raw_documents {
             raws.push(self.create_raw(tx, owner, document).await?);
@@ -1097,7 +1151,11 @@ impl<'a> MutationRepo<'a> {
         for write in &change.facts {
             match write {
                 FactChange::Create { .. } => {
-                    let snapshot = self.create_fact(tx, owner, write).await?;
+                    let stable = change
+                        .quality_details
+                        .as_ref()
+                        .and_then(|details| details.stable_slots.get(minted.len()));
+                    let snapshot = self.create_fact_at(tx, owner, write, stable).await?;
                     minted.push(snapshot.id.as_record_id().clone());
                     if let Some(heat) = change.heat_seed {
                         self.seed_heat(tx, snapshot.id.as_record_id(), heat).await?;
@@ -1149,7 +1207,9 @@ impl<'a> MutationRepo<'a> {
             if matches!(cluster, ClusterChange::Guard { .. }) {
                 continue;
             }
-            let (before, after) = self.apply_cluster(tx, owner, cluster, &minted).await?;
+            let (before, after) = self
+                .apply_cluster(tx, owner, cluster, &minted, revert.is_some())
+                .await?;
             preimages.extend(before);
             postimages.extend(after);
         }
@@ -1179,22 +1239,34 @@ impl<'a> MutationRepo<'a> {
                 .await?;
         }
 
+        if quality {
+            self.write_generated_sessions(tx, change, &minted).await?;
+            self.refresh_quality_images(tx, owner, &mut postimages)
+                .await?;
+        }
+
         // 8. Every image as this transaction produced it. Order is load-bearing: `semantic_operation.preimages`
         //    is the list the history page resolves, so a snapshot written after the row closed over it would
         //    be invisible.
         let mut preimage_ids: Vec<RecordId> = Vec::with_capacity(preimages.len());
         for snapshot in &preimages {
-            preimage_ids.push(
-                self.write_snapshot(tx, snapshot, &journal_id, &workspace)
-                    .await?,
-            );
+            let id = self
+                .write_snapshot(tx, snapshot, &journal_id, &workspace)
+                .await?;
+            if quality {
+                quality::write_graph(tx, &id, snapshot).await?;
+            }
+            preimage_ids.push(id);
         }
         let mut postimage_ids: Vec<RecordId> = Vec::with_capacity(postimages.len());
         for snapshot in &postimages {
-            postimage_ids.push(
-                self.write_snapshot(tx, snapshot, &journal_id, &workspace)
-                    .await?,
-            );
+            let id = self
+                .write_snapshot(tx, snapshot, &journal_id, &workspace)
+                .await?;
+            if quality {
+                quality::write_graph(tx, &id, snapshot).await?;
+            }
+            postimage_ids.push(id);
         }
 
         // 9. A background writer's linked summary, in the same transaction as the change it describes.
@@ -1226,6 +1298,13 @@ impl<'a> MutationRepo<'a> {
             .check()
             .map_err(internal)?;
 
+        if let Some(transition) = &change.quality_transition {
+            link_decision(tx, transition, &journal_id).await?;
+        }
+        if let Some(original) = revert {
+            quality::link_reversal(tx, owner, original, &journal_id).await?;
+        }
+
         let created: Vec<FactId> = minted
             .iter()
             .filter_map(|id| FactId::try_from(id.clone()).ok())
@@ -1241,7 +1320,7 @@ impl<'a> MutationRepo<'a> {
         })
     }
 
-    async fn state_in_tx(
+    pub(super) async fn state_in_tx(
         &self,
         tx: &Transaction<Any>,
         owner: &OwnerContext,
@@ -1446,11 +1525,12 @@ impl<'a> MutationRepo<'a> {
         Ok(())
     }
 
-    async fn create_fact(
+    async fn create_fact_at(
         &self,
         tx: &Transaction<Any>,
         owner: &OwnerContext,
         write: &FactChange,
+        stable: Option<&FactId>,
     ) -> Result<FactSnapshot, StorageError> {
         let FactChange::Create {
             scope,
@@ -1466,8 +1546,13 @@ impl<'a> MutationRepo<'a> {
         };
         self.assert_writable_scope(tx, owner, scope).await?;
         let (kind, project) = scope_parts(scope);
-        let rows: Vec<IdRow> = tx
-            .query(CREATE_FACT_SQL)
+        let mut query = match stable {
+            Some(id) => tx
+                .query(CREATE_FACT_SQL.replacen("CREATE fact", "CREATE $stable", 1))
+                .bind(("stable", id.as_record_id().clone())),
+            None => tx.query(CREATE_FACT_SQL),
+        };
+        query = query
             .bind(("content", content.clone()))
             .bind(("tags", tags.clone()))
             .bind(("confidence", *confidence))
@@ -1478,7 +1563,8 @@ impl<'a> MutationRepo<'a> {
             .bind(("account", owner.account().as_record_id().clone()))
             .bind(("workspace", owner.workspace().as_record_id().clone()))
             .bind(("scope", kind.to_string()))
-            .bind(("project", project))
+            .bind(("project", project));
+        let rows: Vec<IdRow> = query
             .await
             .map_err(internal)?
             .check()
@@ -1631,6 +1717,7 @@ impl<'a> MutationRepo<'a> {
         owner: &OwnerContext,
         change: &ClusterChange,
         minted: &[RecordId],
+        reverting: bool,
     ) -> Result<(Vec<SemanticSnapshot>, Vec<SemanticSnapshot>), StorageError> {
         if let ClusterChange::Restructure {
             partition,
@@ -1658,7 +1745,9 @@ impl<'a> MutationRepo<'a> {
             ),
             ClusterChange::Restructure { .. } => unreachable!("handled above"),
         };
-        let after = self.write_cluster(tx, owner, change, minted).await?;
+        let after = self
+            .write_cluster(tx, owner, change, minted, reverting)
+            .await?;
         Ok((before.into_iter().collect(), vec![after]))
     }
 
@@ -2074,6 +2163,7 @@ impl<'a> MutationRepo<'a> {
         owner: &OwnerContext,
         change: &ClusterChange,
         minted: &[RecordId],
+        reverting: bool,
     ) -> Result<SemanticSnapshot, StorageError> {
         match change {
             ClusterChange::Guard { .. } => Err(StorageError::InvalidInput(
@@ -2200,7 +2290,9 @@ impl<'a> MutationRepo<'a> {
                 // instead of by selecting it. Deriving the partition from the arriving row rather than from
                 // a field on the effect is what makes the guard un-forgettable: an effect that adds a
                 // member is always checked, and no caller can opt out by omitting a claim.
-                if let Some(member) = add_member {
+                if let Some(member) = add_member
+                    && !reverting
+                {
                     self.assert_join_stays_in_one_partition(tx, owner, cluster, member, minted)
                         .await?;
                 }
@@ -2391,6 +2483,7 @@ impl<'a> MutationRepo<'a> {
             from,
             to,
             strength: change.strength,
+            generated_from: None,
         })
     }
 
@@ -3019,7 +3112,7 @@ pub fn structural_reads() -> Vec<(EdgeKind, &'static str)> {
         ),
         (
             EdgeKind::SessionMembership,
-            "SELECT id, in, out FROM contains_session_memory WHERE out = $fact AND in INSIDE \
+            "SELECT id, in, out, generated_from FROM contains_session_memory WHERE out = $fact AND in INSIDE \
              (SELECT VALUE id FROM session WHERE workspace = $workspace) ORDER BY id;",
         ),
         (
@@ -3347,6 +3440,7 @@ impl MemoryEdgeRow {
             from: self.in_node.unwrap_or_else(|| RecordId::new("fact", "")),
             to: self.out_node.unwrap_or_else(|| RecordId::new("fact", "")),
             strength: self.strength.unwrap_or(1.0),
+            generated_from: None,
         }
     }
 }
@@ -3358,6 +3452,7 @@ struct StructuralRow {
     in_node: Option<RecordId>,
     #[surreal(rename = "out")]
     out_node: Option<RecordId>,
+    generated_from: Option<RecordId>,
 }
 
 impl StructuralRow {
@@ -3368,6 +3463,7 @@ impl StructuralRow {
             from: self.in_node.unwrap_or_else(|| RecordId::new("fact", "")),
             to: self.out_node.unwrap_or_else(|| RecordId::new("fact", "")),
             strength: 1.0,
+            generated_from: self.generated_from,
         }
     }
 }
@@ -3576,6 +3672,7 @@ struct SnapshotRow {
     fact_embedding: Option<Vec<f32>>,
     fact_embedding_model: Option<String>,
     fact_embedding_dimensions: Option<i64>,
+    quality_graph: Option<Vec<quality::GraphRow>>,
     edge: Option<RecordId>,
     edge_in: Option<RecordId>,
     edge_out: Option<RecordId>,
@@ -3614,6 +3711,7 @@ impl SnapshotRow {
                 from: self.edge_in.ok_or_else(|| corrupt(snapshot_kind::EDGE))?,
                 to: self.edge_out.ok_or_else(|| corrupt(snapshot_kind::EDGE))?,
                 strength: self.edge_strength.unwrap_or(1.0),
+                generated_from: None,
             })),
             Some(snapshot_kind::CLUSTER) => Ok(SemanticSnapshot::Cluster(ClusterSnapshot {
                 id: self
@@ -3675,7 +3773,12 @@ impl SnapshotRow {
                         dimensions: self.fact_embedding_dimensions.unwrap_or(0).max(0) as usize,
                         vector,
                     }),
-                    relation_versions: Vec::new(),
+                    relation_versions: self
+                        .quality_graph
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(quality::GraphRow::into_edge)
+                        .collect::<Result<_, _>>()?,
                 }))
             }
         }

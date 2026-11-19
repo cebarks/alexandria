@@ -1767,6 +1767,7 @@ async fn cluster_images_are_hashed_by_state_not_by_handle() {
         from: RecordId::new("fact", "f1"),
         to: RecordId::new("fact", "f2"),
         strength: 1.0,
+        generated_from: None,
     });
     assert_ne!(
         edge.integrity_digest(),

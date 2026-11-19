@@ -16,8 +16,12 @@ use crate::Database;
 use crate::access::{OwnerContext, SystemContext, WriteAuthorization, credential_entitles_read};
 use crate::error::StorageError;
 use crate::models::auth::{Account, Credential};
-use crate::models::identity::{AccountId, FactId, MemoryScope, OperationId, Partition, Version};
-use crate::models::mutation::{EdgeKind, ExpectedState, RelationExpectation};
+use crate::models::identity::{
+    AccountId, FactId, MemoryScope, OperationId, Partition, SemanticOperationId, Version,
+};
+use crate::models::mutation::{
+    AppliedChange, EdgeKind, ExpectedState, PreparedChangeSet, RelationExpectation,
+};
 use crate::models::refinement::{
     ApprovalMode, ApprovalSetting, ApprovedRelationshipEffect, Candidate, ConfiguredPolicy,
     Consent, ConsentChoice, EffectivePolicy, EvidenceBundle, EvidenceSelectionKind,
@@ -25,6 +29,7 @@ use crate::models::refinement::{
     ProposalRevision, ProposalState, QualityOperation, RouteDestinationId,
 };
 
+pub(super) mod application;
 mod candidates;
 mod work;
 
@@ -33,7 +38,8 @@ pub use candidates::{
 };
 pub use work::{
     AttemptId, AttemptState, AttemptView, BudgetDenial, BudgetRepo, CallLimits, EnqueueRequest,
-    PassId, QueuedWork, Reservation, Usage, WorkKind, WorkSelection, admission, current_authority,
+    OwnerUsage, PassId, QueuedWork, Reservation, Usage, WorkKind, WorkSelection, admission,
+    current_authority,
 };
 
 pub struct RefinementRepo<'a> {
@@ -78,54 +84,25 @@ impl<'a> RefinementRepo<'a> {
         let evidence_fingerprint = evidence_fingerprint(&proposal.evidence)?;
         let source_fingerprint = source_fingerprint(&proposal)?;
         let proposal_payload = proposal_payload(&proposal)?;
-        self.write(async |tx| {
-            claim_owner(tx, owner).await?;
-            let matching: Vec<StoredProposal> = tx
-                .query("SELECT * FROM refinement_proposal WHERE account = $account AND evidence_fingerprint = $evidence AND source_fingerprint = $sources ORDER BY revision DESC LIMIT 1")
-                .bind(("account", owner.account().as_record_id().clone()))
-                .bind(("evidence", evidence_fingerprint.clone()))
-                .bind(("sources", source_fingerprint.clone()))
-                .await.map_err(internal)?.check().map_err(internal)?.take(0).map_err(internal)?;
-            if !force_revision && let Some(existing) = matching.first() {
-                let mut result = proposal.clone();
-                result.id = existing.id.clone().ok_or_else(|| {
-                    StorageError::Internal(anyhow::anyhow!("proposal row is missing its record id"))
-                })?;
-                result.revision = Version::new(existing.revision);
-                result.state = existing.state;
-                result.needs_human = existing.needs_human;
-                result.deferred = existing.deferred;
-                return Ok(result);
+        let db = self.db.inner().clone();
+        let owner = owner.clone();
+        let plan = PersistProposal {
+            proposal,
+            evidence_fingerprint,
+            source_fingerprint,
+            proposal_payload,
+            force_revision,
+        };
+        for _ in 0..GUARD_CONFLICT_ATTEMPTS {
+            let tx = db.clone().begin().await.map_err(internal)?;
+            let result = persist_in_tx(&tx, &owner, &plan).await;
+            match finish_write(tx, result.is_ok()).await.and(result) {
+                Ok(result) => return Ok(result),
+                Err(error) if can_retry(&error) => tokio::task::yield_now().await,
+                Err(error) => return Err(error),
             }
-            let revision = if force_revision {
-                next_revision(matching.first().ok_or(StorageError::NotFound)?.revision)?
-            } else {
-                1
-            };
-            let mut stored_proposal = proposal.clone();
-            stored_proposal.revision = Version::new(revision);
-            stored_proposal.state = ProposalState::Pending;
-            stored_proposal.needs_human = true;
-            stored_proposal.deferred = false;
-            let existing_evidence = matching.first().map(|row| row.evidence.clone());
-            let evidence_id = existing_evidence.clone().unwrap_or_else(|| {
-                let evidence_key = sha256(format!("{}:{}:{}", owner.account().as_record_id().to_sql(), evidence_fingerprint, source_fingerprint).as_bytes());
-                RecordId::new("refinement_evidence", evidence_key)
-            });
-            let record = proposal_record(owner, &stored_proposal, evidence_id.clone(), evidence_fingerprint.clone(), source_fingerprint.clone(), proposal_payload.clone());
-            if existing_evidence.is_none() {
-                let evidence_row = evidence_row(owner, &stored_proposal)?;
-                tx.query("CREATE $evidence_id CONTENT $evidence")
-                    .bind(("evidence_id", evidence_id))
-                    .bind(("evidence", evidence_row.into_value()))
-                    .await.map_err(internal)?.check().map_err(internal)?;
-            }
-            tx.query("CREATE $id CONTENT $record")
-                .bind(("id", stored_proposal.id.clone()))
-                .bind(("record", record.into_value()))
-                .await.map_err(internal)?.check().map_err(internal)?;
-            Ok(stored_proposal)
-        }).await
+        }
+        Err(StorageError::RetryableBookkeepingConflict)
     }
 
     /// Dismiss only the cited pending revision; terminal decisions cannot be overwritten.
@@ -135,18 +112,10 @@ impl<'a> RefinementRepo<'a> {
         id: &RecordId,
         revision: Version,
     ) -> Result<(), StorageError> {
-        if id.table.as_str() != "refinement_proposal" {
-            return Err(StorageError::NotFound);
-        }
-        let revision = i64::try_from(revision.get())
-            .map_err(|_| StorageError::InvalidInput("proposal revision is out of range".into()))?;
-        self.write(async |tx| {
-            claim_owner(tx, owner).await?;
-            let rows: Vec<Value> = tx.query("UPDATE $id SET state = 'dismissed' WHERE account = $account AND revision = $revision AND state = 'pending' RETURN AFTER")
-                .bind(("id", id.clone())).bind(("account", owner.account().as_record_id().clone())).bind(("revision", revision))
-                .await.map_err(internal)?.check().map_err(internal)?.take(0).map_err(internal)?;
-            if rows.len() == 1 { Ok(()) } else { Err(StorageError::Stale) }
-        }).await
+        let id = crate::models::identity::RefinementProposalId::try_from(id.clone())
+            .map_err(|_| StorageError::NotFound)?;
+        application::decide_review(self.db.inner().clone(), owner.clone(), id, revision, false)
+            .await
     }
 
     /// A reviewer alternative is stored as a new pending revision, never as approval.
@@ -456,6 +425,104 @@ impl<'a> RefinementRepo<'a> {
         }
         Err(StorageError::RetryableBookkeepingConflict)
     }
+}
+
+struct PersistProposal {
+    proposal: ProposalRevision,
+    evidence_fingerprint: String,
+    source_fingerprint: String,
+    proposal_payload: String,
+    force_revision: bool,
+}
+
+async fn finish_write(tx: Transaction<Any>, commit: bool) -> Result<(), StorageError> {
+    if commit {
+        tx.commit().await.map_err(internal)?;
+    } else {
+        tx.cancel().await.map_err(internal)?;
+    }
+    Ok(())
+}
+
+async fn persist_in_tx(
+    tx: &Transaction<Any>,
+    owner: &OwnerContext,
+    plan: &PersistProposal,
+) -> Result<ProposalRevision, StorageError> {
+    let PersistProposal {
+        proposal,
+        evidence_fingerprint,
+        source_fingerprint,
+        proposal_payload,
+        force_revision,
+    } = plan;
+    claim_owner(tx, owner).await?;
+    let matching: Vec<StoredProposal> = tx
+        .query("SELECT * FROM refinement_proposal WHERE account = $account AND evidence_fingerprint = $evidence AND source_fingerprint = $sources ORDER BY revision DESC LIMIT 1")
+        .bind(("account", owner.account().as_record_id().clone()))
+        .bind(("evidence", evidence_fingerprint.clone()))
+        .bind(("sources", source_fingerprint.clone()))
+        .await.map_err(internal)?.check().map_err(internal)?.take(0).map_err(internal)?;
+    if !*force_revision && let Some(existing) = matching.first() {
+        let mut result = proposal.clone();
+        result.id = existing.id.clone().ok_or_else(|| {
+            StorageError::Internal(anyhow::anyhow!("proposal row is missing its record id"))
+        })?;
+        result.revision = Version::new(existing.revision);
+        result.state = existing.state;
+        result.needs_human = existing.needs_human;
+        result.deferred = existing.deferred;
+        return Ok(result);
+    }
+    let revision = if *force_revision {
+        next_revision(matching.first().ok_or(StorageError::NotFound)?.revision)?
+    } else {
+        1
+    };
+    let mut stored_proposal = proposal.clone();
+    stored_proposal.revision = Version::new(revision);
+    stored_proposal.state = ProposalState::Pending;
+    stored_proposal.needs_human = true;
+    stored_proposal.deferred = false;
+    let existing_evidence = matching.first().map(|row| row.evidence.clone());
+    let evidence_id = existing_evidence.clone().unwrap_or_else(|| {
+        let evidence_key = sha256(
+            format!(
+                "{}:{}:{}",
+                owner.account().as_record_id().to_sql(),
+                evidence_fingerprint,
+                source_fingerprint
+            )
+            .as_bytes(),
+        );
+        RecordId::new("refinement_evidence", evidence_key)
+    });
+    let record = proposal_record(
+        owner,
+        &stored_proposal,
+        evidence_id.clone(),
+        evidence_fingerprint.clone(),
+        source_fingerprint.clone(),
+        proposal_payload.clone(),
+    );
+    if existing_evidence.is_none() {
+        let evidence_row = evidence_row(owner, &stored_proposal)?;
+        tx.query("CREATE $evidence_id CONTENT $evidence")
+            .bind(("evidence_id", evidence_id))
+            .bind(("evidence", evidence_row.into_value()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?;
+    }
+    tx.query("CREATE $id CONTENT $record")
+        .bind(("id", stored_proposal.id.clone()))
+        .bind(("record", record.into_value()))
+        .await
+        .map_err(internal)?
+        .check()
+        .map_err(internal)?;
+    Ok(stored_proposal)
 }
 
 #[derive(Clone, SurrealValue)]

@@ -263,6 +263,7 @@ pub struct AlexandriaServer {
     /// Whether `schema::ensure_vector_index` succeeded at boot. Off, retrieval stays on the
     /// brute-force KNN form, which returns the same rows without the index.
     pub vector_index: bool,
+    pub(crate) refinement: Option<Arc<crate::refinement::ReconciledRefinement>>,
     /// The identity a stdio transport acts as, when the operator configured one.
     ///
     /// Task 5's transport seam, and narrow on purpose: the value can only have been issued by
@@ -293,6 +294,7 @@ impl AlexandriaServer {
             cohesion_floor: DEFAULT_COHESION_FLOOR,
             reminders: RemindersSettings::default(),
             vector_index: false,
+            refinement: None,
             stdio_identity: None,
         }
     }
@@ -324,6 +326,15 @@ impl AlexandriaServer {
 
     pub fn with_vector_index(mut self, defined: bool) -> Self {
         self.vector_index = defined;
+        self
+    }
+
+    /// Give the owner review UI the same reconciled policy as the HTTP worker.
+    pub fn with_refinement_runtime(
+        mut self,
+        runtime: Option<Arc<crate::refinement::ReconciledRefinement>>,
+    ) -> Self {
+        self.refinement = runtime;
         self
     }
 

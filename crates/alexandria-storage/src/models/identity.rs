@@ -112,6 +112,18 @@ typed_record_id! {
     "credential"
 }
 
+typed_record_id! {
+    /// The durable row linking one quality decision to its immutable revision and evidence.
+    RefinementProposalId,
+    "refinement_proposal"
+}
+
+typed_record_id! {
+    /// A committed journal row, distinct from the client-supplied `OperationId` key.
+    SemanticOperationId,
+    "semantic_operation"
+}
+
 /// A semantic revision, used as the compare-and-swap guard on writes that carry an expectation
 /// (`expected == actual`, otherwise [`StorageError::Stale`]).
 ///

@@ -31,6 +31,9 @@
 //! ```
 
 use crate::models::identity::{FactId, MemoryScope, ProjectId, Version, WorkspaceId};
+use crate::models::refinement::{
+    PreparedQualityEmbedding, QualityDetails, QualityProposalTransition,
+};
 use crate::models::{operation_kind, scope_kind};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -48,6 +51,7 @@ pub struct EdgeSnapshot {
     pub from: RecordId,
     pub to: RecordId,
     pub strength: f64,
+    pub generated_from: Option<RecordId>,
 }
 
 impl EdgeSnapshot {
@@ -59,6 +63,7 @@ impl EdgeSnapshot {
             from,
             to,
             strength: 1.0,
+            generated_from: None,
         }
     }
 }
@@ -194,6 +199,10 @@ impl FactSnapshot {
             field(&mut hasher, &id_bytes(&edge.from));
             field(&mut hasher, &id_bytes(&edge.to));
             field(&mut hasher, &edge.strength.to_bits().to_le_bytes());
+            if let Some(source) = &edge.generated_from {
+                field(&mut hasher, b"generated-from");
+                field(&mut hasher, &id_bytes(source));
+            }
         }
         hex(&hasher)
     }
@@ -954,6 +963,13 @@ pub struct PreparedChangeSet {
     /// touched by a mutation.
     pub heat_seed: Option<f64>,
     pub classification_approval: Option<ClassificationApproval>,
+    /// The pending quality proposal to decide within this write. Ordinary mutations leave it absent.
+    pub quality_transition: Option<QualityProposalTransition>,
+    /// Preparation-only artifacts. The refinement planner resolves these into guarded fact writes;
+    /// the transaction kernel must never accept an unplanned artifact as a write.
+    pub quality_embeddings: Vec<PreparedQualityEmbedding>,
+    /// Present only for storage-planned quality application or rollback.
+    pub quality_details: Option<QualityDetails>,
 }
 
 impl PreparedChangeSet {
@@ -974,6 +990,9 @@ impl PreparedChangeSet {
             provenance_rows: Vec::new(),
             heat_seed: None,
             classification_approval: None,
+            quality_transition: None,
+            quality_embeddings: Vec::new(),
+            quality_details: None,
         }
     }
 
@@ -1080,6 +1099,34 @@ impl PreparedChangeSet {
         let mut hasher = Sha256::new();
         field(&mut hasher, b"semantic-request");
         field(&mut hasher, self.kind.as_bytes());
+        if let Some(transition) = &self.quality_transition {
+            field(&mut hasher, &id_bytes(transition.proposal.as_record_id()));
+            field(&mut hasher, &transition.revision.get().to_le_bytes());
+            field(
+                &mut hasher,
+                &[u8::from(
+                    self.quality_details
+                        .as_ref()
+                        .is_some_and(|d| d.generation.is_some()),
+                )],
+            );
+            if let Some(payload_hash) = self
+                .quality_details
+                .as_ref()
+                .and_then(|d| d.request_payload_hash.as_ref())
+            {
+                field(&mut hasher, payload_hash.as_bytes());
+                return hex(&hasher);
+            }
+        }
+        if let Some(original) = self
+            .quality_details
+            .as_ref()
+            .and_then(|d| d.reverts.as_ref())
+        {
+            field(&mut hasher, &id_bytes(original.as_record_id()));
+            return hex(&hasher);
+        }
         for effect in &self.effects {
             field(&mut hasher, effect.as_bytes());
         }
@@ -1725,6 +1772,7 @@ mod tests {
             from: RecordId::new("fact", key),
             to: RecordId::new("fact", to),
             strength: 1.0,
+            generated_from: None,
         };
         let mut first = snapshot(&[], "x", 0.5);
         first.relation_versions = vec![edge("a", "b"), edge("c", "d")];

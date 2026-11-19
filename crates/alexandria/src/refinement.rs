@@ -1,27 +1,29 @@
 //! Explicit offline refinement and policy commands for the configured trusted-local principal.
 
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use alexandria_mcp::refinement::provider::RouteProvider;
 use alexandria_mcp::refinement::worker::{Dispatch, Worker, WorkerOutput, WorkerSettings};
 use alexandria_mcp::refinement::{
     EffectiveRefinementPolicy, ReconciledRefinement, RefinementService,
 };
-use alexandria_pipeline::embedding::load_provider;
+use alexandria_pipeline::embedding::{EmbeddingProvider, load_provider};
 use alexandria_storage::access::{AccessRepo, OwnerContext, Principal, SystemContext};
+use alexandria_storage::error::StorageError;
 use alexandria_storage::models::identity::ToSql;
 use alexandria_storage::models::refinement::{ApprovalMode, ConsentChoice, ProposalState};
 use alexandria_storage::models::{MemoryScope, Partition, ReadSelection};
 use alexandria_storage::offline_copy::OfflineStoreGuard;
 use alexandria_storage::ownership_migration::check_ownership_ready;
-use alexandria_storage::repos::RefinementRepo;
 use alexandria_storage::repos::refinement_repo::{
     AttemptState, EnqueueRequest, WorkKind, WorkSelection,
 };
+use alexandria_storage::repos::{IdentityRepo, RefinementRepo};
 use alexandria_storage::{Database, schema, system_config};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, reconcile_refinement_policy};
 
@@ -182,6 +184,70 @@ fn lock_refusal(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// One worker for the configured HTTP instance. Boot recovery invalidates all old verdicts.
+pub(crate) async fn run_worker(
+    db: Arc<Database>,
+    system: SystemContext,
+    configured: Arc<ReconciledRefinement>,
+    embedding: Arc<dyn EmbeddingProvider>,
+    cancel: CancellationToken,
+    scheduled: bool,
+) {
+    let settings = WorkerSettings::default();
+    let provider = RouteProvider::new(&configured, settings);
+    let worker =
+        Worker::new(&db, &system, &configured, settings).with_embedding(embedding.as_ref());
+    if worker.recover_interrupted(Utc::now()).await.is_err() {
+        tracing::error!("refinement worker could not recover its queue; not dispatching");
+        return;
+    }
+    let repo = RefinementRepo::new(&db);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = worker_turn(&db, &system, &repo, &worker, &provider, scheduled) => {},
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+        }
+    }
+}
+
+async fn worker_turn(
+    db: &Database,
+    system: &SystemContext,
+    repo: &RefinementRepo<'_>,
+    worker: &Worker<'_>,
+    provider: &RouteProvider,
+    scheduled: bool,
+) {
+    if scheduled && enqueue_due_partitions(db, system, repo).await.is_err() {
+        tracing::warn!("refinement cadence request remains pending");
+    }
+    if worker.step(Utc::now(), provider).await.is_err() {
+        tracing::warn!("refinement worker turn failed");
+    }
+}
+
+async fn enqueue_due_partitions(
+    db: &Database,
+    system: &SystemContext,
+    repo: &RefinementRepo<'_>,
+) -> Result<(), StorageError> {
+    let (requested, completed) = repo.refinement_progress(system).await?;
+    if requested == 0 || completed.is_some_and(|stamp| stamp >= requested) {
+        return Ok(());
+    }
+    for partition in IdentityRepo::maintenance_partitions(db.inner(), db, system).await? {
+        match repo.enqueue_scheduled(system, partition, requested).await {
+            Ok(()) | Err(StorageError::Stale | StorageError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    repo.finish_enqueue_request(system, requested).await
+}
+
 pub(crate) async fn run_dream(partition: Partition) -> Result<()> {
     let config = Config::load()?;
     let mut db = open_local_store(&config.database.data_dir).await?;
@@ -222,9 +288,19 @@ pub(crate) async fn run_dream(partition: Partition) -> Result<()> {
         loaded.space == stored,
         "loaded embedding provider identity differs from the locked store; restore the matching artifacts or migrate embeddings offline"
     );
-    drop(loaded);
-
-    run_scoped_turn(&db, &system, &configured, owner, partition, settings).await
+    let provider = RouteProvider::new(&configured, settings);
+    let worker =
+        Worker::new(&db, &system, &configured, settings).with_embedding(loaded.provider.as_ref());
+    run_scoped_turn(
+        &db,
+        &system,
+        worker,
+        &provider,
+        &configured,
+        owner,
+        partition,
+    )
+    .await
 }
 
 async fn authorize_partition(
@@ -257,10 +333,11 @@ async fn authorize_partition(
 async fn run_scoped_turn(
     db: &Database,
     system: &SystemContext,
+    worker: Worker<'_>,
+    provider: &RouteProvider,
     configured: &ReconciledRefinement,
     owner: OwnerContext,
     partition: Partition,
-    settings: WorkerSettings,
 ) -> Result<()> {
     let operation_id = format!(
         "{}-{}",
@@ -286,15 +363,13 @@ async fn run_scoped_turn(
     // Print the discoverable, durable id before the first outbound call or an interruption.
     eprintln!("refinement operation {operation_id}; attempt {attempt_id}");
 
-    let provider = RouteProvider::new(configured, settings);
-    let worker = Worker::new(db, system, configured, settings);
     let dispatch = worker
         .step_assigned_attempt(
             owner.clone(),
             partition.clone(),
             attempt.clone(),
             Utc::now(),
-            &provider,
+            provider,
         )
         .await
         .context("explicit refinement worker failed")?;
@@ -317,6 +392,14 @@ async fn run_scoped_turn(
             Some(proposal.id.to_sql()),
             Some(pass.0),
         ),
+        (
+            Dispatch::Completed {
+                pass,
+                output: WorkerOutput::Applied(id),
+                ..
+            },
+            AttemptState::Completed,
+        ) => ("applied", Some(id.to_sql()), Some(pass.0)),
         (Dispatch::Idle, AttemptState::Completed) => ("no_proposal", None, None),
         (Dispatch::Denied, AttemptState::Queued) => {
             // Keep the durable attempt, but do not leave a one-shot request armed for a future

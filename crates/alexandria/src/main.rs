@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
             config.database.data_dir.display()
         )
     })?;
-    let _refinement = reconcile_refinement_at_boot(&db, &system, &config.refinement).await?;
+    let refinement_runtime = reconcile_refinement_at_boot(&db, &system, &config.refinement).await?;
     let db = Arc::new(db);
 
     // 4. Create MCP server
@@ -264,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
             service.waiting().await?;
         }
         "http" => {
-            serve_http(server, &config, system).await?;
+            serve_http(server, &config, system, refinement_runtime).await?;
         }
         other => {
             anyhow::bail!("Unknown transport: {other}. Use 'stdio' or 'http'.");
@@ -432,6 +432,7 @@ async fn serve_http(
     server: AlexandriaServer,
     config: &Config,
     system: alexandria_storage::access::SystemContext,
+    refinement_runtime: Option<alexandria_mcp::refinement::ReconciledRefinement>,
 ) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -549,8 +550,22 @@ async fn serve_http(
     })?;
     let web_boundary =
         alexandria_mcp::debug::WebBoundary::new(gate.clone(), Arc::clone(&server.db), policy);
+    let bind_addr = format!("{}:{}", config.server.host, config.server.port);
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    let refinement_runtime = refinement_runtime.map(Arc::new);
+    let server = server.with_refinement_runtime(refinement_runtime.clone());
     let debug_router =
         alexandria_mcp::debug::router_secured(server.clone(), Some(debug_ctx), web_boundary);
+    if let Some(configured) = refinement_runtime {
+        let _refinement_worker = tokio::spawn(refinement::run_worker(
+            Arc::clone(&server.db),
+            system,
+            configured,
+            Arc::clone(&server.embedding),
+            cancel.clone(),
+            config.dreaming.enabled,
+        ));
+    }
 
     let service: StreamableHttpService<AlexandriaServer, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(server.clone()), sessions, http_config);
@@ -562,8 +577,6 @@ async fn serve_http(
             alexandria_mcp::auth::admit,
         ))
         .merge(debug_router);
-    let bind_addr = format!("{}:{}", config.server.host, config.server.port);
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
     tracing::info!(
         "Alexandria ready, serving HTTP on http://{bind_addr}/mcp (debug UI at http://{bind_addr}/debug)"

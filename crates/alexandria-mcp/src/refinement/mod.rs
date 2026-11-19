@@ -10,4 +10,6 @@ pub mod worker;
 pub use alexandria_storage::repos::refinement_repo::{
     AttemptId, AttemptView, EnqueueRequest, WorkKind, WorkSelection,
 };
-pub use service::{EffectiveRefinementPolicy, ReconciledRefinement, RefinementService};
+pub use service::{
+    EffectiveRefinementPolicy, ReconciledRefinement, RefinementService, prepare_change,
+};
