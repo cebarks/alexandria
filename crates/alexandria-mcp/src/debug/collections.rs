@@ -217,7 +217,8 @@ pub(crate) async fn list(
 /// A memory, as the collections row renders it. Text only, plus the two states that change what the
 /// controls may honestly promise.
 struct MemoryView {
-    id: String,
+    /// Parser-safe form and detail handle; a display id can conflate numeric and string keys.
+    handle: String,
     content: String,
     tags: String,
     confidence: String,
@@ -239,7 +240,11 @@ struct MemoryView {
 impl From<alexandria_storage::repos::OwnedRow> for MemoryView {
     fn from(row: alexandria_storage::repos::OwnedRow) -> Self {
         Self {
-            id: row.id.as_ref().map(record_id_to_string).unwrap_or_default(),
+            handle: row
+                .id
+                .as_ref()
+                .map(surrealdb::types::ToSql::to_sql)
+                .unwrap_or_default(),
             content: row.content,
             tags: row.tags.join(", "),
             confidence: format!("{:.2}", row.confidence),
@@ -513,7 +518,7 @@ pub(crate) async fn edit(
         // reach the tools cannot ask for. See [`AlexandriaServer::delete_reviewed_within`].
         return match server.delete_reviewed_within(&scope, &form.id).await {
             Ok(_) => redirect("hidden — the change is in your history"),
-            Err(error) => redirect_failed(error.to_string()),
+            Err(error) => redirect_failed(edit_failure(&anyhow::Error::new(error))),
         };
     }
     // H2, in one line: **an empty tags field is no change.** A browser posts `tags=` for a text input the
@@ -554,7 +559,29 @@ pub(crate) async fn edit(
         Err(error) if is_stale(&error) => redirect_failed(
             "that memory changed since this page loaded; reload and edit again".to_string(),
         ),
-        Err(error) => redirect_failed(error.to_string()),
+        Err(error) => redirect_failed(edit_failure(&error)),
+    }
+}
+
+fn edit_failure(error: &anyhow::Error) -> String {
+    use alexandria_storage::error::StorageError;
+
+    let retryable = crate::error::ServiceError::RetryableBookkeepingConflict;
+    if error
+        .downcast_ref::<crate::error::ServiceError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                crate::error::ServiceError::RetryableBookkeepingConflict
+            )
+        })
+        || error
+            .downcast_ref::<StorageError>()
+            .is_some_and(|error| matches!(error, StorageError::RetryableBookkeepingConflict))
+    {
+        owner_failure(&retryable)
+    } else {
+        error.to_string()
     }
 }
 
@@ -649,16 +676,16 @@ pub(crate) async fn move_one(
 /// naming the class is the point. A redirect is read by a person, and "retryable bookkeeping conflict"
 /// names no act they can take: it is the internal variant spelled out, and an owner who cannot tell whether
 /// to reload, wait, or stop and report is likelier to click the same button again than to do any of those.
-/// The retryable class therefore gets its own arm here — reload, because the cluster bookkeeping the move
-/// was ranked against has moved, and a fresh page re-ranks it — while the classes the handlers already
+/// The retryable class therefore gets its own arm here — reload against current bookkeeping —
+/// while the classes the handlers already
 /// render distinctly (`Stale`, `NotFound`) keep their existing wording at the call sites above this one.
 ///
 /// Every other class falls through to storage's sanitized text, which names no table, id or bound value.
 fn owner_failure(error: &crate::error::ServiceError) -> String {
     match error {
         crate::error::ServiceError::RetryableBookkeepingConflict => {
-            "the cluster bookkeeping this move was planned against changed while it was being written; \
-             reload the page and make the move again"
+            "the cluster bookkeeping changed while this action was being written; \
+             reload the page and try again"
                 .to_string()
         }
         other => other.to_string(),

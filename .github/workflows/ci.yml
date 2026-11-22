@@ -96,11 +96,16 @@ jobs:
         run: df -h .
       - run: just verify-assets
       - run: just cpu-deps
+      # Explicit integration targets and the review fixture's in-memory example test; no browser or live model.
+      - run: just refinement-admission
       - run: just test
       - run: just test-cpu
       # Real inference/conversion requires explicit cached artifacts and is ignored here.
       - run: just artifact-test
       - run: just eval-test
+      - run: just refinement-eval-test
+      - run: just refinement-eval
+      - run: just claude-test
       - name: Runner disk after tests
         if: always()
         run: df -h .

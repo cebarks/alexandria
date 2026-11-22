@@ -208,28 +208,21 @@ for what they are and how to install them.
 ## Debug Web UI
 
 When `transport = "http"`, a debug web UI is served alongside the MCP endpoint at
-`http://<host>:<port>/debug`. It is **authenticated**: every page and every JSON endpoint belongs to the
-signed-in account, and shows only that account's own memories, sessions, clusters, graph, reminders and
-query results. It has two disclosed write paths: the Query Tester's non-dry `retrieve` run performs
-spreading activation, so it writes heat exactly as a real `retrieve_memories` call does; and the owner
-may release a held legacy reminder mapping on `/debug/reminder-mapping`. Tick **Dry run** for a strictly
-read-only retrieval probe that writes nothing.
+`<public_origin>/debug`. Private pages and JSON endpoints require sign-in. Corpus views show only
+the signed-in account's memories, sessions, clusters, graph, reminders and query results. The
+non-dry Query Tester can write retrieval heat; tick **Dry run** for a read-only probe.
 
 ### Signing in, and what an account can see
 
-`/debug/login` is the only unauthenticated page that reaches data — and it reaches none. Login,
-invitation redemption and password recovery are the three public pages; each carries a short-lived,
-single-use token issued with the page, so a bookmarked form cannot be replayed, and none of them is a
-session. Signing in sets two cookies: `alexandria_session` (the credential) and `alexandria_csrf`
-(the value every mutation must echo back). Both are `HttpOnly`, `SameSite=Lax`, `Path=/`, and `Secure`
-unless the deployment is running under the explicit loopback-development exception below.
-
-**Every mutation on this server requires the CSRF pair** — the Query Tester's run, reminder mapping
-release, sign-out, token issue and revoke, invitation creation (administrators) and recovery creation,
-and suspension. The guard,
-not the handler, is the single authority for that, and it is what the paragraph below used to lean on
-`Sec-Fetch-Site` alone for. An account can also mint and revoke its own agent tokens from
-`/debug/account`, which is the same credential surface the MCP `Authorization` header consumes.
+- **Authenticated web writes** use a browser session and the CSRF pair, enforced by the secured
+  router. This includes Collections edits and moves, Classification decisions, Refinement settings,
+  submissions and decisions, Query Tester runs, reminder mapping, and account/admin actions.
+  Sign-in sets the host-only `alexandria_session` and `alexandria_csrf` cookies. Both are
+  `HttpOnly`, `SameSite=Lax`, `Path=/`, and `Secure` except under explicit loopback development.
+- **Public sign-in, invitation redemption and password recovery** use short-lived, single-use
+  form tokens issued for the specific page, not the signed-in session's CSRF pair.
+- **HTTP MCP writes** use the account's bearer token in the `Authorization` header, not browser
+  cookies. Owners issue and revoke their agent tokens in `/debug/account`.
 
 - **Account** (`/debug/account`) — the signed-in account's own credentials: browser sessions and agent
   tokens by label and creation time, with revoke, plus a recovery link for **this** account's password.
@@ -245,9 +238,13 @@ not the handler, is the single authority for that, and it is what the paragraph 
   identities, no stored values and no per-row dispositions — a disposition lives in the audit table, not
   on this page. See the note under the page list below for why this replaced the per-row audit page
 
-An administrator's own memories, sessions and clusters are read through the same owner-scoped path as
-anybody else's: `AdminCapability` authorizes account management and nothing else, and there is no
-route on this server that lists another account's content.
+An administrator's own memories, sessions and clusters are read through the same owner-scoped path
+as anybody else's. Admin views do not let administrators read other owners' content directly.
+**An administrator can issue and redeem a password-recovery link for another account, reset its
+credentials and then sign in as that owner.** The v016 `admin_recovery_log` records issuance
+(who initiated it, the target, and when); the issuing admin receives the usable link.
+
+Separately, host administrators can read disk and backups. This is not end-to-end encryption.
 
 Two consequences of that boundary are deliberate and worth stating before they surprise anyone:
 
@@ -257,12 +254,9 @@ Two consequences of that boundary are deliberate and worth stating before they s
   debug UI is reachable only as the page that says it cannot sign anybody in. Nothing about stdio,
   loopback, a `Host` header or the absence of accounts grants authority — authority comes from a
   credential and nothing else.
-- **Owner-facing per-record history is not on this page yet.** The rows the old audit page listed still
-  exist in `maintenance_log`, and the rows written before attribution landed carry no `run_id`, no
-  `job` and no actor; they are counted into an "unattributed" group rather than shown to a browser role
-  as record identities, because revealing which memories the scheduler collapsed is another account's
-  content seen through an operator's page. A per-record history for owners is the next surface, over the
-  operation journal.
+- **Owner-facing per-record history lives in Operations, not Maintenance.** Maintenance shows
+  aggregates, including an unattributed group for rows written before run attribution. The owner can
+  inspect linked journal entries without exposing record identities in the administrator's view.
 
 ### The pages
 
@@ -277,9 +271,8 @@ Two consequences of that boundary are deliberate and worth stating before they s
 - **Memories** (`/debug/memories`) — paginated, sortable search/filter of **the caller's** facts by
   content and tag, with **include deleted** and **include quarantined** checkboxes; click through to a
   detail view showing heat, stability, timestamps, cluster membership, and graph edges. Quarantine is
-  off by default so the page matches what an agent can retrieve, and this is the operator view for a
-  memory on that middle rung — hidden from every retrieval path, still present, still reversible.
-  Nothing in the UI can put a row into quarantine or take it out. A detail id that belongs to somebody
+  off by default so the page matches what an agent can retrieve. The owner can inspect a
+  quarantined memory even though ordinary recall excludes it. A detail id that belongs to somebody
   else answers `404` exactly as an absent one does, which is the point: a distinguishable answer would
   be a way to test which record ids exist
 - **Clusters** (`/debug/clusters`) — the caller's clusters with live member counts and depth; drill into
@@ -315,9 +308,10 @@ Two consequences of that boundary are deliberate and worth stating before they s
   application pre/postimages/revert status. The settings page discloses endpoints and model names (never
   credentials), exposes revision-checked consent/revocation and review-mode controls, and makes human review
   the default. Unassigned proposals are marked and filterable; classification may stale pending work.
+  Deferred proposals are hidden by default and available through the **Deferred** filter.
   Owners can approve, dismiss, or defer the displayed revision, and can revert an application while its
   semantic effects and references are unchanged. Opening a page never starts inference or applies a
-  proposal. The owner can check a known attempt ID separately; browser enqueue remains unavailable, and quota and attempt counts on these pages are this account's real rolling counts.
+  proposal. With destination consent, owners can queue an assigned assessment or a manual Unassigned assessment from the queue, and request an opinion or regeneration from proposal detail. Submission opens a private status page that polls while the attempt is queued or running. Quota and attempt counts on these pages are the account's real rolling counts.
 - **Query Tester** (`/debug/query`, `POST /debug/query/run`) — run `retrieve_memories`/`recall` live
   against the real embedding model to sanity-check retrieval quality, from inside the signed-in
   account's own population, with optional `session_id` scoping and a **Dry run** checkbox. Results
@@ -349,8 +343,8 @@ reverse proxy you configure. What the server enforces itself:
   refused. The wildcard `["*"]` remains an option only for the legacy no-boundary build, which shows
   nothing anyway.
 - **CSRF is a session property, not a header heuristic.** `Sec-Fetch-Site` is still read — a
-  cross-site or cross-origin *mutation* is refused outright, and the check is unconditional — but a
-  mutation now also needs the token that matches the caller's own session, in the `csrf` form field or
+  cross-site or cross-origin web mutation is refused outright. A signed-in web mutation also
+  needs the token that matches the caller's own session, in the `csrf` form field or
   the `X-CSRF-Token` header. `OPTIONS` is not exempt: this router advertises no CORS configuration, so a
   preflight here is the attack rather than a use case. A direct top-level navigation (`Sec-Fetch-Site:
   none`) still needs the token too, which is why a cross-site form cannot reach the Query Tester's heat

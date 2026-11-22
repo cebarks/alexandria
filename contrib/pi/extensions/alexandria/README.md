@@ -59,6 +59,8 @@ prompt_budget_ms = 10000
 
 Timeouts must be positive finite numbers; per-call timeout must be less than or equal to the whole-path budget, and the whole-path budget must not exceed `120000` ms. Invalid values fail configuration rather than clamp. Each stage shares the same whole-path deadline; the configured call timeout is not a fresh allowance per stage. These settings govern automatic prompt work, not explicit native MCP calls.
 
+These are automatic-path budgets, not hosted latency measurements. The companion does not submit refinement work or approve classification; use the [owner UI](../../../../docs/ownership-and-refinement.md) for review.
+
 The old automatic-storage settings are obsolete: `ALEXANDRIA_AUTO_STORE`, `ALEXANDRIA_EXTRACT_MODEL`, `ALEXANDRIA_EXTRACT_TIMEOUT_MS`, and `[store]` extraction fields (`enabled`, `extract_model`, `extract_timeout_ms`) are ignored with a warning. Remove them and explicitly call `store_memory` or `import_document` when something should be saved.
 
 ## Reminders

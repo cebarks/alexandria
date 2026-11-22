@@ -1,9 +1,14 @@
+use std::fmt::Write;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, SurrealValue, ToSql};
 
+use super::scope::{Bind, GuardedWrite, ScopeFilter, guarded_run};
+use crate::access::{OwnerContext, ScopedContext};
+use crate::error::StorageError;
 use crate::models::HeatState;
 
 /// Band labels for [`HeatRepo::heat_histogram`], in render order.
@@ -19,6 +24,15 @@ pub struct HeatUpdate {
     pub heat: f64,
     pub stability: f64,
     pub access_count: i64,
+}
+
+/// One exact fact that was returned by retrieval and the resulting access values.
+pub struct HeatAccess {
+    pub memory: RecordId,
+    pub heat: f64,
+    pub stability: f64,
+    pub access_count: i64,
+    pub create_if_missing: bool,
 }
 
 /// One row the sweep wants to materialise: the value to write, and the decay anchor the caller read
@@ -185,6 +199,99 @@ impl<'a> HeatRepo<'a> {
         }
         let mut response = prepared.await?;
         Ok(response.take(0)?)
+    }
+
+    /// Read heat only for exact returned ids still live in the admitted population.
+    pub async fn get_many_scoped(
+        &self,
+        owner: &OwnerContext,
+        scope: &ScopedContext,
+        memory_ids: &[RecordId],
+    ) -> Result<Vec<HeatState>> {
+        anyhow::ensure!(
+            owner.workspace() == scope.workspace(),
+            "mismatched workspace"
+        );
+        if memory_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = ScopeFilter::new(scope);
+        let query = self.db.query(format!(
+            "SELECT * FROM heat_state WHERE memory INSIDE $ids AND memory INSIDE (\
+             SELECT VALUE id FROM $ids WHERE account = $account AND deleted = false \
+             AND quarantined_at = NONE AND {})",
+            scope.conjunct()
+        ));
+        let mut response = scope
+            .apply(query)
+            .bind(("ids", memory_ids.to_vec()))
+            .bind(("account", owner.account().as_record_id().clone()))
+            .await?
+            .check()?;
+        Ok(response.take(0)?)
+    }
+
+    /// Batch a retrieve's access writes under one owner claim. Recheck the live population
+    /// inside the data write, including for the rows that lacked heat when retrieval read them.
+    pub async fn record_access_scoped(
+        &self,
+        owner: &OwnerContext,
+        scope: &ScopedContext,
+        updates: &[HeatAccess],
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        if owner.workspace() != scope.workspace() {
+            return Err(StorageError::NotFound);
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let scope = ScopeFilter::new(scope);
+        let names: Vec<_> = (0..updates.len())
+            .map(|i| {
+                (
+                    format!("m{i}"),
+                    format!("h{i}"),
+                    format!("s{i}"),
+                    format!("a{i}"),
+                )
+            })
+            .collect();
+        let mut sql = String::new();
+        for ((m, h, s, a), update) in names.iter().zip(updates) {
+            let eligible = format!(
+                "array::len((SELECT id FROM ${m} WHERE account = $account \
+                 AND deleted = false AND quarantined_at = NONE AND {})) = 1",
+                scope.conjunct()
+            );
+            let values = format!(
+                "heat = ${h}, stability = ${s}, access_count = ${a}, \
+                 last_touched = time::now(), last_accessed_at = time::now()"
+            );
+            write!(
+                sql,
+                "UPDATE heat_state SET {values} WHERE memory = ${m} AND {eligible} RETURN AFTER; "
+            )
+            .expect("writing to String");
+            if update.create_if_missing {
+                write!(sql,
+                    "IF {eligible} AND array::len((SELECT id FROM heat_state WHERE memory = ${m} LIMIT 1)) = 0 {{ \
+                     CREATE heat_state SET memory = ${m}, {values} RETURN NONE; }}; "
+                ).expect("writing to String");
+            }
+        }
+        let mut write = GuardedWrite::new(sql).with_scope(&scope);
+        for ((m, h, s, a), update) in names.iter().zip(updates) {
+            write = write
+                .id(m, update.memory.clone())
+                .value(h, Bind::Float(update.heat))
+                .value(s, Bind::Float(update.stability))
+                .value(a, Bind::OptInt(Some(update.access_count)));
+        }
+        guarded_run::<HeatState>(self.db, owner, &write, now)
+            .await?
+            .ok_or(StorageError::Stale)?;
+        Ok(())
     }
 
     /// Write several accesses in **one** round trip, as one multi-statement query.

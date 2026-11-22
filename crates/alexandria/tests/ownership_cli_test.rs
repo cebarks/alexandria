@@ -142,10 +142,9 @@ impl Fixture {
     fn legacy() -> Self {
         let fixture = Self::new();
         fixture.child("legacy");
-        OfflineStoreGuard::acquire(&fixture.store)
-            .unwrap()
-            .copy_to(&fixture.backup)
-            .unwrap();
+        // Keep the copy's flock out of the parallel test harness, where a sibling's
+        // pre-exec subprocess could inherit it across the guard's drop.
+        fixture.child("offline-backup");
         fixture
     }
 
@@ -213,6 +212,13 @@ async fn fixture_child() {
     let root = PathBuf::from(std::env::var_os("OWNERSHIP_CLI_FIXTURE_ROOT").unwrap());
     let mode = std::env::var("OWNERSHIP_CLI_FIXTURE_MODE").unwrap();
     let store = root.join("store");
+    if mode == "offline-backup" {
+        OfflineStoreGuard::acquire(&store)
+            .unwrap()
+            .copy_to(&root.join("backup"))
+            .unwrap();
+        return;
+    }
     let mut db = Database::connect_persistent(&store).await.unwrap();
     match mode.as_str() {
         "legacy" => seed_legacy(&db).await,

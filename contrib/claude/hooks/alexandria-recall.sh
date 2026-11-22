@@ -22,10 +22,15 @@ LIMIT="${ALEXANDRIA_AUTO_RECALL_LIMIT:-10}"
 MIN_SIM="${ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY:-0.45}"
 
 hcurl() {
-  local left=$((8 - SECONDS))
-  curl -sS --max-time "$((left > 5 ? 5 : left < 1 ? 1 : left))" \
-    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-    -H "Authorization: Bearer ${ALEXANDRIA_API_TOKEN:-}" "$@"
+  local left=$((8 - SECONDS)) token=${ALEXANDRIA_API_TOKEN:-}
+  if [[ $token == *$'\r'* || $token == *$'\n'* ]]; then
+    return 1
+  fi
+  # Request bodies are passed as arguments, leaving stdin free for the secret header.
+  printf 'Authorization: Bearer %s\n' "$token" | ALEXANDRIA_API_TOKEN= \
+    curl -sS --max-time "$((left > 5 ? 5 : left < 1 ? 1 : left))" \
+      -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+      -H @- "$@"
 }
 post() {
   local body=$1

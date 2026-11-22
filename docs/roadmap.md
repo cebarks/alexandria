@@ -1,7 +1,7 @@
 # Roadmap
 
-**Current state:** 17 MCP tools, schema `v010`, HTTP + stdio + Docker deployment, one
-crate per layer and two client-side pi integrations under `contrib/pi/`.
+**Current implementation:** 17 MCP tools, schema `v015`, hosted HTTP and trusted-local stdio,
+private accounts, scoped storage and optional consented refinement. See the release gates below.
 
 ## Completed
 
@@ -62,7 +62,7 @@ The gap between "I stored something" and "I can see what the retrieval model act
 
 Documented in the README "Debug Web UI" section.
 
-### v0.2.3 — Proactive Capture / Auto-Store (2026-08-18)
+### v0.2.3 — Proactive Capture / Auto-Store (2026-08-18; historical, independent writers removed)
 
 Extended the pi extension from recall-only into a three-layer write funnel, so durable facts get
 captured even when the agent doesn't think to store them:
@@ -192,10 +192,9 @@ intervals catches up with one run per job, not three.
   `spacing_reference_secs` (#36): the old key named a half-life while being used as a spacing
   denominator, and documented the opposite direction from the code
 - **Quarantine** (`fact.quarantined_at`, v008) is the middle rung of a demote → quarantine →
-  soft-delete ladder: hidden from every live read path, still inspectable by an operator, reversible.
-  Nothing writes it yet — #29's secret scanning is the first producer. Nine read paths filter on it,
-  and the predicate must be `= NONE`, because on this engine both `IS NOT NULL` and `!= NULL` are
-  satisfied by `NONE` and filter nothing
+  soft-delete ladder. In v0.2.8 it was hidden from live reads but inspectable in the debug UI,
+  and no writer was shipped yet. Live-read filters used `= NONE`, not the SQL-style null checks.
+  The current owner-scoped behavior is described below.
 - **Audit**: `maintenance_log` gained `run_id`, `job`, `actor` and `disposition` (v008). Collapse and
   demote write rows, and splits and merges now carry the run id too, because a split moves members
   between clusters and is the most destructive thing any job does. One `run_id` per tick is the unit
@@ -203,7 +202,7 @@ intervals catches up with one run per job, not three.
   audit trail for it would be hundreds of rows an hour recording that nothing happened
 - `ClusterRepo::get_members` now excludes deleted and quarantined facts, mirroring the filter
   `SessionRepo::get_memories` already had — soft-deleted duplicates were contaminating cohesion
-- Schema head is `v008`. Due-time arithmetic and both job predicates live in
+- The schema head at v0.2.8 was `v008`. Due-time arithmetic and both job predicates live in
   `alexandria_engine::dreaming`, pure and clock-free, because the binary crate cannot
   integration-test its own modules
 - Storage additions: `HeatRepo::record_access`/`materialize_heat` and their batched forms
@@ -215,6 +214,15 @@ intervals catches up with one run per job, not three.
 - 468 tests
 
 ## Implemented, release-gated
+
+### Private hosted accounts and optional refinement
+
+- Shared hosted authentication, owner-private workspaces, Personal/project scopes, Unassigned classification, account-private session archive, and guarded offline legacy adoption.
+- Five partition-aware housekeeping jobs and a separate bounded refinement enqueue/worker path. Human review is the default; account consent and exact current secondary authority gate optional automatic quality application.
+- The current schema head is `v016_admin_recovery_log`. Admin views manage accounts and show aggregates; they do not directly expose other owners' content. Administrators can reset another account's credentials via a recovery link they issue, then sign in as that owner. The v016 audit records issuance, not secrecy from the issuer. Separately, host administrators can read disk and backups; this is not end-to-end encryption.
+- The private journal supports guarded rollback. Quarantine is now a quality operation; owner review can inspect quarantined records, and classification does not remove quarantine or make those records eligible for ordinary recall.
+- Pi and Claude preserve scoped explicit stores and automatic recall, not independent extraction writers. Pi keeps reminder consumption.
+- The browser exposes consent- and revision-checked assessment, opinion and regeneration submissions with owner-only attempt status. The [operating guide](ownership-and-refinement.md) documents the remaining scope limits, including no cross-scope contradiction assessment. Hermetic qualification does not replace hosted timing, native-browser or real model evaluation.
 
 ### Native Granite and separate offline embedding migration
 
@@ -249,10 +257,8 @@ milestone:
   lists them in the browser. `recall` still walks clusters rather than sessions.
 - ~~**`session.agent_id` / `session.model` are dead columns.**~~ Done: optional `agent_id` / `model`
   on `store_memory` and `import_document`, the first non-null value wins whenever it arrives.
-- ~~**No tests for the pi extension.**~~ Done: the detectors, serializer and response parser are
-  covered under `just ext-test`. The extraction prompt text is still unguarded.
-- ~~**Extension does not use sessions.**~~ Done: auto-store writes carry pi's session id,
-  `agent_id = "pi"` and the model. Finalize-at-shutdown is still open.
+- **Client admission:** `just ext-test` covers Pi configuration, project context, recall, reminders and transport; `just claude-test` checks the Claude hook. Both protect against reintroducing automatic stores.
+- **Session grouping and finalization are explicit agent actions.** Historical auto-store is not an installed writer.
 - ~~**The debug graph's BFS is unbounded.**~~ Done 2026-09-14 — `EdgeRepo::get_neighbors_capped` visits
   at most `max_nodes` records and reports whether that bound is what stopped it; the debug graph
   calls it with `GRAPH_VISIT_CAP` (4 × `GRAPH_NODE_CAP` = 800) and its notice distinguishes "the
@@ -260,7 +266,7 @@ milestone:
   ego-graph, so spreading activation is untouched. The gap as found: `GRAPH_NODE_CAP` (200) cut the
   node list only *after* `get_neighbors` had completed the BFS — two SurrealDB queries per reachable
   node, no frontier limit — so a hub session or cluster cost thousands of round trips per request on
-  a route that needs no authentication, and the debug UI had just widened the radius from a fixed 2
+  a route that at the time needed no authentication, and the debug UI had just widened the radius from a fixed 2
   hops to a selectable `MAX_HOPS = 3`.
 - **README said MIT.** Corrected to AGPL-3.0-or-later to match `LICENSE` and
   `license.workspace`; verified nothing else in-tree still claims MIT (`deny.toml`'s MIT entries are
@@ -300,7 +306,7 @@ The goal: memories should organize themselves without manual curation.
 - Higher quality embeddings at API cost
 - Model-agnostic — any OpenAI-compatible API
 
-### v0.4+ — Scale & Multi-Tenancy
+### v0.4+ — Scale beyond private hosted accounts
 
 **Multi-tenancy**
 

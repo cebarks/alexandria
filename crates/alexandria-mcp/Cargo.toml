@@ -25,6 +25,8 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "json", "query"] }
+# Already resolved through rmcp; used to terminate the HTTP body on lease cancellation.
+futures-util = { version = "0.3", default-features = false }
 # The already-resolved tokio-util, for the single type a credential lease is built on:
 # `sync::CancellationToken`. No feature is requested because 0.7.20 has none to request — `sync` is an
 # unconditional module there, and naming it as a feature fails to resolve — and `default-features = false`
@@ -39,6 +41,6 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "test-util"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing-subscriber = { workspace = true }

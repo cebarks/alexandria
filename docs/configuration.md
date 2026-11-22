@@ -16,12 +16,13 @@ Alexandria loads server config with this precedence:
 transport = "http"            # "stdio" or "http" (default: "stdio")
 host = "127.0.0.1"            # HTTP bind address (default: "127.0.0.1")
 port = 3000                   # HTTP port (default: 3000)
-allowed_origins = ["*"]       # CORS origins; ["*"] disables validation (default: ["*"])
-allowed_hosts = ["*"]         # Allowed Host headers; ["*"] disables validation (default: ["*"])
-# public_origin = "https://memory.example.com"   # required when transport = "http"
-# loopback_development = false                    # drop `Secure` on cookies, loopback bind only
+public_origin = "https://memory.example.com" # external origin at the TLS reverse proxy
+allowed_origins = ["https://memory.example.com"]
+allowed_hosts = ["memory.example.com"]
+loopback_development = false  # explicit local-only HTTP exception, described below
 sse_keep_alive_secs = 15      # SSE keep-alive interval in seconds (default: 15)
 
+# For stdio only, in a separate config: [auth] with stdio_account = "owner".
 [database]
 # data_dir = "/home/you/.local/share/alexandria/data"  # Storage path; ":memory:" for ephemeral (default: $XDG_DATA_HOME/alexandria/data)
 
@@ -72,24 +73,36 @@ escalation_hours = 48              # Project-targeted reminders escalate to glob
 | `transport` | string | `"stdio"` | Transport protocol. `"stdio"` for direct pipe, `"http"` for persistent HTTP service. |
 | `host` | string | `"127.0.0.1"` | Bind address for HTTP mode. Use `"0.0.0.0"` to listen on all interfaces. |
 | `port` | u16 | `3000` | Port for HTTP mode. |
-| `allowed_origins` | string[] | `["*"]` | CORS allowed origins. `["*"]` disables origin validation. Set to specific origins (e.g. `["http://localhost:3000"]`) in production. |
-| `allowed_hosts` | string[] | `["*"]` | Allowed HTTP Host header values. Under a hosted origin this must contain the request `Host`, with or without its port; `["*"]` is accepted only by the legacy no-boundary debug build, which serves no data. |
-| `public_origin` | string | *none* | **Required when `transport = "http"`.** The `https` origin browsers actually reach, as `scheme://host[:port]` with no path, query, credentials or trailing slash — `https://memory.example.com`, or `https://example.com:8443`. It is the origin the debug UI's cookies are scoped to, the value an `Origin` header is compared against, and the thing the server refuses to guess. `http` is refused except on the loopback exception below. A missing or malformed value stops startup with a message naming the three keys to set. |
+| `allowed_origins` | string[] | `["*"]` (unused in stdio) | Explicit CORS origins for HTTP. Must include `public_origin`; empty or wildcard entries are refused at HTTP startup. |
+| `allowed_hosts` | string[] | `["*"]` (unused in stdio) | Explicit HTTP Host allowlist, including the public origin's host. Entries match with or without the port. Empty or wildcard entries are refused at HTTP startup. |
+| `public_origin` | string | *none* | **Required when `transport = "http"`.** The `https` origin browsers actually reach, as `scheme://host[:port]` with no path, query, credentials or trailing slash — `https://memory.example.com`, or `https://example.com:8443`. It is the value a browser mutation's `Origin` header is compared against; it does not set a cookie domain. `http` is refused except on the loopback exception below. A missing or malformed value stops startup with a message naming the three keys to set. |
 | `loopback_development` | bool | `false` | The one exception to the `https` rule: session cookies are sent without `Secure` so a developer can sign in over plain `http` on `127.0.0.1`/`::1`/`localhost`. Honoured **only** when `host` is a loopback address — setting it with `host = "0.0.0.0"` is a startup error, not a warning, because the flag's whole meaning is "there is nobody between me and the browser". It never turns off the CSRF pair, the `Host` check or authentication. |
 | `sse_keep_alive_secs` | u64 | `15` | SSE keep-alive interval in seconds. Controls how often the server sends keep-alive pings on Streamable HTTP connections. |
 
 #### HTTP origins, hosts and what a proxy may not decide
 
-`transport = "http"` arms the browser boundary, and the three keys above are its whole configuration
-surface. The rules the server applies, and the ones operators most often get wrong:
+**HTTP upgrade:** previous wildcard defaults no longer admit HTTP startup. Set all three keys in
+`[server]` before restart. For TLS at a reverse proxy, pass the public Host through or allow the
+actual rewritten Host as well:
+
+```toml
+[server]
+transport = "http"
+public_origin = "https://memory.example.com"
+allowed_hosts = ["memory.example.com"]
+allowed_origins = ["https://memory.example.com"]
+```
+
+Startup stops before opening the store and lists the offending keys, ending with `fix the keys above in [server]; transport = "stdio" needs none of them`. For **local browser development only**, set `host = "127.0.0.1"`, `public_origin = "http://127.0.0.1:3000"`, `allowed_hosts = ["127.0.0.1"]`, `allowed_origins = ["http://127.0.0.1:3000"]`, and `loopback_development = true`. This does not waive authentication, Host or CSRF checks. The full rules:
 
 - **`public_origin` is mandatory, and it is not derived.** The server will not infer it from the bind
-  address, from a `Host` header, or from the absence of either. A wrong guess here is not cosmetic:
-  cookies scoped to an origin the browser did not use are either dropped (nobody can sign in) or sent to
-  a host the operator did not choose (every signed-in page is a cross-origin read for someone else).
-- **`allowed_origins` must contain `public_origin` exactly.** Origin comparison is scheme, host and port
-  together; `https://example.com` and `https://example.com:443` are the same origin and the check knows
-  it, but `http://example.com` is not.
+  address or from a `Host` header. A mismatch can cause browser mutations to be refused. The
+  session and CSRF cookies are host-only: there is no `Domain` attribute, so the browser uses
+  the host that returned the response, not a cookie domain derived from `public_origin`.
+- **`allowed_origins` must contain `public_origin` exactly.** Scheme and host are compared
+  case-insensitively, and the port is preserved as written. An explicit default port does
+  not match an omitted port. Omit default ports in browser-facing origin settings so the
+  configured value matches the browser's serialized `Origin`.
 - **`allowed_hosts` must contain the request `Host`.** Entries match with or without the port. A request
   with no `Host` header at all is refused once the boundary is armed — including by `curl`, which sends
   one; the refusal is the DNS-rebinding defence (S1 in `docs/security-findings.md`), and it holds even
@@ -106,6 +119,14 @@ surface. The rules the server applies, and the ones operators most often get wro
   administrator, so the first account and the first administrator arrive through the operator command,
   not through `/debug/login`. An empty store served over HTTP is reachable and correctly says it cannot
   sign anybody in.
+
+### `[auth]`
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `stdio_account` | string | `""` | Enrolled active account login for trusted-local stdio, and the identity for explicit offline refinement commands. Unset does not grant an identity. Do not set it in the HTTP service config: serving HTTP refuses it and authenticates each request instead. No env override. |
+
+See [bootstrap and offline adoption](ownership-and-refinement.md#choose-the-boundary-and-enroll-an-owner). Stdio needs no hosted origin settings.
 
 ### `[database]`
 
@@ -277,10 +298,10 @@ a complete set would answer. `dreaming` is not the only section in that position
 is the complete list of what the server reads from the environment, not an excerpt of a scheme that
 covers every section.
 
-All five jobs dispatch over active-account assigned partitions; Unassigned data is intentionally outside maintenance. Mixed-membership clusters (members spanning owned and physically unowned records) are not restructured by either path: they remain surfaced for owner classification rather than being treated as personal data or silently repaired.
+The owned paths for all five jobs dispatch over active-account assigned partitions; Unassigned data is intentionally outside maintenance. The capped jobs charge selected rows (`sweep`, `appraise`) or retired duplicates (`collapse`) against one global allowance per job per pass, not per account or partition. Mixed-membership clusters (members spanning owned and physically unowned records) are not restructured by either path: they remain surfaced for owner classification rather than being treated as personal data or silently repaired.
 
 Job runs are logged at `debug` with `examined` and `acted` counts. `cluster`, `merge`, `collapse` and
-`appraise` each write a row to `maintenance_log` — visible at `/debug/maintenance` — and `sweep`
+`appraise` emit audit rows for changes in `maintenance_log` — aggregate counts at `/debug/maintenance` — and `sweep`
 deliberately does not. `appraise`, `collapse` and semantic `cluster_change` writes pass through the
 mutation kernel and create `semantic_operation` rows with preimages; system operations use the
 schema's `initiator = NONE`, with readable `system:dreaming` attribution on the linked maintenance
@@ -332,6 +353,7 @@ Refinement has no routes by default. Only the operator can configure destination
 
 ```toml
 [refinement]
+interval_secs = 86400             # positive seconds; separate assigned-scope enqueue cadence
 approval_mode_ceiling = "human"  # default; "secondary_llm" permits an owner to select that mode
 
 [refinement.proposer]
@@ -346,7 +368,9 @@ output_limit_field = "max_completion_tokens"         # optional protocol-specifi
 x-gateway-key = "ALEXANDRIA_REFINEMENT_GATEWAY_KEY"
 ```
 
-A route requires `protocol`, `api_prefix`, and a nonblank `model`. The HTTP(S) URL keeps its gateway path prefix; userinfo, query strings, and fragments are refused. `credential_ref` and each `header_refs` value, if present, must be a name matching `[A-Za-z_][A-Za-z0-9_]*`. Startup does not read the referenced values. To use a different reviewer, supply a complete `[refinement.reviewer]` route with its own references. Omit it to inherit the proposer route, including its model and references; a reviewer without a proposer is invalid.
+`interval_secs` defaults to `86400`; `approval_mode_ceiling` defaults to `human`. Both route blocks are absent by default. There are no section environment overrides; the values named by credential/header references are read only for requests. Fixed worker ceilings include 20 focal records per pass, up to 8 neighbors per focal, 40 inference attempts per pass, 100 per account and 500 global per rolling day (40 interactive per account), 20 queued interactive items per account and 200 items globally, 32 KiB request and 64 KiB response, 4,096 output tokens, 120 seconds per request and 600 seconds of active pass time. They are not throughput or cost guarantees.
+
+A route requires `protocol`, `api_prefix`, and a nonblank `model`. `output_limit_field` defaults to `max_tokens`; OpenAI also accepts `max_completion_tokens`, Anthropic only `max_tokens`. The HTTP(S) URL keeps its gateway path prefix; userinfo, query strings, and fragments are refused. `credential_ref` and each `header_refs` value, if present, must be a name matching `[A-Za-z_][A-Za-z0-9_]*`. Startup does not read the referenced values. To use a different reviewer, supply a complete `[refinement.reviewer]` route with its own references. Omit it to inherit the proposer route, including its model and references; a reviewer without a proposer is invalid.
 
 Consent is per account and covers the disclosed destinations (protocol, origin, and API prefix). A destination change requires a fresh grant. Changing only the model does not require consent renewal, but it changes the inference policy ID; the current model is shown in disclosure. Credential rotation alone changes neither the destination nor the policy ID.
 
@@ -431,20 +455,13 @@ These env vars override individual config values after the TOML file is loaded:
 | `ALEXANDRIA_REMINDERS_TIMEZONE` | `reminders.timezone` |
 | `ALEXANDRIA_REMINDERS_ESCALATION_HOURS` | `reminders.escalation_hours` — a non-numeric value fails startup with an error naming the variable |
 
-The `ALEXANDRIA_SERVER_*` variables exist so a container can be configured entirely by environment
-(the bundled [Containerfile](../Containerfile) uses them to default to HTTP on `0.0.0.0:3000`) without
-shipping a config file.
-
-Everything else — `[heat]`, `[activation]`, `[cluster]`, `[retrieve]`, CORS, and SSE keep-alive —
-can only be set via the TOML file.
+The bundled [Containerfile](../Containerfile) selects HTTP and a bind address by environment. The explicit Host and CORS allowlists are TOML-only; an HTTP container must be supplied with that configuration. `[auth]`, `[heat]`, `[activation]`, `[cluster]`, `[dreaming]`, `[refinement]`, `[retrieve]`, and SSE keep-alive have no section environment overrides.
 
 ---
 
 ## Client Configuration
 
-The Pi companion extension (recall / store / reminders) loads its own config from
-`$XDG_CONFIG_HOME/alexandria/client.toml`. It is a separate file with separate keys — the server
-never reads it and the extension never reads `config.toml`.
+The Pi companion (recall and reminders, no automatic stores) uses `$XDG_CONFIG_HOME/alexandria/client.toml`, or `~/Library/Application Support/alexandria/client.toml` on macOS without XDG. It does not read `config.toml`. Claude's hook uses its own fixed timeouts; see the [Claude guide](../contrib/claude/README.md).
 
 Precedence: defaults → `client.toml` → `ALEXANDRIA_CLIENT_CONFIG` env var (path to alt TOML) → individual `ALEXANDRIA_*` env vars.
 
@@ -459,14 +476,13 @@ enabled = true
 limit = 10
 min_similarity = 0.45
 
-[store]
-enabled = true
-extract_model = "vertex/claude-haiku-4-5"
-extract_timeout_ms = 5000
+[transport]
+prompt_call_timeout_ms = 5000
+prompt_budget_ms = 10000
 
 [reminders]
 enabled = true
-project = "alexandria"
+# Optional: project = "project:7" # An owned canonical handle, not a repository name.
 ```
 
 ### `[server]`
@@ -474,6 +490,8 @@ project = "alexandria"
 | Key | Type | Default | Env Override | Description |
 |-----|------|---------|-------------|-------------|
 | `url` | string | `"http://127.0.0.1:3000/mcp"` | `ALEXANDRIA_URL` | Alexandria MCP server endpoint URL. |
+
+Set `ALEXANDRIA_API_TOKEN` in the client environment for HTTP bearer authentication (not TOML); `ALEXANDRIA_PROJECT_ID` can override resolution with a known owned project handle. See the [Pi guide](../contrib/pi/README.md#project-context).
 
 ### `[recall]`
 
@@ -483,13 +501,14 @@ project = "alexandria"
 | `limit` | number | `10` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. It is not merely a cap — a target ranked below it cannot be surfaced by any threshold, so it is a recall lever in its own right, and the stronger of the two. A judgement call on a small hand-authored question set, not a measurement — the questions were written against facts already in the corpus and none lacks a target (see [docs/minilm-test-data.md](minilm-test-data.md), "Limitations"). What the 2026-09-09 limit × threshold grid on an 880-fact corpus showed ("Result limit"): delivery saturates at `10`, because the worst of the 12 benchmark target ranks is 9, so `15` and `20` add non-target memories and no hits. Was `5` until that pass, which hid 3 of the 11 targets that cleared the then-default threshold on score. Lowering it below `3` also silently narrows spreading activation (`activation.top_n`). |
 | `min_similarity` | number | `0.45` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. A judgement call read off the same grid, with the same caveats; the grid counts how many of 12 known targets a threshold actually delivers *through* `limit`. **Read it together with `limit` — the two are not independent.** At `limit = 10`: `0.45` delivers 8/12 at ~1.0 non-targets per prompt, `0.35` delivers 11/12 at ~4.7, `0.50` delivers 7/12 at ~0.5, and the old `0.58` Pi default delivers only 4/12 — it assumed genuine matches score 0.6+ and drops two thirds of real hits. `0.40` was dominated on that 12-question grid (same 8 delivered as `0.45`, roughly double the noise); with the 20-question set it delivers 16/20 at ~3.0 against `0.45`'s 14/20 at ~1.65, a genuine trade that the strict-dominance rule used to pick the pair does not take. `0.45` is chosen as the frontier pick: paired with `limit = 10` it delivers what the previous `5`/`0.35` pair did at a third of the injection. Note that `0.45` is only on the frontier *because* the limit is 10 — at `limit = 5` it was dominated by `0.50`, so do not lower one without revisiting the other. It is not free: the weakest target scores 0.338 and falls below it. |
 
-### `[store]`
+### `[transport]`
 
-| Key | Type | Default | Env Override | Description |
-| ----- | ------ | --------- | ------------- | ------------- |
-| `enabled` | bool | `true` | `ALEXANDRIA_AUTO_STORE=off` | Enable heuristic store detectors and LLM extraction. |
-| `extract_model` | string | `"vertex/claude-haiku-4-5"` | `ALEXANDRIA_EXTRACT_MODEL` | Model for session-end LLM extraction. Falls back to session model if unavailable. |
-| `extract_timeout_ms` | number | `5000` | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | Timeout for the extraction LLM call in milliseconds. |
+| Key | Default | Env Override |
+| --- | --- | --- |
+| `prompt_call_timeout_ms` | `5000` ms | `ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS` |
+| `prompt_budget_ms` | `10000` ms | `ALEXANDRIA_PROMPT_BUDGET_MS` |
+
+Values must be positive and finite, with call timeout ≤ shared prompt budget ≤ `120000` ms. The shared deadline includes project resolution, any in-path handshake, recall, reminder checks and reconnect; native Pi MCP tools are independent. The companion also prewarms its connection; its SDK handshake has a 5 s ceiling. These are timeout settings, not measured hosted latency. Legacy `[store]` and the old extraction environment variables are ignored with a warning; explicit agent stores remain available.
 
 ### `[reminders]`
 
@@ -500,7 +519,7 @@ what project hint it sends with the question.
 | Key | Type | Default | Env Override | Description |
 | ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_REMINDERS=off` | Call `check_reminders` on every prompt and inject whatever is due. The server runs no timer, so turning this off means reminders reach the user only if the agent calls `check_reminders` itself. |
-| `project` | string | (git repo dir name) | `ALEXANDRIA_REMINDERS_PROJECT` | The legacy client sends this string with each check, defaulting to the basename of `git rev-parse --show-toplevel`. That basename is **not accepted** by the authenticated server: configure an existing owned `project:<opaque-id>` handle rather than a project name. Automatic client handle discovery is not implemented here. A context-free check receives only your global and eligible escalated reminders; sending an unknown/name/foreign context is refused, not treated as context-free. |
+| `project` | string | (resolved current project, if known) | `ALEXANDRIA_REMINDERS_PROJECT` | Optional owned `project:<opaque-id>` override for reminder checks. Otherwise uses the companion's resolved project, or a context-free check if none is known. A context-free check receives only the account's global and eligible escalated reminders; an invalid supplied context is refused. |
 
 ---
 

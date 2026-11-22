@@ -137,6 +137,22 @@ impl Database {
         self.authority.issued_to(system)
     }
 
+    /// Verify both the capability and the exact handle a repository is about to use.
+    ///
+    /// A `Surreal` clone has its own SDK session and may select a different namespace/database.
+    /// Require the borrowed handle from this instance; a clone of an unrelated (or reconfigured)
+    /// session is not proof of identity.
+    pub(crate) fn verified_system_handle(
+        &self,
+        db: &Surreal<Any>,
+        system: &SystemContext,
+    ) -> Result<&Surreal<Any>, StorageError> {
+        if !std::ptr::eq(self.inner(), db) || !self.holds_authority(system) {
+            return Err(StorageError::Stale);
+        }
+        Ok(self.inner())
+    }
+
     fn new(db: Surreal<Any>) -> Self {
         Self {
             db,

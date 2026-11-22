@@ -56,6 +56,17 @@ refinement-eval-test:
 refinement-eval:
     python3 -I -B tools/refinement-evaluation/score.py tools/refinement-evaluation/fixtures/cases.jsonl tools/refinement-evaluation/fixtures/deterministic-proposals.jsonl
 
+# Scoped release admission: temp stores, deterministic providers and loopback only.
+refinement-admission:
+    cargo test --locked -p alexandria --test joint_admission_test --test ownership_cli_test --test refinement_cli_test
+    cargo test --locked -p alexandria-mcp --test refinement_authority_test --test refinement_inference_test --test refinement_ui_test --test refinement_worker_test --test web_auth_test
+    cargo test --locked -p alexandria-storage --test classification_test --test refinement_apply_test --test refinement_candidates_test --test refinement_policy_test --test refinement_proposal_test
+    cargo test --locked -p alexandria-mcp --example review_fixture
+
+# Claude hooks against disposable local fixtures, not a running Claude install.
+claude-test:
+    python3 -B -m unittest discover -s contrib/claude/tests -p 'test_*.py'
+
 # Disposable loopback review UI. The example does not read Alexandria configuration.
 review-fixture:
     cargo run --locked -p alexandria-mcp --example review_fixture
@@ -70,7 +81,7 @@ ext-install:
     cd contrib/pi/extensions/alexandria && npm ci --ignore-scripts
 
 # All tests, Rust and client-side
-test-all: test ext-test
+test-all: test ext-test claude-test
 
 # Fast type-check
 check:
@@ -113,7 +124,7 @@ verify-assets:
     done
 
 # Full CI suite locally — run before pushing
-ci: fmt lint cpu-deps test test-cpu artifact-ci eval-test ext-test deny verify-assets
+ci: fmt lint verify-assets cpu-deps refinement-admission test test-cpu artifact-ci eval-test refinement-eval-test refinement-eval ext-test claude-test deny
 
 # Install git hooks (pre-commit: fmt + clippy)
 install-hooks:

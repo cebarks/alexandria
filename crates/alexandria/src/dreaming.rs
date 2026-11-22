@@ -13,17 +13,19 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alexandria_engine::clusters::maintenance::{
-    MaintenanceAction, MergeCheck, check_cohesion, check_merge,
+    MaintenanceAction, MergeCheck, check_cohesion, check_merge, check_merge_by_id,
 };
 use alexandria_engine::dreaming::budget::RowBudget;
-use alexandria_engine::dreaming::collapse::{Candidate, UNKNOWN_CREATED_AT, duplicate_groups};
+use alexandria_engine::dreaming::collapse::{
+    Candidate, UNKNOWN_CREATED_AT, duplicate_groups, duplicate_groups_by_id,
+};
 use alexandria_engine::dreaming::dispatch::{interleave_rounds, rotate_after};
 use alexandria_engine::dreaming::liveness::{Liveness, SharedLiveness};
 use alexandria_engine::dreaming::{DEMOTED_CONFIDENCE, Intervals, Job, JobReport, should_demote};
 use alexandria_engine::heat::{HeatColumns, HeatState as EngineHeatState, projected_heat};
 use alexandria_storage::access::SystemContext;
 use alexandria_storage::models::LiveConfidence;
-use alexandria_storage::models::identity::{FactId, OperationId, Partition};
+use alexandria_storage::models::identity::{FactId, OperationId, Partition, ToSql};
 use alexandria_storage::models::maintenance::MaintenanceBudgetJob;
 use alexandria_storage::models::maintenance::{action, disposition, job as job_name};
 use alexandria_storage::models::mutation::{
@@ -690,19 +692,27 @@ impl Jobs {
                 let rows = heat_repo
                     .page_oldest_in_partition_after(partition, limit, row_cursor)
                     .await?;
-                let confidences: HashMap<String, LiveConfidence> = memories
+                // `RecordId` has interior mutability, so a HashMap keyed on it trips
+                // clippy's `mutable_key_type`; a sorted, deduplicated Vec of pairs serves the
+                // same lookup without that hazard.
+                let mut confidences: Vec<(RecordId, LiveConfidence)> = memories
                     .live_confidences_in_partition(partition)
                     .await?
                     .into_iter()
-                    .map(|row| (record_id_to_string(&row.id), row))
+                    .map(|row| (row.id.clone(), row))
                     .collect();
+                confidences.sort_by(|a, b| a.0.cmp(&b.0));
+                confidences.dedup_by(|a, b| a.0 == b.0);
 
                 let mut report = JobReport::new(Job::Appraise);
                 let now = now_secs();
                 let mut demotions: Vec<(RecordId, f64)> = Vec::new();
                 for row in &rows {
-                    let id = record_id_to_string(&row.memory);
-                    let Some(live) = confidences.get(&id) else {
+                    let Some(live) = confidences
+                        .iter()
+                        .find(|(key, _)| key == &row.memory)
+                        .map(|(_, row)| row)
+                    else {
                         report.skipped += 1;
                         continue;
                     };
@@ -777,10 +787,8 @@ impl Jobs {
                             disposition: disposition::DEMOTE.to_string(),
                             previous_value: Some(*previous),
                         });
-                    let operation = OperationId::new(format!(
-                        "{run_id}:appraise:{}",
-                        record_id_to_string(fact)
-                    ));
+                    let operation =
+                        OperationId::new(format!("{run_id}:appraise:{}", fact.to_sql()));
                     match mutation
                         .apply_system(
                             &self.db,
@@ -816,42 +824,32 @@ impl Jobs {
                 let limit = row_allowance.unwrap_or(self.max_rows_per_run);
                 let memories = MemoryRepo::new(self.db.inner());
                 let rows = memories.collapse_candidates_in_partition(partition).await?;
-                let candidates: Vec<Candidate> = rows
-                    .iter()
-                    .map(|row| Candidate {
-                        id: record_id_to_string(&row.id),
-                        content: row.content.clone(),
-                        confidence: row.confidence,
-                        created_at: row
-                            .created_at
-                            .map(|at| at.timestamp())
-                            .unwrap_or(UNKNOWN_CREATED_AT),
+                let candidates = rows
+                    .into_iter()
+                    .map(|row| {
+                        Ok(Candidate {
+                            id: FactId::try_from(row.id)?,
+                            content: row.content,
+                            confidence: row.confidence,
+                            created_at: row
+                                .created_at
+                                .map(|at| at.timestamp())
+                                .unwrap_or(UNKNOWN_CREATED_AT),
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, alexandria_storage::error::StorageError>>()?;
 
                 let mut report = JobReport::new(Job::Collapse);
-                report.examined = rows.len();
-                // The engine groups by display string; the typed ids the scoped read returned are
-                // the authority, so the strings are only keys back into this map. No id is ever
-                // *parsed* from text - that is the type-erasing trap the reminder work removed.
-                let typed: HashMap<String, RecordId> = rows
-                    .iter()
-                    .map(|row| (record_id_to_string(&row.id), row.id.clone()))
-                    .collect();
+                report.examined = candidates.len();
                 let mut retired: Vec<(RecordId, RecordId)> = Vec::new();
-                'groups: for group in duplicate_groups(&candidates) {
+                'groups: for group in duplicate_groups_by_id(&candidates) {
                     for collapsed in &group.collapsed {
                         if retired.len() >= limit {
                             break 'groups;
                         }
-                        let Some(from) = typed.get(collapsed) else {
-                            continue;
-                        };
-                        let Some(to) = typed.get(&group.survivor) else {
-                            continue;
-                        };
-                        let (from, to) = (from.clone(), to.clone());
-                        let fact = FactId::try_from(from.clone())?;
+                        let from = collapsed.as_record_id().clone();
+                        let to = group.survivor.as_record_id().clone();
+                        let fact = collapsed.clone();
                         let mutation = MutationRepo::new(self.db.inner());
                         let expected = mutation
                             .expected_state_system(&self.db, &self.system, partition, &fact)
@@ -885,10 +883,8 @@ impl Jobs {
                                 disposition: disposition::SOFT_DELETE.to_string(),
                                 previous_value: None,
                             });
-                        let operation = OperationId::new(format!(
-                            "{run_id}:collapse:{}",
-                            record_id_to_string(&from)
-                        ));
+                        let operation =
+                            OperationId::new(format!("{run_id}:collapse:{}", from.to_sql()));
                         if mutation
                             .apply_system(
                                 &self.db,
@@ -1008,47 +1004,22 @@ impl Jobs {
         loop {
             let clusters = repo.partition_clusters(partition).await?;
             report.examined += clusters.len();
-            let infos: Vec<(String, Vec<f32>, usize)> = clusters
-                .iter()
-                .map(|entry| {
-                    let id = entry
-                        .cluster
-                        .id
-                        .as_ref()
-                        .expect("listed cluster has a typed id");
-                    (
-                        record_id_to_string(id),
-                        entry.cluster.centroid.clone(),
-                        entry.members.len(),
-                    )
-                })
-                .collect();
-            let index: HashMap<&str, usize> = infos
-                .iter()
-                .enumerate()
-                .map(|(index, info)| (info.0.as_str(), index))
-                .collect();
             let mut merged = false;
-            'scan: for left in 0..infos.len() {
-                for right in (left + 1)..infos.len() {
+            'scan: for (left, a) in clusters.iter().enumerate() {
+                for (right, b) in clusters.iter().enumerate().skip(left + 1) {
                     if let MergeCheck::Merge {
-                        keep_id,
-                        remove_id,
+                        keep_id: keep,
+                        remove_id: remove,
                         merged_centroid,
-                    } = check_merge(
-                        &infos[left].0,
-                        &infos[left].1,
-                        infos[left].2,
-                        &infos[right].0,
-                        &infos[right].1,
-                        infos[right].2,
+                    } = check_merge_by_id(
+                        left,
+                        &a.cluster.centroid,
+                        a.members.len(),
+                        right,
+                        &b.cluster.centroid,
+                        b.members.len(),
                         self.merge_threshold,
                     ) {
-                        let (Some(&keep), Some(&remove)) =
-                            (index.get(keep_id.as_str()), index.get(remove_id.as_str()))
-                        else {
-                            anyhow::bail!("merge verdict named an unlisted cluster");
-                        };
                         repo.execute_partitioned_merge(
                             &self.db,
                             &self.system,
@@ -3731,6 +3702,130 @@ model = "scheduler-fixture"
         );
         assert_eq!(logs[0]["job"], "appraise");
         assert_eq!(logs[0]["actor"], "system:dreaming");
+    }
+
+    async fn run107b_seed_colliding_fact_keys(
+        db: &Database,
+        same_content: bool,
+    ) -> (RecordId, RecordId) {
+        let ids = IdentityRepo::new(db.inner())
+            .bootstrap_owner(
+                "collision-owner",
+                "digest-dispatch-padding-padding",
+                &OperationId::new("collision-owner"),
+            )
+            .await
+            .unwrap();
+        let numeric = RecordId::new("fact", 7_i64);
+        let text = RecordId::new("fact", "7");
+        for (id, confidence, content) in [
+            (&numeric, 0.5_f64, "collision low"),
+            (
+                &text,
+                0.95_f64,
+                if same_content {
+                    "collision low"
+                } else {
+                    "collision high"
+                },
+            ),
+        ] {
+            db.inner()
+                .query("CREATE $id SET account = $account, workspace = $workspace, scope = 'personal', content = $content, confidence = $confidence, embedding = [0.1, 0.2], created_at = time::now(), semantic_revision = 1 RETURN NONE")
+                .bind(("id", id.clone()))
+                .bind(("account", ids.account.as_record_id().clone()))
+                .bind(("workspace", ids.workspace.as_record_id().clone()))
+                .bind(("content", content))
+                .bind(("confidence", confidence))
+                .await.unwrap().check().unwrap();
+        }
+        assert_eq!(record_id_to_string(&numeric), record_id_to_string(&text));
+        (numeric, text)
+    }
+
+    #[tokio::test]
+    async fn run107b_appraise_joins_heat_to_the_exact_typed_fact() {
+        let (db, system) = migrated_db().await;
+        system_config::arm_access_recording(db.inner())
+            .await
+            .unwrap();
+        let (numeric, text) = run107b_seed_colliding_fact_keys(&db, false).await;
+        for id in [&numeric, &text] {
+            HeatRepo::new(db.inner())
+                .create_for_memory(&id.to_sql(), 1.0)
+                .await
+                .unwrap();
+        }
+        db.inner()
+            .query("UPDATE heat_state SET last_touched = $old")
+            .bind(("old", chrono::Utc::now() - chrono::Duration::days(400)))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        let report = jobs
+            .dispatch_job(Job::Appraise, "run107b-appraise")
+            .await
+            .unwrap();
+        assert_eq!(
+            report.report.acted, 1,
+            "only the low-confidence numeric key qualifies"
+        );
+        for (id, expected) in [(numeric, DEMOTED_CONFIDENCE), (text, 0.95)] {
+            let actual: Vec<f64> = db
+                .inner()
+                .query("SELECT VALUE confidence FROM $id")
+                .bind(("id", id))
+                .await
+                .unwrap()
+                .check()
+                .unwrap()
+                .take(0)
+                .unwrap();
+            assert_eq!(actual, [expected]);
+        }
+    }
+
+    #[tokio::test]
+    async fn run107b_collapse_retires_only_the_weaker_typed_fact() {
+        let (db, system) = migrated_db().await;
+        let (numeric, text) = run107b_seed_colliding_fact_keys(&db, true).await;
+        let jobs = Jobs::new(db.clone(), system, &Config::default());
+        let report = jobs
+            .dispatch_job(Job::Collapse, "run107b-collapse")
+            .await
+            .unwrap();
+        assert_eq!(report.report.acted, 1);
+        for (id, expected) in [(numeric.clone(), true), (text.clone(), false)] {
+            let actual: Vec<bool> = db
+                .inner()
+                .query("SELECT VALUE deleted FROM $id")
+                .bind(("id", id))
+                .await
+                .unwrap()
+                .check()
+                .unwrap()
+                .take(0)
+                .unwrap();
+            assert_eq!(actual, [expected]);
+        }
+        // Lineage lives in `memory_edge` (`derived_from` is a typed row subtype, not its own
+        // table), with endpoints the kernel wrote as typed record ids.
+        let targets: Vec<RecordId> = db
+            .inner()
+            .query(
+                "SELECT VALUE out FROM memory_edge \
+                 WHERE edge_type = 'derived_from' AND in = $id;",
+            )
+            .bind(("id", numeric))
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(targets, [text]);
     }
 
     /// WITNESS 5c (run 84, finding 1) — appraise's page must ADVANCE past examined-but-ineligible

@@ -399,8 +399,8 @@ where
 /// The system writer's half of [`guarded_writes`]: same transaction shape, same retry bound, same
 /// rollback-on-conflict — only the claim differs.
 ///
-/// The claim is the **actual-write active-account barrier**: the capability is verified against the
-/// issuing instance (pointer equality, no write), and then the partition's owner account is
+/// The claim is the **actual-write active-account barrier**: the capability and write handle are
+/// verified against the issuing instance, and then the partition's owner account is
 /// re-asserted *as a conditional write* inside the transaction — `status = 'active'` on the account
 /// row that owns the workspace — so a suspension landing between the dispatcher's enumeration and
 /// the write costs the commit a conflict and rolls the data write back with it. There is no
@@ -445,9 +445,7 @@ pub async fn guarded_system_writes<T>(
 where
     T: SurrealValue + Send,
 {
-    if !instance.holds_authority(system) {
-        return Err(StorageError::Stale);
-    }
+    let db = instance.verified_system_handle(db, system)?;
     if writes.is_empty() {
         return Ok(Some(Vec::new()));
     }
@@ -746,6 +744,67 @@ mod system_barrier_tests {
         assert_eq!(
             rows[0]["content"], "after",
             "the refused pass wrote nothing: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_system_capability_cannot_be_paired_with_another_store_handle() {
+        let (issuer, system) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let (target, _) = crate::Database::bootstrap_embedded_for_tests()
+            .await
+            .unwrap();
+        let ids = crate::repos::IdentityRepo::new(target.inner())
+            .bootstrap_owner(
+                "barrier-target",
+                "digest-barrier-padding-padding-pad",
+                &OperationId::new("barrier-target"),
+            )
+            .await
+            .unwrap();
+        let partition = crate::models::identity::Partition {
+            workspace: ids.workspace,
+            scope: crate::models::identity::MemoryScope::Personal,
+        };
+        let fact = RecordId::new("fact", "barrier-foreign-row");
+        target
+            .inner()
+            .query(
+                "CREATE $fact SET content = 'before', embedding = [0.1, 0.2], \
+                 workspace = $workspace, deleted = false RETURN NONE;",
+            )
+            .bind(("fact", fact.clone()))
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let write = GuardedWrite::new(
+            "UPDATE $fact SET content = 'foreign write' WHERE workspace = $workspace RETURN AFTER;",
+        )
+        .id("fact", fact.clone());
+        let refused: Result<Option<Vec<serde_json::Value>>, _> =
+            guarded_system_run(target.inner(), &issuer, &system, &partition, &write).await;
+        let journal = crate::repos::MutationRepo::new(target.inner())
+            .system_mutation_context(&issuer, &system, &partition)
+            .await;
+        let rows: Vec<String> = target
+            .inner()
+            .query("SELECT VALUE content FROM $fact;")
+            .bind(("fact", fact))
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert!(
+            matches!(refused, Err(StorageError::Stale))
+                && matches!(journal, Err(StorageError::Stale))
+                && rows == ["before"],
+            "a capability from the issuer must not authorize the target: guarded={refused:?}, journal={journal:?}, contents={rows:?}"
         );
     }
 

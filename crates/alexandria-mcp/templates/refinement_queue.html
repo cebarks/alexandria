@@ -1,4 +1,5 @@
 {% extends "layout.html" %}
+{% import "_refinement_enqueue.html" as e %}
 {% block title %}Refinement queue{% endblock %}
 {% block body %}
 <h1>Quality refinement</h1>
@@ -15,6 +16,11 @@
     <option value="project" {% if filter_scope == "project" %}selected{% endif %}>Projects</option>
     <option value="unassigned" {% if filter_scope == "unassigned" %}selected{% endif %}>Unassigned</option>
   </select>
+  <label for="status-filter">Filter proposals by status</label>
+  <select id="status-filter" name="status">
+    <option value="regular" {% if !deferred %}selected{% endif %}>Non-deferred</option>
+    <option value="deferred" {% if deferred %}selected{% endif %}>Deferred</option>
+  </select>
   <button type="submit">Filter</button>
 </form>
 <p>Attempt and quota status: {{ attempt_status }}. The queue does not imply an inference call was made.</p>
@@ -22,7 +28,7 @@
   <thead><tr><th>Proposal</th><th>State</th><th>Scope</th><th>Selected records</th><th>Changes and rationale</th><th>Uncertainty</th><th>Model disclosure</th></tr></thead>
   <tbody>
   {% if rows.is_empty() %}
-    <tr><td colspan="7" class="empty">No proposals match this scope filter.</td></tr>
+    <tr><td colspan="7" class="empty">No proposals match these filters.</td></tr>
   {% else %}
     {% for row in rows %}
     <tr>
@@ -38,6 +44,28 @@
   {% endif %}
   </tbody>
 </table>
-<p class="note">The attempt and quota counts above are this account's real rolling counts. Browser enqueue remains unavailable, and a known attempt ID can be checked separately.</p>
+<p class="note">The attempt and quota counts above are this account's real rolling counts. Submission opens the owner-only attempt status, which polls while work is queued or running.</p>
+{% if enqueue.enabled %}
+<section aria-labelledby="assessment-heading">
+  <h2 id="assessment-heading">Queue an assessment</h2>
+  <form method="post" action="/debug/refinement/enqueue">
+    {{ e::version_fields(enqueue) }}
+    <label>Assigned partition <select name="scope">
+      <option value="personal">Personal</option>
+      {% for project in projects %}<option value="{{ project }}">{{ project }}</option>{% endfor %}
+    </select></label>
+    <button type="submit" name="action" value="run">Run assessment</button>
+  </form>
+  <form method="post" action="/debug/refinement/enqueue">
+    {{ e::version_fields(enqueue) }}
+    <p>Manual Unassigned assessment uses only the memory you name. Get its exact id and revision from your <a href="/debug/collections?partition=unassigned">Unassigned collections</a>.</p>
+    <label>Unassigned memory id <input type="text" name="target" required></label>
+    <label>Memory revision <input type="number" name="revision" min="0" required></label>
+    <button type="submit" name="action" value="assess_unassigned">Assess Unassigned memory</button>
+  </form>
+</section>
+{% else %}
+<p>Assessment submission requires an available destination and your consent in <a href="/debug/refinement/settings">settings</a>.</p>
+{% endif %}
 <p><a href="/debug/refinement/settings">Consent and review settings</a></p>
 {% endblock %}

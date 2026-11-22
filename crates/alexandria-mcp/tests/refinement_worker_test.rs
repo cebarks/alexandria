@@ -1,4 +1,4 @@
-//! RED witnesses for the fair refinement worker. No sockets, wall-clock sleeps or corpus applier.
+//! Witnesses for the fair refinement worker and the route provider reused by its supervisor.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -13,14 +13,16 @@ use alexandria_mcp::refinement::worker::{
 use alexandria_mcp::refinement::{ReconciledRefinement, RefinementService};
 use alexandria_storage::access::{AccessRepo, OwnerContext, SystemContext};
 use alexandria_storage::models::OperationId;
-use alexandria_storage::models::identity::{FactId, MemoryScope, Partition, ProjectId, Version};
+use alexandria_storage::models::identity::{
+    FactId, MemoryScope, Partition, ProjectId, RefinementProposalId, Version,
+};
 use alexandria_storage::models::refinement::{
     ApprovalMode, Authority, ConsentChoice, EvidenceBundle, ProposalCategory, ProposalRevision,
     ProposalState, QualityOperation, SecondaryVerdict,
 };
 use alexandria_storage::repos::refinement_repo::{
     AttemptId, AttemptState, BudgetDenial, BudgetRepo, CallLimits, EnqueueRequest, EvidenceOutcome,
-    EvidenceSelection, PassId, Reservation, WorkKind, WorkSelection,
+    EvidenceSelection, PassId, Reservation, WorkKind, WorkSelection, current_authority,
 };
 use alexandria_storage::repos::{IdentityRepo, RefinementRepo};
 use alexandria_storage::{Database, schema};
@@ -284,6 +286,12 @@ struct Sent {
     text: String,
 }
 
+#[derive(Clone, Copy)]
+enum SecondaryChange {
+    SwitchToHuman,
+    RegrantAfterReservation,
+}
+
 #[derive(Default)]
 struct FakeProvider<'a> {
     sent: Mutex<Vec<Sent>>,
@@ -292,6 +300,7 @@ struct FakeProvider<'a> {
     hold: bool,
     primary_attempts: usize,
     after_reservation: Option<(&'a Database, &'a OwnerContext)>,
+    secondary_change: Option<(&'a Fixture, SecondaryChange)>,
     reservations: AtomicUsize,
 }
 
@@ -308,6 +317,17 @@ impl WorkerProvider for FakeProvider<'_> {
         } else {
             1
         };
+        let change = (call.stage == Stage::Secondary)
+            .then_some(self.secondary_change)
+            .flatten();
+        if let Some((fx, SecondaryChange::SwitchToHuman)) = change {
+            let service = fx.service();
+            let policy = service.effective_policy(&fx.owner).await.unwrap().policy;
+            service
+                .set_approval_mode(&fx.owner, &policy.version(), ApprovalMode::Human)
+                .await
+                .unwrap();
+        }
         for _ in 0..attempts {
             quota
                 .reserve_attempt()
@@ -317,10 +337,36 @@ impl WorkerProvider for FakeProvider<'_> {
             if let Some((db, owner)) = self.after_reservation {
                 set_status(db, owner, "suspended").await;
             }
-            quota
-                .authorize_outbound()
-                .await
-                .map_err(|_| InferenceError::QuotaDenied)?;
+            if let Some((fx, SecondaryChange::RegrantAfterReservation)) = change {
+                let service = fx.service();
+                let policy = service.effective_policy(&fx.owner).await.unwrap().policy;
+                let revoked = service
+                    .consent(
+                        &fx.owner,
+                        policy.version().consent_revision,
+                        ConsentChoice::Revoke,
+                    )
+                    .await
+                    .unwrap();
+                service
+                    .consent(
+                        &fx.owner,
+                        revoked.revision,
+                        ConsentChoice::Grant {
+                            disclosed_policy_revision: policy.configured.unwrap().revision,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let authorized = quota.authorize_outbound().await;
+            if matches!(change, Some((_, SecondaryChange::RegrantAfterReservation))) {
+                assert!(
+                    authorized.is_err(),
+                    "regrant must not restore a dispatched grant"
+                );
+            }
+            authorized.map_err(|_| InferenceError::QuotaDenied)?;
             if cancel.is_cancelled() {
                 return Err(InferenceError::Cancelled);
             }
@@ -448,6 +494,40 @@ async fn one_in_flight_and_real_task18_projection_produces_typed_proposal() {
         fx.service().attempt(&fx.other, &attempt).await.is_err(),
         "attempt views are owner-scoped"
     );
+
+    let service = fx.service();
+    let repo = RefinementRepo::new(&fx.db);
+    let persisted = repo.persist_proposal(&fx.owner, proposal).await.unwrap();
+    let visible = service
+        .owner_proposals(&fx.owner, None, false)
+        .await
+        .unwrap();
+    assert_eq!(visible.len(), 1, "new proposal is in the regular queue");
+    assert_eq!(visible[0].id, persisted.id);
+    let id = RefinementProposalId::try_from(persisted.id).unwrap();
+    repo.defer_proposal_revision(&fx.owner, &id, persisted.revision)
+        .await
+        .unwrap();
+    assert!(
+        service
+            .owner_proposals(&fx.owner, None, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let deferred = service
+        .owner_proposals(&fx.owner, Some("personal"), true)
+        .await
+        .unwrap();
+    assert_eq!(deferred.len(), 1);
+    assert_eq!(&deferred[0].id, id.as_record_id());
+    assert!(
+        service
+            .owner_proposals(&fx.other, None, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -512,6 +592,140 @@ async fn account_partition_and_interactive_class_get_turns_under_backlog() {
             "turn lost to the Personal backlog: {expected:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn run107b_rotation_survives_restart_with_two_older_requeued_partitions() {
+    let fx = Fixture::new().await;
+    let personal = MemoryScope::Personal;
+    let project = fx.project(&fx.owner, "rotation-project").await;
+    fx.seed(&fx.owner, personal.clone(), "rotation-a1", 8).await;
+    fx.seed(&fx.owner, project.clone(), "rotation-a2", 8).await;
+    fx.seed(&fx.other, personal.clone(), "rotation-b", 8).await;
+    let a1 = fx.enqueue(&fx.owner, personal.clone(), "rotation-a1").await;
+    let a2 = fx.enqueue(&fx.owner, project, "rotation-a2").await;
+    let provider = FakeProvider::default();
+    assert!(matches!(
+        fx.worker(WorkerSettings::default())
+            .step(now(), &provider)
+            .await
+            .unwrap(),
+        Dispatch::Completed { .. }
+    ));
+    let b = fx.enqueue(&fx.other, personal, "rotation-b").await;
+    // Model two interrupted requeues at the unchanged head of the FIFO.
+    for (id, age) in [(&a1, 3), (&a2, 2), (&b, 1)] {
+        fx.db
+            .inner()
+            .query("UPDATE ONLY $id SET state = 'queued', created_at = $created RETURN NONE")
+            .bind(("id", id.record().clone()))
+            .bind(("created", now() - TimeDelta::hours(age)))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+    let dispatched = fx
+        .worker(WorkerSettings::default())
+        .step(now(), &provider)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&dispatched, Dispatch::Completed { attempt, .. } if attempt == &b),
+        "the other eligible account must go first after reconstruction: {dispatched:?}"
+    );
+}
+
+#[tokio::test]
+async fn run107b_route_provider_survives_elapsed_pass_deadline() {
+    use alexandria_mcp::refinement::inference::{AttemptQuota, QuotaDenied};
+    use alexandria_mcp::refinement::provider::RouteProvider;
+
+    struct Admit;
+    #[async_trait::async_trait]
+    impl AttemptQuota for Admit {
+        async fn reserve_attempt(&self) -> Result<(), QuotaDenied> {
+            Ok(())
+        }
+    }
+    #[async_trait::async_trait]
+    impl WorkerQuota for Admit {
+        async fn authorize_outbound(&self) -> Result<(), QuotaDenied> {
+            Ok(())
+        }
+    }
+
+    let fx = Fixture::new().await;
+    fx.seed(&fx.owner, MemoryScope::Personal, "deadline-focal", 8)
+        .await;
+    let mut page = RefinementRepo::new(&fx.db)
+        .page_candidates(&partition(&fx.owner, MemoryScope::Personal), None, 1, now())
+        .await
+        .unwrap();
+    let EvidenceOutcome::Ready(evidence) = page.outcomes.pop().unwrap() else {
+        panic!("fixture must produce provider evidence");
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let prefix = format!("http://{}/v1", listener.local_addr().unwrap());
+    let host = tokio::spawn(async move {
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(|| async {
+            axum::Json(serde_json::json!({
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ready"}, "finish_reason": "stop"}]
+            }))
+        }));
+        axum::serve(listener, app).await.unwrap();
+    });
+    let routes = RoutePair::resolve(
+        Route {
+            protocol: Protocol::OpenAiChatCompletions,
+            api_prefix: prefix,
+            model: "fixture".into(),
+            credential_ref: None,
+            headers: BTreeMap::new(),
+            output_limit_field: None,
+        },
+        None,
+    )
+    .unwrap();
+    let config = ReconciledRefinement::reconcile(
+        &fx.db,
+        &fx.system,
+        Some(routes),
+        &InferencePolicyInputs {
+            prompt_template: b"deadline fixture",
+            prompt_template_version: "1",
+            operation_schema_version: "1",
+            settings: &BTreeMap::new(),
+        },
+        ApprovalMode::Human,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let settings = WorkerSettings::default();
+    let provider = RouteProvider::new(&config, settings);
+    let complete = || {
+        provider.complete(
+            Call {
+                kind: WorkKind::Assess,
+                stage: Stage::Primary,
+                evidence: &evidence,
+                proposal: None,
+            },
+            &Admit,
+            CancellationToken::new(),
+        )
+    };
+    assert_eq!(complete().await.unwrap().text, "ready");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(settings.pass_active_secs + 1)).await;
+    tokio::time::resume();
+    let second = complete().await;
+    host.abort();
+    assert_eq!(
+        second.expect("independent calls get a fresh deadline").text,
+        "ready"
+    );
 }
 
 #[tokio::test]
@@ -640,25 +854,14 @@ async fn budget_denial_prevents_http_and_does_not_reset_on_a_new_request() {
         ..Default::default()
     };
     let repo = BudgetRepo::new(&fx.db, settings.calls);
-    let partition = partition(&fx.owner, MemoryScope::Personal);
-    let policy = fx
-        .service()
-        .effective_policy(&fx.owner)
+    let authority = current_authority(&fx.db, fx.owner.account())
         .await
         .unwrap()
-        .policy;
-    let policy = policy.configured.unwrap().configuration.inference_policy_id;
+        .unwrap();
     assert_eq!(
-        repo.reserve_attempt(
-            &policy,
-            fx.owner.account(),
-            &partition,
-            &PassId("prior-call".into()),
-            false,
-            now()
-        )
-        .await
-        .unwrap(),
+        repo.reserve_attempt(&authority, &PassId("prior-call".into()), false, now())
+            .await
+            .unwrap(),
         Reservation::Granted
     );
     fx.seed(&fx.owner, MemoryScope::Personal, "denied-focal", 0)
@@ -680,15 +883,14 @@ async fn budget_denial_prevents_http_and_does_not_reset_on_a_new_request() {
 #[tokio::test]
 async fn call_caps_are_independent_atomic_and_rolling() {
     let fx = Fixture::new().await;
-    let policy = fx
-        .service()
-        .effective_policy(&fx.owner)
+    let a = current_authority(&fx.db, fx.owner.account())
         .await
         .unwrap()
-        .policy;
-    let policy = policy.configured.unwrap().configuration.inference_policy_id;
-    let a = partition(&fx.owner, MemoryScope::Personal);
-    let b = partition(&fx.other, MemoryScope::Personal);
+        .unwrap();
+    let b = current_authority(&fx.db, fx.other.account())
+        .await
+        .unwrap()
+        .unwrap();
     let repo = BudgetRepo::new(
         &fx.db,
         CallLimits {
@@ -701,45 +903,28 @@ async fn call_caps_are_independent_atomic_and_rolling() {
     let first = PassId("first".into());
     let second = PassId("second".into());
     let other = PassId("other".into());
-    assert_eq!(
-        repo.reserve_attempt(&policy, fx.owner.account(), &a, &first, true, now())
-            .await
-            .unwrap(),
-        Reservation::Granted
-    );
-    assert_eq!(
-        repo.reserve_attempt(&policy, fx.owner.account(), &a, &second, true, now())
-            .await
-            .unwrap(),
-        Reservation::Denied(BudgetDenial::Interactive)
-    );
-    assert_eq!(
-        repo.reserve_attempt(&policy, fx.owner.account(), &a, &first, false, now())
-            .await
-            .unwrap(),
-        Reservation::Granted
-    );
-    assert_eq!(
-        repo.reserve_attempt(&policy, fx.owner.account(), &a, &first, false, now())
-            .await
-            .unwrap(),
-        Reservation::Denied(BudgetDenial::Pass)
-    );
-    assert_eq!(
-        repo.reserve_attempt(&policy, fx.owner.account(), &a, &second, false, now())
-            .await
-            .unwrap(),
-        Reservation::Granted
-    );
-    assert_eq!(
-        repo.reserve_attempt(&policy, fx.owner.account(), &a, &second, false, now())
-            .await
-            .unwrap(),
-        Reservation::Denied(BudgetDenial::Account)
-    );
+    for (pass, interactive, expected) in [
+        (&first, true, Reservation::Granted),
+        (
+            &second,
+            true,
+            Reservation::Denied(BudgetDenial::Interactive),
+        ),
+        (&first, false, Reservation::Granted),
+        (&first, false, Reservation::Denied(BudgetDenial::Pass)),
+        (&second, false, Reservation::Granted),
+        (&second, false, Reservation::Denied(BudgetDenial::Account)),
+    ] {
+        assert_eq!(
+            repo.reserve_attempt(&a, pass, interactive, now())
+                .await
+                .unwrap(),
+            expected
+        );
+    }
     let latest = now() + TimeDelta::hours(23);
-    let left = repo.reserve_attempt(&policy, fx.other.account(), &b, &other, false, latest);
-    let right = repo.reserve_attempt(&policy, fx.other.account(), &b, &other, false, latest);
+    let left = repo.reserve_attempt(&b, &other, false, latest);
+    let right = repo.reserve_attempt(&b, &other, false, latest);
     let (left, right) = tokio::join!(left, right);
     let results = [left.unwrap(), right.unwrap()];
     assert_eq!(
@@ -752,8 +937,6 @@ async fn call_caps_are_independent_atomic_and_rolling() {
     assert!(results.contains(&Reservation::Denied(BudgetDenial::Global)));
     assert_eq!(
         repo.reserve_attempt(
-            &policy,
-            fx.owner.account(),
             &a,
             &PassId("next-day".into()),
             true,
@@ -779,20 +962,18 @@ async fn reservation_rejects_stale_policy_revoked_consent_and_suspended_accounts
     let fx = Fixture::new().await;
     let service = fx.service();
     let old = service.effective_policy(&fx.owner).await.unwrap().policy;
-    let old_id = &old
-        .configured
-        .as_ref()
+    let a = current_authority(&fx.db, fx.owner.account())
+        .await
         .unwrap()
-        .configuration
-        .inference_policy_id;
-    let a = partition(&fx.owner, MemoryScope::Personal);
-    let b = partition(&fx.other, MemoryScope::Personal);
+        .unwrap();
+    let b = current_authority(&fx.db, fx.other.account())
+        .await
+        .unwrap()
+        .unwrap();
     let pass = PassId("authority-test".into());
     let repo = BudgetRepo::new(&fx.db, WorkerSettings::default().calls);
     assert_eq!(
-        repo.reserve_attempt(old_id, fx.owner.account(), &a, &pass, false, now())
-            .await
-            .unwrap(),
+        repo.reserve_attempt(&a, &pass, false, now()).await.unwrap(),
         Reservation::Granted
     );
     service
@@ -803,32 +984,18 @@ async fn reservation_rejects_stale_policy_revoked_consent_and_suspended_accounts
         )
         .await
         .unwrap();
-    assert!(
-        repo.reserve_attempt(old_id, fx.owner.account(), &a, &pass, false, now())
-            .await
-            .is_err()
-    );
+    assert!(repo.reserve_attempt(&a, &pass, false, now()).await.is_err());
     set_status(&fx.db, &fx.other, "suspended").await;
-    assert!(
-        repo.reserve_attempt(old_id, fx.other.account(), &b, &pass, false, now())
-            .await
-            .is_err()
-    );
+    assert!(repo.reserve_attempt(&b, &pass, false, now()).await.is_err());
     set_status(&fx.db, &fx.other, "active").await;
-    let newer = configure(&fx.db, &fx.system, "same-destination-new-policy").await;
-    assert!(
-        repo.reserve_attempt(old_id, fx.other.account(), &b, &pass, false, now())
-            .await
-            .is_err()
-    );
-    let fresh = RefinementService::new(&fx.db, Some(&newer))
-        .effective_policy(&fx.other)
+    configure(&fx.db, &fx.system, "same-destination-new-policy").await;
+    assert!(repo.reserve_attempt(&b, &pass, false, now()).await.is_err());
+    let fresh = current_authority(&fx.db, fx.other.account())
         .await
         .unwrap()
-        .policy;
-    let fresh_id = &fresh.configured.unwrap().configuration.inference_policy_id;
+        .unwrap();
     assert_eq!(
-        repo.reserve_attempt(fresh_id, fx.other.account(), &b, &pass, false, now())
+        repo.reserve_attempt(&fresh, &pass, false, now())
             .await
             .unwrap(),
         Reservation::Granted
@@ -839,6 +1006,99 @@ async fn reservation_rejects_stale_policy_revoked_consent_and_suspended_accounts
         (1, 2),
         "rejected authority consumed no call budget"
     );
+}
+
+#[tokio::test]
+async fn returning_to_a_previous_destination_requires_renewed_consent() {
+    let fx = Fixture::new().await;
+    let repo = RefinementRepo::new(&fx.db);
+    let initial = repo.effective_policy(&fx.owner).await.unwrap();
+    assert!(initial.inference_admitted);
+    let route_a = initial.configured.unwrap().configuration;
+    let mut route_b = route_a.clone();
+    let mut destination = route_a.destination_set.iter().next().unwrap().clone();
+    destination.host = "other-inference.example".into();
+    route_b.destination_set = [destination].into_iter().collect();
+
+    repo.reconcile_policy(&fx.system, None).await.unwrap();
+    assert!(
+        !repo
+            .effective_policy(&fx.owner)
+            .await
+            .unwrap()
+            .inference_admitted
+    );
+    repo.reconcile_policy(&fx.system, Some(&route_b))
+        .await
+        .unwrap();
+    assert!(
+        !repo
+            .effective_policy(&fx.owner)
+            .await
+            .unwrap()
+            .inference_admitted
+    );
+    let restored = repo
+        .reconcile_policy(&fx.system, Some(&route_a))
+        .await
+        .unwrap()
+        .unwrap();
+    let stale = repo.effective_policy(&fx.owner).await.unwrap();
+    assert!(!stale.inference_admitted);
+    let historical = stale.consent.unwrap();
+    assert_eq!(historical.destination_set, route_a.destination_set);
+    assert!(historical.revoked_at.is_none());
+
+    let request = scheduled(&fx.owner, MemoryScope::Personal, "renewed-destination");
+    let refused = repo.enqueue(&fx.owner, request.clone()).await;
+    assert!(
+        matches!(
+            refused,
+            Err(alexandria_storage::error::StorageError::Unavailable)
+        ),
+        "queue admission must agree with the effective policy: {refused:?}"
+    );
+
+    repo.set_consent(
+        &fx.owner,
+        historical.revision,
+        ConsentChoice::Grant {
+            disclosed_policy_revision: restored.revision,
+        },
+        now(),
+    )
+    .await
+    .unwrap();
+    repo.enqueue(&fx.owner, request).await.unwrap();
+}
+
+#[tokio::test]
+async fn enqueue_refuses_policy_changed_after_browser_check() {
+    let fx = Fixture::new().await;
+    let service = fx.service();
+    let displayed = service.effective_policy(&fx.owner).await.unwrap().policy;
+    assert!(displayed.inference_admitted);
+    let expected = displayed.version();
+    let request = scheduled(&fx.owner, MemoryScope::Personal, "stale-browser-form");
+
+    // The browser has already verified the displayed version. Change only the mode before
+    // enqueue: inference remains admitted, so checking admission alone would accept the form.
+    fx.automatic().await;
+    let current = service.effective_policy(&fx.owner).await.unwrap().policy;
+    assert!(current.inference_admitted);
+    assert_ne!(current.version(), expected);
+    assert!(matches!(
+        service
+            .enqueue_checked(&fx.owner, request.clone(), expected)
+            .await,
+        Err(alexandria_mcp::error::ServiceError::Stale)
+    ));
+    assert_eq!(service.owner_usage(&fx.owner).await.unwrap().queued, 0);
+    service
+        .enqueue_checked(&fx.owner, request, current.version())
+        .await
+        .unwrap();
+    assert_eq!(service.owner_usage(&fx.owner).await.unwrap().queued, 1);
 }
 
 #[tokio::test]
@@ -1111,6 +1371,44 @@ async fn revocation_cancels_a_supported_in_flight_call() {
         1,
         "no retry or secondary after revocation"
     );
+}
+
+#[tokio::test]
+async fn secondary_disclosure_uses_dispatched_mode_and_consent_revisions() {
+    for (change, reservations) in [
+        (SecondaryChange::SwitchToHuman, 1),
+        (SecondaryChange::RegrantAfterReservation, 2),
+    ] {
+        let fx = Fixture::new().await;
+        fx.automatic().await;
+        fx.seed(&fx.owner, MemoryScope::Personal, "secondary-focal", 0)
+            .await;
+        let attempt = fx
+            .enqueue(&fx.owner, MemoryScope::Personal, "secondary-fence")
+            .await;
+        let provider = FakeProvider {
+            secondary_change: Some((&fx, change)),
+            ..Default::default()
+        };
+        let result = fx
+            .worker(WorkerSettings::default())
+            .step(now(), &provider)
+            .await
+            .unwrap();
+        assert!(matches!(result, Dispatch::Denied));
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 1, "only the primary may send");
+        assert_eq!(sent[0].stage, Stage::Primary);
+        assert_eq!(provider.reservations.load(Ordering::SeqCst), reservations);
+        assert_eq!(
+            fx.service()
+                .attempt(&fx.owner, &attempt)
+                .await
+                .unwrap()
+                .state,
+            AttemptState::Cancelled
+        );
+    }
 }
 
 #[tokio::test]

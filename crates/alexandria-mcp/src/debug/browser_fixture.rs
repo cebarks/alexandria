@@ -14,10 +14,159 @@ use crate::auth::admission::Admission;
 use crate::auth::http::AuthMiddleware;
 use crate::auth::mcp_transport::McpSessionRegistry;
 
+async fn configured_refinement_fixture() -> (
+    crate::AlexandriaServer,
+    Arc<crate::refinement::ReconciledRefinement>,
+) {
+    use alexandria_engine::refinement::policy::{
+        InferencePolicyInputs, Protocol, Route, RoutePair,
+    };
+    use alexandria_storage::models::refinement::ApprovalMode;
+    use std::collections::BTreeMap;
+
+    let mut server = test_server().await;
+    let db = Arc::get_mut(&mut server.db).expect("fixture still owns its store");
+    let system = db.claim_system_authority().unwrap();
+    let routes = RoutePair::resolve(
+        Route {
+            protocol: Protocol::OpenAiChatCompletions,
+            api_prefix: "https://inference.example/v1".into(),
+            model: "synthetic-browser-model".into(),
+            credential_ref: None,
+            headers: BTreeMap::new(),
+            output_limit_field: None,
+        },
+        None,
+    )
+    .unwrap();
+    let runtime = Arc::new(
+        crate::refinement::ReconciledRefinement::reconcile(
+            db,
+            &system,
+            Some(routes),
+            &InferencePolicyInputs {
+                prompt_template: b"synthetic browser fixture",
+                prompt_template_version: "1",
+                operation_schema_version: "1",
+                settings: &BTreeMap::new(),
+            },
+            ApprovalMode::Human,
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    (
+        server.with_refinement_runtime(Some(runtime.clone())),
+        runtime,
+    )
+}
+
+#[tokio::test]
+async fn run107b_owner_browser_submits_enqueue_and_polls_its_attempt() {
+    use alexandria_storage::models::refinement::ConsentChoice;
+    use axum::http::StatusCode;
+
+    let (server, runtime) = configured_refinement_fixture().await;
+    let alice = AuthenticatedTestApp::on_server(server, "enqueue-alice").await;
+    let bob = alice.second_owner("enqueue-bob").await;
+    let service = crate::refinement::RefinementService::new(&alice.db, Some(&runtime));
+    let policy = service.effective_policy(&alice.owner).await.unwrap().policy;
+    service
+        .consent(
+            &alice.owner,
+            policy.version().consent_revision,
+            ConsentChoice::Grant {
+                disclosed_policy_revision: policy.version().configured_revision.unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    let version = service
+        .effective_policy(&alice.owner)
+        .await
+        .unwrap()
+        .policy
+        .version();
+    let configured = version.configured_revision.unwrap().to_string();
+    let consent = version.consent_revision.to_string();
+    let mode = version.owner_mode_revision.to_string();
+    let key = uuid::Uuid::new_v4().to_string();
+    let form = [
+        ("action", "run"),
+        ("scope", "personal"),
+        ("request_key", key.as_str()),
+        ("configured_revision", &configured),
+        ("consent_revision", &consent),
+        ("mode_revision", &mode),
+    ];
+    let (status, location, body) = alice
+        .post_form_located("/debug/refinement/enqueue", &form)
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    assert!(
+        location.starts_with("/debug/refinement/attempts/"),
+        "{location}"
+    );
+    let (status, body) = alice.get(&location).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["state"],
+        "queued"
+    );
+    assert_eq!(bob.get(&location).await.0, StatusCode::NOT_FOUND);
+    let (status, queue) = alice.get("/debug/refinement").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(queue.contains("Run assessment") && queue.contains("Assess Unassigned memory"));
+
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use tower::ServiceExt;
+    for (name, value) in [
+        (header::ACCEPT, "text/html"),
+        (header::HeaderName::from_static("hx-request"), "true"),
+    ] {
+        let response = alice
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(location.as_str())
+                    .header(header::HOST, super::test_support::HOST)
+                    .header(header::COOKIE, alice.session.cookie_header())
+                    .header(name, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let html = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&html).unwrap();
+        assert!(
+            html.contains("hx-trigger=\"every 2s\"") && html.contains("<strong>queued</strong>")
+        );
+    }
+
+    let mut stale = form;
+    stale[4].1 = "0";
+    assert_eq!(
+        alice
+            .post_form_located("/debug/refinement/enqueue", &stale)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(service.owner_usage(&alice.owner).await.unwrap().queued, 1);
+}
+
 #[tokio::test]
 #[ignore = "explicit disposable browser journey; serves until its owned process is stopped"]
 async fn owner_browser_fixture() {
-    let server = test_server().await;
+    let (server, _) = configured_refinement_fixture().await;
     let alice = AuthenticatedTestApp::on_server(server.clone(), "fixture-alice").await;
     let bob = alice.second_owner("fixture-bob").await;
 
@@ -242,7 +391,7 @@ async fn owner_browser_fixture() {
                 "refinement_owner_controls": {
                     "queue": "/debug/refinement",
                     "settings": "/debug/refinement/settings",
-                    "expect": "owner-only queue and destination disclosure; human approval is default; consent and mode forms require the rendered CSRF token and expected revisions; GET does not enqueue or apply"
+                    "expect": "grant consent as Alice in settings, visit the queue, submit Run assessment for Personal, and follow the redirect to a queued attempt. Save its URL, then sign in as Bob and verify it returns 404. There is no worker in this fixture, so refreshing the status as Alice still shows queued."
                 },
                 "private_refinement_history": {
                     "expect": "proposal detail shows only this owner's source, changes, rationale, uncertainty, linked operation and exact private before/after history; operator health contains no proposal rows"

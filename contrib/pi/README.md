@@ -10,6 +10,8 @@ Optional client-side pieces for using Alexandria from [pi](https://github.com/ea
 | Writes | Agent calls `store_memory` / `import_document` explicitly when appropriate | No automatic observation/extraction writes; explicit agent tool calls remain available |
 | Install | Copy a skill directory | Copy extension directory and install its locked runtime dependencies |
 
+Hosted users need their own agent token issued from Account after enrollment; see the [ownership and refinement guide](../../docs/ownership-and-refinement.md). The companion does not grant inference consent, approve quality proposals, or classify memories. Application admin views do not expose other owners' content directly. Administrators can issue and use password-recovery links to reset another account's credentials and sign in as that owner. Issuance is audit-logged (v016); the issuer receives the usable link. Separately, host administrators can read disk and backups. This is not end-to-end encryption.
+
 ## Memory skill
 
 The skill gives explicit trigger guidance for reading, updating, importing, and storing durable information. It uses pi's native MCP tool names, `mcp__alexandria__<tool>`.
@@ -72,6 +74,8 @@ prompt_budget_ms = 10000
 | `[transport].prompt_budget_ms` | `10000` ms | `ALEXANDRIA_PROMPT_BUDGET_MS` | One deadline shared by project resolution, handshake, recall, reminders, and reconnect attempts |
 
 Timeout values must be positive finite numbers; `prompt_call_timeout_ms` must be no greater than `prompt_budget_ms`, and `prompt_budget_ms` must be at most `120000` ms. Invalid values fail configuration rather than being clamped. The whole-path budget is one deadline, not a fresh budget per stage. It applies to automatic prompt work, not explicit native MCP calls. The defaults remain 5 s per call and 10 s for the prompt path.
+
+The hermetic timeouts and loopback tests do not establish hosted p50/p95 or throughput. Measure cold and warm paths separately on an approved deployment before changing the defaults.
 
 Older extraction settings are ignored with a warning: `ALEXANDRIA_AUTO_STORE`, `ALEXANDRIA_EXTRACT_MODEL`, `ALEXANDRIA_EXTRACT_TIMEOUT_MS`, and the old `[store]` extraction fields (`enabled`, `extract_model`, `extract_timeout_ms`). Remove them; saving memory now requires an explicit `store_memory`/`import_document` call.
 

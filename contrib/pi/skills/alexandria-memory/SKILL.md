@@ -145,8 +145,8 @@ If you only know a basename/name, first propose resolving the project or selecti
 project listing, using the available tool's schema. Wait for an actual successful result before using
 its handle. Do not invent a resolver result, an issued ID, or an account-management RPC. If those
 tools are unavailable, explain that an owned handle is needed. Do not silently omit a selector and
-widen a project-specific request. For deliberately global reminders or account-wide/context-free
-checks, omit the respective optional selector instead.
+widen a project-specific request. To set a global reminder, omit the optional target. Checking
+without a project delivers only global and eligible escalated reminders, not all project reminders.
 
 Global delivery and overdue escalation stay **within the reminder owner's account**. A valid project
 target at least `[reminders].escalation_hours` overdue may deliver in another project context of that
@@ -169,8 +169,8 @@ integrations do it automatically at the start of each turn; if yours doesn't (ch
 actually does), you are that something. That call is the *only* thing that consumes reminders
 (recurring ones advance; missed fires coalesce rather than trickle). So don't call it reflexively;
 call it when the user asks "anything due?", or when a reminder they expected hasn't shown up, passing
-the actual owned issued project handle so typed targets match (or omitting context for an intentional
-account-wide check). The `due_reminders` array on
+the actual owned issued project handle so typed targets match. Omit the project only when checking
+for global and eligible escalated reminders. The `due_reminders` array on
 `mcp__alexandria__retrieve_memories` / `mcp__alexandria__recall` responses is a read-only safety net (a small
 oldest-due sample) that is *untargeted within your account*: eligible entries carry `global` or a
 typed project handle. Another owned project's entry is informational, not consumed; delivery occurs
@@ -185,6 +185,10 @@ then use the returned owned ID with the relevant tool's project/context paramete
 from a name or checkout basename. Project writes require an explicit project target; a session ID is
 not a substitute for a scope. The Pi companion can resolve a sanitized git origin automatically, but
 an agent using the tools directly must resolve the project before issuing a project-scoped request.
+
+## Classification and quality review
+
+Unassigned is an owner review partition, not a recall mode. Use `mcp__alexandria__list_unassigned_memories` only for deliberate Unassigned review; `mcp__alexandria__propose_memory_scope` stages a revision for the owner, not a move or approval. Do not treat quality proposals as facts or grant egress consent on the owner's behalf. Use the owner UI for quality decisions and private operation history. Refinement does not look for contradictions between Personal and a project, even when both are recalled.
 
 ## Guidelines
 

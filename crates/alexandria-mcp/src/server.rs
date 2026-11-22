@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -58,9 +57,10 @@ use alexandria_storage::models::{
 };
 use alexandria_storage::project_handle::format_project_handle;
 use alexandria_storage::repos::{
-    ClusterRepo, EdgeRepo, HeatRepo, HeatUpdate, MemoryRepo, MutationRepo, RetrievalStrategy,
-    ScopeFilter, ScopedClusterRepo, ScopedGraphReader, ScopedHeatWriter, ScopedMemoryRepo,
-    ScopedReminderRepo, ScopedSessionRepo, SessionPageQuery, SessionProjection, SessionRepo,
+    ClusterRepo, EdgeRepo, HeatAccess, HeatRepo, HeatUpdate, MemoryRepo, MutationRepo,
+    RetrievalStrategy, ScopeFilter, ScopedClusterRepo, ScopedGraphReader, ScopedHeatWriter,
+    ScopedMemoryRepo, ScopedReminderRepo, ScopedSessionRepo, SessionPageQuery, SessionProjection,
+    SessionRepo,
 };
 use chrono::{DateTime, SecondsFormat, Utc, Weekday};
 use rmcp::RoleServer;
@@ -3559,18 +3559,54 @@ impl AlexandriaServer {
         // `test_query_run_retrieve_writes_heat_without_dry_run` caught exactly that on the first
         // attempt at this code. Reset, then propagate.
         //
-        // Two round trips regardless of `limit` (one bulk read, one batched write) rather than two
-        // per result, because this path runs on every agent prompt. Failures are logged, never
+        // One bulk heat read and one guarded write batch for scoped retrieval. Failures are logged, never
         // propagated: housekeeping must not turn a working retrieve into a tool error, but it is not
         // swallowed the way `add_heat`'s `.ok()` swallows either — a persistent breakage here
         // silently stops accesses being counted, which is the failure mode this branch exists to fix.
         if options.record_access {
-            let ids: Vec<String> = ranked
+            let ids: Vec<RecordId> = ranked
                 .iter()
-                .filter_map(|(idx, _)| facts[*idx].id.as_ref())
-                .map(record_id_to_string)
+                .filter_map(|(idx, _)| facts[*idx].id.clone())
                 .collect();
-            if let Err(e) = self.record_accesses(&ids).await {
+            let recorded = match scope {
+                Some(scope) => self.record_accesses(scope, &ids).await,
+                None if ids.is_empty() => Ok(()),
+                // Keep the legacy writer local to this audited interim arm. Its text API
+                // reparses record IDs, so pass SQL literals rather than display strings.
+                None => async {
+                    let heat_repo = HeatRepo::new(self.db.inner());
+                    let at = Utc::now();
+                    let keys: Vec<_> = ids.iter().map(ToSql::to_sql).collect();
+                    let rows = heat_repo.get_many(&keys).await?;
+                    let updates = self.access_updates(&ids, rows, at);
+                    let rowless: Vec<_> = updates
+                        .iter()
+                        .filter(|update| update.create_if_missing)
+                        .map(|update| update.memory.to_sql())
+                        .collect();
+                    let rowless_refs: Vec<_> = rowless.iter().map(String::as_str).collect();
+                    heat_repo.create_for_memory_many(&rowless_refs).await?;
+                    let updates: Vec<_> = updates
+                        .into_iter()
+                        .map(|update| HeatUpdate {
+                            memory_id: update.memory.to_sql(),
+                            heat: update.heat,
+                            stability: update.stability,
+                            access_count: update.access_count,
+                        })
+                        .collect();
+                    let written = heat_repo.record_access_many(&updates).await?;
+                    if written != updates.len() {
+                        tracing::warn!(
+                            "retrieve: recorded access for {written} of {} rows; the rest lost their \
+                             heat_state between the read and the write",
+                            updates.len()
+                        );
+                    }
+                    Ok(())
+                }.await,
+            };
+            if let Err(e) = recorded {
                 tracing::warn!(
                     "retrieve: could not record accesses for {} results: {e}",
                     ids.len()
@@ -3593,7 +3629,7 @@ impl AlexandriaServer {
             // into a tool error. Activation is a *write*, so the interim unscoped arm uses
             // `trigger_activation_interim`: a store-wide warm is the cross-partition leak in its most
             // damaging form. The debug dry run and unfiltered window were already non-mutating, and the
-            // wet debug arm keeps its disclosed heat write in `record_accesses`, not here.
+            // wet debug arm keeps its disclosed heat write in the preceding access batch, not here.
             //
             // INTERIM (Task 6; see also the store-wide due sample below): the debug arm activates through
             // the unscoped path, because no lawful scope exists there until Task 9.
@@ -3656,45 +3692,53 @@ impl AlexandriaServer {
     /// `MemoryRepo::create_fact`) gets one created at the access values rather than being skipped:
     /// skipping would leave `access_count` at 0 forever for precisely those rows, and `Appraise`
     /// reads 0 as "never surfaced".
-    async fn record_accesses(&self, memory_ids: &[String]) -> anyhow::Result<()> {
+    async fn record_accesses(
+        &self,
+        scope: &RequestScope,
+        memory_ids: &[RecordId],
+    ) -> anyhow::Result<()> {
         if memory_ids.is_empty() {
             return Ok(());
         }
         let heat_repo = HeatRepo::new(self.db.inner());
-        let now = chrono::Utc::now().timestamp().max(0) as u64;
-        let rows = heat_repo.get_many(memory_ids).await?;
-        let by_memory: HashMap<String, alexandria_storage::models::HeatState> = rows
-            .into_iter()
-            .map(|row| (record_id_to_string(&row.memory), row))
-            .collect();
-
-        // One round trip for the rows that have no heat_state, then one for the accesses. Doing this
-        // per row was correct and read as "two round trips" in the docs, which was true only for a
-        // corpus where every returned row already has a heat row — and memories written through
-        // `create_fact` directly, or predating `do_store_memory`'s heat write, have none. So the
-        // count of statements here is a property of the corpus rather than of the code.
-        let rowless: Vec<&String> = memory_ids
-            .iter()
-            .filter(|id| !by_memory.contains_key(id.as_str()))
-            .collect();
-        heat_repo
-            .create_for_memory_many(
-                rowless
-                    .iter()
-                    .map(|id| id.as_str())
-                    .collect::<Vec<&str>>()
-                    .as_slice(),
-            )
+        let at = Utc::now();
+        let rows = heat_repo
+            .get_many_scoped(scope.owner(), scope.read(), memory_ids)
             .await?;
+        let updates = self.access_updates(memory_ids, rows, at);
+        heat_repo
+            .record_access_scoped(scope.owner(), scope.read(), &updates, at)
+            .await?;
+        Ok(())
+    }
+
+    fn access_updates(
+        &self,
+        memory_ids: &[RecordId],
+        rows: Vec<alexandria_storage::models::HeatState>,
+        at: DateTime<Utc>,
+    ) -> Vec<HeatAccess> {
+        let now = at.timestamp().max(0) as u64;
+        // `RecordId` has interior mutability, so a HashMap keyed on it is a clippy `mutable_key_type`;
+        // a sorted, deduplicated Vec of pairs carries the same lookup without that hazard.
+        let mut by_memory: Vec<(RecordId, alexandria_storage::models::HeatState)> = rows
+            .into_iter()
+            .map(|row| (row.memory.clone(), row))
+            .collect();
+        by_memory.sort_by(|a, b| a.0.cmp(&b.0));
+        by_memory.dedup_by(|a, b| a.0 == b.0);
 
         let mut updates = Vec::with_capacity(memory_ids.len());
         for id in memory_ids {
-            let mut state = match by_memory.get(id) {
+            let mut state = match by_memory
+                .iter()
+                .find(|(key, _)| key == id)
+                .map(|(_, row)| row)
+            {
                 Some(row) => heat_engine_state(row),
                 None => {
-                    // Created above, in the batch. Its anchor is this instant: the first sight of a
-                    // brand-new row earns no spacing credit, which is the correct reading rather than
-                    // the accident of `HeatState::new` starting at the epoch.
+                    // A brand-new row starts with this instant as both anchors, so its first
+                    // sight earns no spacing credit.
                     EngineHeatState {
                         heat: 1.0,
                         stability: 1.0,
@@ -3705,23 +3749,16 @@ impl AlexandriaServer {
                 }
             };
             on_access(&mut state, now, self.heat.spacing_reference_secs);
-            updates.push(HeatUpdate {
-                memory_id: id.clone(),
+            updates.push(HeatAccess {
+                memory: id.clone(),
                 heat: state.heat,
                 stability: state.stability,
                 access_count: state.access_count as i64,
+                create_if_missing: !by_memory.iter().any(|(key, _)| key == id),
             });
         }
 
-        let written = heat_repo.record_access_many(&updates).await?;
-        if written != updates.len() {
-            tracing::warn!(
-                "retrieve: recorded access for {written} of {} rows; the rest lost their \
-                 heat_state between the read and the write",
-                updates.len()
-            );
-        }
-        Ok(())
+        updates
     }
 
     pub async fn do_recall(&self, params: RecallParams) -> anyhow::Result<String> {
@@ -8748,6 +8785,67 @@ mod get_info_tests {
             .expect("the returned row has a heat_state");
         assert_eq!(surfaced.heat, 1.0, "an access resets heat");
         assert!(surfaced.last_accessed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn run107b_scoped_retrieve_heats_only_the_typed_fact_returned() {
+        let (server, alice, _) = two_trusted_local_owners().await;
+        let numeric = RecordId::new("fact", 7_i64);
+        let text = RecordId::new("fact", "7");
+        for (id, embedding, content) in [
+            (&numeric, vec![-1.0_f32, 0.0], "nonmatching numeric key"),
+            (&text, vec![1.0_f32, 0.0], "matching string key"),
+        ] {
+            server.db.inner()
+                .query("CREATE $id SET account = $account, workspace = $workspace, scope = 'personal', content = $content, embedding = $embedding, semantic_revision = 1 RETURN NONE")
+                .bind(("id", id.clone()))
+                .bind(("account", alice.owner().account().as_record_id().clone()))
+                .bind(("workspace", alice.owner().workspace().as_record_id().clone()))
+                .bind(("content", content))
+                .bind(("embedding", embedding))
+                .await.unwrap().check().unwrap();
+            HeatRepo::new(server.db.inner())
+                .create_for_memory(&id.to_sql(), 1.0)
+                .await
+                .unwrap();
+        }
+        assert_eq!(record_id_to_string(&numeric), record_id_to_string(&text));
+        let result = server
+            .retrieve_scoped(
+                &alice,
+                RetrieveMemoriesParams {
+                    scope: None,
+                    project: None,
+                    query: "matching".into(),
+                    limit: Some(1),
+                    session_id: None,
+                },
+                RetrieveOptions {
+                    activate: false,
+                    record_access: true,
+                    apply_floor: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["results"][0]["content"], "matching string key");
+        let heat = HeatRepo::new(server.db.inner());
+        assert_eq!(
+            heat.get(&text.to_sql())
+                .await
+                .unwrap()
+                .unwrap()
+                .access_count,
+            1
+        );
+        assert_eq!(
+            heat.get(&numeric.to_sql())
+                .await
+                .unwrap()
+                .unwrap()
+                .access_count,
+            0
+        );
     }
 
     /// The end-to-end half of the clock split. The decay anchor is left at now (what a swept row

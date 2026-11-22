@@ -2,6 +2,8 @@
 
 Optional client-side pieces for Alexandria; they are not part of the MCP server and do not install automatically. The memory skill guides tool use. The hooks provide automatic recall, but do not automatically store observations or extract transcripts.
 
+Get your own agent token from the hosted Account page after enrollment; see the [ownership and refinement guide](../../docs/ownership-and-refinement.md). The hooks do not grant consent or submit, approve or classify refinement work. Application admin views do not expose other owners' content directly. Administrators can issue and use password-recovery links to reset another account's credentials and sign in as that owner. Issuance is audit-logged (v016); the issuer receives the usable link. Separately, host administrators can read disk and backups. This is not end-to-end encryption.
+
 ## Memory skill
 
 The skill uses Claude Code's native MCP tool names (`mcp__alexandria__<tool>`) and provides explicit guidance for recalling, storing, updating, importing, and managing reminders.

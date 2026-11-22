@@ -429,12 +429,12 @@ impl<'a> ScopeService<'a> {
         // caller actually received, which cannot skip a record.
         let read_rows = page.entries.len();
         let (entries, oversize) = fit_page(page.entries, project_size);
-        let trimmed = read_rows > entries.len();
-        let next_cursor = match (oversize, trimmed) {
-            (true, _) | (false, true) => entries
+        let next_cursor = if read_rows > entries.len() {
+            entries
                 .last()
-                .map(|entry| entry.project.normalized_alias.clone()),
-            (false, false) => page.next_cursor,
+                .map(|entry| entry.project.normalized_alias.clone())
+        } else {
+            page.next_cursor
         };
         Ok(ProjectPage {
             entries,
@@ -479,13 +479,16 @@ impl<'a> ScopeService<'a> {
         if has_more {
             rows.pop();
         }
+        let read_rows = rows.len();
         let (rows, oversize) = fit_page(rows, fact_size);
         let last = rows
             .last()
             .and_then(|row| row.id.as_ref())
             .map(alexandria_storage::record_id_to_string);
         Ok(UnassignedPage {
-            next_cursor: (has_more || oversize).then_some(last).flatten(),
+            next_cursor: (has_more || read_rows > rows.len())
+                .then_some(last)
+                .flatten(),
             rows,
             limit,
             oversize,
@@ -631,9 +634,9 @@ fn parse_record_handle(text: &str) -> Option<RecordId> {
 /// Trim a page to whole records within [`MAX_SCOPE_PAGE_BYTES`], reporting what was dropped.
 ///
 /// At least one record always survives: a page that returned *nothing* because the first row was large
-/// would be indistinguishable from an empty population, which is the failure this whole pass is written
-/// against. The `oversize` flag tells a client the cap ended the page rather than the store running out,
-/// and the cursor then names the last row the caller was *given*, so no record can be skipped.
+/// would be indistinguishable from an empty population. The `oversize` flag reports either a
+/// byte-trimmed page or a first record that alone exceeded the cap. Only omitted rows require
+/// a continuation; the cursor always names the last row actually returned.
 ///
 /// Sizes come from a caller-supplied measure rather than from `Serialize`: the row types here are
 /// storage's, and making them serializable to satisfy a byte cap would widen another crate's public
@@ -649,7 +652,7 @@ fn fit_page<T>(rows: Vec<T>, size_of: impl Fn(&T) -> usize) -> (Vec<T>, bool) {
         bytes += size;
         kept.push(row);
     }
-    (kept, false)
+    (kept, bytes > MAX_SCOPE_PAGE_BYTES)
 }
 
 /// The bytes one project row costs a response: its alias and label are the only unbounded parts, and an

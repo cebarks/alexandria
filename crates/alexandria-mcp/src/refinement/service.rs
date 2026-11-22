@@ -278,6 +278,15 @@ impl<'a> RefinementService<'a> {
             .map_err(ServiceError::from)
     }
 
+    pub async fn enqueue_checked(
+        &self,
+        owner: &OwnerContext,
+        request: EnqueueRequest,
+        expected: PolicyVersion,
+    ) -> Result<AttemptId, ServiceError> {
+        Ok(self.repo.enqueue_checked(owner, request, expected).await?)
+    }
+
     pub async fn attempt(
         &self,
         owner: &OwnerContext,
@@ -302,9 +311,15 @@ impl<'a> RefinementService<'a> {
         &self,
         owner: &OwnerContext,
         scope: Option<&str>,
+        deferred: bool,
     ) -> Result<Vec<ProposalDisplay>, ServiceError> {
         self.repo
-            .owner_proposals(owner, scope, alexandria_storage::repos::MAX_OWNER_PROPOSALS)
+            .owner_proposals(
+                owner,
+                scope,
+                deferred,
+                alexandria_storage::repos::MAX_OWNER_PROPOSALS,
+            )
             .await
             .map_err(ServiceError::from)
     }

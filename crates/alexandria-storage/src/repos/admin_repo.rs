@@ -295,19 +295,9 @@ impl<'a> AdminRepo<'a> {
 
     /// Mints a password-recovery link for the account an administrator names.
     ///
-    /// The account-management half of the recovery flow, and the reason it is here rather than on
-    /// [`crate::repos::AuthRepo`]: `AuthRepo::create_recovery_link` takes a bare account id, which is
-    /// fine inside a store that has no request path, and not fine as a method an HTTP handler could call
-    /// with anything a form carried. The capability argument is what makes "whose recovery link is this"
-    /// answerable: the row belongs to the administrator who issued it (`credential.account`) while the
-    /// link rotates the account it names — the same issuer-owns-the-link rule Task 4 recorded for
-    /// invitations, and the reason an issued link shows up in the issuer's own credential list.
-    ///
-    /// The row belongs to the account it recovers — `credential_kind::RECOVERY` resolves to a target
-    /// account, unlike an invitation, whose issuer owns the link because the invited account does not
-    /// exist yet. The caller still has to hand the secret over out of band and still cannot choose or
-    /// read the new password: consuming the link rotates it and raises that account's `auth_epoch`,
-    /// which retires every credential it held.
+    /// The credential belongs to the account it recovers; the separately persisted issuance audit
+    /// identifies the administrator who requested it. The credential and audit commit together
+    /// before the administrator receives the one-use secret.
     pub async fn create_recovery_link(
         &self,
         admin: &AdminCapability,
@@ -323,21 +313,8 @@ impl<'a> AdminRepo<'a> {
                 "an administrator recovers their own account from the account page".to_string(),
             ));
         }
-        let exists: Vec<serde_json::Value> = self
-            .db
-            .query("SELECT id FROM account WHERE id = $target LIMIT 1;")
-            .bind(("target", target.as_record_id().clone()))
-            .await
-            .map_err(internal)?
-            .check()
-            .map_err(internal)?
-            .take(0)
-            .map_err(internal)?;
-        if exists.is_empty() {
-            return Err(StorageError::NotFound);
-        }
         let minted = crate::repos::AuthRepo::new(self.db)
-            .create_recovery_link(target, lifetime, now)
+            .create_admin_recovery_link(admin, target, lifetime, now)
             .await?;
         Ok(MintedLink {
             credential: minted.credential,
@@ -689,6 +666,59 @@ mod tests {
         let repo = AdminRepo::new(fixture.db.inner());
         let listed = repo.list_accounts(&admin, 50, 0).await.unwrap();
         assert!(listed.iter().all(|entry| !entry.is_suspended()));
+    }
+
+    #[tokio::test]
+    async fn admin_recovery_audit_identifies_issuer_target_and_time() {
+        #[derive(SurrealValue)]
+        struct AuditRow {
+            actor: RecordId,
+            target: RecordId,
+            credential: RecordId,
+            created_at: DateTime<Utc>,
+        }
+
+        let fx = fixture().await;
+        let repo = AdminRepo::new(fx.db.inner());
+        let now = Utc::now();
+        let minted = repo
+            .create_recovery_link(
+                &fx.capability().await,
+                &fx.subject,
+                chrono::Duration::minutes(30),
+                now,
+            )
+            .await
+            .unwrap();
+        let info: Vec<serde_json::Value> = fx
+            .db
+            .inner()
+            .query("INFO FOR DB")
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert!(
+            info[0]["tables"]["admin_recovery_log"].is_string(),
+            "admin recovery must have a durable audit table"
+        );
+        let rows: Vec<AuditRow> = fx
+            .db
+            .inner()
+            .query("SELECT actor, target, credential, created_at FROM admin_recovery_log;")
+            .await
+            .unwrap()
+            .check()
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "admin recovery must write one audit row");
+        assert_eq!(&rows[0].actor, fx.admin.as_record_id());
+        assert_eq!(&rows[0].target, fx.subject.as_record_id());
+        assert_eq!(&rows[0].credential, minted.credential.as_record_id());
+        assert_eq!(rows[0].created_at, now);
     }
 
     #[tokio::test]

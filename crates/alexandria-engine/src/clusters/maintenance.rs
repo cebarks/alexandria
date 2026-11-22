@@ -21,11 +21,11 @@ pub enum MaintenanceAction {
 
 /// Result of checking two clusters for merge eligibility.
 #[derive(Debug)]
-pub enum MergeCheck {
+pub enum MergeCheck<Id = String> {
     /// Clusters should be merged.
     Merge {
-        keep_id: String,
-        remove_id: String,
+        keep_id: Id,
+        remove_id: Id,
         merged_centroid: Vec<f32>,
     },
     /// Clusters are distinct enough, don't merge.
@@ -80,6 +80,38 @@ pub fn check_merge(
     count_b: usize,
     merge_threshold: f32,
 ) -> MergeCheck {
+    match check_merge_by_id(
+        id_a,
+        centroid_a,
+        count_a,
+        id_b,
+        centroid_b,
+        count_b,
+        merge_threshold,
+    ) {
+        MergeCheck::Distinct => MergeCheck::Distinct,
+        MergeCheck::Merge {
+            keep_id,
+            remove_id,
+            merged_centroid,
+        } => MergeCheck::Merge {
+            keep_id: keep_id.to_owned(),
+            remove_id: remove_id.to_owned(),
+            merged_centroid,
+        },
+    }
+}
+
+/// Same merge rules, without converting an opaque id or caller-owned index to text.
+pub fn check_merge_by_id<Id>(
+    id_a: Id,
+    centroid_a: &[f32],
+    count_a: usize,
+    id_b: Id,
+    centroid_b: &[f32],
+    count_b: usize,
+    merge_threshold: f32,
+) -> MergeCheck<Id> {
     let sim = cosine_similarity(centroid_a, centroid_b);
     if sim < merge_threshold {
         return MergeCheck::Distinct;
@@ -95,9 +127,9 @@ pub fn check_merge(
 
     // Keep the cluster with more members
     let (keep_id, remove_id) = if count_a >= count_b {
-        (id_a.to_string(), id_b.to_string())
+        (id_a, id_b)
     } else {
-        (id_b.to_string(), id_a.to_string())
+        (id_b, id_a)
     };
 
     MergeCheck::Merge {

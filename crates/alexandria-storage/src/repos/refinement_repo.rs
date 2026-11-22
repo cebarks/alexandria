@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
-use std::ops::AsyncFnMut;
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -39,7 +38,7 @@ pub use candidates::{
 pub use work::{
     AttemptId, AttemptState, AttemptView, BudgetDenial, BudgetRepo, CallLimits, EnqueueRequest,
     OwnerUsage, PassId, QueuedWork, Reservation, Usage, WorkKind, WorkSelection, admission,
-    current_authority,
+    admit_dispatched_work, current_authority,
 };
 
 pub struct RefinementRepo<'a> {
@@ -48,13 +47,42 @@ pub struct RefinementRepo<'a> {
 
 pub const MAX_OWNER_PROPOSALS: usize = 100;
 
-const OWNER_PROPOSALS_SQL: &str = "SELECT id, revision, state, needs_human, deferred, scope, project, proposal_payload, origin_policy, operation, created_at FROM refinement_proposal WHERE account = $account AND workspace = $workspace ORDER BY created_at DESC, id DESC LIMIT $limit";
-const OWNER_PROPOSALS_SCOPE_SQL: &str = "SELECT id, revision, state, needs_human, deferred, scope, project, proposal_payload, origin_policy, operation, created_at FROM refinement_proposal WHERE account = $account AND workspace = $workspace AND scope = $scope ORDER BY created_at DESC, id DESC LIMIT $limit";
+const OWNER_PROPOSALS_SQL: &str = "SELECT id, revision, state, needs_human, deferred, scope, project, proposal_payload, origin_policy, operation, created_at FROM refinement_proposal WHERE account = $account AND workspace = $workspace AND deferred = $deferred ORDER BY created_at DESC, id DESC LIMIT $limit";
+const OWNER_PROPOSALS_SCOPE_SQL: &str = "SELECT id, revision, state, needs_human, deferred, scope, project, proposal_payload, origin_policy, operation, created_at FROM refinement_proposal WHERE account = $account AND workspace = $workspace AND scope = $scope AND deferred = $deferred ORDER BY created_at DESC, id DESC LIMIT $limit";
 const OWNER_PROPOSAL_SQL: &str = "SELECT id, revision, state, needs_human, deferred, scope, project, proposal_payload, origin_policy, operation, created_at FROM refinement_proposal WHERE id = $id AND account = $account AND workspace = $workspace LIMIT 1";
 
 impl<'a> RefinementRepo<'a> {
     pub fn new(db: &'a Database) -> Self {
         Self { db }
+    }
+
+    /// The revision bound by an interactive enqueue. Read by the worker before sending
+    /// evidence, so an intervening edit cannot turn an old request into a new assessment.
+    pub async fn work_source_revision(
+        &self,
+        system: &SystemContext,
+        attempt: &AttemptId,
+    ) -> Result<Option<Version>, StorageError> {
+        if !self.db.holds_authority(system) {
+            return Err(StorageError::NotFound);
+        }
+        #[derive(SurrealValue)]
+        struct Source {
+            source_revision: Option<u64>,
+        }
+        let rows: Vec<Source> = self
+            .db
+            .inner()
+            .query("SELECT source_revision FROM $attempt")
+            .bind(("attempt", attempt.record().clone()))
+            .await
+            .map_err(internal)?
+            .check()
+            .map_err(internal)?
+            .take(0)
+            .map_err(internal)?;
+        let row = rows.into_iter().next().ok_or(StorageError::NotFound)?;
+        Ok(row.source_revision.map(Version::new))
     }
 
     /// Persist a pending proposal, reusing an existing identical evidence assessment.
@@ -149,11 +177,12 @@ impl<'a> RefinementRepo<'a> {
         self.persist(owner, alternative, true).await
     }
 
-    /// List this owner's proposal revisions, optionally restricted to one scope family.
+    /// List either regular or deferred revisions for this owner, optionally in one scope family.
     pub async fn owner_proposals(
         &self,
         owner: &OwnerContext,
         scope: Option<&str>,
+        deferred: bool,
         limit: usize,
     ) -> Result<Vec<ProposalDisplay>, StorageError> {
         if scope.is_some_and(|scope| !matches!(scope, "personal" | "project" | "unassigned")) {
@@ -168,6 +197,7 @@ impl<'a> RefinementRepo<'a> {
         }
         .bind(("account", owner.account().as_record_id().clone()))
         .bind(("workspace", owner.workspace().as_record_id().clone()))
+        .bind(("deferred", deferred))
         .bind(("limit", limit));
         if let Some(scope) = scope {
             query = query.bind(("scope", scope.to_string()));
@@ -224,16 +254,13 @@ impl<'a> RefinementRepo<'a> {
         if let Some(configuration) = configuration {
             validate_configuration(configuration)?;
         }
-        self.write(async |tx| {
-            let previous: Option<PolicyRow> = select_record(tx, policy_id()).await?;
-            let mut row = previous.clone().unwrap_or_default();
-            if row.configured().as_ref().map(|p| &p.configuration) == configuration {
-                return Ok(row.configured());
+        let configuration = configuration.cloned();
+        self.write(move |tx| {
+            let configuration = configuration.clone();
+            async move {
+                let result = reconcile_policy_in_tx(&tx, configuration.as_ref()).await;
+                (tx, result)
             }
-            row.advance(configuration)?;
-            let result = row.configured();
-            write_record(tx, policy_id(), row, previous.map(|p| p.revision)).await?;
-            Ok(result)
         })
         .await
     }
@@ -252,44 +279,12 @@ impl<'a> RefinementRepo<'a> {
         now: DateTime<Utc>,
     ) -> Result<Consent, StorageError> {
         let owner = owner.clone();
-        self.write(async move |tx| {
-            claim_owner(tx, &owner).await?;
-            let account = owner.account();
-            let id = owned_id("refinement_consent", account);
-            let previous: Option<ConsentRow> = select_record(tx, id.clone()).await?;
-            if let Some(row) = &previous {
-                require_row_owner(account, &row.account)?;
+        self.write(move |tx| {
+            let owner = owner.clone();
+            async move {
+                let result = set_consent_in_tx(&tx, &owner, expected_revision, choice, now).await;
+                (tx, result)
             }
-            let seen = previous.as_ref().map(|row| row.revision);
-            if seen.unwrap_or_default() != expected_revision {
-                return Err(StorageError::Stale);
-            }
-            let row = match choice {
-                ConsentChoice::Grant {
-                    disclosed_policy_revision,
-                } => {
-                    disclosed_grant(
-                        tx,
-                        account,
-                        disclosed_policy_revision,
-                        expected_revision,
-                        now,
-                    )
-                    .await?
-                }
-                ConsentChoice::Revoke => {
-                    let mut row = previous.ok_or(StorageError::NotFound)?;
-                    if row.revoked_at.is_some() {
-                        return row.into_consent();
-                    }
-                    row.revoked_at = Some(now);
-                    row.revision = next_revision(row.revision)?;
-                    row
-                }
-            };
-            let result = row.clone().into_consent()?;
-            write_record(tx, id, row, seen).await?;
-            Ok(result)
         })
         .await
     }
@@ -312,43 +307,12 @@ impl<'a> RefinementRepo<'a> {
     ) -> Result<ApprovalSetting, StorageError> {
         let owner = owner.clone();
         let expected_policy = *expected_policy;
-        self.write(async move |tx| {
-            claim_owner(tx, &owner).await?;
-            let account = owner.account();
-            let snapshot = PolicySnapshot::read(tx, account).await?;
-            let effective = snapshot.effective()?;
-            if effective.version() != expected_policy {
-                return Err(StorageError::Stale);
+        self.write(move |tx| {
+            let owner = owner.clone();
+            async move {
+                let result = set_approval_mode_in_tx(&tx, &owner, expected_policy, mode).await;
+                (tx, result)
             }
-            if mode == ApprovalMode::SecondaryLlm
-                && !effective
-                    .configured
-                    .as_ref()
-                    .is_some_and(|p| p.configuration.allow_automatic)
-            {
-                return Err(StorageError::Unavailable);
-            }
-            if mode == effective.approval.mode {
-                return Ok(effective.approval);
-            }
-            pin_configuration(tx, snapshot.policy.as_ref()).await?;
-            let setting = ApprovalSetting {
-                mode,
-                revision: next_revision(effective.approval.revision)?,
-            };
-            let row = ApprovalRow {
-                account: account.as_record_id().clone(),
-                mode,
-                revision: setting.revision,
-            };
-            write_record(
-                tx,
-                owned_id("refinement_approval_mode", account),
-                row,
-                snapshot.approval.map(|row| row.revision),
-            )
-            .await?;
-            Ok(setting)
         })
         .await
     }
@@ -400,13 +364,21 @@ impl<'a> RefinementRepo<'a> {
         result
     }
 
-    async fn write<T: Send>(
+    // Each action owns its transaction and returns it for settlement. Its future has one
+    // concrete type, not a family of futures borrowing a retry-local transaction.
+    async fn write<T, F>(
         &self,
-        mut action: impl AsyncFnMut(&Transaction<Any>) -> Result<T, StorageError> + Send,
-    ) -> Result<T, StorageError> {
+        mut action: impl FnMut(Transaction<Any>) -> F + Send,
+    ) -> Result<T, StorageError>
+    where
+        T: Send,
+        F: Future<Output = (Transaction<Any>, Result<T, StorageError>)> + Send,
+    {
+        let db = self.db.inner().clone();
         for _ in 0..GUARD_CONFLICT_ATTEMPTS {
-            let tx = self.db.inner().clone().begin().await.map_err(internal)?;
-            let error = match action(&tx).await {
+            let tx = db.clone().begin().await.map_err(internal)?;
+            let (tx, result) = action(tx).await;
+            let error = match result {
                 Ok(output) => match tx.commit().await {
                     Ok(_) => return Ok(output),
                     Err(error) => internal(error),
@@ -425,6 +397,111 @@ impl<'a> RefinementRepo<'a> {
         }
         Err(StorageError::RetryableBookkeepingConflict)
     }
+}
+
+async fn reconcile_policy_in_tx(
+    tx: &Transaction<Any>,
+    configuration: Option<&ConfiguredPolicy>,
+) -> Result<Option<PolicyRevision>, StorageError> {
+    let previous: Option<PolicyRow> = select_record(tx, policy_id()).await?;
+    let mut row = previous.clone().unwrap_or_default();
+    if row.configured().as_ref().map(|p| &p.configuration) == configuration {
+        return Ok(row.configured());
+    }
+    row.advance(configuration)?;
+    let result = row.configured();
+    write_record(tx, policy_id(), row, previous.map(|p| p.revision)).await?;
+    Ok(result)
+}
+
+async fn set_consent_in_tx(
+    tx: &Transaction<Any>,
+    owner: &OwnerContext,
+    expected_revision: u64,
+    choice: ConsentChoice,
+    now: DateTime<Utc>,
+) -> Result<Consent, StorageError> {
+    claim_owner(tx, owner).await?;
+    let account = owner.account();
+    let id = owned_id("refinement_consent", account);
+    let previous: Option<ConsentRow> = select_record(tx, id.clone()).await?;
+    if let Some(row) = &previous {
+        require_row_owner(account, &row.account)?;
+    }
+    let seen = previous.as_ref().map(|row| row.revision);
+    if seen.unwrap_or_default() != expected_revision {
+        return Err(StorageError::Stale);
+    }
+    let row = match choice {
+        ConsentChoice::Grant {
+            disclosed_policy_revision,
+        } => {
+            disclosed_grant(
+                tx,
+                account,
+                disclosed_policy_revision,
+                expected_revision,
+                now,
+            )
+            .await?
+        }
+        ConsentChoice::Revoke => {
+            let mut row = previous.ok_or(StorageError::NotFound)?;
+            if row.revoked_at.is_some() {
+                return row.into_consent();
+            }
+            row.revoked_at = Some(now);
+            row.revision = next_revision(row.revision)?;
+            row
+        }
+    };
+    let result = row.clone().into_consent()?;
+    write_record(tx, id, row, seen).await?;
+    Ok(result)
+}
+
+async fn set_approval_mode_in_tx(
+    tx: &Transaction<Any>,
+    owner: &OwnerContext,
+    expected_policy: PolicyVersion,
+    mode: ApprovalMode,
+) -> Result<ApprovalSetting, StorageError> {
+    claim_owner(tx, owner).await?;
+    let account = owner.account();
+    let snapshot = PolicySnapshot::read(tx, account).await?;
+    let effective = snapshot.effective()?;
+    if effective.version() != expected_policy {
+        return Err(StorageError::Stale);
+    }
+    if mode == ApprovalMode::SecondaryLlm
+        && !effective
+            .configured
+            .as_ref()
+            .is_some_and(|p| p.configuration.allow_automatic)
+    {
+        return Err(StorageError::Unavailable);
+    }
+    if mode == effective.approval.mode {
+        return Ok(effective.approval);
+    }
+    pin_configuration(tx, snapshot.policy.as_ref()).await?;
+    let setting = ApprovalSetting {
+        mode,
+        revision: next_revision(effective.approval.revision)?,
+    };
+    let row = ApprovalRow {
+        account: account.as_record_id().clone(),
+        mode,
+        revision: setting.revision,
+    };
+    write_record(
+        tx,
+        owned_id("refinement_approval_mode", account),
+        row,
+        snapshot.approval.map(|row| row.revision),
+    )
+    .await?;
+    Ok(setting)
 }
 
 struct PersistProposal {

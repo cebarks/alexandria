@@ -131,11 +131,8 @@ impl<'a> MutationRepo<'a> {
         system: &SystemContext,
         partition: &Partition,
     ) -> Result<MutationContext, StorageError> {
-        if !instance.holds_authority(system) {
-            return Err(StorageError::Stale);
-        }
-        let owners: Vec<RecordId> = self
-            .db
+        let db = instance.verified_system_handle(self.db, system)?;
+        let owners: Vec<RecordId> = db
             .query("SELECT VALUE owner FROM workspace WHERE id = $workspace LIMIT 1;")
             .bind(("workspace", partition.workspace.as_record_id().clone()))
             .await

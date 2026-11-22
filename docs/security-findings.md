@@ -7,10 +7,10 @@ cross-checked against the vendored `rmcp 3.3.0` source for transport defaults, p
 against the running server where a claim depended on data.
 
 **Reading this after the audit date.** The findings are kept as written on 2026-09-10. Each one
-carries a **Status** line saying whether it still holds on the tree this file ships in, re-checked
-2026-09-19 after the rebase onto upstream `e251a5e`. Code is cited by symbol, not by line number, so
-a reference survives the next edit. Where the cited code is gone, the Status line names what
-replaced it.
+carries a historical **Status** line from the 2026-09-19 recheck after the rebase onto upstream
+`e251a5e`. These lines describe that checkpoint, not verification against the current tree.
+Code is cited by symbol, not by line number. Where code was already gone at that checkpoint,
+the Status line names what replaced it.
 
 The audit was prompted by reading *Classification of Malignant Prompt Embeddings with Convex Hulls*
 (Kelvin Sanchez, Johns Hopkins Whiting School of Engineering, December 2025). The paper is summarised
@@ -18,21 +18,49 @@ under [Threat model](#threat-model) because its subject, malicious text arriving
 embedding pipeline, is the threat that matters most here, even though its proposed defence does not
 transfer.
 
-Severity is relative to the documented posture: the MCP endpoint and debug UI are unauthenticated by
+Historical severity is relative to the posture at the time: the MCP endpoint and debug UI were unauthenticated by
 design and meant for a trusted network boundary (README, "Debug Web UI" and "Deployment"). Findings
 are ranked by what an attacker gains *within* that posture, not by whether the posture itself should
 change.
 
-> **The posture this section describes no longer holds for `/debug`.** The audit predates the
-> multi-user work; the debug UI is now authenticated per account, owner-scoped on every read, CSRF-bound
-> on every mutation, and fail-closed when no boundary is armed. **S1** and **S4** are closed by that
-> change rather than mitigated by configuration: the `Host` check is armed by `server.allowed_hosts`
-> against a mandatory `server.public_origin`, and the Query Tester's heat write now needs the caller's
-> own session plus its CSRF pair, so a cross-site form cannot reach it. **S2**, **S3**, **S5** and **S6**
-> are untouched by it — provenance, asset integrity, parameter clamping and model-integrity remain as
-> written, and S3 in particular is *sharper* now, since a script injected through the asset path reads
-> an authenticated session rather than a trust-the-network store. Read the findings below as the audit's
-> record; the live contract is "Debug Web UI" and "Guards, and what they are for" in the README.
+## Current boundary
+
+HTTP uses account bearer authentication for MCP and owner-scoped browser sessions for the web UI.
+Explicit origin/Host allowlists and CSRF checks replace the old S1/S4 defaults; legacy unconfigured
+web routers fail closed for private data. Browser assets are vendored and checksum-verified (S3).
+Revocation and recovery invalidate credentials; project and session IDs are not authority. The
+private journal contains operation snapshots, while account administration and maintenance health
+expose management actions and aggregates, not another owner's content. **Application administrators
+cannot read other owners' content directly through admin views, but they can issue and use a
+recovery link to reset credentials and sign in as the owner.** The v016 `admin_recovery_log`
+records issuance; it does not hide the usable link from the issuing administrator.
+
+Host administrators can read disk and backups. This is not end-to-end encryption.
+See [the operating guide](ownership-and-refinement.md).
+
+Refinement adds a distinct egress boundary: configured routes receive selected evidence only under
+current account consent; no route is configured by default. Endpoint changes require renewal, and
+late responses do not carry durable authority to apply. Provider retention is outside Alexandria's
+control, including after revocation. Review text is escaped data, not authority. Prompt injection
+through recalled or model-consumed text remains a risk even with account isolation, attribution,
+strict response validation and revision-bound review. Do not infer that the remaining historical
+findings were re-audited or uniformly closed by this branch.
+
+### Deferred: in-flight admin recovery issuance
+
+`admin_recovery` checks browser authority when admitting the request. `AuthRepo::create_audited_recovery`
+then writes the target account's recovery credential and issuance audit together, but the transaction
+records only the issuer's account ID. It does not recheck the issuer's browser credential, account
+auth epoch or administrator role. If the issuing session is revoked after admission but before that
+transaction commits, the in-flight request can still mint a usable reset link. The link belongs to the
+target account, so revoking the issuer's session does not invalidate it. This is a source-review
+finding, not an observed incident.
+
+**Disposition: open and deferred.** Local qualification can continue; it does not qualify hosted
+use with this risk. The issuance audit records who acted but does not prevent the race. If admin
+recovery is retained, guard the issuer's current authority in the same transaction as both writes.
+Test that revocation before commit leaves neither a usable link nor an issuance audit row, and that
+issuance under current authority still succeeds.
 
 | ID | Finding | Severity |
 |---|---|---|

@@ -12,10 +12,10 @@
 <table>
 <tr><th>Content</th><th>Tags</th><th>Confidence</th><th>Created</th><th>State</th><th>Partition</th><th>Rev</th><th></th></tr>
 {% if rows.is_empty() %}<tr><td colspan="8" class="empty">Nothing in this partition yet.</td></tr>{% endif %}
-{% for row in rows %}<tr><td>{{ row.content }}</td><td>{{ row.tags }}</td><td>{{ row.confidence }}</td><td>{{ row.created }}</td><td>{% if row.hidden %}<span class="badge">hidden</span>{% endif %}{% if row.quarantined %}<span class="badge">quarantined</span>{% endif %}{% if !row.hidden %}{% if !row.quarantined %}live{% endif %}{% endif %}</td><td>{{ row.partition }}</td><td class="rev">{{ row.revision }}</td><td><a class="link" href="/debug/memories/{{ row.id|urlencode }}">detail</a></td></tr>
+{% for row in rows %}<tr><td>{{ row.content }}</td><td>{{ row.tags }}</td><td>{{ row.confidence }}</td><td>{{ row.created }}</td><td>{% if row.hidden %}<span class="badge">hidden</span>{% endif %}{% if row.quarantined %}<span class="badge">quarantined</span>{% endif %}{% if !row.hidden %}{% if !row.quarantined %}live{% endif %}{% endif %}</td><td>{{ row.partition }}</td><td class="rev">{{ row.revision }}</td><td><a class="link" href="/debug/memories/{{ row.handle|urlencode }}">detail</a>{% if row.partition_word == "unassigned" %}<br><code>{{ row.handle }}</code>{% endif %}</td></tr>
 <tr class="controls"><td colspan="8"><form class="inline" method="post" action="/debug/collections/edit">
 <input type="hidden" name="csrf" value="{{ csrf }}">
-<input type="hidden" name="id" value="{{ row.id }}">
+<input type="hidden" name="id" value="{{ row.handle }}">
 <input type="hidden" name="revision" value="{{ row.revision }}">
 <label>New text <input type="text" name="content" size="40" placeholder="{{ row.content }}"></label>
 <label>Tags <input type="text" name="tags" size="20" placeholder="{{ row.tags }}"></label>
@@ -24,7 +24,7 @@
 <button type="submit" name="action" value="delete">Hide</button>
 </form> <form class="inline" method="post" action="/debug/collections/move">
 <input type="hidden" name="csrf" value="{{ csrf }}">
-<input type="hidden" name="id" value="{{ row.id }}">
+<input type="hidden" name="id" value="{{ row.handle }}">
 <input type="hidden" name="revision" value="{{ row.revision }}">
 <label>Move to <select name="destination"><option value="personal" {% if row.partition_word == "personal" %}selected{% endif %}>personal</option><option value="project" {% if row.partition_word == "project" %}selected{% endif %}>project</option><option value="unassigned" {% if row.partition_word == "unassigned" %}selected{% endif %}>unassigned (review)</option></select></label>
 <label>Project <select name="project"><option value="" selected>no project</option>{% for choice in projects %}<option value="{{ choice.handle }}">{{ choice.label }}</option>{% endfor %}</select></label>

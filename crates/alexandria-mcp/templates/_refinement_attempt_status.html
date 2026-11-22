@@ -1,0 +1,4 @@
+<div id="attempt-status" {% if status.poll %}hx-get="/debug/refinement/attempts/{{ status.id|urlencode }}" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+  <p role="status">Status: <strong>{{ status.state }}</strong></p>
+  <p>Action: {{ status.kind }} · Attempt <code>{{ status.id }}</code></p>
+</div>

@@ -30,7 +30,7 @@ pub use classification_repo::{
 };
 pub use cluster_repo::{ClusterRepo, ClusterSplit, PartitionCluster};
 pub use edge_repo::EdgeRepo;
-pub use heat_repo::{HeatMaterialise, HeatRepo, HeatUpdate};
+pub use heat_repo::{HeatAccess, HeatMaterialise, HeatRepo, HeatUpdate};
 pub use identity_repo::IdentityRepo;
 pub use maintenance_repo::{AuditContext, LogEntry, MaintenanceRepo, MaintenanceRunSummary};
 pub use memory_repo::{

@@ -6,7 +6,7 @@
 //! and sends exact automatic verdicts to the transactional refinement service. Without it,
 //! callers can examine an opaque candidate, but dispatch never commits it.
 
-use std::sync::Mutex;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use alexandria_storage::Database;
 use alexandria_storage::access::{AccessRepo, OwnerContext, SystemContext};
 use alexandria_storage::error::StorageError;
 use alexandria_storage::models::identity::{
-    AccountId, OperationId, Partition, ReadSelection, Version,
+    AccountId, MemoryScope, OperationId, Partition, ReadSelection, ToSql, Version,
 };
 use alexandria_storage::models::refinement::{
     ApprovalMode, Authority, EvidenceBundle, ProposalRevision, ProposalState, QualityOperation,
@@ -29,12 +29,12 @@ use alexandria_storage::repos::RefinementRepo;
 use alexandria_storage::repos::refinement_repo::{
     AttemptId, AttemptState, BudgetRepo, CallLimits, CandidateCheckpoint, CandidateCursor,
     EvidenceOutcome, PassId, QueuedWork, Reservation, WorkKind, WorkSelection, admission,
-    current_authority,
+    admit_dispatched_work, current_authority,
 };
 use chrono::{DateTime, TimeDelta, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use surrealdb::types::RecordId;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use super::inference::{AttemptQuota, InferenceError, InferenceReply, QuotaDenied};
@@ -160,7 +160,56 @@ struct DispatchCtx<'a> {
     work: &'a QueuedWork,
     expected: &'a alexandria_storage::models::refinement::InferencePolicyId,
     now: DateTime<Utc>,
+    deadline: Instant,
     provider: &'a dyn WorkerProvider,
+}
+
+/// Persistent positions in two cyclic orders: accounts first, then each account's
+/// partition/work class. IDs here are lossless SQL literals, not display keys.
+#[derive(Default, Deserialize, Serialize)]
+struct DispatchCursor {
+    account: Option<String>,
+    lanes: BTreeMap<String, DispatchLane>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+struct DispatchLane {
+    workspace: String,
+    scope: u8,
+    project: Option<String>,
+    interactive: bool,
+}
+
+impl DispatchLane {
+    fn of(work: &QueuedWork) -> Self {
+        let (scope, project) = match &work.partition.scope {
+            MemoryScope::Personal => (0, None),
+            MemoryScope::Project(id) => (1, Some(id.as_record_id().to_sql())),
+            MemoryScope::Unassigned => (2, None),
+        };
+        Self {
+            workspace: work.partition.workspace.as_record_id().to_sql(),
+            scope,
+            project,
+            interactive: work.interactive,
+        }
+    }
+}
+
+impl DispatchCursor {
+    fn order_key(&self, work: &QueuedWork) -> (bool, String, bool, DispatchLane) {
+        let account = work.account.as_record_id().to_sql();
+        let lane = DispatchLane::of(work);
+        let wrap_account = self.account.as_ref().is_some_and(|last| account <= *last);
+        let wrap_lane = self.lanes.get(&account).is_some_and(|last| lane <= *last);
+        (wrap_account, account, wrap_lane, lane)
+    }
+
+    fn advance(&mut self, work: &QueuedWork) {
+        let account = work.account.as_record_id().to_sql();
+        self.lanes.insert(account.clone(), DispatchLane::of(work));
+        self.account = Some(account);
+    }
 }
 
 pub struct Worker<'a> {
@@ -172,9 +221,6 @@ pub struct Worker<'a> {
     /// One provider call at a time, process-wide. The claim on the attempt row is the durable
     /// half; this is the in-memory half that answers a concurrent dispatch with `Busy`.
     in_flight: AtomicBool,
-    /// The last served (account, partition, class). The next dispatch picks the first queued
-    /// unit that is not this one, which is the whole fairness discipline.
-    last_served: Mutex<Option<(AccountId, Partition, bool)>>,
 }
 
 impl<'a> Worker<'a> {
@@ -191,7 +237,6 @@ impl<'a> Worker<'a> {
             settings,
             embedding: None,
             in_flight: AtomicBool::new(false),
-            last_served: Mutex::new(None),
         }
     }
 
@@ -263,6 +308,7 @@ impl<'a> Worker<'a> {
             work: &work,
             expected: &expected,
             now,
+            deadline: self.dispatch_deadline(),
             provider,
         };
         if !self.claim_dispatch(&ctx).await? {
@@ -329,39 +375,55 @@ impl<'a> Worker<'a> {
         if queue.is_empty() {
             return Ok(Dispatch::Idle);
         }
-        let last = self
-            .last_served
-            .lock()
-            .expect("refinement fairness cursor")
-            .clone();
-        let start = queue
-            .iter()
-            .position(|work| Some(work.fairness_key()) != last)
-            .unwrap_or(0);
-        queue.rotate_left(start);
+        let stored =
+            alexandria_storage::system_config::refinement_dispatch_cursor(self.db, self.system)
+                .await?;
+        let mut cursor: DispatchCursor = stored
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(anyhow::Error::from)?
+            .unwrap_or_default();
+        // The stable sort preserves FIFO within a lane. An account with two old requeues
+        // therefore cannot alternate the two while another eligible account waits.
+        queue.sort_by_cached_key(|work| cursor.order_key(work));
         for work in queue {
             let ctx = DispatchCtx {
                 repo: &repo,
                 work: &work,
                 expected: &expected,
                 now,
+                deadline: self.dispatch_deadline(),
                 provider,
             };
             if self.claim_dispatch(&ctx).await? {
+                cursor.advance(&work);
+                let position = serde_json::to_string(&cursor).map_err(anyhow::Error::from)?;
+                if let Err(error) =
+                    alexandria_storage::system_config::save_refinement_dispatch_cursor(
+                        self.db,
+                        self.system,
+                        &position,
+                    )
+                    .await
+                {
+                    repo.requeue_work(self.system, &work.id).await?;
+                    return Err(error.into());
+                }
                 let result = self.run_work(&ctx).await;
                 if result.is_err() {
                     let _ = repo
                         .finish_work(self.system, &work.id, AttemptState::Failed)
                         .await;
                 }
-                self.last_served
-                    .lock()
-                    .expect("refinement fairness cursor")
-                    .replace(work.fairness_key());
                 return result;
             }
         }
         Ok(Dispatch::Idle)
+    }
+
+    fn dispatch_deadline(&self) -> Instant {
+        Instant::now() + Duration::from_secs(self.settings.pass_active_secs)
     }
 
     async fn claim_dispatch(&self, ctx: &DispatchCtx<'_>) -> Result<bool, ServiceError> {
@@ -572,6 +634,9 @@ impl<'a> Worker<'a> {
             .await?;
         match outcome {
             EvidenceOutcome::Ready(bundle) => {
+                if self.source_changed(ctx, bundle.focal.version).await? {
+                    return Ok(Dispatch::Denied);
+                }
                 let turn = self.assess_bundle(ctx, &bundle, false).await?;
                 match turn {
                     Turn::Completed(output) => {
@@ -615,6 +680,14 @@ impl<'a> Worker<'a> {
         let (proposal, evidence) = repo
             .proposal_with_evidence(self.system, &proposal_id)
             .await?;
+        if proposal.origin_policy.account != work.account || proposal.partition != work.partition {
+            repo.finish_work(self.system, &work.id, AttemptState::Cancelled)
+                .await?;
+            return Ok(Dispatch::Denied);
+        }
+        if self.source_changed(ctx, proposal.revision).await? {
+            return Ok(Dispatch::Denied);
+        }
         let sources = if work.kind == WorkKind::Regenerate {
             repo.capture_sources(self.system, &evidence).await?
         } else {
@@ -668,6 +741,24 @@ impl<'a> Worker<'a> {
                 Ok(Dispatch::Denied)
             }
         }
+    }
+
+    async fn source_changed(
+        &self,
+        ctx: &DispatchCtx<'_>,
+        revision: Version,
+    ) -> Result<bool, ServiceError> {
+        let stale = ctx
+            .repo
+            .work_source_revision(self.system, &ctx.work.id)
+            .await?
+            .is_some_and(|expected| expected != revision);
+        if stale {
+            ctx.repo
+                .finish_work(self.system, &ctx.work.id, AttemptState::Cancelled)
+                .await?;
+        }
+        Ok(stale)
     }
 
     /// One assessment of one real evidence bundle: a primary call producing a strictly
@@ -757,25 +848,25 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Run one provider call with the authority watcher beside it. A revocation, suspension
-    /// or policy replacement that lands mid-call cancels the call instead of waiting for the
-    /// provider's own deadline.
+    /// Run one provider call with the dispatched authority watcher beside it. A mid-call
+    /// authority change cancels the call instead of waiting for the provider's deadline.
     async fn provider_call(
         &self,
         ctx: &DispatchCtx<'_>,
         call: Call<'_>,
     ) -> Result<Result<InferenceReply, InferenceError>, ServiceError> {
+        if Instant::now() >= ctx.deadline {
+            return Ok(Err(InferenceError::DeadlineExceeded));
+        }
         let quota = StepQuota::new(
             self.db,
             self.settings.calls,
-            ctx.expected.clone(),
             ctx.work,
             pass_id(ctx.work),
             ctx.now,
         );
         let cancel = CancellationToken::new();
-        let account = ctx.work.account.clone();
-        let policy = ctx.expected.clone();
+        let authority = &ctx.work.authority;
         let db = self.db;
         let done = tokio::sync::Notify::new();
         let watch = async {
@@ -784,7 +875,7 @@ impl<'a> Worker<'a> {
                     _ = done.notified() => break,
                     _ = sleep(Duration::from_millis(AUTHORITY_POLL_MS)) => {},
                 }
-                if admission(db, &account, &policy).await.is_err() {
+                if admit_dispatched_work(db, authority).await.is_err() {
                     cancel.cancel();
                     break;
                 }
@@ -792,9 +883,19 @@ impl<'a> Worker<'a> {
         };
         let reply = tokio::join!(
             async {
-                let reply = ctx.provider.complete(call, &quota, cancel.clone()).await;
+                let reply = timeout_at(
+                    ctx.deadline,
+                    ctx.provider.complete(call, &quota, cancel.clone()),
+                )
+                .await;
                 done.notify_one();
-                reply
+                match reply {
+                    Ok(result) => result,
+                    Err(_) => {
+                        cancel.cancel();
+                        Err(InferenceError::DeadlineExceeded)
+                    }
+                }
             },
             watch
         )
@@ -814,7 +915,7 @@ impl<'a> Worker<'a> {
         let work = ctx.work;
         match error {
             InferenceError::QuotaDenied | InferenceError::Cancelled => {
-                if admission(self.db, &work.account, ctx.expected)
+                if admit_dispatched_work(self.db, &work.authority)
                     .await
                     .is_err()
                 {
@@ -960,9 +1061,7 @@ fn parse_verdict(text: &str) -> Result<SecondaryVerdict, ServiceError> {
 struct StepQuota<'a> {
     db: &'a Database,
     repo: BudgetRepo<'a>,
-    policy: alexandria_storage::models::refinement::InferencePolicyId,
-    account: AccountId,
-    partition: Partition,
+    authority: Authority,
     pass: PassId,
     interactive: bool,
     now: DateTime<Utc>,
@@ -972,7 +1071,6 @@ impl<'a> StepQuota<'a> {
     fn new(
         db: &'a Database,
         limits: CallLimits,
-        policy: alexandria_storage::models::refinement::InferencePolicyId,
         work: &QueuedWork,
         pass: PassId,
         now: DateTime<Utc>,
@@ -980,9 +1078,7 @@ impl<'a> StepQuota<'a> {
         Self {
             db,
             repo: BudgetRepo::new(db, limits),
-            policy,
-            account: work.account.clone(),
-            partition: work.partition.clone(),
+            authority: work.authority.clone(),
             pass,
             interactive: work.interactive,
             now,
@@ -995,14 +1091,7 @@ impl AttemptQuota for StepQuota<'_> {
     async fn reserve_attempt(&self) -> Result<(), QuotaDenied> {
         match self
             .repo
-            .reserve_attempt(
-                &self.policy,
-                &self.account,
-                &self.partition,
-                &self.pass,
-                self.interactive,
-                self.now,
-            )
+            .reserve_attempt(&self.authority, &self.pass, self.interactive, self.now)
             .await
         {
             Ok(Reservation::Granted) => Ok(()),
@@ -1014,7 +1103,7 @@ impl AttemptQuota for StepQuota<'_> {
 #[async_trait::async_trait]
 impl WorkerQuota for StepQuota<'_> {
     async fn authorize_outbound(&self) -> Result<(), QuotaDenied> {
-        admission(self.db, &self.account, &self.policy)
+        admit_dispatched_work(self.db, &self.authority)
             .await
             .map_err(|_| QuotaDenied)
     }

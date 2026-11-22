@@ -5,7 +5,7 @@
 use askama::Template;
 use axum::Json;
 use axum::extract::{Form, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use serde_json::Value;
@@ -17,14 +17,17 @@ use crate::error::ServiceError;
 use crate::refinement::service::RefinementService;
 use alexandria_storage::access::OwnerContext;
 use alexandria_storage::models::identity::{
-    OperationId, RefinementProposalId, SemanticOperationId, Version,
+    FactId, MemoryScope, OperationId, Partition, ProjectId, RefinementProposalId,
+    SemanticOperationId, Version,
 };
 use alexandria_storage::models::mutation::OperationDetail;
 use alexandria_storage::models::refinement::{
     ApprovalMode, ApprovalSetting, Consent, ConsentChoice, PolicyVersion, ProposalDisplay,
     ProposalState,
 };
-use alexandria_storage::repos::refinement_repo::AttemptId;
+use alexandria_storage::repos::refinement_repo::{
+    AttemptId, AttemptState, EnqueueRequest, EvidenceSelection, WorkKind, WorkSelection,
+};
 use alexandria_storage::repos::{MutationRepo, RefinementRepo};
 use surrealdb::types::ToSql;
 
@@ -33,6 +36,7 @@ const NAV: &str = "refinement";
 #[derive(Deserialize, Default)]
 pub(crate) struct QueueFilter {
     scope: Option<String>,
+    status: Option<String>,
 }
 
 pub(crate) async fn queue(
@@ -41,17 +45,30 @@ pub(crate) async fn queue(
     session: BrowserSession,
     Query(filter): Query<QueueFilter>,
 ) -> Response {
-    let Ok((owner, _)) = boundary.corpus(&session).await else {
+    let Ok((owner, read)) = boundary.corpus(&session).await else {
         return forbidden();
     };
+    let projects = read
+        .partitions()
+        .iter()
+        .filter_map(|partition| match &partition.scope {
+            MemoryScope::Project(id) => Some(id.as_record_id().to_sql()),
+            _ => None,
+        })
+        .collect();
     let filter_scope = filter.scope.unwrap_or_else(|| "all".to_string());
     let scope = match filter_scope.as_str() {
         "all" => None,
         "personal" | "project" | "unassigned" => Some(filter_scope.as_str()),
         _ => return bad_request("unknown refinement scope filter"),
     };
+    let deferred = match filter.status.as_deref() {
+        None | Some("regular") => false,
+        Some("deferred") => true,
+        _ => return bad_request("unknown refinement status filter"),
+    };
     let service = RefinementService::new(server.db.as_ref(), server.refinement.as_deref());
-    let proposals = match service.owner_proposals(&owner, scope).await {
+    let proposals = match service.owner_proposals(&owner, scope, deferred).await {
         Ok(proposals) => proposals,
         Err(_) => return unavailable(),
     };
@@ -86,7 +103,10 @@ pub(crate) async fn queue(
         approval_mode: approval_mode_label(effective.approval_mode).to_string(),
         attempt_status,
         filter_scope,
+        deferred,
         rows,
+        projects,
+        enqueue: EnqueueControls::new(&session, &effective),
     })
 }
 
@@ -148,6 +168,7 @@ pub(crate) async fn detail(
         csrf: session.csrf().to_string(),
         decision_key: uuid::Uuid::new_v4().to_string(),
         can_decide: proposal.state == ProposalState::Pending,
+        enqueue: EnqueueControls::new(&session, &effective),
         can_revert: proposal.state == ProposalState::Applied && proposal.operation.is_some(),
         source: source_summary(&payload),
         selected_records: selected_records(&payload),
@@ -263,10 +284,7 @@ pub(crate) async fn consent(
         "revoke" => ConsentChoice::Revoke,
         _ => return bad_request("unknown consent choice"),
     };
-    match set_consent(server, owner, form.revision, choice).await {
-        Ok(_) => axum::response::Redirect::to("/debug/refinement/settings").into_response(),
-        Err(_) => unavailable(),
-    }
+    settings_result(set_consent(server, owner, form.revision, choice).await)
 }
 
 #[derive(Deserialize)]
@@ -299,10 +317,24 @@ pub(crate) async fn mode(
         consent_revision: form.consent_revision,
         owner_mode_revision: form.mode_revision,
     };
-    match set_mode(server, owner, expected, mode).await {
-        Ok(_) => axum::response::Redirect::to("/debug/refinement/settings").into_response(),
+    settings_result(set_mode(server, owner, expected, mode).await)
+}
+
+fn settings_result<T>(result: Result<T, ServiceError>) -> Response {
+    let mut response = match result {
+        Ok(_) => Redirect::to("/debug/refinement/settings").into_response(),
+        Err(ServiceError::Stale | ServiceError::RetryableBookkeepingConflict) => {
+            let mut response = html::error_page(
+                NAV,
+                "refinement settings changed; reload the settings before submitting again",
+            );
+            *response.status_mut() = StatusCode::CONFLICT;
+            response
+        }
         Err(_) => unavailable(),
-    }
+    };
+    web::no_store(&mut response);
+    response
 }
 
 async fn set_consent(
@@ -325,8 +357,200 @@ async fn set_mode(
     service.set_approval_mode(&owner, &expected, mode).await
 }
 
-pub(crate) async fn enqueue() -> Response {
-    unavailable()
+#[derive(Deserialize)]
+pub(crate) struct EnqueueForm {
+    action: String,
+    scope: Option<String>,
+    target: Option<String>,
+    revision: Option<u64>,
+    request_key: uuid::Uuid,
+    configured_revision: Option<u64>,
+    consent_revision: u64,
+    mode_revision: u64,
+}
+
+pub(crate) async fn enqueue(
+    State(server): State<AlexandriaServer>,
+    boundary: Boundary,
+    session: BrowserSession,
+    Form(form): Form<EnqueueForm>,
+) -> Response {
+    // The protected router has already verified the origin and CSRF token in this form body.
+    let Ok((owner, read)) = boundary.corpus(&session).await else {
+        return forbidden();
+    };
+    let mut response = match enqueue_owner(&server, &owner, &read, form).await {
+        Ok(id) => Redirect::to(&format!(
+            "/debug/refinement/attempts/{}",
+            url_component(&id.record().to_sql())
+        ))
+        .into_response(),
+        Err(ServiceError::Stale) => {
+            let mut response = html::error_page(
+                NAV,
+                "refinement settings or source changed; reload before submitting again",
+            );
+            *response.status_mut() = StatusCode::CONFLICT;
+            response
+        }
+        Err(ServiceError::NotFound) => not_found(),
+        Err(ServiceError::InvalidInput(_)) => bad_request("invalid refinement request"),
+        Err(ServiceError::Quota) => {
+            let mut response =
+                html::error_page(NAV, "the refinement queue is full; try again later");
+            *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            response
+        }
+        Err(_) => unavailable(),
+    };
+    web::no_store(&mut response);
+    response
+}
+
+fn url_component(value: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => write!(out, "%{byte:02X}").expect("writing to String"),
+        }
+    }
+    out
+}
+
+async fn enqueue_owner(
+    server: &AlexandriaServer,
+    owner: &OwnerContext,
+    read: &alexandria_storage::access::ScopedContext,
+    form: EnqueueForm,
+) -> Result<AttemptId, ServiceError> {
+    let service = RefinementService::new(&server.db, server.refinement.as_deref());
+    let expected = PolicyVersion {
+        configured_revision: form.configured_revision,
+        consent_revision: form.consent_revision,
+        owner_mode_revision: form.mode_revision,
+    };
+    let (kind, scope, selection) = match form.action.as_str() {
+        "run" => {
+            let scope = match form.scope.as_deref() {
+                Some("personal") => MemoryScope::Personal,
+                Some(handle) => MemoryScope::Project(ProjectId::try_from(
+                    alexandria_storage::parse_record_id(handle)?,
+                )?),
+                None => {
+                    return Err(ServiceError::InvalidInput(
+                        "missing assessment scope".into(),
+                    ));
+                }
+            };
+            if !read
+                .partitions()
+                .iter()
+                .any(|partition| partition.scope == scope)
+            {
+                return Err(ServiceError::NotFound);
+            }
+            (WorkKind::Assess, scope, WorkSelection::Scheduled)
+        }
+        "opinion" | "regenerate" => {
+            let id = form_target(&form)
+                .and_then(|id| RefinementProposalId::try_from(id).map_err(ServiceError::from))?;
+            let proposal = service
+                .owner_proposal(owner, id.as_record_id())
+                .await?
+                .ok_or(ServiceError::NotFound)?;
+            if Some(proposal.revision) != form.revision {
+                return Err(ServiceError::Stale);
+            }
+            let scope = proposal_scope(proposal.scope.as_str(), proposal.project)?;
+            let kind = if form.action == "opinion" {
+                WorkKind::Opinion
+            } else {
+                WorkKind::Regenerate
+            };
+            (
+                kind,
+                scope,
+                WorkSelection::Proposal(id.as_record_id().clone()),
+            )
+        }
+        "assess_unassigned" => {
+            let id = FactId::try_from(form_target(&form)?)?;
+            let snapshot = MutationRepo::new(server.db.inner())
+                .state(owner, &id)
+                .await?
+                .filter(|fact| {
+                    fact.scope == MemoryScope::Unassigned
+                        && !fact.visibility.deleted
+                        && fact.visibility.quarantined_at.is_some()
+                })
+                .ok_or(ServiceError::NotFound)?;
+            if Some(snapshot.version.get()) != form.revision {
+                return Err(ServiceError::Stale);
+            }
+            (
+                WorkKind::AssessUnassigned,
+                MemoryScope::Unassigned,
+                WorkSelection::Evidence(EvidenceSelection {
+                    focal: id,
+                    related: Vec::new(),
+                }),
+            )
+        }
+        _ => {
+            return Err(ServiceError::InvalidInput(
+                "unknown refinement action".into(),
+            ));
+        }
+    };
+    let effective = service.effective_policy(owner).await?;
+    if effective.policy.version() != expected {
+        return Err(ServiceError::Stale);
+    }
+    if !effective.policy.inference_admitted {
+        return Err(ServiceError::Unavailable);
+    }
+    service
+        .enqueue_checked(
+            owner,
+            EnqueueRequest {
+                owner: owner.account().clone(),
+                partition: Partition {
+                    workspace: owner.workspace().clone(),
+                    scope,
+                },
+                kind,
+                source_revision: form.revision.map(Version::new),
+                selection,
+                idempotency_key: format!("browser-{}-{}", kind.as_str(), form.request_key),
+            },
+            expected,
+        )
+        .await
+}
+
+fn form_target(form: &EnqueueForm) -> Result<surrealdb::types::RecordId, ServiceError> {
+    let target = form
+        .target
+        .as_deref()
+        .ok_or_else(|| ServiceError::InvalidInput("missing refinement target".into()))?;
+    Ok(alexandria_storage::parse_record_id(target)?)
+}
+
+fn proposal_scope(
+    scope: &str,
+    project: Option<surrealdb::types::RecordId>,
+) -> Result<MemoryScope, ServiceError> {
+    match (scope, project) {
+        ("personal", None) => Ok(MemoryScope::Personal),
+        ("unassigned", None) => Ok(MemoryScope::Unassigned),
+        ("project", Some(id)) => Ok(MemoryScope::Project(ProjectId::try_from(id)?)),
+        _ => Err(ServiceError::NotFound),
+    }
 }
 
 #[derive(Deserialize)]
@@ -458,6 +682,7 @@ pub(crate) async fn attempt(
     State(server): State<AlexandriaServer>,
     session: BrowserSession,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let Ok(id) = alexandria_storage::parse_record_id(&id).and_then(AttemptId::try_from) else {
         return not_found();
@@ -465,12 +690,38 @@ pub(crate) async fn attempt(
     let owner = session.owner().clone();
     let service = RefinementService::new(&server.db, server.refinement.as_deref());
     let mut response = match service.attempt(&owner, &id).await {
-        Ok(view) => Json(serde_json::json!({
-            "id": view.id.record().to_sql(),
-            "kind": view.kind.as_str(),
-            "state": view.state.as_str(),
-        }))
-        .into_response(),
+        Ok(attempt) => {
+            let view = AttemptStatus {
+                id: attempt.id.record().to_sql(),
+                kind: attempt.kind.as_str(),
+                state: attempt.state.as_str(),
+                poll: matches!(attempt.state, AttemptState::Queued | AttemptState::Running),
+            };
+            if headers
+                .get("HX-Request")
+                .is_some_and(|value| value == "true")
+            {
+                private_page(AttemptStatusTemplate { status: view })
+            } else if headers
+                .get(header::ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|accept| {
+                    accept
+                        .split(',')
+                        .any(|value| value.trim().starts_with("text/html"))
+                })
+            {
+                private_page(AttemptTemplate {
+                    nav: NAV,
+                    status: view,
+                })
+            } else {
+                Json(serde_json::json!({
+                    "id": view.id, "kind": view.kind, "state": view.state,
+                }))
+                .into_response()
+            }
+        }
         Err(ServiceError::NotFound) => not_found(),
         Err(_) => unavailable(),
     };
@@ -748,7 +999,36 @@ struct QueueTemplate {
     approval_mode: String,
     attempt_status: String,
     filter_scope: String,
+    deferred: bool,
     rows: Vec<QueueRow>,
+    projects: Vec<String>,
+    enqueue: EnqueueControls,
+}
+
+struct EnqueueControls {
+    enabled: bool,
+    csrf: String,
+    key: uuid::Uuid,
+    configured_revision: u64,
+    consent_revision: u64,
+    mode_revision: u64,
+}
+
+impl EnqueueControls {
+    fn new(
+        session: &BrowserSession,
+        effective: &crate::refinement::service::EffectiveRefinementPolicy,
+    ) -> Self {
+        let version = effective.policy.version();
+        Self {
+            enabled: effective.policy.inference_admitted,
+            csrf: session.csrf().to_string(),
+            key: uuid::Uuid::new_v4(),
+            configured_revision: version.configured_revision.unwrap_or_default(),
+            consent_revision: version.consent_revision,
+            mode_revision: version.owner_mode_revision,
+        }
+    }
 }
 
 struct QueueRow {
@@ -778,6 +1058,7 @@ struct DetailTemplate {
     decision_key: String,
     can_decide: bool,
     can_revert: bool,
+    enqueue: EnqueueControls,
     source: String,
     selected_records: String,
     changes: String,
@@ -791,6 +1072,26 @@ struct DetailTemplate {
     preimage: String,
     postimage: String,
     revert_history: String,
+}
+
+#[derive(Template)]
+#[template(path = "refinement_attempt.html")]
+struct AttemptTemplate {
+    nav: &'static str,
+    status: AttemptStatus,
+}
+
+#[derive(Template)]
+#[template(path = "_refinement_attempt_status.html")]
+struct AttemptStatusTemplate {
+    status: AttemptStatus,
+}
+
+struct AttemptStatus {
+    id: String,
+    kind: &'static str,
+    state: &'static str,
+    poll: bool,
 }
 
 #[derive(Template)]

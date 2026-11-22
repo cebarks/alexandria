@@ -23,8 +23,8 @@ use crate::models::mutation::{EdgeKind, ExpectedState, RelationExpectation};
 use crate::models::refinement::ApprovedRelationshipEffect;
 use crate::models::refinement::{
     ApprovalMode, Authority, Candidate, EffectivePolicy, EvidenceBundle, EvidenceCoverage,
-    EvidenceSelectionKind, InferencePolicyId, OmissionReason, OmittedNeighbor, ProposalCategory,
-    ProposalRevision, ProposalState, QualityOperation,
+    EvidenceSelectionKind, InferencePolicyId, OmissionReason, OmittedNeighbor, PolicyVersion,
+    ProposalCategory, ProposalRevision, ProposalState, QualityOperation,
 };
 use crate::parse_record_id;
 use crate::repos::scope::GUARD_CONFLICT_ATTEMPTS;
@@ -232,6 +232,26 @@ impl RefinementRepo<'_> {
         owner: &OwnerContext,
         request: EnqueueRequest,
     ) -> Result<AttemptId, StorageError> {
+        self.enqueue_with_policy(owner, request, None).await
+    }
+
+    /// Enqueue from an owner form only if the disclosed policy is still current at commit.
+    pub async fn enqueue_checked(
+        &self,
+        owner: &OwnerContext,
+        request: EnqueueRequest,
+        expected: PolicyVersion,
+    ) -> Result<AttemptId, StorageError> {
+        self.enqueue_with_policy(owner, request, Some(expected))
+            .await
+    }
+
+    async fn enqueue_with_policy(
+        &self,
+        owner: &OwnerContext,
+        request: EnqueueRequest,
+        expected: Option<PolicyVersion>,
+    ) -> Result<AttemptId, StorageError> {
         if request.partition.workspace != *owner.workspace() || request.owner != *owner.account() {
             return Err(StorageError::InvalidInput(
                 "refinement work is outside the owner workspace".into(),
@@ -263,7 +283,7 @@ impl RefinementRepo<'_> {
         let owner = owner.clone();
         for _ in 0..GUARD_CONFLICT_ATTEMPTS {
             let tx = db.clone().begin().await.map_err(internal)?;
-            let result = enqueue_in_tx(&tx, &owner, &request, &record, interactive).await;
+            let result = enqueue_in_tx(&tx, &owner, &request, &record, interactive, expected).await;
             match super::finish_write(tx, result.is_ok()).await.and(result) {
                 Ok(attempt) => return Ok(attempt),
                 Err(error) if super::can_retry(&error) => tokio::task::yield_now().await,
@@ -496,11 +516,22 @@ async fn enqueue_in_tx(
     request: &EnqueueRequest,
     record: &RecordId,
     interactive: bool,
+    expected: Option<PolicyVersion>,
 ) -> Result<AttemptId, StorageError> {
-    require_active(tx, owner.account(), Some(owner)).await?;
-    let effective = PolicySnapshot::read(tx, owner.account())
-        .await?
-        .effective()?;
+    if expected.is_some() {
+        // Consent and mode writers claim the same owner authority row.
+        super::claim_owner(tx, owner).await?;
+    } else {
+        require_active(tx, owner.account(), Some(owner)).await?;
+    }
+    let snapshot = PolicySnapshot::read(tx, owner.account()).await?;
+    let effective = snapshot.effective()?;
+    if let Some(expected) = expected {
+        if effective.version() != expected {
+            return Err(StorageError::Stale);
+        }
+        super::pin_configuration(tx, snapshot.policy.as_ref()).await?;
+    }
     let authority = bind_authority(owner.account(), &effective).ok_or(StorageError::Unavailable)?;
     if select_record::<AttemptRow>(tx, record.clone())
         .await?
@@ -855,9 +886,7 @@ impl<'a> BudgetRepo<'a> {
 
     pub async fn reserve_attempt(
         &self,
-        expected_policy: &InferencePolicyId,
-        account: &AccountId,
-        _partition: &Partition,
+        expected: &Authority,
         pass: &PassId,
         interactive: bool,
         now: DateTime<Utc>,
@@ -869,8 +898,7 @@ impl<'a> BudgetRepo<'a> {
         // params by value inside the loop's body.
         let db = self.db.inner().clone();
         let limits = self.limits;
-        let policy = expected_policy.clone();
-        let account = account.clone();
+        let expected = expected.clone();
         let pass = pass.clone();
         for _ in 0..GUARD_CONFLICT_ATTEMPTS {
             // `Surreal::begin` consumes its receiver, so each attempt takes a fresh clone of
@@ -879,8 +907,7 @@ impl<'a> BudgetRepo<'a> {
             let error = match reserve_transaction(
                 &tx,
                 limits,
-                policy.clone(),
-                account.clone(),
+                expected.clone(),
                 pass.clone(),
                 interactive,
                 now,
@@ -988,20 +1015,14 @@ impl RefinementRepo<'_> {
 async fn reserve_transaction(
     tx: &Transaction<Any>,
     limits: CallLimits,
-    policy: InferencePolicyId,
-    account: AccountId,
+    expected: Authority,
     pass: PassId,
     interactive: bool,
     now: DateTime<Utc>,
 ) -> Result<Reservation, StorageError> {
-    // Authority is checked inside the same transaction as the charge: a suspended account, a
-    // revoked or mismatched consent, or a superseded policy refuses without spending anything.
-    require_active(tx, &account, None).await?;
-    let effective = PolicySnapshot::read(tx, &account).await?.effective()?;
-    let authority = bind_authority(&account, &effective).ok_or(StorageError::Stale)?;
-    if authority.inference_policy_id != policy {
-        return Err(StorageError::Stale);
-    }
+    // A stale dispatched revision refuses before it can consume budget.
+    require_dispatched_authority(tx, &expected).await?;
+    let account = expected.account;
     let pass_calls = select_record::<BudgetCountRow>(tx, pass_key(&pass))
         .await?
         .map_or(0, |row| row.attempted_calls);
@@ -1045,7 +1066,31 @@ async fn reserve_transaction(
     Ok(Reservation::Granted)
 }
 
-/// Admission at a selection, reservation or egress edge. Suspended accounts, revoked or absent
+/// Revalidate the dispatched grant, approval mode and configuration at the outbound edge.
+pub async fn admit_dispatched_work(
+    db: &Database,
+    expected: &Authority,
+) -> Result<(), StorageError> {
+    let tx = db.inner().clone().begin().await.map_err(internal)?;
+    let result = require_dispatched_authority(&tx, expected).await;
+    tx.cancel().await.map_err(internal)?;
+    result
+}
+
+async fn require_dispatched_authority(
+    tx: &Transaction<Any>,
+    expected: &Authority,
+) -> Result<(), StorageError> {
+    let account = &expected.account;
+    require_active(tx, account, None).await?;
+    let effective = PolicySnapshot::read(tx, account).await?.effective()?;
+    if bind_authority(account, &effective).as_ref() != Some(expected) {
+        return Err(StorageError::Stale);
+    }
+    Ok(())
+}
+
+/// Admission at initial dispatch. Suspended accounts, revoked or absent
 /// consent, mismatched destinations, and a superseded configured policy all refuse.
 pub async fn admission(
     db: &Database,
@@ -1082,12 +1127,12 @@ pub async fn current_authority(
     result
 }
 
-/// The storage-side binder for the engine's `current_authority`: consent must be this
-/// account's, unrevoked, and for exactly the configured destinations. Mode is clamped by the
-/// configured ceiling, exactly as the engine clamps it.
+/// The storage-side binder for the engine's `current_authority`. The effective policy
+/// admits only consent for the current destination revision, even if a historical grant's
+/// destination set matches again. Mode is clamped by the configured ceiling.
 pub(super) fn bind_authority(account: &AccountId, policy: &EffectivePolicy) -> Option<Authority> {
     let configured = policy.configured.as_ref()?;
-    let consent = policy.consent.as_ref()?;
+    let consent = policy.admitted_consent()?;
     if &consent.account != account
         || consent.revoked_at.is_some()
         || consent.destination_set.is_empty()

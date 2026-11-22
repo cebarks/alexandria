@@ -36,6 +36,34 @@ pub async fn set_config(db: &Surreal<Any>, key: &str, value: &str) -> Result<()>
     Ok(())
 }
 
+const REFINEMENT_DISPATCH_CURSOR: &str = "refinement_dispatch_cursor";
+
+/// Durable round-robin position for the single active refinement supervisor.
+pub async fn refinement_dispatch_cursor(
+    db: &crate::Database,
+    system: &crate::access::SystemContext,
+) -> Result<Option<String>> {
+    anyhow::ensure!(db.holds_authority(system), "invalid system authority");
+    get_config(db.inner(), REFINEMENT_DISPATCH_CURSOR).await
+}
+
+/// Replace the position atomically; unlike the generic delete-then-create helper, an
+/// interrupted write cannot erase the cursor from the preceding turn.
+pub async fn save_refinement_dispatch_cursor(
+    db: &crate::Database,
+    system: &crate::access::SystemContext,
+    value: &str,
+) -> Result<()> {
+    anyhow::ensure!(db.holds_authority(system), "invalid system authority");
+    db.inner()
+        .query("UPSERT system_config:refinement_dispatch_cursor SET key = $key, value = $value, updated_at = time::now() RETURN NONE")
+        .bind(("key", REFINEMENT_DISPATCH_CURSOR))
+        .bind(("value", value.to_owned()))
+        .await?
+        .check()?;
+    Ok(())
+}
+
 /// The instant the retrieve path began recording accesses, stored so it survives restarts.
 ///
 /// `Appraise` reads this before it lowers any confidence. `access_count == 0` does not mean "nobody

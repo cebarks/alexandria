@@ -20,6 +20,8 @@ fn queue_discloses_unassigned_and_review_ordering() {
         "attempt",
         "select",
         "records",
+        "name=\"status\"",
+        "value=\"deferred\"",
     ] {
         assert!(
             QUEUE.contains(text),

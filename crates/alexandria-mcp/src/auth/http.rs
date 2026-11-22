@@ -22,23 +22,14 @@
 //! kind — the boundary is the credential table, not a header-name heuristic that could be made to agree by
 //! a future refactor.
 //!
-//! **A response is gated by the lifetime that admitted it**, in two places, because they cover different
-//! windows. A request whose lease is cancelled *before* the transport has produced an answer is dropped
-//! rather than answered — and dropping the forwarded future is exactly the signal rmcp's stateless path
-//! treats as a disconnect, which cancels its handler. Once an answer is streaming, the gate is the session
-//! binding: a revocation cancels the binding's token and closes the session through rmcp's own session
-//! manager, which ends the session worker and therefore every stream it owns, so a frame that was already
-//! queued cannot reach a caller whose authority has ended.
-//!
-//! What that does **not** do is cut an in-flight *stateless* response between its first byte and its
-//! answer: this gate deliberately does not re-implement the SDK's body stream, and no dependency already
-//! in the tree exposes a stream combinator to do it with. A revoked stateless caller can therefore still
-//! receive the one answer its request was producing. It cannot start another one, cannot act on a session
-//! it does not own, and cannot commit a write whose recheck comes after the revocation — which is why
-//! [`revalidate`](crate::auth::mcp_transport::revalidate) and Task 6's in-transaction epoch predicate are
-//! the other half of "an in-flight revoked request cannot commit", rather than a nicety.
-//! `mcp_auth_test::revocation_ends_an_open_stream_and_delivers_no_frame_after_it` exercises a real held
-//! stream, as the brief requires.
+//! **A response is gated by the lifetime that admitted it.** Before the transport returns headers,
+//! cancellation drops the forwarded future. After headers, the SSE body terminates on cancellation of
+//! the same lease, for both stateful and stateless streams. Closing a stateful session through rmcp
+//! still cleans up the session worker, but that asynchronous close cannot prevent its receiver from
+//! draining a frame already queued. The body gate doesn't retract bytes already handed to HTTP.
+//! Delivery and write authority are separate: [`revalidate`](crate::auth::mcp_transport::revalidate)
+//! and the in-transaction credential check still guard writes. The held-stream test
+//! `revocation_ends_an_open_stream_and_delivers_no_frame_after_it` pins the delivery behavior.
 //!
 //! **Work is bounded before it is started.** The body is read here, not left to the SDK, for one reason:
 //! the queue cannot classify a request it has not looked at, and a 429 that arrives after the embedding
@@ -73,6 +64,7 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use chrono::Utc;
+use futures_util::{StreamExt, stream};
 use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 use std::sync::Arc;
 
@@ -504,7 +496,38 @@ pub async fn admit(
         Some(session) => end_session(&gate, response, &session, &method),
     };
     drop(permit);
-    Ok(response)
+    Ok(gate_event_stream(response, lease))
+}
+
+/// End an SSE response without a frame on revocation, even if rmcp has queued an error or result.
+fn gate_event_stream(response: Response, lease: CredentialLease) -> Response {
+    if !response
+        .headers()
+        .get(CONTENT_TYPE)
+        .is_some_and(|content_type| content_type == "text/event-stream")
+    {
+        return response;
+    }
+
+    response.map(|body| {
+        // Keep the lease registered until the stream ends, including for a standalone GET stream.
+        let data = stream::unfold(
+            (body.into_data_stream(), lease),
+            |(mut body, lease)| async move {
+                let item = tokio::select! {
+                    biased;
+                    _ = lease.cancellation().cancelled() => return None,
+                    item = body.next() => item?,
+                };
+                // Cancellation may land while the underlying body is being polled.
+                if lease.is_cancelled() {
+                    return None;
+                }
+                Some((item, (body, lease)))
+            },
+        );
+        Body::from_stream(data.fuse())
+    })
 }
 
 /// The bearer token a hosted request presented, or `None`.

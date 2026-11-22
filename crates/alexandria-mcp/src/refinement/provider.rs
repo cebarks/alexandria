@@ -33,7 +33,6 @@ pub struct RouteProvider {
     proposer: Route,
     reviewer: Route,
     settings: WorkerSettings,
-    deadline: Instant,
 }
 
 impl RouteProvider {
@@ -43,7 +42,6 @@ impl RouteProvider {
             proposer: configured.routes().proposer().clone(),
             reviewer: configured.routes().reviewer().clone(),
             settings,
-            deadline: Instant::now() + Duration::from_secs(settings.pass_active_secs),
         }
     }
 }
@@ -67,9 +65,9 @@ impl WorkerProvider for RouteProvider {
             max_request_bytes: self.settings.max_request_bytes,
             max_response_bytes: self.settings.max_response_bytes,
             max_output_tokens: self.settings.max_output_tokens,
-            deadline: self
-                .deadline
-                .min(Instant::now() + Duration::from_secs(self.settings.request_deadline_secs)),
+            // This deadline covers one completion and its retries. The worker independently
+            // caps the active dispatch turn, which can include both primary and secondary calls.
+            deadline: Instant::now() + Duration::from_secs(self.settings.request_deadline_secs),
             quota: &quota,
         };
         self.client.complete(route, &request, cancel).await

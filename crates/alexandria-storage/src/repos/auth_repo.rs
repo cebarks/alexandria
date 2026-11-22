@@ -724,7 +724,7 @@ impl<'a> AuthRepo<'a> {
         lifetime: Duration,
         now: DateTime<Utc>,
     ) -> Result<MintedSecret, StorageError> {
-        self.create_link(credential_kind::INVITE, issuer, lifetime, now)
+        self.mint_link(credential_kind::INVITE, issuer, lifetime, now, None)
             .await
     }
 
@@ -737,18 +737,39 @@ impl<'a> AuthRepo<'a> {
         lifetime: Duration,
         now: DateTime<Utc>,
     ) -> Result<MintedSecret, StorageError> {
-        self.create_link(credential_kind::RECOVERY, account, lifetime, now)
+        self.mint_link(credential_kind::RECOVERY, account, lifetime, now, None)
             .await
+    }
+
+    /// The admin repo is the only caller. Commit the audit row and credential together so a
+    /// failed audit cannot leave a minted recovery link. Neither the secret nor its digest goes
+    /// into the audit.
+    pub(crate) async fn create_admin_recovery_link(
+        &self,
+        admin: &crate::access::AdminCapability,
+        account: &AccountId,
+        lifetime: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<MintedSecret, StorageError> {
+        self.mint_link(
+            credential_kind::RECOVERY,
+            account,
+            lifetime,
+            now,
+            Some(admin),
+        )
+        .await
     }
 
     /// The shared body of the two links. An authenticating kind is refused here, so a browser session or an
     /// agent token can only be created by the two paths above.
-    async fn create_link(
+    async fn mint_link(
         &self,
         kind: &str,
         account: &AccountId,
         lifetime: Duration,
         now: DateTime<Utc>,
+        admin: Option<&crate::access::AdminCapability>,
     ) -> Result<MintedSecret, StorageError> {
         if kind != credential_kind::INVITE && kind != credential_kind::RECOVERY {
             return Err(StorageError::InvalidInput(
@@ -763,15 +784,26 @@ impl<'a> AuthRepo<'a> {
         let state = self.mint_state(account).await?;
         let secret = BearerSecret::generate();
         let expires_at = now + lifetime;
-        let credential = self
-            .create_credential(
+        let credential = if let Some(admin) = admin {
+            self.create_audited_recovery(
+                account,
+                admin.account(),
+                secret.digest()?,
+                state.epoch,
+                now,
+                expires_at,
+            )
+            .await?
+        } else {
+            self.create_credential(
                 account,
                 &secret,
                 state.epoch,
                 now,
                 Draft::Link { kind, expires_at },
             )
-            .await?;
+            .await?
+        };
         Ok(MintedSecret {
             credential,
             secret,
@@ -858,6 +890,40 @@ impl<'a> AuthRepo<'a> {
             ))
         })?;
         CredentialId::try_from(created.id)
+    }
+
+    /// Use a typed handle for both writes; no audit attribution or ID is inferred from display text.
+    async fn create_audited_recovery(
+        &self,
+        target: &AccountId,
+        issuer: &AccountId,
+        digest: String,
+        auth_epoch: i64,
+        now: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<CredentialId, StorageError> {
+        let id = RecordId::new("credential", uuid::Uuid::new_v4().to_string());
+        self.db
+            .query(
+                "BEGIN TRANSACTION;
+                 CREATE $credential SET account = $target, kind = 'recovery', secret_digest = $digest,
+                     auth_epoch = $auth_epoch, expires_at = $expires_at, created_at = $now RETURN NONE;
+                 CREATE admin_recovery_log SET actor = $actor, target = $target,
+                     credential = $credential, created_at = $now RETURN NONE;
+                 COMMIT TRANSACTION;",
+            )
+            .bind(("credential", id.clone()))
+            .bind(("target", target.as_record_id().clone()))
+            .bind(("actor", issuer.as_record_id().clone()))
+            .bind(("digest", digest))
+            .bind(("auth_epoch", auth_epoch))
+            .bind(("expires_at", expires_at))
+            .bind(("now", now))
+            .await
+            .map_err(engine)?
+            .check()
+            .map_err(engine)?;
+        CredentialId::try_from(id)
     }
 
     // ---------------------------------------------------------------------------------------------

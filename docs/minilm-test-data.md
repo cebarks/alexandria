@@ -14,6 +14,8 @@ this corpus, as a near-paraphrase of it, and there is no question without a stor
 
 ## Running it
 
+**Dataset boundary:** the historical `bench-retrieval` command still operates on a stopped data directory with frozen target IDs and unscoped `MemoryRepo` reads. `ALEXANDRIA_DATA_DIR` selects the snapshot directory, not an account or scope. The storage `select_offline` authorization API exists, but this CLI has no workspace, Personal, project, assigned or Unassigned-review dataset selector. Do not point it at a multi-account or migrated owned store. Use only a disposable, authorized copy of the original isolated labeled corpus. The CLI may define HNSW on that copy. These results are not hosted prompt-path latency or scoped retrieval benchmarks.
+
 SurrealKV is single-writer, so the bench cannot share the data dir with a running server.
 Either stop the server for the run, or copy the data dir and point the bench at the copy —
 the copy keeps the server down only for the duration of a `cp`:
@@ -700,6 +702,8 @@ The retrieve floor derived in this pass was **0.36**, under a rule that has sinc
 0.338, because `nonhit_p99` (0.373) exceeds `hit_min`.
 
 ## Limitations
+
+- This historical corpus result does not measure scoped retrieval on migrated Unassigned data, cross-project behavior, or hosted client latency. The separate [refinement evaluation](../tools/refinement-evaluation/README.md) scores human-labeled fixture proposals and does not replace retrieval calibration.
 
 - **The questions were authored against the corpus.** All 20 were written by reading a stored
   fact and paraphrasing it into a question. Real prompts are not paraphrases of stored facts,

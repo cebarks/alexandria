@@ -1,4 +1,5 @@
 {% extends "layout.html" %}
+{% import "_refinement_enqueue.html" as e %}
 {% block title %}Quality proposal{% endblock %}
 {% block body %}
 <h1>Quality proposal {{ proposal_id }}</h1>
@@ -29,6 +30,15 @@
   {% else %}
   <button type="submit" formaction="/debug/refinement/proposals/{{ proposal_path|urlencode }}/revert">Revert</button>
   {% endif %}
+</form>
+{% endif %}
+{% if enqueue.enabled %}
+<form method="post" action="/debug/refinement/enqueue">
+  {{ e::version_fields(enqueue) }}
+  <input type="hidden" name="target" value="{{ proposal_path }}">
+  <input type="hidden" name="revision" value="{{ revision }}">
+  <button type="submit" name="action" value="opinion">Request a second opinion</button>
+  <button type="submit" name="action" value="regenerate">Request regeneration</button>
 </form>
 {% endif %}
 <section aria-labelledby="application-history-heading">
