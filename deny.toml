@@ -25,6 +25,12 @@ ignore = [
     # ships with SurrealDB 4.0.0. Tracked by the SurrealDB 4 upgrade:
     # https://github.com/cebarks/alexandria/issues/55
     "RUSTSEC-2026-0452",
+    # Explicitly accepted risk, NOT a crypto fix: official SurrealDB 4.0.1 pins
+    # JWT 10.4, whose WASM rust_crypto backend retains crypto-bigint 0.5.5.
+    # The inspected native Linux 4.0.1 graph uses AWS-LC instead. Reconsider if
+    # WASM support is introduced or this path becomes native; remove when the
+    # official dependency route admits patched crypto. See docs/dependency-advisories.md.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]
@@ -71,6 +77,8 @@ exceptions = [
     { allow = ["BUSL-1.1"], crate = "surrealdb-kvs-surrealkv" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-observe" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-parse-common" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-parser-next" },
+    { allow = ["BUSL-1.1"], crate = "surrealdb-stored-derive" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-protocol" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-rpc" },
     { allow = ["BUSL-1.1"], crate = "surrealdb-runtime" },

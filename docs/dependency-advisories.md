@@ -1,9 +1,11 @@
 # Dependency updates and outstanding policy gates
 
-The integrated feature carries the dependency versions below, **not** the main-branch
-`RUSTSEC-2026-0387` ignore or the two additional BUSL exceptions. Its `deny.toml` is unchanged
-from the signed feature checkpoint. The policy result and test counts on this page are historical
-main-branch evidence; they are not results for the combined feature or a release waiver.
+The integrated feature adopts main's `RUSTSEC-2026-0387` ignore and the two
+named BUSL-1.1 license exceptions below. This accepts an existing risk and two
+specific licenses; it does not fix the crypto issue or qualify the release.
+All-target/all-feature and workspace unmaintained checks remain in force.
+The main-branch policy result and test counts on this page are historical, not
+results for the combined feature.
 
 The main-branch update based on `64c25cb68b03a07e120f6ad6ac5ddf5bb699753c` had two phases:
 
@@ -19,9 +21,9 @@ The main-branch update based on `64c25cb68b03a07e120f6ad6ac5ddf5bb699753c` had t
 
 **Main's `just deny` passed under its changed policy. This was not an advisory-free
 dependency graph.** That scan used RustSec `02e2517f457a359fc6d3440ea4560c8ea188fee8`.
-Its one crypto ignore and two package-specific BUSL exceptions are recorded below for provenance
-only. The combined graph requires a fresh all-target/all-feature scan under the unchanged feature
-policy; do not present the original two main-branch phases as a same-policy “20 → 0 fixed.”
+The combined graph requires its own all-target/all-feature scan under the
+current policy. Do not present the original two main-branch phases as a
+same-policy “20 → 0 fixed.”
 
 ## Targeted updates
 
@@ -38,6 +40,7 @@ policy; do not present the original two main-branch phases as a same-policy “2
 | `surrealdb-core` | 3.3.0 | 4.0.1 | RUSTSEC-2026-0454 |
 | `surrealkv` | 0.21.4 | 1.2.0 | RUSTSEC-2026-0452 |
 | `zstd-sys` selected by the 4.0 resolution | 2.1.1+zstd.1.5.7 | 2.1.3+zstd.1.5.7 | RUSTSEC-2026-0410; patched range starts at 2.1.2 |
+| `url` (workspace and curator) | 2.5.8 | 2.5.9 with `form_urlencoded` 1.2.3 | RUSTSEC-2026-0592 |
 
 The 17 compatible fixes remain at their delivered versions. Updates use precise
 package selections, not an unconstrained workspace-wide refresh. The direct
@@ -56,9 +59,10 @@ an unnecessary 1.4.0 refresh. No forks, Git sources or source patches are used.
 The standalone curator lock retains the corresponding Tokio/TLS patches from
 the compatible phase; those are not counted as additional advisory removals.
 
-## Main's historical crypto exception: RUSTSEC-2026-0387
+## Accepted crypto risk: RUSTSEC-2026-0387
 
-Main added one advisory ignore that the feature does not carry. The selected engine has this route:
+The feature adopts exactly the advisory ignore already on main. The selected
+engine has this route:
 
 ```text
 SurrealDB 4.0.1 core/expr
@@ -72,9 +76,8 @@ The patched bigint range begins at **0.7.6**. A precise leaf update is outside
 `elliptic-curve`'s `^0.5` requirement. Current curve 0.14.3 admits bigint
 `^0.7.8`, and JWT 12 admits the newer curve parents, but the official engine's
 JWT `^10.4.0` requirement excludes JWT 12. Actual precise-update probes rejected
-those incompatible selections. That was the rationale for main's waiver
-under that dependency route, not evidence that the crypto bug was fixed or harmless.
-No waiver has been approved for the combined feature.
+those incompatible selections. That is the rationale for the waiver under
+this dependency route, not evidence that the crypto bug was fixed or harmless.
 
 All-feature inverse-tree checks for these exact native targets found no path
 to `crypto-bigint 0.5.5`; JWT uses its native AWS-LC route there:
@@ -93,11 +96,11 @@ native targets. Authentication is not removed or disabled.
 Any future risk decision must revisit the actual all-target graph and available
 official engine releases. A native-only runtime or tree does not clear the full-policy gate.
 
-## Main's historical license exceptions
+## Named license exceptions
 
-Main allowed two additional BUSL packages: `surrealdb-parser-next` and
-`surrealdb-stored-derive`. The combined feature does not extend its allowlist.
-Their BUSL text matches the previously reviewed engine
+The feature adopts the existing BUSL-1.1 allowances for
+`surrealdb-parser-next` and `surrealdb-stored-derive`. Their BUSL text matches
+the previously reviewed engine
 license (SHA-256
 `c6ced847ed26f18394b2bfdd73909f50b0a394d639305d592136014a5e6d262a`,
 change date 2030-11-03). There is no blanket BUSL allowance or unrelated license
@@ -129,7 +132,7 @@ Minimal query compatibility changes preserve the existing behavior:
 
 | Historical main-branch 4.0.1 validation | Result |
 | --- | --- |
-| Full `just deny` | Passed on main under its historical exceptions, not the merged feature policy. |
+| Full `just deny` | Passed on main under its historical exceptions and advisory snapshot; not evidence for the combined graph. |
 | Complete storage suite | Passed, including fresh-store/index tests and the frozen 3.3 physical-copy regression. |
 | Official 3.3/4.0.1 operators | Passed: conversion, rebuild/readiness/KnnScan, strict application JSON equality, vector/centroid preservation, source/LOCK receipts, graceful shutdown, default 4.0.1 reopen without opt-in. |
 | Exact `just ci` | Passed on the 4.0.1 state, using the worktree's own target and the recipe's flags. |
