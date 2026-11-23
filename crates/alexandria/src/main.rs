@@ -567,6 +567,11 @@ async fn serve_http(
         ));
     }
 
+    // Grab the handle before `server` moves into the MCP factory below. `/health` is a
+    // machine contract for supervisors (systemd watchdogs, container healthchecks,
+    // agent memory-status panels) — see `alexandria_mcp::health`.
+    let health_db = Arc::clone(&server.db);
+
     let service: StreamableHttpService<AlexandriaServer, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(server.clone()), sessions, http_config);
 
@@ -576,10 +581,11 @@ async fn serve_http(
             gate,
             alexandria_mcp::auth::admit,
         ))
+        .merge(alexandria_mcp::health::router(health_db))
         .merge(debug_router);
 
     tracing::info!(
-        "Alexandria ready, serving HTTP on http://{bind_addr}/mcp (debug UI at http://{bind_addr}/debug)"
+        "Alexandria ready, serving HTTP on http://{bind_addr}/mcp (debug UI at http://{bind_addr}/debug, health at http://{bind_addr}/health)"
     );
 
     // `ConnectInfo` is what makes the login/invite/recovery attempt budget key on the *peer address*.

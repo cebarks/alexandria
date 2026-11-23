@@ -8,13 +8,13 @@
  *
  * `ALEXANDRIA_CLIENT_CONFIG` is always pointed into this file's temp directory —
  * at a fixture, or at a name that is never created — so a developer's own
- * `~/.config/alexandria/client.toml` can never decide an expectation, and no case
+ * `~/.config/alexandria/client.json` can never decide an expectation, and no case
  * reads a real config file.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { makeScratchDir } from "./helpers.js";
 
@@ -37,38 +37,27 @@ const MANAGED_ENV = [
 	"ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS",
 	"ALEXANDRIA_PROMPT_BUDGET_MS",
 	"ANTHROPIC_API_KEY",
+	"XDG_CONFIG_HOME",
 ];
 
 /** A file that turns every knob off or to a non-default value, including a
  *  whitespace-padded project, so "the file said it" is distinguishable from
  *  "the default said it" for each field. */
-const FULL_TOML = [
-	"[server]",
-	'url = "http://127.0.0.1:9999/mcp"',
-	"",
-	"[recall]",
-	"enabled = false",
-	"limit = 7",
-	"min_similarity = 0.42",
-	"",
-	"[store]",
-	"enabled = false",
-	'extract_model = "test/extract-model"',
-	"extract_timeout_ms = 1234",
-	"",
-	"[reminders]",
-	"enabled = false",
-	'project = "  from-toml  "',
-].join("\n");
+const FULL_JSON = JSON.stringify({
+	server: { url: "http://127.0.0.1:9999/mcp", api_token: "ignored-fixture-token", project_id: "project:ignored" },
+	recall: { enabled: false, limit: 7, min_similarity: 0.42 },
+	store: { enabled: false, extract_model: "test/extract-model", extract_timeout_ms: 1234 },
+	reminders: { enabled: false, project: "  from-json  " },
+});
 
 const workspace = await makeScratchDir("alexandria-client-config-");
-/** A path that is never created: the "no client.toml at all" case. */
-const absentToml = join(workspace, "absent.toml");
-const fullToml = join(workspace, "full.toml");
-const brokenToml = join(workspace, "broken.toml");
+/** A path that is never created: the "no client.json at all" case. */
+const absentJson = join(workspace, "absent.json");
+const fullJson = join(workspace, "full.json");
+const brokenJson = join(workspace, "broken.json");
 await Promise.all([
-	writeFile(fullToml, FULL_TOML, "utf8"),
-	writeFile(brokenToml, "this is not = valid toml [[[", "utf8"),
+	writeFile(fullJson, FULL_JSON, "utf8"),
+	writeFile(brokenJson, "this is not valid JSON [[[", "utf8"),
 ]);
 
 let instances = 0;
@@ -104,7 +93,7 @@ async function configWith(
 }
 
 test("no env and no file: every feature is on, and the defaults hold", async () => {
-	const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: absentToml });
+	const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: absentJson });
 	assert.equal(config.serverUrl, "http://127.0.0.1:3000/mcp");
 	assert.equal(config.apiToken, undefined);
 	assert.equal(config.projectId, undefined);
@@ -117,18 +106,18 @@ test("no env and no file: every feature is on, and the defaults hold", async () 
 	assert.equal(config.promptBudgetMs, 10000);
 });
 
-test("transport timeouts load from client.toml and environment overrides", async () => {
-	const transportToml = join(workspace, "transport.toml");
+test("transport timeouts load from client.json and environment overrides", async () => {
+	const transportJson = join(workspace, "transport.json");
 	await writeFile(
-		transportToml,
-		"[transport]\nprompt_call_timeout_ms = 1200\nprompt_budget_ms = 4000\n",
+		transportJson,
+		JSON.stringify({ transport: { prompt_call_timeout_ms: 1200, prompt_budget_ms: 4000 } }),
 		"utf8",
 	);
-	const fromFile = await configWith({ ALEXANDRIA_CLIENT_CONFIG: transportToml });
+	const fromFile = await configWith({ ALEXANDRIA_CLIENT_CONFIG: transportJson });
 	assert.equal(fromFile.promptCallTimeoutMs, 1200);
 	assert.equal(fromFile.promptBudgetMs, 4000);
 	const fromEnv = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: transportToml,
+		ALEXANDRIA_CLIENT_CONFIG: transportJson,
 		ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS: "2500",
 		ALEXANDRIA_PROMPT_BUDGET_MS: "8000",
 	});
@@ -145,15 +134,41 @@ test("transport timeout configuration rejects invalid bounds instead of clamping
 	];
 	for (const env of invalidConfigs) {
 		await assert.rejects(
-			configWith({ ALEXANDRIA_CLIENT_CONFIG: absentToml, ...env }),
+			configWith({ ALEXANDRIA_CLIENT_CONFIG: absentJson, ...env }),
 			/transport.*(positive|finite|120000|less than or equal)/i,
 		);
 	}
 });
 
+test("default config path selects client.json instead of legacy TOML", async () => {
+	const base = join(workspace, "xdg-default");
+	await mkdir(join(base, "alexandria"), { recursive: true });
+	await writeFile(join(base, "alexandria", "client.toml"), "[recall]\nlimit = 6\n");
+	const withoutJson = await configWith({ XDG_CONFIG_HOME: base });
+	assert.equal(withoutJson.recallLimit, 10);
+	await writeFile(join(base, "alexandria", "client.json"), '{"recall":{"limit":19}}');
+	const withJson = await configWith({ XDG_CONFIG_HOME: base });
+	assert.equal(withJson.recallLimit, 19);
+});
+
+test("a blank client config path uses the default JSON location", async () => {
+	const base = join(workspace, "blank-path-xdg");
+	await mkdir(join(base, "alexandria"), { recursive: true });
+	await writeFile(join(base, "alexandria", "client.json"), '{"recall":{"limit":12}}');
+	const config = await configWith({ XDG_CONFIG_HOME: base, ALEXANDRIA_CLIENT_CONFIG: "  " });
+	assert.equal(config.recallLimit, 12);
+});
+
+test("a nonblank client config path preserves significant whitespace", async () => {
+	const path = join(workspace, "client with spaces ");
+	await writeFile(path, '{"recall":{"limit":13}}');
+	const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: path });
+	assert.equal(config.recallLimit, 13);
+});
+
 test("legacy ALEXANDRIA_AUTO_RECALL=off disables recall alone", async () => {
 	const config = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: absentToml,
+		ALEXANDRIA_CLIENT_CONFIG: absentJson,
 		ALEXANDRIA_AUTO_RECALL: "off",
 	});
 	assert.equal(config.recallDisabled, true);
@@ -166,7 +181,7 @@ test("obsolete extraction environment settings are ignored with upgrade guidance
 	console.warn = (message?: unknown) => warnings.push(String(message));
 	try {
 		const config = await configWith({
-			ALEXANDRIA_CLIENT_CONFIG: absentToml,
+			ALEXANDRIA_CLIENT_CONFIG: absentJson,
 			ALEXANDRIA_AUTO_STORE: "off",
 			ALEXANDRIA_EXTRACT_MODEL: "legacy/model",
 			ALEXANDRIA_EXTRACT_TIMEOUT_MS: "1234",
@@ -186,24 +201,27 @@ test("obsolete extraction environment settings are ignored with upgrade guidance
 
 test("ALEXANDRIA_REMINDERS=off disables reminders alone", async () => {
 	const config = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: absentToml,
+		ALEXANDRIA_CLIENT_CONFIG: absentJson,
 		ALEXANDRIA_REMINDERS: "off",
 	});
 	assert.equal(config.remindersDisabled, true);
 	assert.equal(config.recallDisabled, false);
 });
 
-test("client.toml drives active fields but stale extraction keys do not disable behavior", async () => {
+test("client.json drives active fields but cannot supply credentials or enable legacy extraction", async () => {
 	const warnings: string[] = [];
 	const originalWarn = console.warn;
 	console.warn = (message?: unknown) => warnings.push(String(message));
 	let config: typeof import("../src/config.js").CONFIG;
 	try {
-		config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: fullToml });
+		config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: fullJson });
 	} finally {
 		console.warn = originalWarn;
 	}
 	assert.equal(config.serverUrl, "http://127.0.0.1:9999/mcp");
+	assert.equal(config.apiToken, undefined);
+	assert.equal(config.projectId, undefined);
+	assert.ok(!("storeDisabled" in config));
 	assert.equal(config.recallDisabled, true);
 	assert.equal(config.remindersDisabled, true);
 	assert.equal(config.recallLimit, 7);
@@ -213,12 +231,12 @@ test("client.toml drives active fields but stale extraction keys do not disable 
 	assert.match(warnings[0], /store.extract_model/);
 	assert.match(warnings[0], /store.extract_timeout_ms/);
 	// The target the server matches is trimmed on the way in, not sent padded.
-	assert.equal(config.remindersProject, "from-toml");
+	assert.equal(config.remindersProject, "from-json");
 });
 
-test("explicit env beats client.toml in both directions", async () => {
+test("explicit env beats client.json in both directions", async () => {
 	const config = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: fullToml,
+		ALEXANDRIA_CLIENT_CONFIG: fullJson,
 		ALEXANDRIA_URL: "http://127.0.0.1:4000/mcp",
 		// Not "off": any set value counts as an explicit choice, so the file's
 		// `enabled = false` cannot leave a feature dead after the user opts back in.
@@ -236,7 +254,7 @@ test("explicit env beats client.toml in both directions", async () => {
 
 test("API token and project ID are dedicated environment settings", async () => {
 	const config = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: absentToml,
+		ALEXANDRIA_CLIENT_CONFIG: absentJson,
 		ALEXANDRIA_API_TOKEN: "companion-token",
 		ALEXANDRIA_PROJECT_ID: " project:owned ",
 		ANTHROPIC_API_KEY: "provider-token",
@@ -245,9 +263,9 @@ test("API token and project ID are dedicated environment settings", async () => 
 	assert.equal(config.projectId, "project:owned");
 });
 
-test("ALEXANDRIA_REMINDERS_PROJECT beats client.toml and arrives trimmed", async () => {
+test("ALEXANDRIA_REMINDERS_PROJECT beats client.json and arrives trimmed", async () => {
 	const config = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: fullToml,
+		ALEXANDRIA_CLIENT_CONFIG: fullJson,
 		ALEXANDRIA_REMINDERS_PROJECT: "  alexandria  ",
 	});
 	assert.equal(config.remindersProject, "alexandria");
@@ -258,23 +276,46 @@ test("a whitespace-only ALEXANDRIA_REMINDERS_PROJECT falls through to the file",
 	// target exactly, so a padded or empty project silently degrades delivery to
 	// escalation-only. Falling through to the file keeps delivery working.
 	const config = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: fullToml,
+		ALEXANDRIA_CLIENT_CONFIG: fullJson,
 		ALEXANDRIA_REMINDERS_PROJECT: "   ",
 	});
-	assert.equal(config.remindersProject, "from-toml");
+	assert.equal(config.remindersProject, "from-json");
 });
 
-test("an unparseable client.toml falls back to defaults instead of throwing", async () => {
+test("an unparseable client.json falls back to defaults instead of throwing", async () => {
 	// config.ts warns about the path it could not read — that line on stdout is
 	// expected. What the prompt path depends on is a usable CONFIG either way.
-	const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: brokenToml });
+	const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: brokenJson });
 	assert.equal(config.remindersDisabled, false);
 	assert.equal(config.recallDisabled, false);
 	assert.equal(config.recallLimit, 10);
 	assert.equal(config.remindersProject, undefined);
 });
 
-test("a set-but-blank toggle does not re-enable what client.toml disabled", async () => {
+test("an unreadable config warns before falling back to defaults", async (t) => {
+	if (process.platform === "win32" || process.getuid?.() === 0) {
+		t.skip("POSIX permissions are needed for this check");
+		return;
+	}
+	const parent = join(workspace, "unreadable");
+	await mkdir(parent);
+	const path = join(parent, "client.json");
+	await writeFile(path, '{"recall":{"enabled":false}}');
+	const warnings: string[] = [];
+	const originalWarn = console.warn;
+	console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+	await chmod(parent, 0o000);
+	try {
+		const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: path });
+		assert.equal(config.recallDisabled, false);
+		assert.ok(warnings.some((warning) => warning.includes("failed to read or parse") && warning.includes(path)));
+	} finally {
+		await chmod(parent, 0o700);
+		console.warn = originalWarn;
+	}
+});
+
+test("a set-but-blank toggle does not re-enable what client.json disabled", async () => {
 	// `ALEXANDRIA_REMINDERS=` in a direnv or .env is not a user saying "off", and
 	// gating the file branch on `process.env.X === undefined` let a blank value win
 	// the precedence race by being *present* — silently putting the consuming
@@ -285,7 +326,7 @@ test("a set-but-blank toggle does not re-enable what client.toml disabled", asyn
 	] as const) {
 		for (const blank of ["", "   "]) {
 			const config = await configWith({
-				ALEXANDRIA_CLIENT_CONFIG: fullToml,
+				ALEXANDRIA_CLIENT_CONFIG: fullJson,
 				[key]: blank,
 			});
 			assert.equal(
@@ -300,12 +341,12 @@ test("a set-but-blank toggle does not re-enable what client.toml disabled", asyn
 test("an explicit env value still overrides the file in both directions", async () => {
 	// The blank cases above must not have quietly broken the real contract.
 	const off = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: absentToml,
+		ALEXANDRIA_CLIENT_CONFIG: absentJson,
 		ALEXANDRIA_REMINDERS: "off",
 	});
 	assert.equal(off.remindersDisabled, true);
 	const padded = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: fullToml,
+		ALEXANDRIA_CLIENT_CONFIG: fullJson,
 		ALEXANDRIA_REMINDERS: "  off  ",
 	});
 	assert.equal(padded.remindersDisabled, true, "a padded ' off ' means off");
@@ -321,7 +362,7 @@ test("a blank or unparseable numeric override falls back instead of becoming 0 o
 	]) {
 		for (const junk of ["", "  ", "ten", "1e999"]) {
 			const config = await configWith({
-				ALEXANDRIA_CLIENT_CONFIG: absentToml,
+				ALEXANDRIA_CLIENT_CONFIG: absentJson,
 				[key]: junk,
 			});
 			const value =
@@ -332,10 +373,10 @@ test("a blank or unparseable numeric override falls back instead of becoming 0 o
 	}
 	// A real number still wins over the file, and the file still wins over defaults.
 	const numeric = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: fullToml,
+		ALEXANDRIA_CLIENT_CONFIG: fullJson,
 		ALEXANDRIA_AUTO_RECALL_LIMIT: "3",
 	});
 	assert.equal(numeric.recallLimit, 3);
-	const fromFile = await configWith({ ALEXANDRIA_CLIENT_CONFIG: fullToml });
+	const fromFile = await configWith({ ALEXANDRIA_CLIENT_CONFIG: fullJson });
 	assert.equal(fromFile.recallLimit, 7);
 });

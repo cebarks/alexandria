@@ -617,11 +617,13 @@ async fn review_population_locked_point_read_detects_a_post_check_visibility_cha
         let outcome = tx.commit().await;
         assert_eq!(outcome.is_err(), locked, "locked={locked}: {outcome:?}");
         if let Err(error) = outcome {
-            // The pinned embedded commit API erases kinds. The mutation_repo unit controls exercise
-            // the production commit mapping on real mem/persistent conflicts, not just this raw SDK error.
-            assert!(error.is_internal(), "SDK boundary changed: {error:?}");
-            assert!(error.query_details().is_none());
-            assert!(error.cause().is_none());
+            assert!(
+                matches!(
+                    error.query_details(),
+                    Some(surrealdb::types::QueryError::TransactionConflict)
+                ),
+                "locked commit must reject with a typed write conflict: {error:?}"
+            );
             assert_eq!(f.cluster_row(&group).await.centroid, vec![1.0, 0.0]);
         } else {
             assert_eq!(f.cluster_row(&group).await.centroid, vec![0.5, 0.5]);

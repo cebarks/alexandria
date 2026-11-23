@@ -9,6 +9,17 @@ Alexandria loads server config with this precedence:
    - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
 3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_SERVER_PUBLIC_ORIGIN`, `ALEXANDRIA_SERVER_LOOPBACK_DEVELOPMENT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_EMBEDDING_BATCH_SIZE`, `ALEXANDRIA_EMBEDDING_MAX_TOKENS`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
 
+## Storage engine upgrades
+
+The embedded engine is pinned to SurrealDB 4.0.1. Keep the existing data path and
+embedding identity/token budget unchanged until the [offline copy-first upgrade
+procedure](surrealdb-4-upgrade.md) is complete and an operator separately approves
+cutover. `SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X` is an **external SurrealDB operator**
+option forwarded by `surreal start`, not an Alexandria config key or a global
+application migration switch. Ordinary startup refuses unconverted 3.x files
+and does not rebuild old HNSW indexes automatically. Never use embedding migration
+or identity overrides to bypass a physical-format refusal.
+
 ## Full Example
 
 ```toml
@@ -461,39 +472,69 @@ The bundled [Containerfile](../Containerfile) selects HTTP and a bind address by
 
 ## Client Configuration
 
-The Pi companion (recall and reminders, no automatic stores) uses `$XDG_CONFIG_HOME/alexandria/client.toml`, or `~/Library/Application Support/alexandria/client.toml` on macOS without XDG. It does not read `config.toml`. Claude's hook uses its own fixed timeouts; see the [Claude guide](../contrib/claude/README.md).
+The Pi companion extension (recall and reminders, no automatic memory writers) loads its own JSON
+config from `$XDG_CONFIG_HOME/alexandria/client.json`. The server never reads it and the extension
+never reads `config.toml`. When `XDG_CONFIG_HOME` is unset, the client uses `~/.config` on Linux or
+`~/Library/Application Support` on macOS. Claude's hook uses its own fixed timeouts; see the
+[Claude guide](../contrib/claude/README.md).
 
-Precedence: defaults → `client.toml` → `ALEXANDRIA_CLIENT_CONFIG` env var (path to alt TOML) → individual `ALEXANDRIA_*` env vars.
+The file is selected by `ALEXANDRIA_CLIENT_CONFIG`, if set, or by the default path. Precedence is
+built-in defaults → selected JSON file → individual `ALEXANDRIA_*` env vars. Blank recall and
+reminder overrides are treated as unset; invalid numeric recall overrides fall back to the file/default.
+Transport values are validated separately below. An unreadable or invalid JSON file warns and
+falls back to defaults at startup.
+
+**Breaking change:** The companion no longer reads `client.toml`. Convert any existing client file
+manually to JSON, preserving its keys, and point `ALEXANDRIA_CLIENT_CONFIG` to the JSON file if set.
+There is no automatic migration or TOML fallback. This does not change the server's TOML config.
+
+In Pi, `/alexandria` edits the enabled state, limit, and minimum similarity through an interactive
+menu. It saves to the selected file and changes subsequent prompts in that process; other running Pi
+processes need a reload. A valid environment override remains authoritative and the menu shows both
+the effective and saved values. The menu rejects invalid inputs and refuses to overwrite invalid or unreadable JSON, a read-only
+file, a hard-linked file, duplicate object keys, or numbers that would lose precision. It updates the
+target of a symlink and preserves unrelated JSON values. It also refuses group/world-writable
+non-sticky ancestor directories. Menu saves require no external filesystem metadata tools. They are
+supported on Linux and macOS; Windows menu writes are currently refused because the directory
+ownership check is not available there. The macOS path has not yet been tested on a real Mac.
+
+The same-directory replacement preserves the ordinary Unix mode bits, but it creates a new inode:
+ownership, ACLs, extended attributes, special mode bits, and inode flags are **not** preserved.
+Effective access can therefore change even when the displayed mode bits are the same. If those
+attributes matter for your config, edit the JSON manually instead. Before rename, the temporary file
+uses the original mode but can have a different group; if it is group-writable, a member of that group
+who can access it may alter the staged JSON, even if they could not write the original file. Use an
+owner-only config mode or directory when that risk matters.
+
+The lock serializes **companion writers only**. The writer checks for other changes before rename,
+but an editor that ignores the lock can still save between that check and the rename; do not edit the
+file externally while a menu save is in progress. A crash can leave `<config>.lock`; check that no
+other writer is active before removing it. The same-directory rename persists across ordinary Pi
+restarts but does not call `fsync`, so sudden-power-loss durability is not guaranteed. Other JSON
+formatting may be normalized when saved.
 
 ### Full Example
 
-```toml
-[server]
-url = "http://127.0.0.1:3000/mcp"
-
-[recall]
-enabled = true
-limit = 10
-min_similarity = 0.45
-
-[transport]
-prompt_call_timeout_ms = 5000
-prompt_budget_ms = 10000
-
-[reminders]
-enabled = true
-# Optional: project = "project:7" # An owned canonical handle, not a repository name.
+```json
+{
+  "server": { "url": "http://127.0.0.1:3000/mcp" },
+  "recall": { "enabled": true, "limit": 10, "min_similarity": 0.45 },
+  "transport": { "prompt_call_timeout_ms": 5000, "prompt_budget_ms": 10000 },
+  "reminders": { "enabled": true }
+}
 ```
 
-### `[server]`
+### `server`
 
 | Key | Type | Default | Env Override | Description |
 |-----|------|---------|-------------|-------------|
 | `url` | string | `"http://127.0.0.1:3000/mcp"` | `ALEXANDRIA_URL` | Alexandria MCP server endpoint URL. |
 
-Set `ALEXANDRIA_API_TOKEN` in the client environment for HTTP bearer authentication (not TOML); `ALEXANDRIA_PROJECT_ID` can override resolution with a known owned project handle. See the [Pi guide](../contrib/pi/README.md#project-context).
+Set `ALEXANDRIA_API_TOKEN` in the client environment for HTTP bearer authentication, not in JSON.
+`ALEXANDRIA_PROJECT_ID` can override remote-based resolution with a known owned project handle.
+See the [Pi guide](../contrib/pi/README.md#project-context).
 
-### `[recall]`
+### `recall`
 
 | Key | Type | Default | Env Override | Description |
 | ----- | ------ | --------- | ------------- | ------------- |
@@ -501,27 +542,51 @@ Set `ALEXANDRIA_API_TOKEN` in the client environment for HTTP bearer authenticat
 | `limit` | number | `10` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. It is not merely a cap — a target ranked below it cannot be surfaced by any threshold, so it is a recall lever in its own right, and the stronger of the two. A judgement call on a small hand-authored question set, not a measurement — the questions were written against facts already in the corpus and none lacks a target (see [docs/minilm-test-data.md](minilm-test-data.md), "Limitations"). What the 2026-09-09 limit × threshold grid on an 880-fact corpus showed ("Result limit"): delivery saturates at `10`, because the worst of the 12 benchmark target ranks is 9, so `15` and `20` add non-target memories and no hits. Was `5` until that pass, which hid 3 of the 11 targets that cleared the then-default threshold on score. Lowering it below `3` also silently narrows spreading activation (`activation.top_n`). |
 | `min_similarity` | number | `0.45` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. A judgement call read off the same grid, with the same caveats; the grid counts how many of 12 known targets a threshold actually delivers *through* `limit`. **Read it together with `limit` — the two are not independent.** At `limit = 10`: `0.45` delivers 8/12 at ~1.0 non-targets per prompt, `0.35` delivers 11/12 at ~4.7, `0.50` delivers 7/12 at ~0.5, and the old `0.58` Pi default delivers only 4/12 — it assumed genuine matches score 0.6+ and drops two thirds of real hits. `0.40` was dominated on that 12-question grid (same 8 delivered as `0.45`, roughly double the noise); with the 20-question set it delivers 16/20 at ~3.0 against `0.45`'s 14/20 at ~1.65, a genuine trade that the strict-dominance rule used to pick the pair does not take. `0.45` is chosen as the frontier pick: paired with `limit = 10` it delivers what the previous `5`/`0.35` pair did at a third of the injection. Note that `0.45` is only on the frontier *because* the limit is 10 — at `limit = 5` it was dominated by `0.50`, so do not lower one without revisiting the other. It is not free: the weakest target scores 0.338 and falls below it. |
 
-### `[transport]`
+### `transport`
 
 | Key | Default | Env Override |
 | --- | --- | --- |
 | `prompt_call_timeout_ms` | `5000` ms | `ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS` |
 | `prompt_budget_ms` | `10000` ms | `ALEXANDRIA_PROMPT_BUDGET_MS` |
 
-Values must be positive and finite, with call timeout ≤ shared prompt budget ≤ `120000` ms. The shared deadline includes project resolution, any in-path handshake, recall, reminder checks and reconnect; native Pi MCP tools are independent. The companion also prewarms its connection; its SDK handshake has a 5 s ceiling. These are timeout settings, not measured hosted latency. Legacy `[store]` and the old extraction environment variables are ignored with a warning; explicit agent stores remain available.
+Values must be positive and finite, with call timeout ≤ shared prompt budget ≤ `120000` ms. The shared deadline includes project resolution, any in-path handshake, recall, reminder checks and reconnect; native Pi MCP tools are independent. The companion also prewarms its connection; its SDK handshake has a 5 s ceiling. These are timeout settings, not measured hosted latency. Legacy `store` settings and the old extraction environment variables are ignored with a warning; explicit agent stores remain available.
 
-### `[reminders]`
+### `reminders`
 
-Client-side delivery keys. The server-side `[reminders]` section above configures how
-schedules are interpreted; this section only says whether the extension asks for due reminders, and
-what project hint it sends with the question.
+Client-side delivery setting. The server-side `[reminders]` section above configures how
+schedules are interpreted; this setting controls whether the companion checks them automatically.
 
 | Key | Type | Default | Env Override | Description |
 | ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_REMINDERS=off` | Call `check_reminders` on every prompt and inject whatever is due. The server runs no timer, so turning this off means reminders reach the user only if the agent calls `check_reminders` itself. |
-| `project` | string | (resolved current project, if known) | `ALEXANDRIA_REMINDERS_PROJECT` | Optional owned `project:<opaque-id>` override for reminder checks. Otherwise uses the companion's resolved project, or a context-free check if none is known. A context-free check receives only the account's global and eligible escalated reminders; an invalid supplied context is refused. |
+
+The authenticated dispatcher passes the same issued project ID to recall and reminder checks.
+It refuses pending dispatches or retries if the resolved endpoint or bearer identity has changed.
+Without project context, a check receives only that account's global and eligible escalated reminders.
+The legacy `reminders.project` / `ALEXANDRIA_REMINDERS_PROJECT` inputs do not select a project for
+this dispatcher. Use `ALEXANDRIA_PROJECT_ID` with an issued ID if an override is needed.
 
 ---
+
+### Hermes Agent companion
+
+The Hermes provider reads `memory.alexandria` in Hermes' `config.yaml`, not the Pi client
+configuration above. See [the Hermes reference](../contrib/hermes/README.md#configuration)
+for all provider settings and [the recommended setup](../contrib/hermes/README.md#install)
+for Alexandria-only curated memory. Set `memory.provider: alexandria`,
+`memory.memory_enabled: false`, and `memory.user_profile_enabled: false`, while retaining
+the `memory` toolset. These native-store flags do not disable the external provider or
+redirect Hermes' SQLite conversation history.
+
+The provider requires `ALEXANDRIA_API_TOKEN` from the Hermes process environment. Optional
+`ALEXANDRIA_PROJECT_ID` supplies an issued project ID; without one, recall and explicit stores
+are confined to Personal. The former `auto_store`, `extract`, and `store_session` settings are ignored.
+Turn and session hooks never capture memories, submit transcripts, or persist Alexandria sessions.
+Writes require explicit native tool calls. No built-in-memory mirroring is performed.
+Automatic reminder consumption is primary-foreground-only and never cached. Hermes currently
+skips provider prefetch on trivial prompts, so automatic delivery waits for a nontrivial foreground
+prompt; explicit `alexandria_check_reminders` remains available. Host timeouts still make
+presentation best-effort rather than guaranteed.
 
 ## Legacy Migration
 

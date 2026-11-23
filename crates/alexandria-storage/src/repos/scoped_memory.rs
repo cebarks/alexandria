@@ -60,9 +60,8 @@ pub const MAX_KNN_K: usize = crate::repos::memory_repo::HNSW_EF;
 /// The label is *derived*, never parsed and never supplied by a caller: [`RetrievalStrategy::for_index`]
 /// is the one function that maps "the index is there" onto both the operator argument inside
 /// [`ScopedMemoryRepo::nearest_statement`] and the word in a response, so the two cannot disagree about
-/// what ran. `AGENTS.md` records why that matters on 3.3: the numeric-ef form with no index behind it
-/// matches **no rows**, so a wrong `Indexed` is indistinguishable from an empty population to everyone
-/// but the plan.
+/// what ran. SurrealDB 4.0 rejects numeric-ef search without an eligible index, so the exact path
+/// is what serves scoped results when boot could not define one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrievalStrategy {
     Indexed,
@@ -310,9 +309,8 @@ impl<'a> ScopedMemoryRepo<'a> {
     /// The kNN statement [`Self::nearest`] issues, as text.
     ///
     /// Named rather than inlined, and public rather than crate-private, for one reason each: the query
-    /// plan is the only thing that can tell an index scan from a brute-force scan (the rows cannot, and
-    /// on 3.3 the numeric-ef form with no index behind it returns *no rows at all*, which a row count
-    /// reads as a correctly emptied population), and the durable gate that checks it lives in
+    /// plan is what tells an index scan from a brute-force scan, not the rows. On 4.0 the numeric-ef
+    /// form without an index errors. The durable gate that checks the plan lives in
     /// `tests/scoped_retrieval_test.rs`, outside this crate. Either way the gate runs the text
     /// production runs, never a string a test assembled to look like it.
     ///
@@ -551,8 +549,7 @@ impl<'a> ScopedMemoryRepo<'a> {
     /// filters. Split out so a plan test can be shown to run the shipped text.
     fn list_statement(&self, page: &FactListQuery<'_>) -> String {
         format!(
-            "SELECT *{} FROM fact WHERE {} AND {} ORDER BY {} LIMIT $limit START $offset;",
-            page.sort.projection(),
+            "SELECT * FROM fact WHERE {} AND {} ORDER BY {} LIMIT $limit START $offset;",
             self.read.conjunct(),
             // The filter half is `MemoryRepo`'s own builder, reached rather than restated: a fourth
             // live-predicate spelling is how `quarantined_at = NONE` gets forgotten by one page.
@@ -606,9 +603,8 @@ impl<'a> ScopedMemoryRepo<'a> {
 
     /// Tag frequencies across the caller's live facts, highest first, capped.
     ///
-    /// Same flatten-in-SQL, tally-in-Rust shape as `MemoryRepo::top_tags` (that workaround is recorded
-    /// there), with the population conjunct added — a tag bar chart is a content-derived aggregate and
-    /// is therefore the caller's own or nothing.
+    /// Project only tags and tally every occurrence in Rust: SurrealDB 4.x's `array::group`
+    /// discards repeated arrays. The scoped population stays in the database query.
     pub async fn top_tags(&self, limit: usize) -> Result<Vec<(String, usize)>, StorageError> {
         #[derive(SurrealValue)]
         struct TagRow {
@@ -617,17 +613,16 @@ impl<'a> ScopedMemoryRepo<'a> {
         let mut response = self
             .read
             .apply(self.db.query(format!(
-                "SELECT array::flatten(array::group(tags)) AS tags FROM fact WHERE {} AND \
-                 deleted = false AND quarantined_at = NONE GROUP ALL;",
+                "SELECT tags FROM fact WHERE {} AND deleted = false AND quarantined_at = NONE;",
                 self.read.conjunct()
             )))
             .await
             .map_err(internal)?
             .check()
             .map_err(internal)?;
-        let row: Option<TagRow> = response.take(0).map_err(internal)?;
+        let rows: Vec<TagRow> = response.take(0).map_err(internal)?;
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for tag in row.map(|row| row.tags).unwrap_or_default() {
+        for tag in rows.into_iter().flat_map(|row| row.tags) {
             *counts.entry(tag).or_default() += 1;
         }
         let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
@@ -1331,6 +1326,38 @@ mod tests {
             rows.len(),
             2,
             "the indexed scoped kNN returned no rows while its plan claims an index scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_tag_frequencies_count_repeated_live_rows_only() {
+        let (db, owner, scope) = fixture().await;
+        let repo = ScopedMemoryRepo::new(db.inner(), &owner, &scope);
+        let tags = ["repeat".to_owned(), "also".to_owned()];
+        for content in ["first live fact", "second live fact"] {
+            repo.create_fact(
+                content,
+                0.5,
+                &[0.9, 0.1],
+                &tags,
+                WriteTarget::Personal,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        }
+        crate::repos::MemoryRepo::new(db.inner())
+            .create_fact(
+                "legacy unowned fact",
+                0.5,
+                &[0.9, 0.1],
+                &["legacy".to_owned()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.top_tags(10).await.unwrap(),
+            [("also".to_owned(), 2), ("repeat".to_owned(), 2)]
         );
     }
 

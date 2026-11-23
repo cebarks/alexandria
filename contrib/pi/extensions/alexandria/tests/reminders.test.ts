@@ -18,7 +18,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { basename, join } from "node:path";
 import {
-	absentClientToml,
+	absentClientJson,
 	execFileAsync,
 	extensionRoot,
 	gitToplevel,
@@ -27,8 +27,8 @@ import {
 } from "./helpers.js";
 
 // Hermetic baseline for the config singleton this module pulls in: no project
-// override from the shell, and no real client.toml on disk to supply one.
-process.env.ALEXANDRIA_CLIENT_CONFIG = absentClientToml;
+// override from the shell, and no real client.json on disk to supply one.
+process.env.ALEXANDRIA_CLIENT_CONFIG = absentClientJson;
 delete process.env.ALEXANDRIA_REMINDERS_PROJECT;
 
 const { formatDueBlock, getProjectHint, __resetProjectHint } = await import(

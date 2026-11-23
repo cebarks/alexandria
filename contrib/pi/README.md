@@ -26,6 +26,7 @@ For project-scoped work, resolve the project first with `mcp__alexandria__resolv
 
 The extension does two prompt-time tasks: it retrieves relevant memories and injects them before the agent starts, and it calls `check_reminders` once per prompt. It does not detect corrections/preferences/errors to store and does not run session-end LLM extraction. If you relied on those automatic writers, use the authenticated MCP tools explicitly as directed by the skill.
 
+The extension needs its own installed `@modelcontextprotocol/client` runtime dependency.
 Install:
 
 ```bash
@@ -44,39 +45,30 @@ A configured `ALEXANDRIA_PROJECT_ID` is passed to `resolve_project` and must ide
 
 ### Configuration
 
-The companion reads `$XDG_CONFIG_HOME/alexandria/client.toml` (on macOS, `~/Library/Application Support/alexandria/client.toml` unless `XDG_CONFIG_HOME` is set). `ALEXANDRIA_CLIENT_CONFIG` selects an alternate file. Precedence is defaults → file → individual environment variables. Environment variables override file values.
+The companion reads `$XDG_CONFIG_HOME/alexandria/client.json` (on macOS,
+`~/Library/Application Support/alexandria/client.json` unless `XDG_CONFIG_HOME` is set).
+`ALEXANDRIA_CLIENT_CONFIG` selects an alternate JSON file. Precedence is defaults → selected file
+→ individual environment variables. Convert any old `client.toml` manually; server configuration
+remains TOML. Run `/alexandria` in interactive Pi to inspect or edit the saved recall settings.
+The menu does not override environment values or change credentials, project scope, or reminders.
 
-```toml
-[server]
-url = "http://127.0.0.1:3000/mcp"
-
-[recall]
-enabled = true
-limit = 10
-min_similarity = 0.45
-
-[reminders]
-enabled = true
-
-[transport]
-prompt_call_timeout_ms = 5000
-prompt_budget_ms = 10000
+```json
+{
+  "server": { "url": "http://127.0.0.1:3000/mcp" },
+  "recall": { "enabled": true, "limit": 10, "min_similarity": 0.45 },
+  "reminders": { "enabled": true },
+  "transport": { "prompt_call_timeout_ms": 5000, "prompt_budget_ms": 10000 }
+}
 ```
 
-| Setting | Default | Environment override | Meaning |
-| --- | ---: | --- | --- |
-| `[server].url` | `http://127.0.0.1:3000/mcp` | `ALEXANDRIA_URL` | MCP endpoint |
-| `[recall].enabled` | `true` | `ALEXANDRIA_AUTO_RECALL=off` | Disable automatic prompt recall |
-| `[recall].limit` | `10` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Retrieval limit |
-| `[recall].min_similarity` | `0.45` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Client-side injection threshold; measured with limit 10 |
-| `[reminders].enabled` | `true` | `ALEXANDRIA_REMINDERS=off` | Disable per-prompt reminder checks |
-| `[transport].prompt_call_timeout_ms` | `5000` ms | `ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS` | Maximum duration of an individual prompt-path MCP call |
-| `[transport].prompt_budget_ms` | `10000` ms | `ALEXANDRIA_PROMPT_BUDGET_MS` | One deadline shared by project resolution, handshake, recall, reminders, and reconnect attempts |
+See the [extension reference](extensions/alexandria/README.md#configuration) for environment
+overrides and file-save limits. Read the limit and similarity cutoff together; the defaults
+were chosen together for `all-MiniLM-L6-v2`.
 
 Timeout values must be positive finite numbers; `prompt_call_timeout_ms` must be no greater than `prompt_budget_ms`, and `prompt_budget_ms` must be at most `120000` ms. Invalid values fail configuration rather than being clamped. The whole-path budget is one deadline, not a fresh budget per stage. It applies to automatic prompt work, not explicit native MCP calls. The defaults remain 5 s per call and 10 s for the prompt path.
 
 The hermetic timeouts and loopback tests do not establish hosted p50/p95 or throughput. Measure cold and warm paths separately on an approved deployment before changing the defaults.
 
-Older extraction settings are ignored with a warning: `ALEXANDRIA_AUTO_STORE`, `ALEXANDRIA_EXTRACT_MODEL`, `ALEXANDRIA_EXTRACT_TIMEOUT_MS`, and the old `[store]` extraction fields (`enabled`, `extract_model`, `extract_timeout_ms`). Remove them; saving memory now requires an explicit `store_memory`/`import_document` call.
+Older extraction settings are ignored with a warning: `ALEXANDRIA_AUTO_STORE`, `ALEXANDRIA_EXTRACT_MODEL`, `ALEXANDRIA_EXTRACT_TIMEOUT_MS`, and the old `store` extraction fields (`enabled`, `extract_model`, `extract_timeout_ms`). Remove them; saving memory now requires an explicit `store_memory`/`import_document` call.
 
 See [docs/configuration.md](../../docs/configuration.md) for server and client configuration context, and the companion [README](extensions/alexandria/README.md) for operational details.

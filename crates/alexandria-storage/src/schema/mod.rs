@@ -63,6 +63,11 @@ pub const MIGRATIONS: &[(u32, &str, &str)] = &[
         "admin_recovery_log",
         include_str!("v016_admin_recovery_log.surql"),
     ),
+    (
+        17,
+        "journal_assertion_compat",
+        include_str!("v017_journal_assertion_compat.surql"),
+    ),
 ];
 
 /// Version a fully migrated database reports in `system_config.schema_version`.

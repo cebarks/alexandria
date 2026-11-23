@@ -32,11 +32,12 @@ export function assertProjectResolutionSupported(toolNames: string[]): void {
 	if (!toolNames.includes("resolve_project")) throw new Error(UPGRADE_GUIDANCE);
 }
 
-function identityKey(): string {
-	const account = CONFIG.apiToken
-		? createHash("sha256").update(CONFIG.apiToken).digest("hex")
-		: "missing-token";
-	return `${CONFIG.serverUrl}\u0000${account}`;
+function credentialKey(token: string | undefined): string {
+	return token ? createHash("sha256").update(token).digest("hex") : "missing-token";
+}
+
+function identityKey(server = CONFIG.serverUrl, account = credentialKey(CONFIG.apiToken)): string {
+	return `${server}\u0000${account}`;
 }
 
 /**
@@ -242,26 +243,46 @@ function isStaleSessionError(err: unknown): boolean {
  * prompt the user has abandoned (or that has hit the dispatcher's overall budget)
  * should stop spending a socket rather than run to its own timeout.
  */
-export async function callToolWithRetry(
+export function callToolWithRetry(
 	name: string,
 	args: Record<string, unknown>,
 	timeoutMs?: number,
 	signal?: AbortSignal,
 ): Promise<Awaited<ReturnType<Client["callTool"]>>> {
+	return callToolForIdentity(identityKey(), name, args, timeoutMs, signal);
+}
+
+async function callToolForIdentity(
+	identity: string,
+	name: string,
+	args: Record<string, unknown>,
+	timeoutMs?: number,
+	signal?: AbortSignal,
+): Promise<Awaited<ReturnType<Client["callTool"]>>> {
+	const assertIdentity = () => {
+		if (identityKey() !== identity) {
+			throw new Error("Alexandria companion credentials or endpoint changed. Retry with the current configuration.");
+		}
+	};
 	const options = {
 		...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
 		...(signal === undefined ? {} : { signal }),
 	};
-	try {
+	const attempt = async () => {
+		assertIdentity();
 		const client = await getClient(signal);
-		return await client.callTool({ name, arguments: args }, options);
+		// A cold handshake yields control. Refuse dispatch if the snapshot
+		// no longer matches, even though the resolved client retained its headers.
+		assertIdentity();
+		return client.callTool({ name, arguments: args }, options);
+	};
+	try {
+		return await attempt();
 	} catch (err) {
-		if (isStaleSessionError(err)) {
-			resetClient();
-			const client = await getClient(signal);
-			return await client.callTool({ name, arguments: args }, options);
-		}
-		throw err;
+		if (!isStaleSessionError(err) || signal?.aborted) throw err;
+		assertIdentity();
+		resetClient();
+		return attempt();
 	}
 }
 
@@ -275,11 +296,10 @@ export interface AuthenticatedServer {
 export function authenticatedServer(): AuthenticatedServer {
 	const token = CONFIG.apiToken;
 	if (!token) authorizationHeaders(token);
-	return {
-		serverKey: CONFIG.serverUrl,
-		accountKey: createHash("sha256").update(token!).digest("hex"),
-		callTool: callToolWithRetry,
-	};
+	const serverKey = CONFIG.serverUrl;
+	const accountKey = credentialKey(token);
+	const identity = identityKey(serverKey, accountKey);
+	return { serverKey, accountKey, callTool: (...args) => callToolForIdentity(identity, ...args) };
 }
 
 export function extractTextContent(content: unknown): string | undefined {

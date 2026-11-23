@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-process.env.ALEXANDRIA_CLIENT_CONFIG = "/tmp/alexandria-tests-absent-client.toml";
+process.env.ALEXANDRIA_CLIENT_CONFIG = "/tmp/alexandria-tests-absent-client.json";
 process.env.ALEXANDRIA_API_TOKEN = "";
 process.env.ALEXANDRIA_AUTO_RECALL = "on";
 process.env.ALEXANDRIA_REMINDERS = "on";
@@ -10,7 +10,9 @@ const { default: extension } = await import("../src/index.js");
 
 test("correction, preference, error and receipt prompts only run the prompt dispatcher", async () => {
 	const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+	const commands: string[] = [];
 	const pi = {
+		registerCommand(name: string) { commands.push(name); },
 		on(event: string, handler: (...args: unknown[]) => unknown) {
 			const list = handlers.get(event) ?? [];
 			list.push(handler);
@@ -19,6 +21,7 @@ test("correction, preference, error and receipt prompts only run the prompt disp
 	} as never;
 	extension(pi);
 
+	assert.deepEqual(commands, ["alexandria"], "the settings menu is the only new command");
 	assert.deepEqual([...handlers.keys()].sort(), ["before_agent_start", "session_shutdown"]);
 	const beforeAgentStart = handlers.get("before_agent_start")?.[0];
 	assert.ok(beforeAgentStart, "the bounded recall/reminder prompt path remains registered");

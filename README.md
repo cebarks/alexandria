@@ -129,6 +129,10 @@ The server exposes **17 MCP tools** (13 memory/session/reminder tools plus four 
 Tool and parameter descriptions are written directively ("call this proactively when…") because
 that measurably changes how often client LLMs reach for them unprompted.
 
+**The tool names and parameter shapes above are the server's public API surface.** The client
+companions in `contrib/` bind to them, so a rename or a shape change is a breaking change: it needs
+a changelog entry and coordination with the companions in the same PR, not a quiet rename.
+
 ### Session memory
 
 Passing `session_id` to `store_memory` groups memories under a caller-chosen handle, and the session
@@ -181,7 +185,7 @@ in the response when it recognizes the second one.
 ### Getting agents to actually use memory
 
 A memory server is only useful if agents reach for it unprompted. Alexandria nudges this at
-three levels:
+four levels:
 
 1. **MCP `instructions`** — the server advertises usage guidance (when to read vs. write memory
    and how reminders get delivered) in its `initialize` response via `ServerInfo.instructions`.
@@ -192,18 +196,21 @@ three levels:
    (Claude Code) document concrete trigger conditions and tool choice guidance, mirroring how other high-usage
    MCP tools ship skills alongside themselves.
 3. **Optional companion extension** — [`contrib/pi/extensions/alexandria/`](contrib/pi/extensions/alexandria/)
-   performs prompt-time recall and reminder checks, but has no automatic write side. It resolves
+   performs prompt-time recall and reminder checks, but has no automatic memory writers. It resolves
    project context through a sanitized origin remote (or `ALEXANDRIA_PROJECT_ID`) and requires its
-   independent `ALEXANDRIA_API_TOKEN`.
-   It does not automatically store observed content or extract a session transcript: agents must call
-   `store_memory` or `import_document` explicitly when something should be retained. The Claude Code
-   equivalent is the recall/session hooks at [`contrib/claude/hooks/`](contrib/claude/hooks/); Claude's
-   hook is Personal-only unless `ALEXANDRIA_PROJECT_ID` is set, and it likewise has no automatic
-   observation writer.
+   independent `ALEXANDRIA_API_TOKEN`. The `/alexandria` menu configures auto-recall. Use explicit
+   `store_memory` or `import_document` calls to retain information. The Claude Code recall hook at
+   [`contrib/claude/hooks/`](contrib/claude/hooks/) is Personal-only unless `ALEXANDRIA_PROJECT_ID`
+   is configured, and it likewise has no automatic observation writer.
+4. **Hermes Agent memory provider** — [`contrib/hermes/`](contrib/hermes/) integrates with Hermes'
+   external-memory-provider slot for authenticated cross-session recall, foreground reminders and
+   explicit native memory/reminder tools. It uses an agent bearer from the environment and an optional
+   issued project ID. Turn and session hooks never store memories or send transcripts for extraction.
+   Hermes' native stores can be disabled independently; conversation history stays Hermes-owned.
 
-Items 2 and 3 are client-side integrations, not part of the MCP server itself — see
-[`contrib/pi/README.md`](contrib/pi/README.md) and [`contrib/claude/README.md`](contrib/claude/README.md)
-for what they are and how to install them.
+Items 2–4 are client-side integrations, not part of the MCP server itself — see
+[`contrib/pi/README.md`](contrib/pi/README.md), [`contrib/claude/README.md`](contrib/claude/README.md),
+and [`contrib/hermes/README.md`](contrib/hermes/README.md) for what they are and how to install them.
 
 ## Debug Web UI
 
@@ -366,18 +373,32 @@ port can set all four.
 
 ## Deployment
 
-**Upgrading from a build on SurrealDB 3.2 is one-way: stop the server and copy the data dir
-first** (`$XDG_DATA_HOME/alexandria/data` by default, `/data/db` in the container). A 3.3 build
-opens a 3.2 store, but ordinary use soon writes data 3.2 cannot read. Listing a cluster or session
-with 64 or more members makes 3.3 rewrite that table's definition, and every `store_memory` lists
-every cluster. How close that leaves a given deployment depends on its largest cluster, so check
-yours before upgrading — `/debug/clusters` prints the member count per cluster. Measured on a
-1897-memory store: 1474 clusters ranging from 1 to 51 members, median 1, 1277 of them singletons,
-so nothing is at the threshold yet; `merge` is the job that grows the top of that distribution
-toward 64. Writes to the vector index leave entries 3.2 cannot decode. A 3.2 build started on
-the result still boots, then fails cluster queries and vector search, or returns empty member lists
-with no error. Restoring the copy is the only way back, as SurrealDB's own
-[upgrade notes](https://github.com/surrealdb/surrealdb/blob/v3.3.0/doc/UPGRADING.md) say.
+**The embedded engine is now exactly SurrealDB 4.0.1. A 3.3 deployment must follow the
+[offline copy-first upgrade procedure](docs/surrealdb-4-upgrade.md) before cutover.** Stop writers,
+retain an untouched physical backup and the old binary, and convert only a disposable copy with
+the official operator's explicit experimental admission. Rebuild the old HNSW index and verify
+all application data, embedding identity/budget, exact vectors/centroids, index readiness and a
+real indexed query. Ordinary startup refuses unconverted 3.x files; it does not perform this
+procedure or blindly rebuild indexes. A 4.x-touched target is **not** rollback material for stock
+3.3, even at Legacy feature level. Rollback requires the untouched backup plus the old binary;
+post-cutover writes are a separate reconciliation problem. The default data directory remains
+`$XDG_DATA_HOME/alexandria/data`, or `/data/db` in the container.
+
+The earlier 3.2 → 3.3 transition was also one-way: table graph folds and HNSW queue entries
+written by 3.3 were unreadable by 3.2. Do not chain upgrades without a backup for each boundary;
+see the historical [3.3 upgrade notes](https://github.com/surrealdb/surrealdb/blob/v3.3.0/doc/UPGRADING.md).
+The [dependency security status](docs/dependency-advisories.md) distinguishes patched engine
+advisories from unresolved dependency and license decisions. The historical main-branch exceptions
+are not part of this policy.
+
+### Health check
+
+`GET /health` answers `200 {"status":"ok","version":"…"}` when a trivial query round-trips through
+the engine at request time within a one-second deadline, and
+`503 {"status":"unavailable","error":"…"}` with a fixed diagnostic when the probe fails or times out.
+It is public for supervisors such as systemd, container healthchecks, and the Hermes setup probe.
+It does not return backend error details or change bearer authentication at `/mcp` or sign-in for
+private browser pages.
 
 ### As a systemd user service (recommended)
 
@@ -531,7 +552,13 @@ Legacy `~/.alexandria/config.toml` is used as a fallback when the XDG config fil
 
 Reminder delivery is configured by the `[reminders]` section: `timezone` (IANA name, empty = system-local) governs naive datetime input and pattern/cron evaluation, and `escalation_hours` controls overdue escalation to global delivery.
 
-The Pi companion extension (automatic recall and reminder checks; no automatic memory writers) has its own client config at `$XDG_CONFIG_HOME/alexandria/client.toml` or `~/Library/Application Support/alexandria/client.toml` on macOS. `ALEXANDRIA_CLIENT_CONFIG` selects another file; `ALEXANDRIA_API_TOKEN` and `ALEXANDRIA_PROJECT_ID` configure its authentication and project override, and `[transport]` / `ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS` / `ALEXANDRIA_PROMPT_BUDGET_MS` configure its bounded prompt path. These client settings do not change the server configuration.
+The Pi companion (automatic recall and reminder checks, no automatic memory writers) reads
+`$XDG_CONFIG_HOME/alexandria/client.json`, or `~/Library/Application Support/alexandria/client.json`
+on macOS without XDG. `ALEXANDRIA_CLIENT_CONFIG` selects another JSON file. `/alexandria` edits
+auto-recall settings in Pi. Convert old `client.toml` files manually; server configuration stays
+TOML. Set the companion bearer and optional project override in the environment using
+`ALEXANDRIA_API_TOKEN` and `ALEXANDRIA_PROJECT_ID`. The JSON `transport` section configures one
+deadline shared by project resolution, recall, and reminder checks.
 
 See [docs/configuration.md](docs/configuration.md) for all options, client config reference, and migration instructions.
 
@@ -554,7 +581,7 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | [docs/prompt-path-stall-attribution.md](docs/prompt-path-stall-attribution.md) | 2026-09-22 investigation record: prompt-path stall attribution, the measured cold-handshake fault, and why the worker isolation it proposed was dropped. Carries a STATUS banner naming what shipped |
 | [crates/alexandria-mcp/assets/README.md](crates/alexandria-mcp/assets/README.md) | Vendored debug-UI assets, checksums, how to re-vendor |
 | [TODO-misc.md](TODO-misc.md) | Unprioritised backlog, grouped by area |
-| [AGENTS.md](AGENTS.md) | Working notes for humans and agents on this codebase — SurrealDB 3.3 gotchas, crate boundaries, task runner |
+| [AGENTS.md](AGENTS.md) | Working notes for humans and agents on this codebase — SurrealDB query/storage gotchas, crate boundaries, task runner |
 
 ## Architecture
 

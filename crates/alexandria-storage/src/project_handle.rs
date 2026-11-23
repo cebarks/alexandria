@@ -7,23 +7,23 @@
 
 use crate::error::StorageError;
 use crate::models::ProjectId;
-use surrealdb::types::{RecordId, ToSql, Value};
+use surrealdb::types::{RecordId, RecordIdKey, ToSql, Value};
 
-/// Parse one SurrealQL value and require the whole input to be consumed.
+/// Parse one inert SurrealQL value without executing a query or accepting a prefix.
 ///
-/// The SDK's `surrealdb::parse::value` and core's own `syn::value` both parse a leading value and
-/// return it without checking for trailing text, so `project:7; project:8` would silently parse as
-/// `project:7`. The callback form below is the same native parser with the EOF assertion the
-/// wrapper omits — the mechanism core itself uses for `duration` and its `*_for_definition`
-/// entry points — so equivalent alternate literal forms (e.g. `(project:7)`) stay accepted while
-/// any non-whitespace tail is refused. No delimiter scanning, no canonical-text comparison.
+/// 4.0's `syn::value` does not check EOF, but `syn::record_id` does. A record's array key uses the
+/// same literal grammar, including nested record keys and parenthesized points. Parse a single
+/// parenthesized element with the strict entry point, then unwrap its typed value. Newlines keep a
+/// trailing line comment from swallowing the wrapper's closing delimiters.
 fn parse_full_value(text: &str) -> Result<Value, StorageError> {
-    surrealdb_core::syn::parse_with(text.as_bytes(), async |parser, stk| {
-        let value = parser.parse_value(stk).await?;
-        parser.assert_finished()?;
-        Ok(value)
-    })
-    .map_err(|_| StorageError::InvalidInput("expected one complete SurrealQL value".into()))
+    let invalid = || StorageError::InvalidInput("expected one complete SurrealQL value".into());
+    let wrapper = format!("alexandria_parse_value:[(\n{text}\n)]");
+    let record = surrealdb_core::syn::record_id(&wrapper).map_err(|_| invalid())?;
+    let RecordIdKey::Array(values) = record.key else {
+        return Err(invalid());
+    };
+    let [value] = values.into_vec().try_into().map_err(|_| invalid())?;
+    Ok(value)
 }
 
 /// Serialize a known project record (from a ProjectId or a schema-typed project field).
@@ -78,6 +78,7 @@ pub fn parse_record_id(text: &str) -> Result<RecordId, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use surrealdb::types::SurrealValue;
 
     #[test]
     fn project_handle_preserves_typed_and_quoted_key_identity() {
@@ -120,7 +121,13 @@ mod tests {
     fn project_selector_keeps_aliases_explicit_without_reclassifying_invalid_handles() {
         assert!(parse_project_selector("ordinary-alias").unwrap().is_none());
         assert!(parse_project_selector("project:7").unwrap().is_some());
-        for text in ["project:", "project:1..9", "workspace:7", "fact:7"] {
+        for text in [
+            "project:",
+            "project:1..9",
+            "(project:1..9)",
+            "workspace:7",
+            "(fact:7)",
+        ] {
             assert!(
                 parse_project_selector(text).is_err(),
                 "not an alias fallback: {text:?}"
@@ -162,6 +169,8 @@ mod tests {
             "fact:x; junk",
             "fact:x ;",
             "fact:7 fact:8",
+            "fact:7, fact:8",
+            "(fact:7) /* incomplete comment",
             "fact:1..9",
             "[fact:7]",
             "type::record('fact', 7)",
@@ -181,7 +190,12 @@ mod tests {
             RecordId::new("fact", 7_i64),
             RecordId::new("fact", "7"),
             RecordId::new("fact", "space key"),
+            RecordId::new("fact", "key with [brackets] and )"),
             RecordId::new("fact", uuid),
+            RecordId::new(
+                "fact",
+                RecordIdKey::Array(vec![7_i64.into_value(), "7".into_value()].into()),
+            ),
         ] {
             assert_eq!(parse_record_id(&id.to_sql()).unwrap(), id);
         }

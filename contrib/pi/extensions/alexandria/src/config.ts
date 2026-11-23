@@ -1,9 +1,11 @@
-import { parse } from "smol-toml";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
+import { createRecallSettingsStore } from "./recall-config.js";
 
-interface ClientToml {
+export { createRecallSettingsStore } from "./recall-config.js";
+
+interface ClientJson {
 	server?: { url?: string };
 	recall?: { enabled?: boolean; limit?: number; min_similarity?: number };
 	store?: {
@@ -34,32 +36,36 @@ function configDir(): string {
 	}
 }
 
-function loadToml(): ClientToml {
-	const configPath =
-		process.env.ALEXANDRIA_CLIENT_CONFIG ??
-		join(configDir(), "alexandria", "client.toml");
+const configuredPath = process.env.ALEXANDRIA_CLIENT_CONFIG;
+const configPath = configuredPath?.trim()
+	? configuredPath
+	: join(configDir(), "alexandria", "client.json");
 
-	if (!existsSync(configPath)) return {};
-
+function loadJson(): ClientJson {
 	try {
 		const raw = readFileSync(configPath, "utf-8");
-		return parse(raw) as ClientToml;
+		const parsed: unknown = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("expected a JSON object");
+		}
+		return parsed as ClientJson;
 	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
 		console.warn(
-			`Alexandria: failed to parse ${configPath}: ${err instanceof Error ? err.message : String(err)}; using defaults`,
+			`Alexandria: failed to read or parse ${configPath}: ${err instanceof Error ? err.message : String(err)}; using defaults`,
 		);
 		return {};
 	}
 }
 
-const toml = loadToml();
+const config = loadJson();
 
 /**
  * Read an env override the same way everywhere: trimmed, and a set-but-blank
  * value treated as *unset*. A blank `ALEXANDRIA_REMINDERS=` (a direnv or `.env`
  * habit) is not a user saying "off", and gating the file branch on
  * `process.env.X === undefined` would let it re-enable a feature the user
- * disabled in `client.toml` — silently turning the consuming per-prompt
+ * disabled in `client.json` — silently turning the consuming per-prompt
  * `check_reminders` call back on.
  */
 const env = (key: string): string | undefined => process.env[key]?.trim() || undefined;
@@ -68,9 +74,9 @@ const obsoleteExtractionSettings = [
 	...(process.env.ALEXANDRIA_AUTO_STORE !== undefined ? ["ALEXANDRIA_AUTO_STORE"] : []),
 	...(process.env.ALEXANDRIA_EXTRACT_MODEL !== undefined ? ["ALEXANDRIA_EXTRACT_MODEL"] : []),
 	...(process.env.ALEXANDRIA_EXTRACT_TIMEOUT_MS !== undefined ? ["ALEXANDRIA_EXTRACT_TIMEOUT_MS"] : []),
-	...(toml.store?.enabled !== undefined ? ["store.enabled in client.toml"] : []),
-	...(toml.store?.extract_model !== undefined ? ["store.extract_model in client.toml"] : []),
-	...(toml.store?.extract_timeout_ms !== undefined ? ["store.extract_timeout_ms in client.toml"] : []),
+	...(config.store?.enabled !== undefined ? ["store.enabled in client.json"] : []),
+	...(config.store?.extract_model !== undefined ? ["store.extract_model in client.json"] : []),
+	...(config.store?.extract_timeout_ms !== undefined ? ["store.extract_timeout_ms in client.json"] : []),
 ];
 if (obsoleteExtractionSettings.length > 0) {
 	console.warn(
@@ -106,12 +112,12 @@ function transportTimeouts(): { promptCallTimeoutMs: number; promptBudgetMs: num
 	};
 	const promptCallTimeoutMs = configured(
 		"ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS",
-		toml.transport?.prompt_call_timeout_ms,
+		config.transport?.prompt_call_timeout_ms,
 		5000,
 	);
 	const promptBudgetMs = configured(
 		"ALEXANDRIA_PROMPT_BUDGET_MS",
-		toml.transport?.prompt_budget_ms,
+		config.transport?.prompt_budget_ms,
 		10000,
 	);
 	if (promptBudgetMs > 120000) {
@@ -127,14 +133,19 @@ function transportTimeouts(): { promptCallTimeoutMs: number; promptBudgetMs: num
 
 const transport = transportTimeouts();
 
+// Keep the existing warnings for malformed numeric overrides at startup.
+void envNum("ALEXANDRIA_AUTO_RECALL_LIMIT", config.recall?.limit ?? 10);
+void envNum("ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY", config.recall?.min_similarity ?? 0.45);
+export const RECALL_SETTINGS = createRecallSettingsStore(configPath, process.env, config);
+
 /** Trimmed at the boundary: a set-but-blank or whitespace-only override must fall
  *  through to the file (and then to the git probe) rather than being sent verbatim,
  *  because the server matches the target exactly and an untrimmed value degrades
  *  project delivery to escalation-only with no signal.
- *  Centralized configuration — TOML file with env var overrides. */
+ *  Centralized configuration — JSON file with env var overrides. */
 export const CONFIG = {
 	get serverUrl(): string {
-		return env("ALEXANDRIA_URL") ?? toml.server?.url ?? "http://127.0.0.1:3000/mcp";
+		return env("ALEXANDRIA_URL") ?? config.server?.url ?? "http://127.0.0.1:3000/mcp";
 	},
 
 	// Companion auth is intentionally independent of pi's/model providers' credentials.
@@ -148,40 +159,19 @@ export const CONFIG = {
 		return env("ALEXANDRIA_PROJECT_ID");
 	},
 
-	recallDisabled:
-		env("ALEXANDRIA_AUTO_RECALL") === "off" ||
-		(toml.recall?.enabled === false && env("ALEXANDRIA_AUTO_RECALL") === undefined),
-
-	recallLimit: envNum(
-		"ALEXANDRIA_AUTO_RECALL_LIMIT",
-		// 10, matching the Claude Code hook. A judgement call read off the
-		// 2026-09-09 bench-retrieval limit x threshold grid (880 facts, a small
-		// hand-authored question set): delivery saturates at 10 because the worst
-		// known target rank is 9, so 15 and 20 add non-targets and no hits. Paired
-		// with the threshold below; changing one alone leaves the frontier.
-		toml.recall?.limit ?? 10,
-	),
-
-	recallMinSimilarity: envNum(
-		"ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY",
-		toml.recall?.min_similarity ??
-			// 0.45, matching the Claude Code hook. Same grid, same caveats: at
-			// limit 10 it delivers 8 of 12 targets at ~1.0 non-targets per prompt,
-			// where 5/0.35 delivered the same 8 at ~3.2. It is only on the frontier
-			// because the limit is 10; at 5 it was dominated by 0.50.
-			// See docs/minilm-test-data.md "Result limit".
-			0.45,
-	),
+	get recallDisabled() { return !RECALL_SETTINGS.get().effective.enabled; },
+	get recallLimit() { return RECALL_SETTINGS.get().effective.limit; },
+	get recallMinSimilarity() { return RECALL_SETTINGS.get().effective.minSimilarity; },
 
 	remindersDisabled:
 		env("ALEXANDRIA_REMINDERS") === "off" ||
-		(toml.reminders?.enabled === false && env("ALEXANDRIA_REMINDERS") === undefined),
+		(config.reminders?.enabled === false && env("ALEXANDRIA_REMINDERS") === undefined),
 
 	// Exact, case-sensitive match against the server-side reminder target, so the
 	// env override exists for contexts where the git toplevel basename is not the
 	// project name (git worktrees, copied checkouts).
 	remindersProject:
-		env("ALEXANDRIA_REMINDERS_PROJECT") ?? toml.reminders?.project?.trim() ?? undefined,
+		env("ALEXANDRIA_REMINDERS_PROJECT") ?? config.reminders?.project?.trim() ?? undefined,
 
 	promptCallTimeoutMs: transport.promptCallTimeoutMs,
 	promptBudgetMs: transport.promptBudgetMs,

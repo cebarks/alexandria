@@ -26,13 +26,14 @@
 
 use alexandria_storage::Database;
 use alexandria_storage::access::{AccessRepo, OwnerContext, ScopedContext, SystemContext};
+use alexandria_storage::error::StorageError;
 use alexandria_storage::models::{OperationId, ProjectId, ReadSelection, normalize_login};
 use alexandria_storage::repos::{
     IdentityRepo, MAX_KNN_K, RetrievalStrategy, ScopedHeatWriter, ScopedMemoryRepo,
     ScopedSessionRepo, WarmTarget, WriteTarget, focal_partition_of,
 };
 use chrono::Utc;
-use surrealdb::types::RecordId;
+use surrealdb::types::{RecordId, ToSql};
 
 /// The query every case scores against. All fixture vectors are two-dimensional so a cosine is exact
 /// arithmetic rather than a statistical claim: `cos([1,0], [c, √(1−c²)]) = c`.
@@ -480,9 +481,8 @@ async fn a_personal_plus_project_read_covers_both_partitions_and_nothing_of_the_
 
 /// With no index defined, only the fallback answers — and it answers *filtered*.
 ///
-/// Both halves matter. The numeric-ef form matching nothing when no index exists is the documented
-/// 3.3 behaviour, and it is exactly why the mode cannot be a caller's choice: a client that believed
-/// an index existed would be told the population is empty.
+/// Both halves matter: 4.0 rejects the numeric-ef form without an eligible index. The server must
+/// select the fallback when boot did not define the index; this is not a caller option.
 #[tokio::test]
 async fn without_a_defined_index_only_the_fallback_answers_and_it_still_filters() {
     let store = Store::build().await;
@@ -514,15 +514,16 @@ async fn without_a_defined_index_only_the_fallback_answers_and_it_still_filters(
         "the no-index fallback did not serve the eligible row"
     );
 
-    let stranded = repo
+    let error = repo
         .nearest(&QUERY, 3, RetrievalStrategy::Indexed)
         .await
-        .unwrap();
+        .expect_err("numeric-ef kNN requires an index");
+    let StorageError::Internal(cause) = error else {
+        panic!("expected an internal storage error, got {error}");
+    };
     assert!(
-        stranded.is_empty(),
-        "the numeric-ef form found rows with no index defined, which contradicts the pinned 3.3 \
-         behaviour the server-side selection exists to avoid: {:?}",
-        Store::ids(&stranded)
+        cause.to_string().contains("needs an HNSW or DiskANN index"),
+        "indexed retrieval failed for the wrong reason: {cause}"
     );
 }
 
@@ -1023,9 +1024,12 @@ async fn planned(
     store: &Store,
     sql: &str,
     filter: &alexandria_storage::repos::ScopeFilter,
+    cluster: Option<&RecordId>,
 ) -> String {
-    use surrealdb::types::ToSql;
-    let query = filter.apply(store.db().query(format!("EXPLAIN FORMAT JSON {sql}")));
+    let mut query = filter.apply(store.db().query(format!("EXPLAIN FORMAT JSON {sql}")));
+    if let Some(cluster) = cluster {
+        query = query.bind(("cluster", cluster.clone()));
+    }
     let mut response = query.await.unwrap().check().unwrap();
     let plan: surrealdb::types::Value = response.take(0).unwrap();
     plan.to_sql()
@@ -1050,12 +1054,14 @@ async fn review_page_plans_the_qualified_partition_index_on_both_pages() {
         &store,
         &alexandria_storage::repos::review_page_sql(conjunct, ""),
         &filter,
+        None,
     )
     .await;
     let resumed = planned(
         &store,
         &alexandria_storage::repos::review_page_sql(conjunct, " AND id > $cursor"),
         &filter,
+        None,
     )
     .await;
     for (label, plan) in [("first page", first), ("resumed page", resumed)] {
@@ -1070,17 +1076,11 @@ async fn review_page_plans_the_qualified_partition_index_on_both_pages() {
     }
 }
 
-/// The scoped cluster member read carries the population predicate *into* the traversal, and the plan
-/// says what it honestly is: an edge-driven read (`GraphEdgeScan`) whose fact-side filter is applied per
-/// record — bounded by the cluster's own membership, never by the size of the store.
-///
-/// This is the disclosure the fix lane owes: the claim is **not** "the member read is an index scan".
-/// A cluster's members are reached through its `contains_memory` edges, so the cost is per edge, and the
-/// partition conjunct narrows which edges survive. A partitioned *cluster* (so that an edge list need not
-/// be filtered at all) is Task 12's maintenance pass. What must never come back is a whole-store scan,
-/// which the `TableScan` assertion below is for.
+/// The cluster member plan must keep the bound traversal and its fact-side population filter.
+/// 4.0 renders this graph lookup in a `Values` expression, not a separate `GraphEdgeScan` node.
+/// The engine's VM lookup reads adjacency by origin; EXPLAIN itself does not count visited keys.
 #[tokio::test(flavor = "multi_thread")]
-async fn cluster_member_read_carries_the_partition_predicate_and_never_scans_the_store() {
+async fn cluster_member_plan_keeps_bound_traversal_and_partition_filter() {
     let store = Store::build().await;
     let owner = &store.alice;
     let scope = store.personal_only(owner).await;
@@ -1093,10 +1093,19 @@ async fn cluster_member_read_carries_the_partition_predicate_and_never_scans_the
         sql.contains("$scope_projects") && sql.contains("$scope_personal"),
         "the member read no longer carries the partition binds: {sql}"
     );
-    let plan = planned(&store, &sql, &filter).await;
+    let cluster = alexandria_storage::repos::ClusterRepo::new(store.db())
+        .create(None, &QUERY)
+        .await
+        .unwrap();
+    let plan = planned(&store, &sql, &filter, Some(&cluster)).await;
+    let traversal = format!("({})->contains_memory->(fact WHERE ", cluster.to_sql());
     assert!(
-        plan.contains("GraphEdgeScan") || plan.contains("IndexScan"),
-        "the member read is neither edge-driven nor indexed: {plan}"
+        plan.contains("operator: 'Values'") && plan.contains(&traversal),
+        "the member read lost its bound adjacency traversal: {plan}"
+    );
+    assert!(
+        plan.contains("scope = 'personal'") && plan.contains("project INSIDE []"),
+        "the personal-only scope did not reach the fact-side filter: {plan}"
     );
     assert!(
         !plan.contains("TableScan"),
@@ -1109,12 +1118,13 @@ async fn cluster_member_read_carries_the_partition_predicate_and_never_scans_the
         "SELECT * FROM $cluster->contains_memory->(fact WHERE deleted = false AND quarantined_at = \
          NONE AND workspace = $scope_workspace);",
         &filter,
+        Some(&cluster),
     )
     .await;
-    assert_ne!(
-        plan.contains("$scope_projects"),
-        without.contains("$scope_projects"),
-        "the filtered and unfiltered member reads plan identically, so one of them is not what this \
-         repo issues"
+    assert!(
+        without.contains(&traversal)
+            && !without.contains("scope = 'personal'")
+            && !without.contains("project INSIDE"),
+        "removing the partition conjunct should leave only the bound, workspace-filtered traversal: {without}"
     );
 }

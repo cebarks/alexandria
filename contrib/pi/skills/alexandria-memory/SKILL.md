@@ -1,6 +1,6 @@
 ---
 name: alexandria-memory
-description: Use the Alexandria agent-memory MCP tools (mcp__alexandria__store_memory, mcp__alexandria__retrieve_memories, mcp__alexandria__recall, mcp__alexandria__update_memory, mcp__alexandria__import_document, mcp__alexandria__delete_memory, mcp__alexandria__list_sessions, mcp__alexandria__get_session, mcp__alexandria__finalize_session) and its reminder tools (mcp__alexandria__set_reminder, mcp__alexandria__check_reminders, mcp__alexandria__list_reminders, mcp__alexandria__cancel_reminder) to persist and recall durable facts, decisions, and preferences across sessions, and to schedule and manage future follow-ups. Use PROACTIVELY at the start of tasks in known projects/domains, whenever the user references past context ("last time", "we decided", "like before") or asks for a future nudge ("remind me", "don't let me forget", "check this tomorrow"), and immediately after learning something worth keeping (a preference, an architectural decision + rationale, a bug's root cause, a correction) — not only when explicitly asked to remember or recall.
+description: Use when working in known projects or domains, recalling prior conversations and decisions, learning durable preferences or facts, resolving bugs, or scheduling and managing reminders and future follow-ups with Alexandria memory.
 ---
 
 # Alexandria Memory

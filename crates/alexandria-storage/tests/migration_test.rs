@@ -487,12 +487,15 @@ async fn test_v010_leaves_migration_pending_sessions_unowned_and_unreachable() {
     {
         db.inner().query(*sql).await.unwrap().check().unwrap();
     }
-    // A v009-era store: two legacy sessions, no owner on either, sharing nothing.
+    // A v009-era store has a v009 stamp. Without it this fixture replays v005's
+    // required memory_count definition on populated v009 sessions instead of testing v010.
     db.inner()
         .query(
-            "CREATE `session` SET external_id = 'legacy-a', tags = [];
+            "CREATE system_config SET key = 'schema_version', value = $version, updated_at = time::now();
+             CREATE `session` SET external_id = 'legacy-a', tags = [];
              CREATE `session` SET external_id = 'legacy-b', tags = [];",
         )
+        .bind(("version", ACCOUNTS_SCOPES_VERSION.to_string()))
         .await
         .unwrap()
         .check()
@@ -524,7 +527,7 @@ async fn test_v010_leaves_migration_pending_sessions_unowned_and_unreachable() {
         .query("SELECT count() FROM `session` WHERE account = $account GROUP ALL;")
         .bind((
             "account",
-            surrealdb::types::RecordId::parse_simple("account:anyone").unwrap(),
+            surrealdb::types::RecordId::new("account", "anyone"),
         ))
         .await
         .unwrap()

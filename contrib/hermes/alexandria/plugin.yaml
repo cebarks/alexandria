@@ -1,0 +1,8 @@
+name: alexandria
+version: 0.1.0
+description: "Alexandria — authenticated scoped recall, foreground reminders, and explicit memory tools."
+external_dependencies:
+  - name: alexandria
+    check: "curl -sf -m 2 http://127.0.0.1:3000/health -o /dev/null"
+config_keys:
+  - memory.alexandria

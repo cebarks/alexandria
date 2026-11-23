@@ -9,6 +9,7 @@ use alexandria_mcp::auth::http::admit;
 use alexandria_mcp::auth::{
     Admission, AuthEvents, AuthMiddleware, AuthService, McpSessionRegistry, OneTimeSecret,
 };
+use alexandria_mcp::debug::{WebBoundary, WebPolicy, router_secured};
 use alexandria_mcp::server::HeatSettings;
 use alexandria_pipeline::embedding::EmbeddingProvider;
 use alexandria_storage::access::{AccessRepo, OwnerContext, SystemContext};
@@ -123,6 +124,20 @@ impl Host {
             0.75,
             HeatSettings::default(),
         );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let policy = WebPolicy::hosted(
+            &origin,
+            &["127.0.0.1".to_owned()],
+            std::slice::from_ref(&origin),
+            true,
+        )
+        .expect("valid loopback fixture policy");
+        let debug = router_secured(
+            server.clone(),
+            None,
+            WebBoundary::new(gate.clone(), Arc::clone(&db), policy),
+        );
         let mcp: StreamableHttpService<AlexandriaServer, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok(server.clone()),
@@ -132,9 +147,10 @@ impl Host {
             );
         let app = Router::new()
             .nest_service("/mcp", mcp)
-            .layer(axum::middleware::from_fn_with_state(gate, admit));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+            .layer(axum::middleware::from_fn_with_state(gate, admit))
+            .merge(alexandria_mcp::health::router(Arc::clone(&db)))
+            .merge(debug);
+        let endpoint = format!("{origin}/mcp");
         let serving = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("fixture listener");
         });
@@ -338,6 +354,22 @@ fn only(response: &Value, present: &[&str], absent: &[&str]) {
 
 // Capture a real regression if the hosted project is inferred from a label instead of the
 // authenticated workspace and issued context ID, or the live session survives token revocation.
+#[tokio::test]
+async fn public_health_does_not_relax_mcp_or_web_admission() -> Result<()> {
+    let host = Host::open().await?;
+    let origin = host.endpoint.strip_suffix("/mcp").unwrap();
+    let health = host.client.get(format!("{origin}/health")).send().await?;
+    assert_eq!(health.status(), StatusCode::OK);
+    let health_body: Value = serde_json::from_slice(&health.bytes().await?)?;
+    assert_eq!(health_body["status"], "ok");
+
+    let mcp = host.client.get(&host.endpoint).send().await?;
+    assert_eq!(mcp.status(), StatusCode::UNAUTHORIZED);
+    let debug = host.client.get(format!("{origin}/debug")).send().await?;
+    assert_eq!(debug.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
 #[tokio::test]
 async fn invite_token_context_store_and_live_revocation() -> Result<()> {
     for swap_adapters in [false, true] {

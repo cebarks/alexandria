@@ -24,31 +24,58 @@
  *   ALEXANDRIA_URL                          default: http://127.0.0.1:3000/mcp
  *   ALEXANDRIA_AUTO_RECALL                  set to "off" to disable recall
  *   ALEXANDRIA_AUTO_RECALL_LIMIT            default: 10 (read with MIN_SIMILARITY; see docs/minilm-test-data.md)
- *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.45 (only valid at LIMIT=10)
+ *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.45 (calibrated for LIMIT=10)
  *   ALEXANDRIA_REMINDERS                    set to "off" to disable reminder checks
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { CONFIG } from "./config.js";
-import { resetClient, closeClient, authenticatedServer } from "./mcp-client.js";
+import { CONFIG, RECALL_SETTINGS } from "./config.js";
+import { showRecallSettings } from "./recall-settings.js";
+import {
+	authenticatedServer,
+	closeClient,
+	connectionsEstablished,
+	prewarm,
+	PROMPT_BUDGET_MS,
+	resetClient,
+} from "./mcp-client.js";
 import { retrieveMemories, formatMemoriesBlock } from "./recall.js";
 import { checkReminders, formatDueBlock } from "./reminders.js";
 import { getProjectContext } from "./project-context.js";
 import { buildInjection, type FeatureOutcome } from "./injection.js";
 import { asFailure } from "./failure.js";
-import { PROMPT_BUDGET_MS, prewarm, connectionsEstablished } from "./mcp-client.js";
 import { recordPromptPath, startDriftProbe, outcomeLabel } from "./diag.js";
 
-export default function alexandriaExtension(pi: ExtensionAPI) {
+interface ExtensionDependencies {
+	authenticatedServer: typeof authenticatedServer;
+	prewarm: typeof prewarm;
+	retrieveMemories: typeof retrieveMemories;
+	checkReminders: typeof checkReminders;
+}
+
+export default function alexandriaExtension(
+	pi: ExtensionAPI,
+	dependencies: ExtensionDependencies = { authenticatedServer, prewarm, retrieveMemories, checkReminders },
+) {
+	pi.registerCommand("alexandria", {
+		description: "Configure Alexandria auto-recall",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) return;
+			await showRecallSettings(ctx.ui, RECALL_SETTINGS, dependencies.prewarm);
+		},
+	});
+
 	// ── Combined injection dispatcher (recall + reminders) ──────────────
-	if (!CONFIG.recallDisabled || !CONFIG.remindersDisabled) {
+	{
 		// Open the connection now rather than on the first prompt. The cold handshake
 		// is the one window measured to turn a healthy server into a false
 		// `REQUEST_TIMEOUT` when pi's event loop stalls, and this is what takes it off
 		// the prompt path. Not awaited: extension load must not block on the server.
-		prewarm();
+		if (!CONFIG.recallDisabled || !CONFIG.remindersDisabled) dependencies.prewarm();
 
 		pi.on("before_agent_start", async (event, ctx) => {
+			const recallSettings = RECALL_SETTINGS.get().effective;
+			if (!recallSettings.enabled && CONFIG.remindersDisabled) return undefined;
 			const query = event.prompt?.trim();
 			// Diagnostics start before any await so the recorded window covers the
 			// whole handler, including the git probe and any stall of pi's own loop.
@@ -106,22 +133,26 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 
 			// One authenticated project context feeds both tool calls and the injection;
 			// if resolution fails, neither feature is allowed to widen to an unscoped read.
-			const projectContextTask = Promise.resolve().then(() =>
-				getProjectContext(ctx, authenticatedServer(), budget.signal),
-			);
+			const projectContextTask = Promise.resolve().then(async () => {
+				const server = dependencies.authenticatedServer();
+				const project = await getProjectContext(ctx, server, budget.signal);
+				return { project, call: server.callTool };
+			});
 
 			// Settled, not awaited: one feature failing must never suppress the
 			// other's injection or its notification.
 			const recallTask: Promise<FeatureOutcome> =
-				!CONFIG.recallDisabled && query
+				recallSettings.enabled && query
 					? (async () => {
 							try {
-								const projectContext = await projectContextTask;
-								const { items, error } = await retrieveMemories(
+								const { project, call } = await projectContextTask;
+								const { items, error } = await dependencies.retrieveMemories(
 									query,
-									undefined,
+									call,
 									budget.signal,
-									projectContext.projectId,
+									project.projectId
+										? { ...recallSettings, projectId: project.projectId }
+										: recallSettings,
 								);
 								return {
 									block: items.length > 0 ? formatMemoriesBlock(items) : null,
@@ -137,10 +168,10 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 				? Promise.resolve({ block: null, count: 0 })
 				: (async () => {
 						try {
-							const projectContext = await projectContextTask;
-							const { items, error } = await checkReminders(
-								projectContext.projectId,
-								undefined,
+							const { project, call } = await projectContextTask;
+							const { items, error } = await dependencies.checkReminders(
+								project.projectId,
+								call,
 								budget.signal,
 							);
 							return {
@@ -174,7 +205,7 @@ export default function alexandriaExtension(pi: ExtensionAPI) {
 			const injection = buildInjection(
 				recallRes,
 				remindersRes,
-				projectContextRes.status === "fulfilled" ? projectContextRes.value : undefined,
+				projectContextRes.status === "fulfilled" ? projectContextRes.value.project : undefined,
 			);
 			if (injection.resetClient) {
 				// Only a failure that implicates the connection reaches here —

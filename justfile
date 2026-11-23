@@ -80,8 +80,12 @@ ext-test:
 ext-install:
     cd contrib/pi/extensions/alexandria && npm ci --ignore-scripts
 
+# Hermes companion (Python 3.12+, requires httpx in the selected environment)
+hermes-test:
+    python3 -m unittest discover -s contrib/hermes/tests -v
+
 # All tests, Rust and client-side
-test-all: test ext-test claude-test
+test-all: test ext-test claude-test hermes-test
 
 # Fast type-check
 check:
@@ -124,7 +128,7 @@ verify-assets:
     done
 
 # Full CI suite locally — run before pushing
-ci: fmt lint verify-assets cpu-deps refinement-admission test test-cpu artifact-ci eval-test refinement-eval-test refinement-eval ext-test claude-test deny
+ci: fmt lint verify-assets cpu-deps refinement-admission test test-cpu artifact-ci eval-test refinement-eval-test refinement-eval ext-test claude-test hermes-test deny
 
 # Install git hooks (pre-commit: fmt + clippy)
 install-hooks:

@@ -243,8 +243,8 @@ async fn typed_id(db: &Database, id_sql: &str) -> RecordId {
 async fn the_head_migration_is_registered_and_advances_the_stamped_version() {
     let (head_version, head_name, _) = schema::MIGRATIONS.last().unwrap();
     assert_eq!(
-        *head_name, "admin_recovery_log",
-        "the head migration must be v016_admin_recovery_log.surql"
+        *head_name, "journal_assertion_compat",
+        "the head migration must be v017_journal_assertion_compat.surql"
     );
     assert_eq!(schema::LATEST_VERSION, *head_version);
 
@@ -258,6 +258,84 @@ async fn the_head_migration_is_registered_and_advances_the_stamped_version() {
         stamped[0]["value"].as_str().unwrap(),
         schema::LATEST_VERSION.to_string()
     );
+}
+
+#[tokio::test]
+async fn upgrading_v016_preserves_the_journal_array_contract() {
+    let db = Database::connect_embedded().await.unwrap();
+    let previous = schema::MIGRATIONS
+        .iter()
+        .find(|(_, name, _)| *name == "admin_recovery_log")
+        .unwrap()
+        .0;
+    for &(_, _, sql) in schema::MIGRATIONS.iter().take_while(|m| m.0 <= previous) {
+        db.inner().query(sql).await.unwrap().check().unwrap();
+    }
+    run!(
+        &db,
+        "CREATE system_config SET key = 'schema_version', value = $version;",
+        "version",
+        previous.to_string()
+    );
+    let alice = account(&db, "journal-upgrade-owner").await;
+    let workspace = workspace_of(&db, &alice).await;
+    let before = row(&db, &workspace).await;
+    schema::migrate(db.inner()).await.unwrap();
+    assert_eq!(row(&db, &workspace).await, before);
+
+    let operation = operation(
+        &db,
+        &workspace,
+        &alice,
+        "after-v016-upgrade",
+        "valid-effects-journal-fingerprint",
+        &["fact:content"],
+    )
+    .await;
+    assert_eq!(
+        row(&db, &operation).await["affected_scope_kinds"],
+        serde_json::json!([])
+    );
+    let allowed = serde_json::json!(["personal", "project", "unassigned"]);
+    run!(
+        &db,
+        "UPDATE ONLY $operation SET affected_scope_kinds = ['personal', 'project', 'unassigned'];",
+        "operation",
+        operation.clone()
+    );
+    assert_eq!(row(&db, &operation).await["affected_scope_kinds"], allowed);
+    let expected = row(&db, &operation).await;
+    for (sql, field) in [
+        (
+            "UPDATE ONLY $operation SET expected_effects = [];",
+            "expected_effects",
+        ),
+        (
+            "UPDATE ONLY $operation SET expected_effects = ['fact:content', ''];",
+            "expected_effects",
+        ),
+        (
+            "UPDATE ONLY $operation SET affected_scope_kinds = ['personal', 'invalid'];",
+            "affected_scope_kinds",
+        ),
+    ] {
+        let error = refused!(&db, sql, "operation", operation.clone());
+        assert!(
+            error.contains(field),
+            "failed for the wrong reason: {error}"
+        );
+        assert_eq!(row(&db, &operation).await, expected);
+    }
+
+    // Replay v017 on actual journal data, as after a definition pass whose stamp was lost.
+    run!(
+        &db,
+        "UPDATE system_config SET value = $version WHERE key = 'schema_version';",
+        "version",
+        previous.to_string()
+    );
+    schema::migrate(db.inner()).await.unwrap();
+    assert_eq!(row(&db, &operation).await, expected);
 }
 
 /// The failure this pins: a migration that "cleans up" while it defines. Replaying the head over a

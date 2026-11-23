@@ -5,8 +5,9 @@ const previousConfig = process.env.ALEXANDRIA_CLIENT_CONFIG;
 const previousCallTimeout = process.env.ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS;
 const previousBudget = process.env.ALEXANDRIA_PROMPT_BUDGET_MS;
 const previousProjectId = process.env.ALEXANDRIA_PROJECT_ID;
-process.env.ALEXANDRIA_CLIENT_CONFIG = "/tmp/alexandria-tests-absent-client.toml";
+process.env.ALEXANDRIA_CLIENT_CONFIG = "/tmp/alexandria-tests-absent-client.json";
 process.env.ALEXANDRIA_PROJECT_ID = "project:timeout";
+const recallSettings = { limit: 10, minSimilarity: 0.5 };
 process.env.ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS = "30";
 process.env.ALEXANDRIA_PROMPT_BUDGET_MS = "100";
 const [
@@ -43,7 +44,7 @@ test(
 			return { content: [{ type: "text", text }] };
 		};
 		try {
-			await retrieveMemories("test", call, signal, "project:test");
+			await retrieveMemories("test", call, signal, { ...recallSettings, projectId: "project:test" });
 			await checkReminders("project:test", call, signal);
 		} finally {
 			cancel();
@@ -94,7 +95,10 @@ test("a warm context fits the budget while a cache-miss resolution exhausts the 
 	try {
 		const project = await getProjectContext(ctx, authenticatedServer, warmBudget.signal);
 		const outcomes = await Promise.all([
-			retrieveMemories("q", authenticatedServer.callTool, warmBudget.signal, project.projectId),
+			retrieveMemories("q", authenticatedServer.callTool, warmBudget.signal, {
+				...recallSettings,
+				projectId: project.projectId,
+			}),
 			checkReminders(project.projectId, authenticatedServer.callTool, warmBudget.signal),
 		]);
 		assert.equal(outcomes.length, 2);
@@ -107,7 +111,10 @@ test("a warm context fits the budget while a cache-miss resolution exhausts the 
 	try {
 		const project = await getProjectContext(ctx, authenticatedServer, coldBudget.signal);
 		const coldOutcomes = await Promise.allSettled([
-			retrieveMemories("q", authenticatedServer.callTool, coldBudget.signal, project.projectId),
+			retrieveMemories("q", authenticatedServer.callTool, coldBudget.signal, {
+				...recallSettings,
+				projectId: project.projectId,
+			}),
 			checkReminders(project.projectId, authenticatedServer.callTool, coldBudget.signal),
 		]);
 		assert.ok(coldOutcomes.every((outcome) => outcome.status === "rejected"));
@@ -141,7 +148,7 @@ test("a slow mocked transport aborts at the per-call timeout and keeps its proje
 		});
 	};
 	await assert.rejects(
-		retrieveMemories("test", call, controller.signal, "project:scoped"),
+		retrieveMemories("test", call, controller.signal, { ...recallSettings, projectId: "project:scoped" }),
 		/mock transport timeout/,
 	);
 	assert.equal(calls.length, 1);
@@ -161,7 +168,9 @@ test("an aborted call rejects without retrying an unscoped request", async () =>
 		controller.abort(new Error("cancelled"));
 		throw signal?.reason;
 	};
-	await assert.rejects(retrieveMemories("test", call, controller.signal, "project:scoped"));
+	await assert.rejects(
+		retrieveMemories("test", call, controller.signal, { ...recallSettings, projectId: "project:scoped" }),
+	);
 	assert.equal(calls.length, 1);
 	assert.deepEqual(calls[0].args, { query: "test", limit: 10, project: "project:scoped" });
 });

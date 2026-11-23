@@ -19,10 +19,10 @@ export const execFileAsync = promisify(execFile);
 /** The extension package root — the directory holding `package.json`. */
 export const extensionRoot = fileURLToPath(new URL("../", import.meta.url));
 
-/** A path that is never created, so `config.ts` sees no client.toml on disk. */
-export const absentClientToml = join(
+/** A path that is never created, so `config.ts` sees no client.json on disk. */
+export const absentClientJson = join(
 	tmpdir(),
-	"alexandria-extension-tests-absent-client.toml",
+	"alexandria-extension-tests-absent-client.json",
 );
 
 /**
