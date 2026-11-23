@@ -259,8 +259,8 @@ async fn classification_repair_route_partial_message() {
 #[tokio::test]
 async fn classification_repair_ranking_failure_is_not_ungrouped() {
     let app = authenticated_on_server(test_server().await).await;
-    let (cluster, _) =
-        population(&app, MemoryScope::Personal, "ranking witness", &[0.1, 0.2]).await;
+    let centroid = [0.1, 0.2];
+    let (cluster, _) = population(&app, MemoryScope::Personal, "ranking witness", &centroid).await;
     let (_id, id_t) = app
         .seed_quarantined_unassigned("ranking failure subject")
         .await;
@@ -286,8 +286,16 @@ async fn classification_repair_ranking_failure_is_not_ungrouped() {
     );
     assert_eq!(ledger(&app).await, before);
     assert_eq!(snapshot(&app, &id_t).await, state);
-    app.db.inner().query("UPDATE $cluster SET centroid = [0.1, 0.2]; DEFINE FIELD OVERWRITE centroid ON cluster TYPE array<float>;")
-        .bind(("cluster", cluster.clone())).await.unwrap().check().unwrap();
+    // Only the value needs restoring in this disposable fixture.
+    app.db
+        .inner()
+        .query("UPDATE $cluster SET centroid = $centroid;")
+        .bind(("cluster", cluster.clone()))
+        .bind(("centroid", centroid.to_vec()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
     let (_, location, _) = app
         .post_form_located(
             "/debug/classification/decide",
@@ -296,7 +304,12 @@ async fn classification_repair_ranking_failure_is_not_ungrouped() {
         .await;
     let (_, page) = app.get(&location).await;
     assert!(page.contains("1 moved"), "{page}");
-    assert_eq!(ledger(&app).await.0, before.0 + 1);
+    assert_eq!(ledger(&app).await, (before.0 + 1, before.1));
+    let destination = MutationRepo::new(app.db.inner())
+        .cluster_of(&app.owner, state.id.as_record_id())
+        .await
+        .unwrap();
+    assert_eq!(destination.map(|(id, _)| id), Some(cluster));
 }
 
 #[tokio::test]
