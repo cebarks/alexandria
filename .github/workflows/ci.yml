@@ -96,8 +96,7 @@ jobs:
         run: df -h .
       - run: just verify-assets
       - run: just cpu-deps
-      # Explicit integration targets and the review fixture's in-memory example test; no browser or live model.
-      - run: just refinement-admission
+      # Workspace tests include refinement admission and the in-memory review fixture test.
       - run: just test
       - run: just test-cpu
       # Real inference/conversion requires explicit cached artifacts and is ignored here.

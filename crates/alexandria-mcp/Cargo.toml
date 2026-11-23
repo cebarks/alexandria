@@ -39,6 +39,10 @@ askama = { workspace = true }
 # disable system proxies because pipeline enables `system-proxy` on the shared crate.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
+[[example]]
+name = "review_fixture"
+test = true
+
 [dev-dependencies]
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 tokio = { workspace = true, features = ["io-util", "test-util"] }
