@@ -7,6 +7,7 @@
 - Update ammonia, rmcp, Tokio, TLS/root bundles, Candle Core/ZIP, and zstd-sys to patched releases; upgrade the official SurrealDB family to exactly 4.0.1 and SurrealKV to 1.2.0. See [dependency advisory status](docs/dependency-advisories.md).
 - Keep Pi project resolution, recall, reminder checks, and retries bound to the same configured endpoint and bearer identity.
 - Adopt main's single WASM crypto advisory ignore (`RUSTSEC-2026-0387`) and two named SurrealDB BUSL-1.1 allowances. The vulnerable dependency is not patched by this policy change; all-target/all-feature and unmaintained checks remain in force.
+- Temporarily waive only the `chrono` and `chrono-tz` maintenance advisories (`RUSTSEC-2026-0543` and `RUSTSEC-2026-0555`). Neither dependency was upgraded; remove both ignores once [#57](https://github.com/cebarks/alexandria/issues/57) clears the full audit without them.
 - Require pinned, hash-checked, wheel-only Python dependencies for Hermes companion tests. Hermes setup no longer installs the Alexandria server when its health check fails; provision and start the server explicitly.
 
 ### Breaking

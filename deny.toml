@@ -31,6 +31,11 @@ ignore = [
     # WASM support is introduced or this path becomes native; remove when the
     # official dependency route admits patched crypto. See docs/dependency-advisories.md.
     "RUSTSEC-2026-0387",
+    # Temporary maintenance-risk acceptance, not dependency remediation.
+    # Remove both ignores after https://github.com/cebarks/alexandria/issues/57
+    # replaces the direct dependencies and the full audit passes without them.
+    "RUSTSEC-2026-0543", # chrono
+    "RUSTSEC-2026-0555", # chrono-tz
 ]
 
 [licenses]

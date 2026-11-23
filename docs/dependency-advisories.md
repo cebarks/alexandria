@@ -3,9 +3,10 @@
 The integrated feature adopts main's `RUSTSEC-2026-0387` ignore and the two
 named BUSL-1.1 license exceptions below. This accepts an existing risk and two
 specific licenses; it does not fix the crypto issue or qualify the release.
-All-target/all-feature and workspace unmaintained checks remain in force.
-The main-branch policy result and test counts on this page are historical, not
-results for the combined feature.
+The integrated feature also carries two temporary maintenance exceptions below.
+All-target/all-feature and workspace unmaintained checks remain in force for
+findings not explicitly ignored. The main-branch policy result and test counts
+on this page are historical, not results for the combined feature.
 
 The main-branch update based on `64c25cb68b03a07e120f6ad6ac5ddf5bb699753c` had two phases:
 
@@ -95,6 +96,20 @@ native targets. Authentication is not removed or disabled.
 
 Any future risk decision must revisit the actual all-target graph and available
 official engine releases. A native-only runtime or tree does not clear the full-policy gate.
+
+## Temporary Chrono maintenance exceptions
+
+| Advisory | Current direct dependency |
+| --- | --- |
+| [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543.html) | `chrono 0.4.45` |
+| [RUSTSEC-2026-0555](https://rustsec.org/advisories/RUSTSEC-2026-0555.html) | `chrono-tz 0.10.4` |
+
+The audit lists no safe upgrade for either maintenance advisory. These two
+specific ignores accept the risk of keeping unmaintained direct dependencies
+for now; they do not change either package or lockfile. Other unmaintained
+workspace dependencies are still checked. Remove both ignores when
+[#57](https://github.com/cebarks/alexandria/issues/57) removes direct use and
+the full workspace audit passes without them.
 
 ## Named license exceptions
 
