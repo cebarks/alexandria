@@ -510,23 +510,27 @@ mod tests {
         crate::schema::migrate(db.inner()).await.unwrap();
         let repo = SessionRepo::new(db.inner());
 
-        let (a, b) = tokio::join!(
-            repo.find_or_create("sess-race", Some("pi"), None),
-            repo.find_or_create("sess-race", None, Some("sonnet")),
-        );
-        let a = a.unwrap();
-        let b = b.unwrap();
-        assert_ne!(
-            a, b,
-            "v010 removed the global unique index, so an unowned concurrent first store now produces \
-             two rows: this is the interim path's exact limitation, and the reason no request-facing \
-             write may use it"
-        );
-        assert_eq!(
-            repo.list(10, 0).await.unwrap().len(),
-            2,
-            "both rows are stored, which is what makes the limitation real rather than cosmetic"
-        );
+        // Exercise the interleaving where both legacy callers miss before either inserts.
+        // Joining two full calls allows one to finish before the other lookup, reusing its row.
+        let handle = "sess-race";
+        for _ in 0..2 {
+            assert!(repo.find_by_external_id(handle).await.unwrap().is_none());
+        }
+        let a = repo.create(handle, Some("pi"), None).await.unwrap();
+        let b = repo
+            .create(handle, None, Some("sonnet"))
+            .await
+            .expect("v010 allows a second unowned create for the same external ID");
+        assert_ne!(a, b);
+
+        let mut response = db
+            .inner()
+            .query("SELECT * FROM `session` WHERE external_id = $handle AND account = NONE")
+            .bind(("handle", handle))
+            .await
+            .unwrap();
+        let rows: Vec<Session> = response.take(0).unwrap();
+        assert_eq!(rows.len(), 2, "both unowned rows are stored");
     }
 
     #[tokio::test]
