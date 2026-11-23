@@ -660,10 +660,12 @@ addition to their exact top-level pins: pinning the SurrealDB SDK alone does not
 freeze its internal engine crates. Engine changes need the deployment/storage-format
 review described below; inference-stack changes need artifact and vector validation.
 
-[`.github/workflows/container.yml`](.github/workflows/container.yml) additionally builds the Docker
-image and boot-tests it — waits on `/debug`, then performs a real MCP `initialize` handshake against
-`/mcp` — but only when a change touches the `Containerfile`, `.dockerignore`, the manifests, or
-`crates/**`. A green `CI` run therefore says nothing about the image, and vice versa.
+[`.github/workflows/container.yml`](.github/workflows/container.yml) builds the Docker image and
+boots it with hosted HTTP settings and disposable storage. It checks `/health`, anonymous denial
+on `/debug` and `/mcp`, then a real MCP `initialize` with an API token issued to a disposable owner.
+The smoke reaches only the private HTTP leg, not a browser or TLS reverse proxy. Its path filters
+cover the container inputs, workspace manifests and lockfile, `crates/**`, and the smoke workflow
+and script. A green `CI` run does not prove the image passed, and vice versa.
 
 ## License
 
