@@ -27,6 +27,47 @@ pub const MIGRATIONS: &[(u32, &str, &str)] = &[
     ),
     (7, "reminder", include_str!("v007_reminder.surql")),
     (8, "dreaming", include_str!("v008_dreaming.surql")),
+    (
+        9,
+        "accounts_scopes",
+        include_str!("v009_accounts_scopes.surql"),
+    ),
+    (
+        10,
+        "scoped_sessions",
+        include_str!("v010_scoped_sessions.surql"),
+    ),
+    (11, "refinement", include_str!("v011_refinement.surql")),
+    (
+        12,
+        "refinement_proposals",
+        include_str!("v012_refinement_proposals.surql"),
+    ),
+    (
+        13,
+        "refinement_candidate_progress",
+        include_str!("v013_refinement_candidate_progress.surql"),
+    ),
+    (
+        14,
+        "refinement_work",
+        include_str!("v014_refinement_work.surql"),
+    ),
+    (
+        15,
+        "refinement_application",
+        include_str!("v015_refinement_application.surql"),
+    ),
+    (
+        16,
+        "admin_recovery_log",
+        include_str!("v016_admin_recovery_log.surql"),
+    ),
+    (
+        17,
+        "journal_assertion_compat",
+        include_str!("v017_journal_assertion_compat.surql"),
+    ),
 ];
 
 /// Version a fully migrated database reports in `system_config.schema_version`.

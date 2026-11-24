@@ -31,8 +31,8 @@ impl<'a> EdgeRepo<'a> {
         edge_type: &str,
         strength: f64,
     ) -> Result<()> {
-        let from_id = RecordId::parse_simple(from)?;
-        let to_id = RecordId::parse_simple(to)?;
+        let from_id = crate::parse_record_id(from)?;
+        let to_id = crate::parse_record_id(to)?;
         self.db
             .query(
                 "RELATE $from->memory_edge->$to \
@@ -140,7 +140,7 @@ impl<'a> EdgeRepo<'a> {
     ) -> Result<(Vec<Neighbor>, bool)> {
         let mut all_neighbors = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        let start_id = surrealdb::types::RecordId::parse_simple(id)?;
+        let start_id = crate::parse_record_id(id)?;
         visited.insert(format!("{:?}", start_id));
 
         let mut frontier = vec![(id.to_string(), 0u32)];

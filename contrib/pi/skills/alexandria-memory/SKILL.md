@@ -134,27 +134,67 @@ not what you meant (a restricted day-of-month with a restricted day-of-week, a `
 turn** — a mis-parsed "every Friday" is cheapest to fix while they're still there. Optional `note` and
 provenance fields ride along at delivery for context.
 
-Targeting: reminders are **global** by default (delivered in any context). Use `target_project` for
-repo-bound follow-ups; delivery matches the project name exactly and case-sensitively. A targeted
-reminder in a project that stops being visited is not lost — once it is at least the server's
-escalation window overdue (`[reminders].escalation_hours`) it delivers everywhere, flagged
-`escalated: true`.
+Targeting: reminders are **account-bound**. For a project-specific follow-up, use an existing owned,
+issued `project:<opaque-id>` returned by `mcp__alexandria__resolve_project` or
+`mcp__alexandria__list_projects`. Copy that handle exactly into `set_reminder.target_project`,
+`check_reminders.project`, and `list_reminders.target_project`. A display name, alias, repository name,
+or checkout basename is not that handle; unknown and foreign handles are refused, even if no rows
+are due.
+
+If you only know a basename/name, first propose resolving the project or selecting it from the owned
+project listing, using the available tool's schema. Wait for an actual successful result before using
+its handle. Do not invent a resolver result, an issued ID, or an account-management RPC. If those
+tools are unavailable, explain that an owned handle is needed. Do not silently omit a selector and
+widen a project-specific request. To set a global reminder, omit the optional target. Checking
+without a project delivers only global and eligible escalated reminders, not all project reminders.
+
+Global delivery and overdue escalation stay **within the reminder owner's account**. A valid project
+target at least `[reminders].escalation_hours` overdue may deliver in another project context of that
+same account, flagged `escalated: true`; it never transfers to another account, even with the same
+checkout basename. Held rows and unresolved historical text targets stay pending and suppressed,
+not global or escalated. There is no automatic historical mapping.
+
+The Pi companion resolves the session directory's sanitized `origin` remote with
+`mcp__alexandria__resolve_project`, then uses the returned owned project ID for recall and reminder
+checks. Userinfo, query and fragment are discarded before remote identity is sent; absent a usable
+remote and absent `ALEXANDRIA_PROJECT_ID`, the companion sends no project selector and remains
+Personal-only. The explicit override is resolved and validated too. Authentication uses the
+companion's `ALEXANDRIA_API_TOKEN`, independently of model-provider credentials; an incompatible
+server requires upgrade, never an anonymous or unscoped fallback. Automatic observation stores and
+session-end extraction were removed: when a durable fact should be retained, call
+`mcp__alexandria__store_memory` explicitly, or `mcp__alexandria__import_document` for source material.
 
 Delivery happens only when something calls **`mcp__alexandria__check_reminders`** — some client
 integrations do it automatically at the start of each turn; if yours doesn't (check what your client
 actually does), you are that something. That call is the *only* thing that consumes reminders
 (recurring ones advance; missed fires coalesce rather than trickle). So don't call it reflexively;
 call it when the user asks "anything due?", or when a reminder they expected hasn't shown up, passing
-the current project so project-targeted reminders match. The `due_reminders` array on
+the actual owned issued project handle so typed targets match. Omit the project only when checking
+for global and eligible escalated reminders. The `due_reminders` array on
 `mcp__alexandria__retrieve_memories` / `mcp__alexandria__recall` responses is a read-only safety net (a small
-oldest-due sample) that is *untargeted*: entries appear there with their `target` whatever project
-they belong to, so another project's entry is informational — it reaches the user through the next
-`mcp__alexandria__check_reminders` instead.
+oldest-due sample) that is *untargeted within your account*: eligible entries carry `global` or a
+typed project handle. Another owned project's entry is informational, not consumed; delivery occurs
+through a matching or eligible escalated `mcp__alexandria__check_reminders` call. Held/unresolved
+targets are excluded from that sample but remain inspectable in your unfiltered reminder history.
+
+## Project scope and explicit writes
+
+Without an explicit project context, ordinary reads are Personal-only; they do not search every project.
+For project-specific work, call `mcp__alexandria__resolve_project` with the available project identity,
+then use the returned owned ID with the relevant tool's project/context parameter. Do not infer an ID
+from a name or checkout basename. Project writes require an explicit project target; a session ID is
+not a substitute for a scope. The Pi companion can resolve a sanitized git origin automatically, but
+an agent using the tools directly must resolve the project before issuing a project-scoped request.
+
+## Classification and quality review
+
+Unassigned is an owner review partition, not a recall mode. Use `mcp__alexandria__list_unassigned_memories` only for deliberate Unassigned review; `mcp__alexandria__propose_memory_scope` stages a revision for the owner, not a move or approval. Do not treat quality proposals as facts or grant egress consent on the owner's behalf. Use the owner UI for quality decisions and private operation history. Refinement does not look for contradictions between Personal and a project, even when both are recalled.
 
 ## Guidelines
 
-- **Bias toward storing.** Memory writes are cheap and clustering handles rough dedup; losing a
-  decision/rationale is more costly than an extra memory entry.
+- **Store durable information explicitly.** Use `store_memory` for a standalone durable fact,
+  decision, preference, correction, or resolved bug; use `import_document` for reference material.
+  Client integrations do not automatically extract or write observed conversation content.
 - **Write for a stranger.** Assume the reader has zero context from this conversation.
 - **Don't narrate it.** Store/retrieve silently as part of normal work, the same way you'd read
   a file — don't announce "let me check my memory" unless the result changes what you tell the

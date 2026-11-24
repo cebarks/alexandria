@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 
 use super::html::{self, error_page, page, unavailable};
+use super::web::{Boundary, BrowserSession};
 use crate::AlexandriaServer;
 use crate::server::record_id_to_string;
 
@@ -56,10 +57,15 @@ struct SessionsTemplate {
 /// tolerance `memories::list` gives its own pagination and `graph::api_graph` gives `?hops`.
 /// A hand-typed `?limit=abc` is a typo, not a malformed request, and this page is a diagnostic
 /// surface that a failing request would leave the operator staring at.
-pub async fn list(
+pub(crate) async fn list(
     State(server): State<AlexandriaServer>,
+    boundary: Boundary,
+    session: BrowserSession,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    let Ok((owner, read)) = boundary.corpus(&session).await else {
+        return forbidden_page("this page requires an authenticated owner session");
+    };
     let limit: usize = params
         .get("limit")
         .and_then(|v| v.parse().ok())
@@ -69,8 +75,23 @@ pub async fn list(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let repo = alexandria_storage::repos::SessionRepo::new(server.db.inner());
-    let sessions = match repo.list(limit, offset).await {
+    // The caller's own sessions, counted and paginated inside their own account: the unscoped shape
+    // here listed every account's handles to anyone who could open the page, and a foreign
+    // `external_id` was indistinguishable from a missing one only by accident.
+    let repo = alexandria_storage::repos::ScopedSessionRepo::new(server.db.inner(), owner);
+    let membership = alexandria_storage::repos::ScopeFilter::new(&read);
+    let sessions = match repo
+        .list_scoped(&alexandria_storage::repos::SessionPageQuery {
+            agent_id: None,
+            tag: None,
+            finalized: None,
+            membership,
+            projection: alexandria_storage::repos::SessionProjection::Scoped,
+            limit,
+            offset,
+        })
+        .await
+    {
         Ok(s) => s,
         Err(e) => return error_page("sessions", &e.to_string()),
     };
@@ -85,12 +106,12 @@ pub async fn list(
                 .clone()
                 .unwrap_or_else(|| html::ABSENT.to_string()),
             model: s.model.clone().unwrap_or_else(|| html::ABSENT.to_string()),
-            memory_count: s.memory_count,
+            memory_count: s.memory_count as usize,
             started: html::format_dt(s.started_at),
             last_activity: html::format_dt(s.ended_at),
-            // Finalized is *only* ever the summary. `ended_at` is written by `touch()` on every
-            // attached memory, so a live idle session has one too and would be mislabelled.
-            finalized: s.summary.is_some(),
+            // The projected flag, not the prose: `list_scoped`'s scoped withholds `summary`, and a
+            // page badge is not a licence to read somebody's session text back.
+            finalized: s.finalized.unwrap_or_else(|| s.summary.is_some()),
         })
         .collect();
 
@@ -145,11 +166,16 @@ struct SessionDetailTemplate {
     memories: Vec<MemoryRow>,
 }
 
-pub async fn detail(
+pub(crate) async fn detail(
     State(server): State<AlexandriaServer>,
+    boundary: Boundary,
+    session: BrowserSession,
     Path(external_id): Path<String>,
 ) -> Response {
-    let repo = alexandria_storage::repos::SessionRepo::new(server.db.inner());
+    let Ok((owner, _read)) = boundary.corpus(&session).await else {
+        return forbidden_page("this page requires an authenticated owner session");
+    };
+    let repo = alexandria_storage::repos::ScopedSessionRepo::new(server.db.inner(), owner);
 
     // Keyed on `external_id`, the id operators actually pass to `store_memory(session_id)` and
     // `get_session`, not the internal RecordId.
@@ -202,8 +228,17 @@ pub async fn detail(
     })
 }
 
+/// A refusal rendered through the layout, for a handler that passed the guard and could not resolve
+/// its caller's population.
+fn forbidden_page(message: &str) -> Response {
+    let mut response = error_page("sessions", message);
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::HOST_HEADER;
     use super::{SessionDetailTemplate, SessionsTemplate};
     use askama::Template;
     use axum::body::Body;
@@ -212,7 +247,13 @@ mod tests {
 
     async fn fetch_body(app: axum::Router, uri: &str) -> String {
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(HOST_HEADER, super::super::test_support::HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200, "unexpected status for {uri}");
@@ -259,7 +300,13 @@ mod tests {
         let server = super::super::test_support::test_server().await;
         seed(&server).await;
 
-        let text = fetch_body(crate::debug::router(server), "/debug/sessions").await;
+        let text = fetch_body(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+            "/debug/sessions",
+        )
+        .await;
         assert!(
             text.contains("pi:sess-7"),
             "external_id must be the visible key: {text}"
@@ -313,7 +360,13 @@ mod tests {
             .await
             .unwrap();
 
-        let text = fetch_body(crate::debug::router(server), "/debug/sessions").await;
+        let text = fetch_body(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+            "/debug/sessions",
+        )
+        .await;
         let row_of = |id: &str| -> String {
             let start = text
                 .find(id)
@@ -352,7 +405,13 @@ mod tests {
             .await
             .unwrap();
 
-        let text = fetch_body(crate::debug::router(server), "/debug/sessions").await;
+        let text = fetch_body(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+            "/debug/sessions",
+        )
+        .await;
         assert!(
             !text.contains("<script>alert(1)</script>"),
             "raw <script> tag must not appear unescaped; got: {text}"
@@ -383,7 +442,13 @@ mod tests {
             .await
             .unwrap();
 
-        let detail = fetch_body(crate::debug::router(server), "/debug/sessions/sess-tagged").await;
+        let detail = fetch_body(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+            "/debug/sessions/sess-tagged",
+        )
+        .await;
         assert!(
             detail.contains(r#"<span class="badge">&#60;img src=x onerror=alert(2)&#62;</span>"#),
             "tag must render HTML-escaped; got: {detail}"
@@ -410,7 +475,10 @@ mod tests {
             session_repo.create(id, None, None).await.unwrap();
         }
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let junk = fetch_body(app.clone(), "/debug/sessions?limit=abc&offset=%20").await;
         let blank = fetch_body(app.clone(), "/debug/sessions?limit=&offset=").await;
         let plain = fetch_body(app, "/debug/sessions").await;
@@ -446,7 +514,10 @@ mod tests {
             session_repo.create(id, None, None).await.unwrap();
         }
 
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let first = fetch_body(app.clone(), "/debug/sessions?limit=2&offset=0").await;
         assert!(
             first.contains("of 3 sessions"),
@@ -505,7 +576,13 @@ mod tests {
             .await
             .unwrap();
 
-        let text = fetch_body(crate::debug::router(server), "/debug/sessions/pi%3Asess-7").await;
+        let text = fetch_body(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+            "/debug/sessions/pi%3Asess-7",
+        )
+        .await;
         assert!(text.contains("pi:sess-7"));
         assert!(
             text.contains(r#"<pre class="content-block">the session summary</pre>"#),
@@ -547,7 +624,13 @@ mod tests {
             .await
             .unwrap();
 
-        let text = fetch_body(crate::debug::router(server), "/debug/sessions/pi%3Asess-7").await;
+        let text = fetch_body(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+            "/debug/sessions/pi%3Asess-7",
+        )
+        .await;
         // The id in the href is urlencoded (`:` -> `%3A`); the link text is the plain id.
         let href = fact_id.replace(':', "%3A");
         assert!(
@@ -565,7 +648,13 @@ mod tests {
         let server = super::super::test_support::test_server().await;
         seed(&server).await;
 
-        let text = fetch_body(crate::debug::router(server), "/debug/sessions/pi%3Asess-7").await;
+        let text = fetch_body(
+            super::super::test_support::authenticated_on_server(server)
+                .await
+                .session_router(),
+            "/debug/sessions/pi%3Asess-7",
+        )
+        .await;
         assert!(text.contains("first memory"));
         assert!(
             !text.contains("deleted memory"),
@@ -576,11 +665,15 @@ mod tests {
     #[tokio::test]
     async fn test_session_detail_404_for_unknown_external_id() {
         let server = super::super::test_support::test_server().await;
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/sessions/nope-not-here")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -797,7 +890,10 @@ mod tests {
         // here would break that premise, so it is part of the contract, not an accident.
         let server = super::super::test_support::test_server().await;
         seed(&server).await;
-        let app = crate::debug::router(server);
+        let app = {
+            let fixture = super::super::test_support::authenticated_on_server(server).await;
+            fixture.session_router()
+        };
         let list = fetch_body(app.clone(), "/debug/sessions").await;
         let detail = fetch_body(app, "/debug/sessions/pi%3Asess-7").await;
         for page in [&list, &detail] {
@@ -812,27 +908,25 @@ mod tests {
 
     /// Storage failure ⇒ `html::UNAVAILABLE_STATUS`, asserted on bytes the handler produced.
     ///
-    /// Forced by handing the handler a database that was never migrated: the first repo call then
-    /// fails for real, with no mock and no change to `alexandria-storage`. The body assertion matters
+    /// Forced by removing the table the read needs, on a store that *is* migrated: the first repo call
+    /// then fails for real, with no mock and no change to `alexandria-storage`. The body assertion matters
     /// as much as the status one — it is what proves this page goes through `html::unavailable`
     /// rather than re-inlining `error_page` plus a `status_mut` (the old `memories.rs` shape), which
     /// would keep the status identical and only change the wording.
     #[tokio::test]
     async fn test_session_storage_failure_answers_with_the_one_status() {
-        let db = alexandria_storage::Database::connect_embedded()
-            .await
-            .unwrap();
-        let server = crate::AlexandriaServer::new(
-            std::sync::Arc::new(db),
-            std::sync::Arc::new(super::super::test_support::StubEmbedding),
-            0.75,
-            crate::server::HeatSettings::default(),
-        );
-        let app = crate::debug::router(server);
+        // A migrated store with the one table the read needs removed: the handler's repo call then
+        // fails for real. (The pre-Task 9 injection was an unmigrated database, which the boundary now
+        // refuses before any handler runs — a page cannot be shown to fail on a store that cannot
+        // sign anybody in.)
+        let fixture = super::super::test_support::authenticated_app(true).await;
+        fixture.drop_table("session").await;
+        let app = fixture.session_router();
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/debug/sessions/pi%3Asess-7")
+                    .header(HOST_HEADER, super::super::test_support::HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -892,6 +986,75 @@ mod tests {
         assert!(
             !detail_html.contains("<p>No memories.</p>"),
             "the retired bare-paragraph empty shape must not come back; got: {detail_html}"
+        );
+    }
+}
+
+/// Sessions as two owners see them: the list is a population, and a foreign `external_id` is not
+/// distinguishable from an absent one.
+#[cfg(test)]
+mod boundary {
+    use crate::debug::test_support as support;
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn each_owner_lists_only_their_own_sessions() {
+        let server = crate::debug::test_support::test_server().await;
+        let alice = support::authenticated_on_server(server.clone()).await;
+        let bob = alice.second_owner("debug-fixture-second").await;
+        alice
+            .seed_session("alice-session", Some("alice summary"))
+            .await;
+        bob.seed_session("bob-session", None).await;
+
+        let (status, page) = alice.get("/debug/sessions").await;
+        assert_eq!(status, StatusCode::OK, "{}", support::clip(&page));
+        assert!(
+            page.contains("alice-session"),
+            "the owner's session is missing"
+        );
+        assert!(
+            !page.contains("bob-session"),
+            "a second owner's session was listed: {}",
+            support::clip(&page)
+        );
+
+        // The detail half, with the positive control the "absent" case cannot provide on its own.
+        let (own, own_body) = alice.get("/debug/sessions/alice-session").await;
+        assert_eq!(own, StatusCode::OK, "{}", support::clip(&own_body));
+        let (foreign, _) = alice.get("/debug/sessions/bob-session").await;
+        let (absent, _) = alice.get("/debug/sessions/no-such-session").await;
+        assert_eq!(foreign, StatusCode::NOT_FOUND);
+        assert_eq!(
+            absent, foreign,
+            "a foreign session is distinguishable from an absent one"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_summary_a_session_carries_stays_with_its_owner() {
+        let server = crate::debug::test_support::test_server().await;
+        let alice = support::authenticated_on_server(server.clone()).await;
+        let bob = alice.second_owner("debug-fixture-second").await;
+        alice
+            .seed_session("alice-session", Some("ALICE-ONLY-SUMMARY"))
+            .await;
+        bob.seed_session("bob-session", Some("BOB-ONLY-SUMMARY"))
+            .await;
+
+        let (_, alice_page) = alice.get("/debug/sessions/alice-session").await;
+        assert!(
+            alice_page.contains("ALICE-ONLY-SUMMARY"),
+            "the owner lost their own summary"
+        );
+        assert!(
+            !alice_page.contains("BOB-ONLY-SUMMARY"),
+            "a foreign summary was rendered"
+        );
+        let (_, anonymous) = alice.get_anonymous("/debug/sessions/alice-session").await;
+        assert!(
+            !anonymous.contains("ALICE-ONLY-SUMMARY"),
+            "an unsigned read reached a session summary"
         );
     }
 }

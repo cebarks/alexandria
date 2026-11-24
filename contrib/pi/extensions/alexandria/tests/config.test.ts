@@ -23,6 +23,8 @@ const CONFIG_MODULE = new URL("../src/config.ts", import.meta.url);
 /** Every variable `src/config.ts` reads, so no case inherits state from the shell. */
 const MANAGED_ENV = [
 	"ALEXANDRIA_URL",
+	"ALEXANDRIA_API_TOKEN",
+	"ALEXANDRIA_PROJECT_ID",
 	"ALEXANDRIA_AUTO_RECALL",
 	"ALEXANDRIA_AUTO_RECALL_LIMIT",
 	"ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY",
@@ -32,6 +34,9 @@ const MANAGED_ENV = [
 	"ALEXANDRIA_REMINDERS",
 	"ALEXANDRIA_REMINDERS_PROJECT",
 	"ALEXANDRIA_CLIENT_CONFIG",
+	"ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS",
+	"ALEXANDRIA_PROMPT_BUDGET_MS",
+	"ANTHROPIC_API_KEY",
 	"XDG_CONFIG_HOME",
 ];
 
@@ -39,7 +44,7 @@ const MANAGED_ENV = [
  *  whitespace-padded project, so "the file said it" is distinguishable from
  *  "the default said it" for each field. */
 const FULL_JSON = JSON.stringify({
-	server: { url: "http://127.0.0.1:9999/mcp" },
+	server: { url: "http://127.0.0.1:9999/mcp", api_token: "ignored-fixture-token", project_id: "project:ignored" },
 	recall: { enabled: false, limit: 7, min_similarity: 0.42 },
 	store: { enabled: false, extract_model: "test/extract-model", extract_timeout_ms: 1234 },
 	reminders: { enabled: false, project: "  from-json  " },
@@ -76,7 +81,7 @@ async function configWith(
 		const loaded = (await import(
 			`${CONFIG_MODULE.href}?case=${instances++}`
 		)) as typeof import("../src/config.js");
-		return loaded.CONFIG;
+		return { ...loaded.CONFIG } as typeof loaded.CONFIG;
 	} finally {
 		// Leave no trace: a leaked variable would mislead every later case in this
 		// file, and the runner starts from the developer's own shell environment.
@@ -90,14 +95,49 @@ async function configWith(
 test("no env and no file: every feature is on, and the defaults hold", async () => {
 	const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: absentJson });
 	assert.equal(config.serverUrl, "http://127.0.0.1:3000/mcp");
+	assert.equal(config.apiToken, undefined);
+	assert.equal(config.projectId, undefined);
 	assert.equal(config.recallDisabled, false);
-	assert.equal(config.storeDisabled, false);
 	assert.equal(config.remindersDisabled, false);
 	assert.equal(config.recallLimit, 10);
 	assert.equal(config.recallMinSimilarity, 0.45);
-	assert.equal(config.extractModel, "vertex/claude-haiku-4-5");
-	assert.equal(config.extractTimeoutMs, 5000);
 	assert.equal(config.remindersProject, undefined);
+	assert.equal(config.promptCallTimeoutMs, 5000);
+	assert.equal(config.promptBudgetMs, 10000);
+});
+
+test("transport timeouts load from client.json and environment overrides", async () => {
+	const transportJson = join(workspace, "transport.json");
+	await writeFile(
+		transportJson,
+		JSON.stringify({ transport: { prompt_call_timeout_ms: 1200, prompt_budget_ms: 4000 } }),
+		"utf8",
+	);
+	const fromFile = await configWith({ ALEXANDRIA_CLIENT_CONFIG: transportJson });
+	assert.equal(fromFile.promptCallTimeoutMs, 1200);
+	assert.equal(fromFile.promptBudgetMs, 4000);
+	const fromEnv = await configWith({
+		ALEXANDRIA_CLIENT_CONFIG: transportJson,
+		ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS: "2500",
+		ALEXANDRIA_PROMPT_BUDGET_MS: "8000",
+	});
+	assert.equal(fromEnv.promptCallTimeoutMs, 2500);
+	assert.equal(fromEnv.promptBudgetMs, 8000);
+});
+
+test("transport timeout configuration rejects invalid bounds instead of clamping", async () => {
+	const invalidConfigs: Record<string, string>[] = [
+		{ ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS: "0" },
+		{ ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS: "Infinity" },
+		{ ALEXANDRIA_PROMPT_BUDGET_MS: "120001" },
+		{ ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS: "6000", ALEXANDRIA_PROMPT_BUDGET_MS: "5000" },
+	];
+	for (const env of invalidConfigs) {
+		await assert.rejects(
+			configWith({ ALEXANDRIA_CLIENT_CONFIG: absentJson, ...env }),
+			/transport.*(positive|finite|120000|less than or equal)/i,
+		);
+	}
 });
 
 test("default config path selects client.json instead of legacy TOML", async () => {
@@ -132,18 +172,31 @@ test("legacy ALEXANDRIA_AUTO_RECALL=off disables recall alone", async () => {
 		ALEXANDRIA_AUTO_RECALL: "off",
 	});
 	assert.equal(config.recallDisabled, true);
-	assert.equal(config.storeDisabled, false);
 	assert.equal(config.remindersDisabled, false);
 });
 
-test("ALEXANDRIA_AUTO_STORE=off disables store alone", async () => {
-	const config = await configWith({
-		ALEXANDRIA_CLIENT_CONFIG: absentJson,
-		ALEXANDRIA_AUTO_STORE: "off",
-	});
-	assert.equal(config.storeDisabled, true);
-	assert.equal(config.recallDisabled, false);
-	assert.equal(config.remindersDisabled, false);
+test("obsolete extraction environment settings are ignored with upgrade guidance", async () => {
+	const warnings: string[] = [];
+	const originalWarn = console.warn;
+	console.warn = (message?: unknown) => warnings.push(String(message));
+	try {
+		const config = await configWith({
+			ALEXANDRIA_CLIENT_CONFIG: absentJson,
+			ALEXANDRIA_AUTO_STORE: "off",
+			ALEXANDRIA_EXTRACT_MODEL: "legacy/model",
+			ALEXANDRIA_EXTRACT_TIMEOUT_MS: "1234",
+		});
+		assert.equal(config.recallDisabled, false);
+		assert.equal(config.remindersDisabled, false);
+		assert.doesNotMatch(JSON.stringify(config), /legacy\/model|1234/);
+	} finally {
+		console.warn = originalWarn;
+	}
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /ALEXANDRIA_AUTO_STORE/);
+	assert.match(warnings[0], /ALEXANDRIA_EXTRACT_MODEL/);
+	assert.match(warnings[0], /ALEXANDRIA_EXTRACT_TIMEOUT_MS/);
+	assert.match(warnings[0], /store_memory.*explicitly/i);
 });
 
 test("ALEXANDRIA_REMINDERS=off disables reminders alone", async () => {
@@ -153,19 +206,30 @@ test("ALEXANDRIA_REMINDERS=off disables reminders alone", async () => {
 	});
 	assert.equal(config.remindersDisabled, true);
 	assert.equal(config.recallDisabled, false);
-	assert.equal(config.storeDisabled, false);
 });
 
-test("client.json drives every field when no env is set", async () => {
-	const config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: fullJson });
+test("client.json drives active fields but cannot supply credentials or enable legacy extraction", async () => {
+	const warnings: string[] = [];
+	const originalWarn = console.warn;
+	console.warn = (message?: unknown) => warnings.push(String(message));
+	let config: typeof import("../src/config.js").CONFIG;
+	try {
+		config = await configWith({ ALEXANDRIA_CLIENT_CONFIG: fullJson });
+	} finally {
+		console.warn = originalWarn;
+	}
 	assert.equal(config.serverUrl, "http://127.0.0.1:9999/mcp");
+	assert.equal(config.apiToken, undefined);
+	assert.equal(config.projectId, undefined);
+	assert.ok(!("storeDisabled" in config));
 	assert.equal(config.recallDisabled, true);
-	assert.equal(config.storeDisabled, true);
 	assert.equal(config.remindersDisabled, true);
 	assert.equal(config.recallLimit, 7);
 	assert.equal(config.recallMinSimilarity, 0.42);
-	assert.equal(config.extractModel, "test/extract-model");
-	assert.equal(config.extractTimeoutMs, 1234);
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /store.enabled/);
+	assert.match(warnings[0], /store.extract_model/);
+	assert.match(warnings[0], /store.extract_timeout_ms/);
 	// The target the server matches is trimmed on the way in, not sent padded.
 	assert.equal(config.remindersProject, "from-json");
 });
@@ -177,21 +241,26 @@ test("explicit env beats client.json in both directions", async () => {
 		// Not "off": any set value counts as an explicit choice, so the file's
 		// `enabled = false` cannot leave a feature dead after the user opts back in.
 		ALEXANDRIA_AUTO_RECALL: "on",
-		ALEXANDRIA_AUTO_STORE: "on",
 		ALEXANDRIA_REMINDERS: "on",
 		ALEXANDRIA_AUTO_RECALL_LIMIT: "3",
 		ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY: "0.1",
-		ALEXANDRIA_EXTRACT_MODEL: "env/model",
-		ALEXANDRIA_EXTRACT_TIMEOUT_MS: "4321",
 	});
 	assert.equal(config.serverUrl, "http://127.0.0.1:4000/mcp");
 	assert.equal(config.recallDisabled, false);
-	assert.equal(config.storeDisabled, false);
 	assert.equal(config.remindersDisabled, false);
 	assert.equal(config.recallLimit, 3);
 	assert.equal(config.recallMinSimilarity, 0.1);
-	assert.equal(config.extractModel, "env/model");
-	assert.equal(config.extractTimeoutMs, 4321);
+});
+
+test("API token and project ID are dedicated environment settings", async () => {
+	const config = await configWith({
+		ALEXANDRIA_CLIENT_CONFIG: absentJson,
+		ALEXANDRIA_API_TOKEN: "companion-token",
+		ALEXANDRIA_PROJECT_ID: " project:owned ",
+		ANTHROPIC_API_KEY: "provider-token",
+	});
+	assert.equal(config.apiToken, "companion-token");
+	assert.equal(config.projectId, "project:owned");
 });
 
 test("ALEXANDRIA_REMINDERS_PROJECT beats client.json and arrives trimmed", async () => {
@@ -253,7 +322,6 @@ test("a set-but-blank toggle does not re-enable what client.json disabled", asyn
 	// per-prompt check_reminders call back on with no signal.
 	for (const [key, field] of [
 		["ALEXANDRIA_AUTO_RECALL", "recallDisabled"],
-		["ALEXANDRIA_AUTO_STORE", "storeDisabled"],
 		["ALEXANDRIA_REMINDERS", "remindersDisabled"],
 	] as const) {
 		for (const blank of ["", "   "]) {
@@ -262,7 +330,7 @@ test("a set-but-blank toggle does not re-enable what client.json disabled", asyn
 				[key]: blank,
 			});
 			assert.equal(
-				config[field as "recallDisabled" | "storeDisabled" | "remindersDisabled"],
+				config[field],
 				true,
 				`${key}=${JSON.stringify(blank)} overrode the file's enabled=false`,
 			);
@@ -291,7 +359,6 @@ test("a blank or unparseable numeric override falls back instead of becoming 0 o
 	for (const key of [
 		"ALEXANDRIA_AUTO_RECALL_LIMIT",
 		"ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY",
-		"ALEXANDRIA_EXTRACT_TIMEOUT_MS",
 	]) {
 		for (const junk of ["", "  ", "ten", "1e999"]) {
 			const config = await configWith({
@@ -299,11 +366,7 @@ test("a blank or unparseable numeric override falls back instead of becoming 0 o
 				[key]: junk,
 			});
 			const value =
-				key === "ALEXANDRIA_AUTO_RECALL_LIMIT"
-					? config.recallLimit
-					: key === "ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY"
-						? config.recallMinSimilarity
-						: config.extractTimeoutMs;
+				key === "ALEXANDRIA_AUTO_RECALL_LIMIT" ? config.recallLimit : config.recallMinSimilarity;
 			assert.ok(Number.isFinite(value), `${key}=${JSON.stringify(junk)} -> ${value}`);
 			assert.ok(value > 0, `${key}=${JSON.stringify(junk)} -> ${value}`);
 		}

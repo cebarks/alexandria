@@ -232,6 +232,15 @@ pub struct JobReport {
     pub skipped: usize,
 }
 
+/// One partition's contribution to a capped job. The charge is the job-specific unit, not always
+/// `report.acted`: sweep/appraise charge selected heat-page rows while collapse charges successful
+/// retirements.
+#[derive(Debug, Clone, Copy)]
+pub struct PartitionJobReport {
+    pub report: JobReport,
+    pub budget_used: usize,
+}
+
 impl JobReport {
     /// A run that has examined nothing yet. There is no `Default`: a report without a `job` is
     /// meaningless, and deriving it would have to invent one.

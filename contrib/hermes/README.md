@@ -3,7 +3,7 @@
 Optional client-side companion for using Alexandria from
 [Hermes Agent](https://hermes-agent.nousresearch.com). Like the pi companion, it is not part of the
 MCP server and is not required to use Alexandria. Hermes has a first-class external
-*memory provider* slot, so recall and capture do not depend only on the agent choosing tools.
+*memory provider* slot for automatic recall and deliberate tool calls.
 Selecting a provider is additive by default; the configuration below makes Alexandria the sole
 active curated-memory backend without modifying Hermes.
 
@@ -11,8 +11,8 @@ What you get when it's active:
 
 | Direction | Behaviour |
 | --- | --- |
-| Read | `prefetch()` retrieves global, cross-session memories for nontrivial prompts and applies the configured client similarity floor. Semantic results are cached briefly. |
-| Write | Regex detectors ported from the pi companion (corrections, preferences, error→resolution pairs, tool-store tracking) capture during the session; an LLM extraction pass at session end stores durable facts via the host's own model. |
+| Read | `prefetch()` recalls across sessions from Personal and the configured project, if any, and applies a client-side similarity floor. Foreground semantic-cache hits require a fresh authenticated reminder check. |
+| Write | Only explicit memory tool calls write memories. Stores go to the configured project or to Personal if no project is configured. No automatic turn capture, session persistence, or LLM extraction. |
 | Time | Primary foreground prefetch checks due reminders freshly, including semantic-cache hits. Hermes currently skips this hook on trivial prompts such as “thanks”; delivery waits for a nontrivial foreground prompt or an explicit check. Background/cron/flush/subagent paths never consume automatically. The four reminder operations are also native tools. |
 | Tools | `alexandria_store_memory`, `alexandria_search_memories`, `alexandria_recall`, `alexandria_update_memory`, `alexandria_delete_memory`, plus the four reminder tools. |
 
@@ -21,6 +21,10 @@ What you get when it's active:
 - A running Alexandria HTTP server (see the root [README](../../README.md)); default
   `http://127.0.0.1:3000/mcp`. Install and start it explicitly before configuring Hermes.
   The companion checks `/health` but never installs or upgrades the server when that check fails.
+- An Alexandria agent bearer credential. Supply it to the Hermes process as `ALEXANDRIA_API_TOKEN`,
+  not in `config.yaml`, the endpoint URL, or a prompt. Use HTTPS for remote connections, or HTTP on
+  `localhost`, `127.0.0.1`, or `[::1]`. The authenticated client does not follow redirects or use
+  ambient HTTP proxy settings.
 - Hermes Agent with the memory-provider plugin surface (`agent/memory_provider.py`).
 
 ## Install
@@ -48,9 +52,6 @@ memory:
   user_profile_enabled: false
   alexandria:
     url: http://127.0.0.1:3000/mcp
-    auto_store: true
-    extract: true
-    store_session: true
 ```
 
 Keep the **`memory` toolset enabled**: disabling the whole toolset also hides external-provider
@@ -65,7 +66,14 @@ that store and Alexandria.
 
 ## Configuration
 
-All keys live under `memory.alexandria` in Hermes' `config.yaml`:
+Set `ALEXANDRIA_PROJECT_ID` to an Alexandria-issued project ID if this Hermes profile should work
+in a project. The provider reads the project and bearer once per instance; restart it after
+changing either. Recall includes Personal and the configured project. Explicit stores use that
+project, and foreground reminder checks pass that same ID. Without it, recall and stores are
+Personal-only and reminder checks have no project target. An unresolved project is not retried as
+Personal. Legacy `auto_store`, `extract`, and `store_session` keys are ignored.
+
+These non-secret settings live under `memory.alexandria` in Hermes' `config.yaml`:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -73,32 +81,23 @@ All keys live under `memory.alexandria` in Hermes' `config.yaml`:
 | `timeout` | `10.0` | Per-request HTTP timeout (seconds) |
 | `recall_limit` | `5` | Max memories injected per turn |
 | `min_similarity` | `0.45` | Client-side noise floor on top of the server's |
-| `auto_store` | `true` | Automatically capture corrections, preferences and error-resolution pairs; explicit native tool writes are unaffected |
-| `extract` | `true` | Run the LLM extraction pass at session end |
-| `store_session` | `true` | Pass `session_id` on stores so Alexandria groups memories per conversation |
-| `cache_ttl` | `60.0` | Recall cache lifetime (seconds); a failed recall falls back to the last cached text |
+| `cache_ttl` | `60.0` | Semantic recall cache lifetime (seconds); a failed check or retrieval does not fall back to cached text |
 
 ## How it maps to Hermes' hooks
 
 | Hermes hook | Alexandria call |
 | --- | --- |
-| `prefetch(query)` | `retrieve_memories` (or `recall`); returned text is injected into context |
-| `sync_turn(user, assistant, messages)` | detector pass → `store_memory`; tool-event scan feeds the error tracker and dedup buffer |
-| `on_session_end(messages)` | flush error→resolution pairs, LLM extraction pass → `store_memory` + `finalize_session` |
+| `prefetch(query)` | Fresh foreground reminder check and scoped `retrieve_memories` (or a valid semantic-cache hit) |
+| `sync_turn(user, assistant, messages)` | No network request or memory write |
+| `on_session_end(messages)` | Clear its recall cache; no transcript or finalization request |
 | `get_tool_schemas()` / `handle_tool_call()` | native store/search/recall/update/delete and all four reminder tools |
-| `on_session_switch(reset=True)` | ordered reset of per-session state; rewind preserves confirmed-store dedup |
+| `on_session_switch(reset=True)` | ordered reset of the session's semantic cache |
 
-Capture design follows the pi companion (see
-[`contrib/pi/extensions/alexandria/README.md`](../pi/extensions/alexandria/README.md)): heuristics
-during the session, one LLM pass at session end, one shared dedup buffer, fail-open everywhere —
-a down or slow Alexandria costs recall, never the conversation. Background work runs on Hermes'
-`spawn_context_thread` so profile multiplexing keeps working. Turn capture, explicit native tools,
-and session-end work are ordered on that worker; session IDs and transcript snapshots are captured
-before queueing. Tool-result identities, rather than transcript length, survive compression/rewind.
-Caller waits are bounded: a timeout may leave accepted work running, so the provider retains its
-state/client until that work completes and does not blindly retry writes. Failed stores do not
-become extraction exclusions. Pending failed error-resolution writes can be attempted again by a
-later in-process session-end call, but there is no durable retry spool across process exit.
+Recall failure does not interrupt the conversation. Background prefetch and explicit tool calls run
+on Hermes' `spawn_context_thread` so profile multiplexing keeps working. Explicit tool arguments and
+background cache session IDs are captured before queueing. Caller waits are bounded: a timeout may
+leave an already accepted tool call running, so the provider retains its client until that work
+completes. Inspect any uncertain write outcome before trying it again.
 
 ## Tests
 
@@ -131,9 +130,9 @@ uv pip compile --python-version 3.12 --universal --generate-hashes --only-binary
 the locked environment's interpreter. CI runs the same unittest discovery command as
 `just hermes-test`; its installer checks the pinned artifacts even if a dependency is already present.
 
-Plain `unittest`, no pytest. The suite runs against `mock_server.py`, an in-memory MCP
-StreamableHTTP server that speaks the same wire protocol as Alexandria (initialize handshake,
-session header, JSON and SSE response bodies) with naive word-overlap scoring standing in for
+Plain `unittest`, no pytest. The suite runs against `mock_server.py`, an in-memory loopback MCP
+fixture that accepts only a test credential and exercises the authenticated handshake, session
+header, JSON and SSE response bodies with naive word-overlap scoring standing in for
 embeddings. The mock is a protocol double, not a reference implementation of Alexandria's ranking.
 The provider tests import Hermes' real `MemoryProvider` ABC when a Hermes source tree is present
 and fall back to `tests/_hermes_stub/` otherwise (CI).
@@ -162,8 +161,6 @@ Listing defaults to `pending`, with `delivered`, `cancelled`, and `all` also sup
 
 - Not exercised against a live Alexandria in CI — the mock pins the wire contract, not ranking
   behaviour. A smoke test against a real server is worth adding if this gains users.
-- The extraction pass uses whatever model the host has active; quality varies with it, and it is
-  skipped entirely if the host exposes no plugin LLM.
 - Retrieval records access and updates heat, but ranking still ignores heat (see
   [`docs/performance-and-ability-findings.md`](../../docs/performance-and-ability-findings.md) A2).
   Recall therefore remains ordered by cosine similarity, not by the access/heat signal.

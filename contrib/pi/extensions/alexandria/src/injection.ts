@@ -96,6 +96,7 @@ export interface Injection {
 export function buildInjection(
 	recall: Settled<FeatureOutcome>,
 	reminders: Settled<ReminderOutcome>,
+	projectContext?: { projectId?: string; source: string },
 ): Injection {
 	const notifications: Notification[] = [];
 	const blocks: string[] = [];
@@ -168,6 +169,13 @@ export function buildInjection(
 		});
 	}
 
+	if (projectContext) {
+		blocks.unshift(
+			projectContext.projectId
+				? `Alexandria project context: ${projectContext.projectId.replace(/\s+/g, " ")} (resolved from ${projectContext.source}).`
+				: `Alexandria project context: Personal-only (${projectContext.source}).`,
+		);
+	}
 	if (blocks.length === 0) {
 		return { notifications, resetClient };
 	}

@@ -1,0 +1,25 @@
+{% extends "auth_page.html" %}
+{% block title %}Accept an invitation{% endblock %}
+{% block content %}
+<h1>Accept an invitation</h1>
+<p class="lede">Paste the invitation link your administrator gave you, then choose a login and password. The link works once.</p>
+{% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}
+<form method="post" action="/debug/invite">
+<input type="hidden" name="page" value="{{ page }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<div>
+<label for="secret">Invitation secret</label>
+<input id="secret" name="secret" autocomplete="off" required>
+</div>
+<div>
+<label for="login">Choose a login</label>
+<input id="login" name="login" autocomplete="username" required>
+</div>
+<div>
+<label for="password">Choose a password</label>
+<input id="password" name="password" type="password" autocomplete="new-password" required>
+</div>
+<button type="submit">Create my account</button>
+</form>
+<p class="note">Your account gets its own private workspace. Nothing in it is readable by the administrator who invited you, and an administrator&rsquo;s own memories are managed with the same authority any other owner has.</p>
+{% endblock %}

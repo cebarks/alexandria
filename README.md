@@ -8,13 +8,13 @@ Agent memory server with tiered maturity, hierarchical clustering, spreading act
 - **Ebbinghaus heat model** — Memories have heat (recency) and stability (spaced repetition). Frequently accessed memories stay hot; forgotten ones cool. Heat is recorded on retrieval but is not yet a ranking input — retrieval still ranks by cosine similarity (see [`A2`](docs/performance-and-ability-findings.md#a2-the-heat-model-is-inert)).
 - **Spreading activation** — Accessing a memory warms its graph neighbors. Heat propagates along edges with configurable decay.
 - **Graph edges** — Memories link via `derived_from` and `extracted_from` edges. `relates_to`, `supports` and `contradicts` exist in the schema but nothing in production writes them yet; auto-linking them is planned v0.3 work
-- **Hierarchical clustering** — Automatic cluster assignment on store, plus a background housekeeping scheduler that splits, merges, collapses byte-identical duplicates and lowers the confidence of memories that have gone cold without ever being retrieved, all with a queryable audit log that one `alexandria dream` pass can be reviewed (or run on demand) against
+- **Hierarchical clustering** — Automatic cluster assignment on store, plus a background housekeeping scheduler that splits, merges, collapses byte-identical duplicates and lowers the confidence of memories that have gone cold without ever being retrieved, all with a queryable audit log that one `alexandria dream` pass can be reviewed (or run on demand) against. Legacy split/merge currently skips owned or mixed populations pending scoped maintenance ([details](docs/configuration.md#dreaming)).
 - **Progressive recall** — Two-phase retrieval: broad cluster matching first, then scope-narrowing within a cluster
 - **Session memory** — Group memories by conversation, search within a session, and close it out with a summary
 - **Document import** — Chunk by heading, paragraph, or fixed size with batch tracking and `extracted_from` lineage
 - **Reminders** — One-shot and recurring follow-ups delivered on the next interaction, with project targeting and overdue escalation
 - **Persistent storage** — SurrealKV on disk, survives restarts
-- **Debug web UI** — Browser for memories, clusters, sessions, graph neighborhoods, cluster maintenance history, and a live query tester. Read-only apart from one disclosed heat write (see [Debug Web UI](#debug-web-ui))
+- **Debug web UI** — Browser for memories, clusters, sessions, graph neighborhoods, reminder migration holds, cluster maintenance history, and a live query tester. Its two disclosed writes are retrieval heat activation and owner-authorized reminder mapping (see [Debug Web UI](#debug-web-ui))
 - **Schema migrations** — Versioned `.surql` files with forward-only migration runner
 
 ## Quick Start
@@ -83,7 +83,9 @@ that run once and exit.
 | `alexandria migrate-embeddings --output-data-dir PATH [--resume] [--force]` | Copy a stopped persistent source into a separate, nonoverlapping target, then rewrite and verify it. Logs go to stderr and the completed JSON report to stdout. Resume requires the original adjacent receipt and matching journal/configuration; `--force` does not bypass ownership or replay a completed target. No automatic cutover, deletion, swap or restart. |
 | `alexandria bench-retrieval` | Measure how well the configured model separates a correct answer from the rest of the corpus, and print the score distributions and the limit × threshold grid that the `retrieve.min_similarity` floor and the client recall defaults are judged against — see [docs/minilm-test-data.md](docs/minilm-test-data.md). |
 | `alexandria dream [--job NAME]... [--max-rows N]` | Run one or more of the five housekeeping jobs **once, now**, and print what each did (`job=… examined=… acted=… skipped=…`) plus the run id its audit rows carry, so `/debug/maintenance?run=<id>` shows exactly what that pass changed. With no `--job` it runs all five. The way to answer "why did my corpus change" or "run the collapse now" without editing `[dreaming]` cadences and restarting the service — see [docs/configuration.md](docs/configuration.md). |
-| `alexandria --help` | Print the same list. |
+| `alexandria refinement --help` | Inspect routes, grant or revoke disclosed destination consent, or set an approval preference for the configured trusted-local account. See the [refinement configuration](docs/configuration.md#refinement). |
+| `alexandria dream --job refine --workspace ID --scope personal` | Run one explicit offline refinement turn for the trusted-local administrator's own workspace with current consent. `--scope project:ID` selects one project instead. Human-mode results remain pending for review; a currently authorized exact secondary approval can apply. This is not a sixth housekeeping job. |
+| `alexandria --help` | Print the command summary. |
 
 The legacy in-place command, benchmark and `dream` open the data dir directly, and SurrealKV
 is single-writer, so the server has to be stopped first. `alexandria dream` refuses a held
@@ -94,29 +96,35 @@ Linux only. Keep the adjacent source-manifest receipt with the target, especiall
 unfinished. `bench-retrieval` can instead run against a copy of the data dir via
 `ALEXANDRIA_DATA_DIR`, which keeps the server down only for a `cp`. It is not read-only: like
 server boot it checks the embedding-model lock (refusing on a mismatch) and defines the HNSW
-index if it is missing. `alexandria dream` needs neither the model nor the index — it reads the
+index if it is missing. The five housekeeping jobs need neither the model nor the index — they read the
 stored vectors, heat and confidence. It validates stored embedding readiness/identity before
 schema or job writes and refuses unfinished or corrupt migration targets, without loading a
-provider or requiring the configured model to match. `--max-rows N` overrides `dreaming.max_rows_per_run`
+provider or requiring the configured model to match. The cap is one allowance per capped job per pass **across all eligible partitions** — the dispatcher enumerates active accounts' partitions, rotates fairly with a persisted cursor, and shares the allowance, so one account's many projects cannot take every turn and a suspended account's workspace is neither enumerated nor written. `cluster` and `merge` are not partitioned yet: they remain legacy-gated whole-store jobs (they refuse owned/workspace data by construction), with partitioned owned-cluster maintenance as named follow-up work. `--max-rows N` overrides `dreaming.max_rows_per_run`
 for that invocation only, without touching the config file.
 
 ## MCP Tools
 
+The server exposes **17 MCP tools** (13 memory/session/reminder tools plus four project/classification tools). This table is the current server surface; the companion client additions do not add tools.
+
 | Tool | Description |
 | ------ | ------------- |
-| `store_memory` | Store text with auto-embedding, clustering, and heat initialization; optional `session_id` to group it. Returns `truncated: true` when the text is longer than `embedding.max_tokens`, meaning only its head is searchable |
-| `retrieve_memories` | Semantic similarity search with spreading activation on top results; optional `session_id` to scope |
-| `recall` | Progressive two-phase recall: broad cluster scan → focused scope narrowing |
+| `store_memory` | Store text with auto-embedding, clustering, and heat initialization; optional `session_id` to group it, plus `scope` (`personal`/`project`) with `project`/`context_project` to choose where it lands — a hosted request that names neither is refused before anything is embedded. Returns `truncated: true` when the text is longer than `embedding.max_tokens`, meaning only its head is searchable, and `scope` to confirm where the row went |
+| `retrieve_memories` | Semantic similarity search with spreading activation on top results; optional `session_id` to narrow within the scope, plus `scope` (`auto`/`personal`/`project`/`assigned`) and `project` to choose which partitions are searched. The response reports the selection that actually ran as `scope` — a label, never a partition handle |
+| `recall` | Progressive two-phase recall: broad cluster scan → focused scope narrowing; takes the same `scope`/`project` selection as `retrieve_memories` and applies the same population predicate to cluster members, reporting the selection it ran as `scope` |
 | `update_memory` | Update content/tags/confidence; content changes re-embed and create lineage |
-| `import_document` | Import and chunk documents with `extracted_from` edge tracking |
+| `import_document` | Import and chunk documents with `extracted_from` edge tracking; takes the same `scope`/`project`/`context_project` target, refused before the batch is embedded when a hosted request names none |
 | `delete_memory` | Soft-delete a memory by ID |
-| `get_session` | Return a session's metadata plus every memory stored during it |
-| `list_sessions` | List sessions newest-first with live memory counts; filter by `agent_id`, `tag`, or `finalized` |
+| `get_session` | Return a session's metadata plus the memories stored during it, inside the population selected by `project`; `view: "archive"` is the deliberate whole-session read that also returns the account-private summary and tags |
+| `list_sessions` | List sessions newest-first with live memory counts restricted to the population selected by `project`; filter by `agent_id` or `finalized`, and by `tag` only in `view: "archive"` |
 | `finalize_session` | Close a session with a summary, tags, and `ended_at` |
 | `set_reminder` | Schedule a one-shot (`due_at`) or recurring (named pattern / cron) reminder; response previews the next fire times |
 | `check_reminders` | Deliver due reminders and mark them consumed (global, project-matching, or escalated) |
 | `list_reminders` | List scheduled reminders by status and target project, oldest-due first, paginated |
 | `cancel_reminder` | Soft-cancel a reminder by ID |
+| `resolve_project` | Establish which project the current work belongs to from a sanitized origin remote or a project name/ID, and return the opaque project ID to use as `context_project`; the only tool that can create a project, so no agent guesses a partition into existence |
+| `list_projects` | List the projects you own with live memory counts, paged by opaque cursor (default 20, max 100); never names another workspace's project, not even by existence |
+| `list_unassigned_memories` | Enumerate the Unassigned partition for owner review, paged by cursor; the response says plainly that these rows are review state and are in no recall path, which is the point of the partition |
+| `propose_memory_scope` | Propose where a memory belongs, naming the revision it was read at (1–20 per call). Records a pending proposal and moves nothing: only the owner's decision, made later, changes a memory's scope |
 
 Tool and parameter descriptions are written directively ("call this proactively when…") because
 that measurably changes how often client LLMs reach for them unprompted.
@@ -142,11 +150,30 @@ cost of that design is that nothing reaches anyone until a client asks: the pi c
 `check_reminders` once per prompt and additionally notifies the human, and that client-side step is
 where "and the user" actually lives — a client that never calls the tool receives nothing.
 `set_reminder` validates schedules at set time and echoes the parsed next fire times for confirmation;
-`check_reminders` delivers and consumes them, one-way. Reminders target the global
-context or a specific project, and a project-targeted reminder that is overdue by at least
-`[reminders].escalation_hours` escalates to global delivery — nothing is silently lost. Overdue
-items are also surfaced read-only, capped and oldest-due first, in the `due_reminders` array of
-`retrieve_memories` and `recall` responses.
+`check_reminders` delivers and consumes them, one-way. All reminder operations are account-bound.
+Omit `set_reminder.target_project` for a global reminder **within your account**, or supply an existing
+owned `project:<opaque-id>` handle. `check_reminders.project` and `list_reminders.target_project`
+accept that same owned handle, not a name, alias, or checkout basename. Project tool results use
+canonical SurrealDB record text: copy it verbatim, including any quoting/escaping that distinguishes
+numeric, string, or literal-backtick keys. Do not strip delimiters or rebuild it from a display label.
+Unknown or foreign handles
+are refused even when nothing is due; omit a check context when no handle is known.
+
+A valid project target overdue by at least `[reminders].escalation_hours` escalates within its owner's
+account. A historical unresolved text target or `migration_hold` row stays pending and suppressed,
+including from the read-only due sample; escalation never turns it into a global reminder. No automatic
+legacy-name mapping is performed. Unfiltered `list_reminders` still exposes owned held/unresolved
+history for inspection (`target: null` for unresolved text, with separate legacy fields). The owner can
+review held rows, their original target text and an exact outstanding count at `/debug/reminder-mapping`,
+then release each with a revision-checked choice of Personal or an owned project. The journal records the
+mapping while preserving the legacy text and schedule/delivery history.
+Overdue eligible items are surfaced read-only, capped and oldest-due first, in the `due_reminders`
+array of `retrieve_memories` and `recall` responses. Targets there and in delivery responses are
+`global` or a single typed `project:<opaque-id>` handle, never a doubled prefix.
+
+Compatibility: older companion clients that send repository basenames do not satisfy this server
+contract. Configure an existing owned project handle where supported, or omit the context; automatic
+client-side handle discovery and historical target mapping are separate work, not provided here.
 
 Recurring schedules are evaluated as wall clock in `[reminders].timezone`, so a daily 09:00 stays 09:00
 local across a DST change: a time the spring-forward gap removed does not fire that day, and a time a
@@ -169,21 +196,17 @@ four levels:
    (Claude Code) document concrete trigger conditions and tool choice guidance, mirroring how other high-usage
    MCP tools ship skills alongside themselves.
 3. **Optional companion extension** — [`contrib/pi/extensions/alexandria/`](contrib/pi/extensions/alexandria/)
-   runs in both directions. On `before_agent_start` it calls `retrieve_memories` for every prompt and
-   injects hits above a similarity threshold, and calls `check_reminders` to deliver whatever is due,
-   so the agent never has to decide to check memory or wait for a timer the server doesn't run. On the
-   write side it adds heuristic detectors (corrections, stated preferences, error→resolution pairs)
-   that store without being asked, plus an LLM extraction pass at `session_shutdown` for durable facts
-   both the agent and the heuristics missed. This trades latency and potential noise for guaranteed
-   recall and much denser capture; recall, store, and reminders each toggle independently. The Claude
-   Code equivalent is the set of `UserPromptSubmit`, `PreToolUse`, and `Stop` hooks at
-   [`contrib/claude/hooks/`](contrib/claude/hooks/).
+   performs prompt-time recall and reminder checks, but has no automatic memory writers. It resolves
+   project context through a sanitized origin remote (or `ALEXANDRIA_PROJECT_ID`) and requires its
+   independent `ALEXANDRIA_API_TOKEN`. The `/alexandria` menu configures auto-recall. Use explicit
+   `store_memory` or `import_document` calls to retain information. The Claude Code recall hook at
+   [`contrib/claude/hooks/`](contrib/claude/hooks/) is Personal-only unless `ALEXANDRIA_PROJECT_ID`
+   is configured, and it likewise has no automatic observation writer.
 4. **Hermes Agent memory provider** — [`contrib/hermes/`](contrib/hermes/) integrates with Hermes'
-   external-memory-provider slot for automatic cross-session recall, heuristic capture,
-   session-end extraction, and native memory/reminder tools. The recommended configuration
-   disables Hermes' built-in curated stores so Alexandria is the only active long-term memory
-   backend; conversation history stays Hermes-owned. Coexistence is also supported, without
-   copying or synchronizing native memory entries into Alexandria.
+   external-memory-provider slot for authenticated cross-session recall, foreground reminders and
+   explicit native memory/reminder tools. It uses an agent bearer from the environment and an optional
+   issued project ID. Turn and session hooks never store memories or send transcripts for extraction.
+   Hermes' native stores can be disabled independently; conversation history stays Hermes-owned.
 
 Items 2–4 are client-side integrations, not part of the MCP server itself — see
 [`contrib/pi/README.md`](contrib/pi/README.md), [`contrib/claude/README.md`](contrib/claude/README.md),
@@ -192,71 +215,161 @@ and [`contrib/hermes/README.md`](contrib/hermes/README.md) for what they are and
 ## Debug Web UI
 
 When `transport = "http"`, a debug web UI is served alongside the MCP endpoint at
-`http://<host>:<port>/debug`. It is **read-only except for one disclosed exception**: the Query
-Tester's non-dry `retrieve` run performs spreading activation, so it writes heat exactly as a real
-`retrieve_memories` call does. Tick **Dry run** for a strictly read-only probe that writes nothing.
+`<public_origin>/debug`. Private pages and JSON endpoints require sign-in. Corpus views show only
+the signed-in account's memories, sessions, clusters, graph, reminders and query results. The
+non-dry Query Tester can write retrieval heat; tick **Dry run** for a read-only probe.
 
-- **Dashboard** (`/debug`) — record counts (facts active/deleted, clusters, edges, raw documents,
-  sessions), the **effective configuration** the server is actually running with (retrieval floor,
-  activation knobs, cluster and heat thresholds, the dreaming scheduler's cadences, live embedding
-  model and dimensions) shown alongside
+### Signing in, and what an account can see
+
+- **Authenticated web writes** use a browser session and the CSRF pair, enforced by the secured
+  router. This includes Collections edits and moves, Classification decisions, Refinement settings,
+  submissions and decisions, Query Tester runs, reminder mapping, and account/admin actions.
+  Sign-in sets the host-only `alexandria_session` and `alexandria_csrf` cookies. Both are
+  `HttpOnly`, `SameSite=Lax`, `Path=/`, and `Secure` except under explicit loopback development.
+- **Public sign-in, invitation redemption and password recovery** use short-lived, single-use
+  form tokens issued for the specific page, not the signed-in session's CSRF pair.
+- **HTTP MCP writes** use the account's bearer token in the `Authorization` header, not browser
+  cookies. Owners issue and revoke their agent tokens in `/debug/account`.
+
+- **Account** (`/debug/account`) — the signed-in account's own credentials: browser sessions and agent
+  tokens by label and creation time, with revoke, plus a recovery link for **this** account's password.
+  A newly minted token's or link's secret is shown **once**, in the response that created it; afterwards
+  the page lists the label and its last-used time, never the value. Creating an invitation is not
+  here — see Admin
+- **Admin** (`/debug/admin`, administrators only) — the account table: status, role, credential and
+  memory counts, and the actions that suspend, activate, invite and reset. An ordinary owner gets
+  `403` here, and the capability that gates it is a type the storage layer only issues after re-reading
+  `account.role`, so a demotion cannot be outrun by a page rendered while the account still had it
+- **Maintenance** (`/debug/maintenance`, administrators only) — the scheduler's **aggregate** health:
+  one row per `run_id` with its jobs, the action verbs it ran and how many rows each touched. No record
+  identities, no stored values and no per-row dispositions — a disposition lives in the audit table, not
+  on this page. See the note under the page list below for why this replaced the per-row audit page
+
+An administrator's own memories, sessions and clusters are read through the same owner-scoped path
+as anybody else's. Admin views do not let administrators read other owners' content directly.
+**An administrator can issue and redeem a password-recovery link for another account, reset its
+credentials and then sign in as that owner.** The v016 `admin_recovery_log` records issuance
+(who initiated it, the target, and when); the issuing admin receives the usable link.
+
+Separately, host administrators can read disk and backups. This is not end-to-end encryption.
+
+Two consequences of that boundary are deliberate and worth stating before they surprise anyone:
+
+- **A fresh, empty store cannot create its first account or administrator through the browser.**
+  Enrollment is invitation-only, and an invitation needs an administrator. The operator command that
+  bootstraps the first account is the deployment step that comes next; until it exists, a new store's
+  debug UI is reachable only as the page that says it cannot sign anybody in. Nothing about stdio,
+  loopback, a `Host` header or the absence of accounts grants authority — authority comes from a
+  credential and nothing else.
+- **Owner-facing per-record history lives in Operations, not Maintenance.** Maintenance shows
+  aggregates, including an unattributed group for rows written before run attribution. The owner can
+  inspect linked journal entries without exposing record identities in the administrator's view.
+
+### The pages
+
+- **Dashboard** (`/debug`) — the caller's own record counts (facts active/deleted, clusters, edges, raw
+  documents, sessions), the **effective configuration** the server is actually running with (retrieval
+  floor, activation knobs, cluster and heat thresholds, the dreaming scheduler's cadences, live
+  embedding model and dimensions) shown alongside
   what the TOML asked for, rollups for cluster health, sessions finalized/idle, top tags and heat
-  distribution, and the schema version — applied versus compiled-in, with a mismatch called out
-- **Memories** (`/debug/memories`) — paginated, sortable search/filter of facts by content and tag,
-  with **include deleted** and **include quarantined** checkboxes; click through to a detail view
-  showing heat, stability, timestamps, cluster membership, and graph edges. Quarantine is off by
-  default so the page matches what an agent can retrieve, and this is the operator view for a memory
-  on that middle rung — hidden from every retrieval path, still present, still reversible. Nothing
-  in the UI can put a row into quarantine or take it out
-- **Clusters** (`/debug/clusters`) — cluster list with live member counts and depth; drill into
+  distribution, and the schema version — applied versus compiled-in, with a mismatch called out. Every
+  number is the signed-in population's, not the store's: this page used to call `stats::gather`, which
+  counted every account's rows into one operator's summary
+- **Memories** (`/debug/memories`) — paginated, sortable search/filter of **the caller's** facts by
+  content and tag, with **include deleted** and **include quarantined** checkboxes; click through to a
+  detail view showing heat, stability, timestamps, cluster membership, and graph edges. Quarantine is
+  off by default so the page matches what an agent can retrieve. The owner can inspect a
+  quarantined memory even though ordinary recall excludes it. A detail id that belongs to somebody
+  else answers `404` exactly as an absent one does, which is the point: a distinguishable answer would
+  be a way to test which record ids exist
+- **Clusters** (`/debug/clusters`) — the caller's clusters with live member counts and depth; drill into
   `/debug/clusters/{id}` for member facts and cohesion. Cohesion is computed from each cluster's stored
   centroid, on the detail page and in the dashboard rollup alike, so the verdict matches what
-  the background maintenance task will actually act on
-- **Sessions** (`/debug/sessions`) — every session with agent, model, derived memory count, start and
-  last-activity times, and a finalized/active badge; `/debug/sessions/{external_id}` shows the
-  summary, tags, and the session's memories. Keyed by the `external_id` you pass to `store_memory(session_id)`
-- **Graph** (`/debug/graph/{id}`) — visualizes a memory's local edge neighborhood: nodes labelled with
-  content snippets rather than raw record ids (full id and hop distance in the tooltip), colour and
-  shape by table, edges styled by `edge_type` with strength banded into width, a legend generated from
-  those same maps, and click-through to the memory detail page. `?hops=1..3` sets the radius, clamped
-  server-side; the view caps at 200 nodes and says so when it truncates rather than rendering a
-  hairball. The backing JSON is at `/debug/api/graph/{id}`
-- **Maintenance log** (`/debug/maintenance`) — paginated history of the background scheduler's
-  writes: cluster splits and merges (source, resulting clusters, members moved), duplicate collapses
-  and cold-memory demotions, each carrying the `run_id` of the tick that wrote it, the job that ran,
-  the disposition and — for a demotion — the confidence it replaced. `?run=` narrows the whole page
-  to one run, which is how a pass gets reviewed as a unit or reversed as one; the run ids written by
-  `alexandria dream` start `run-cli-`, so a manual pass is separable from a scheduler tick in that
-  same filter. The filter is carried
-  across pagination, and the form is a GET to the same route (the panel stays read-only). The only way to audit *why* the corpus changed since you last
-  looked. The heat sweep deliberately writes nothing here: it changes ranking by nothing, so an audit
-  trail for it would be hundreds of rows an hour recording that nothing happened.
+  the background maintenance task will actually act on. A cluster the caller's population does not
+  contain is a `404`, including one whose row is gone but whose edges still carry member facts: those
+  edges hold other people's content, and labelling them would be the leak, not the diagnosis
+- **Sessions** (`/debug/sessions`) — the caller's sessions with agent, model, derived memory count,
+  start and last-activity times, and a finalized/active badge; `/debug/sessions/{external_id}` shows
+  the summary, tags, and the session's memories. Keyed by the `external_id` you pass to
+  `store_memory(session_id)`
+- **Graph** (`/debug/graph/{id}`, JSON at `/debug/api/graph/{id}`) — visualizes **one of the caller's**
+  memories' local edge neighborhood: nodes labelled with content snippets rather than raw record ids
+  (full id and hop distance in the tooltip), colour and shape by table, edges styled by `edge_type`
+  with strength banded into width, a legend generated from those same maps, and click-through to the
+  memory detail page. `?hops=1..3` sets the radius, clamped server-side; the view caps at 200 nodes and
+  says so when it truncates rather than rendering a hairball. Only edges whose **both** ends are inside
+  the caller's population are drawn, and the labels are read back through the same scoped repo that
+  produced the node list — a walk filtered by owner and labels fetched without that filter would put
+  another account's text on the canvas
+- **Maintenance** (`/debug/maintenance`, administrators only) — scheduler health as aggregates: runs
+  and what each did, with no fact, session or cluster identities and no content. This deliberately
+  replaced the pre-Task 9 page that listed every `maintenance_log` row across the whole store, because
+  those rows name records belonging to accounts that were never given an operator role, and the rows
+  written before attribution carries a `NONE` run id that cannot be shown to one owner without showing
+  it to all. An owner asking *why did my memory move* is answered by the operation journal, not here
+- **Reminder mapping** (`/debug/reminder-mapping`) — owner-only review of every held legacy target, including
+  original free-text target and an exact hold count. Releasing a hold requires a revision-current choice
+  of Personal or an owned project; it does not rewrite the historical target or reset schedule/delivery state.
+- **Refinement** (`/debug/refinement`) — owner/workspace-filtered proposal queue and detail pages, with selected
+  source records, proposed changes, rationale, uncertainty, model-policy comparison and linked private
+  application pre/postimages/revert status. The settings page discloses endpoints and model names (never
+  credentials), exposes revision-checked consent/revocation and review-mode controls, and makes human review
+  the default. Unassigned proposals are marked and filterable; classification may stale pending work.
+  Deferred proposals are hidden by default and available through the **Deferred** filter.
+  Owners can approve, dismiss, or defer the displayed revision, and can revert an application while its
+  semantic effects and references are unchanged. Opening a page never starts inference or applies a
+  proposal. With destination consent, owners can queue an assigned assessment or a manual Unassigned assessment from the queue, and request an opinion or regeneration from proposal detail. Submission opens a private status page that polls while the attempt is queued or running. Quota and attempt counts on these pages are the account's real rolling counts.
 - **Query Tester** (`/debug/query`, `POST /debug/query/run`) — run `retrieve_memories`/`recall` live
-  against the real embedding model to sanity-check retrieval quality, with optional `session_id`
-  scoping and a **Dry run** checkbox. Results report the effective `min_similarity` floor, list what
+  against the real embedding model to sanity-check retrieval quality, from inside the signed-in
+  account's own population, with optional `session_id` scoping and a **Dry run** checkbox. Results
+  report the effective `min_similarity` floor, list what
   that floor dropped, whether spreading activation fired and on which top-N, and carry a measured
   score-band legend so a similarity number can be read without a ruler
 
 All browser assets (htmx, vis-network) are **vendored** into the binary and served from
-`/debug/assets/{name}`, so the UI loads nothing from a CDN and works fully air-gapped.
+`/debug/assets/{name}`, so the UI loads nothing from a CDN and works fully air-gapped. The asset
+allowlist is the only public surface besides the three auth pages, and it is a closed `match` over
+literal filenames, so traversal is impossible by construction.
 
-The debug UI has **no authentication** and is intended for a trusted network boundary (same
-posture as the unauthenticated MCP endpoint) — do not expose it on a public interface without
-putting a reverse proxy/auth layer in front of it. That tradeoff is defensible because nothing on
-the page mutates except the one disclosed heat write above; if a mutating route is ever added, this
-paragraph is the thing that has to change first.
+### Guards, and what they are for
 
-Two guards in `debug/guard.rs` narrow that boundary. Every non-`GET` request that arrives with
-`Sec-Fetch-Site: cross-site` or `cross-origin` is refused with `403`, so a hidden auto-submitting
-form on a page you visit cannot drive the Query Tester into writing heat on an attacker-chosen
-query — this check is unconditional and needs no configuration. Separately, **binding to loopback
-is not by itself a security boundary**: DNS rebinding lets a remote page resolve its own domain to
-`127.0.0.1` and then read `/debug/sessions` — session summaries and tags — as same-origin. Setting
-`allowed_hosts` in `[server]` now guards the debug UI as well as `/mcp`, accepting a `Host` either
-with or without its port, and requests with no `Host` at all are refused while it is armed. The
-Host half is opt-in, so the shipped default of `["*"]` behaves exactly as before; prefer setting
-`allowed_hosts` explicitly (for example `["localhost", "127.0.0.1"]`) over leaving the wildcard,
-especially when `host = "0.0.0.0"`.
+The debug UI is no longer a thing you must put a proxy in front of to make it safe to publish, but the
+proxy advice still applies to `/mcp`: an agent token is a bearer credential, and TLS terminates at the
+reverse proxy you configure. What the server enforces itself:
+
+- **Authentication is fail-closed.** `debug::router(server)` and `debug::router_with_context(server,
+  Some(ctx))` — the two builds that used to be "the debug UI, unauthenticated" — now serve the asset
+  allowlist and refuse **every** private route with `403` *before* any handler runs, so a route mounted
+  above the guard, or a router assembled without a boundary, cannot leak. The production build is
+  `router_secured(server, ctx, boundary)`, and `main.rs` is its only caller. A `403` here is a refusal,
+  not an error page: it renders no markup, so a page cannot be probed for which routes exist.
+- **`Host` and `Origin` are checked against the published origin.** Binding to loopback is not by
+  itself a security boundary: DNS rebinding lets a remote page resolve its own domain to `127.0.0.1` and
+  read `/debug/sessions` as same-origin. Under a secured build, `allowed_hosts` must contain the request
+  `Host` and `allowed_origins` must contain `server.public_origin` exactly; a request with no `Host` is
+  refused. The wildcard `["*"]` remains an option only for the legacy no-boundary build, which shows
+  nothing anyway.
+- **CSRF is a session property, not a header heuristic.** `Sec-Fetch-Site` is still read — a
+  cross-site or cross-origin web mutation is refused outright. A signed-in web mutation also
+  needs the token that matches the caller's own session, in the `csrf` form field or
+  the `X-CSRF-Token` header. `OPTIONS` is not exempt: this router advertises no CORS configuration, so a
+  preflight here is the attack rather than a use case. A direct top-level navigation (`Sec-Fetch-Site:
+  none`) still needs the token too, which is why a cross-site form cannot reach the Query Tester's heat
+  write even with `Lax` cookies present.
+- **Private and auth-page responses carry `no-store`**, so a shared machine's cache cannot hold another
+  account's memory text.
+- **Sessions expire on idle**, and an agent token's revocation is noticed on the next request rather
+  than at some later reconnect, because the guard re-reads the live rows through the same `AuthService`
+  that `/mcp` admits through.
+
+Set `server.public_origin` to the `https` origin the UI is published at. Refusing to start without it —
+rather than booting a browser-facing server on an inferred origin — is the point of the check;
+`server.loopback_development = true` is the one exception, and it is honoured only on a loopback bind.
+`[server] allowed_hosts` and `allowed_origins` must cover that origin, and see
+[docs/configuration.md](docs/configuration.md) for the exact rules and the failure messages. Forwarded
+headers are never consulted: `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-For` and `Forwarded`
+cannot establish the origin, the host, or the loopback exception, because a client that can reach the
+port can set all four.
 
 ## Deployment
 
@@ -275,17 +388,17 @@ The earlier 3.2 → 3.3 transition was also one-way: table graph folds and HNSW 
 written by 3.3 were unreadable by 3.2. Do not chain upgrades without a backup for each boundary;
 see the historical [3.3 upgrade notes](https://github.com/surrealdb/surrealdb/blob/v3.3.0/doc/UPGRADING.md).
 The [dependency security status](docs/dependency-advisories.md) distinguishes patched engine
-advisories from the explicitly accepted, still-vulnerable WASM crypto dependency route.
+advisories from unresolved dependency and license decisions. The historical main-branch exceptions
+are not part of this policy.
 
 ### Health check
 
 `GET /health` answers `200 {"status":"ok","version":"…"}` when a trivial query round-trips through
 the engine at request time within a one-second deadline, and
-`503 {"status":"unavailable","error":"…"}` when the probe fails or times out — a wedged or closed
-store is never reported healthy from process state alone. No auth (the server has
-none anywhere) and nothing sensitive in the body. It exists for supervisors: systemd watchdogs,
-container healthchecks, and agent memory-status panels (the Hermes companion's `plugin.yaml` probes
-it during setup).
+`503 {"status":"unavailable","error":"…"}` with a fixed diagnostic when the probe fails or times out.
+It is public for supervisors such as systemd, container healthchecks, and the Hermes setup probe.
+It does not return backend error details or change bearer authentication at `/mcp` or sign-in for
+private browser pages.
 
 ### As a systemd user service (recommended)
 
@@ -351,8 +464,10 @@ The image defaults to HTTP transport on `0.0.0.0:3000` via `ALEXANDRIA_SERVER_*`
 
 Override config per-container with env vars (see [docs/configuration.md](docs/configuration.md)) or
 mount a TOML file and point `ALEXANDRIA_CONFIG` at it. Note the server binds `0.0.0.0` in the
-image and the MCP endpoint plus debug UI are unauthenticated — publish the port only behind a
-reverse proxy or on a trusted network. The debug UI needs no outbound network: its browser assets are
+image and the **MCP endpoint is authenticated by bearer token while the debug UI is authenticated by
+account session** — publish the port only behind a reverse proxy that terminates TLS, because the token
+and the session cookie both travel as bearer secrets and `server.public_origin` must name the `https`
+origin clients actually reach. The debug UI needs no outbound network: its browser assets are
 vendored into the binary, so a container with no egress still renders it (the first-run HuggingFace
 model download is the only thing that still needs the internet).
 
@@ -383,10 +498,11 @@ Or via stdio (for single-session use):
 #### In Claude Code
 
 ```bash
+# Configure the native MCP client with an authorized bearer credential as required by the server.
 claude mcp add --transport http --scope user alexandria http://127.0.0.1:3000/mcp
-# optional: client-side skill (content-parity with contrib/pi, using Claude Code's mcp__alexandria__<tool> names)
+# Optional: explicit tool-use guidance.
 cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
-# optional: auto-recall hook (see contrib/claude/README.md for the settings.json snippet)
+# Optional: hook recall uses ALEXANDRIA_API_TOKEN; see contrib/claude/README.md.
 cp contrib/claude/hooks/alexandria-recall.sh ~/.claude/hooks/
 ```
 
@@ -400,6 +516,7 @@ Pi 0.99 and later read MCP servers from `~/.pi/agent/mcp.json` (or a trusted pro
   "mcpServers": {
     "alexandria": {
       "url": "http://127.0.0.1:3000/mcp",
+      "headers": { "Authorization": "Bearer ${ALEXANDRIA_API_TOKEN}" },
       "exposure": "direct"
     }
   }
@@ -420,8 +537,9 @@ use OAuth, `pi mcp login <server>`. If a running session does not see a new or e
 `/reload` or start a new session.
 
 Pi names these tools `mcp__<server>__<tool>` — `mcp__alexandria__store_memory`,
-`mcp__alexandria__retrieve_memories`, and so on — which is the form the skill uses. The companion's
-auto-store detectors match on the tool-name *suffix*, so they work with either naming convention.
+`mcp__alexandria__retrieve_memories`, and so on — which is the form the skill uses. The native
+connection above uses pi's standard MCP configuration; the separate companion extension uses
+`ALEXANDRIA_API_TOKEN` and its own prompt-path configuration.
 
 Then optionally add the client-side nudges — see
 [`contrib/pi/README.md`](contrib/pi/README.md).
@@ -434,7 +552,13 @@ Legacy `~/.alexandria/config.toml` is used as a fallback when the XDG config fil
 
 Reminder delivery is configured by the `[reminders]` section: `timezone` (IANA name, empty = system-local) governs naive datetime input and pattern/cron evaluation, and `escalation_hours` controls overdue escalation to global delivery.
 
-The Pi companion extension (recall / store / reminders) has its own JSON config at `$XDG_CONFIG_HOME/alexandria/client.json`. Its `/alexandria` command configures auto-recall inside Pi. The companion no longer reads the former `client.toml`; existing client configuration must be converted manually. Server configuration remains TOML.
+The Pi companion (automatic recall and reminder checks, no automatic memory writers) reads
+`$XDG_CONFIG_HOME/alexandria/client.json`, or `~/Library/Application Support/alexandria/client.json`
+on macOS without XDG. `ALEXANDRIA_CLIENT_CONFIG` selects another JSON file. `/alexandria` edits
+auto-recall settings in Pi. Convert old `client.toml` files manually; server configuration stays
+TOML. Set the companion bearer and optional project override in the environment using
+`ALEXANDRIA_API_TOKEN` and `ALEXANDRIA_PROJECT_ID`. The JSON `transport` section configures one
+deadline shared by project resolution, recall, and reminder checks.
 
 See [docs/configuration.md](docs/configuration.md) for all options, client config reference, and migration instructions.
 
@@ -448,8 +572,8 @@ See [docs/configuration.md](docs/configuration.md) for all options, client confi
 | [docs/granite-test-data.md](docs/granite-test-data.md) | Granite public multi-relevant/unanswerable pilot, native offline evaluation, model-specific cutoff caveats and release gates |
 | [docs/roadmap.md](docs/roadmap.md) | Shipped milestones, known gaps, planned work |
 | [contrib/pi/README.md](contrib/pi/README.md) | pi skill vs. extension: what each does, install, failure behavior |
-| [contrib/pi/extensions/alexandria/README.md](contrib/pi/extensions/alexandria/README.md) | The pi companion extension in detail: recall/store/reminders, configuration, known gaps |
-| [contrib/pi/skills/alexandria-memory/SKILL.md](contrib/pi/skills/alexandria-memory/SKILL.md) | The pi client-side skill (`alexandria_<tool>` names) |
+| [contrib/pi/extensions/alexandria/README.md](contrib/pi/extensions/alexandria/README.md) | The pi companion extension: authenticated recall/reminder behavior, project context, configuration and known gaps |
+| [contrib/pi/skills/alexandria-memory/SKILL.md](contrib/pi/skills/alexandria-memory/SKILL.md) | The pi client-side skill (`mcp__alexandria__<tool>` names) |
 | [contrib/claude/README.md](contrib/claude/README.md) | Claude Code skill and hooks: install, `settings.json`, requirements |
 | [contrib/claude/skills/alexandria-memory/SKILL.md](contrib/claude/skills/alexandria-memory/SKILL.md) | The Claude Code skill (`mcp__alexandria__<tool>` names) |
 | [docs/security-findings.md](docs/security-findings.md) | 2026-09-10 security audit: threat model, the convex-hull paper verdict, findings S1–S6 with current status |
@@ -536,10 +660,12 @@ addition to their exact top-level pins: pinning the SurrealDB SDK alone does not
 freeze its internal engine crates. Engine changes need the deployment/storage-format
 review described below; inference-stack changes need artifact and vector validation.
 
-[`.github/workflows/container.yml`](.github/workflows/container.yml) additionally builds the Docker
-image and boot-tests it — waits on `/debug`, then performs a real MCP `initialize` handshake against
-`/mcp` — but only when a change touches the `Containerfile`, `.dockerignore`, the manifests, or
-`crates/**`. A green `CI` run therefore says nothing about the image, and vice versa.
+[`.github/workflows/container.yml`](.github/workflows/container.yml) builds the Docker image and
+boots it with hosted HTTP settings and disposable storage. It checks `/health`, anonymous denial
+on `/debug` and `/mcp`, then a real MCP `initialize` with an API token issued to a disposable owner.
+The smoke reaches only the private HTTP leg, not a browser or TLS reverse proxy. Its path filters
+cover the container inputs, workspace manifests and lockfile, `crates/**`, and the smoke workflow
+and script. A green `CI` run does not prove the image passed, and vice versa.
 
 ## License
 

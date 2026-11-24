@@ -27,4 +27,14 @@ pub struct SessionListItem {
     pub summary: Option<String>,
     pub tags: Vec<String>,
     pub memory_count: i64,
+    /// Whether the row carries a summary — the one honest "was this session finalized" test, computed
+    /// by the statement. `ScopedSessionRepo::list_scoped`'s scoped projection withholds `summary` and
+    /// `tags` as prose, and a page that shows a finalized/active badge still needs the discriminator
+    /// without the text: `ended_at` will not do, because `touch()` moves it on every attached memory.
+    ///
+    /// `Option`, not `bool` with a default: a reader that never projected the column (`SessionRepo`'s
+    /// own list) must report "this read did not answer that" rather than a `false` that would read as
+    /// "not finalized". A caller that has the prose does not need the flag at all.
+    #[serde(default)]
+    pub finalized: Option<bool>,
 }

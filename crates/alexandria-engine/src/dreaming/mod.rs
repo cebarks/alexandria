@@ -7,7 +7,9 @@
 //! the binary's job to exactly one thing — talking to the database.
 
 pub mod appraise;
+pub mod budget;
 pub mod collapse;
+pub mod dispatch;
 pub mod liveness;
 pub mod schedule;
 
@@ -23,5 +25,6 @@ pub use liveness::{Liveness, SchedulerState};
 pub use schedule::{
     ALL_JOBS, DEFAULT_APPRAISE_INTERVAL_SECS, DEFAULT_CLUSTER_INTERVAL_SECS,
     DEFAULT_COLLAPSE_INTERVAL_SECS, DEFAULT_MAX_ROWS_PER_RUN, DEFAULT_MERGE_INTERVAL_SECS,
-    DEFAULT_SWEEP_INTERVAL_SECS, Intervals, Job, JobReport, JobTiming, Schedule,
+    DEFAULT_SWEEP_INTERVAL_SECS, Intervals, Job, JobReport, JobTiming, PartitionJobReport,
+    Schedule,
 };

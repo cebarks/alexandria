@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+#[path = "reminders_test/typed_targets.rs"]
+mod typed_targets;
+
 use alexandria_engine::reminders::{human_readable, spec_from_reminder};
 use alexandria_mcp::server::{AlexandriaServer, HeatSettings, RemindersSettings};
 use alexandria_mcp::tools::{
@@ -1055,6 +1058,54 @@ async fn list_and_cancel_roundtrip() {
     assert_eq!(row["provenance"]["session_id"], "session-7");
 }
 
+/// A numeric record key spelled `reminder:418` must name the numeric-keyed row. `parse_simple`
+/// always produced a *string* key (`"418"`), so the interim cancel path answered "not found"
+/// for a row that existed — the same numeric/string confusion the project handles were fixed for.
+/// The strict parse resolves the key as the number it spells, and the cancel reaches the row.
+#[tokio::test]
+async fn cancelling_a_numeric_keyed_reminder_resolves_the_row() {
+    let server = setup().await;
+    // A numeric-keyed row, seeded the way an operator or a migration might name one.
+    server
+        .db
+        .inner()
+        .query(
+            "CREATE reminder:418 SET message = 'numeric keyed', schedule_kind = 'once', \
+             due_at = d'2030-01-01T00:00:00Z', next_due_at = d'2030-01-01T00:00:00Z', \
+             status = 'pending', delivered_count = 0;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    let cancel: serde_json::Value = serde_json::from_str(
+        &server
+            .do_cancel_reminder(CancelReminderParams {
+                id: "reminder:418".to_string(),
+            })
+            .await
+            .expect("a numeric key must resolve to the row it spells, not the string key \"418\""),
+    )
+    .unwrap();
+    assert_eq!(cancel["status"], "ok");
+
+    let mut response = server
+        .db
+        .inner()
+        .query("SELECT status FROM reminder:418;")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    let rows: Vec<serde_json::Value> = response.take(0).unwrap();
+    assert_eq!(
+        rows[0]["status"],
+        serde_json::json!("cancelled"),
+        "the cancel must write the numeric-keyed row it resolved"
+    );
+}
+
 /// The filter semantics the tool description promises: `pending` is the default,
 /// `all` is the only spelling of "no filter", an unknown status matches nothing
 /// (rather than erroring at the user), and the project filter is byte-exact and
@@ -1313,6 +1364,9 @@ async fn piggyback_lists_due_reminders_without_consuming() {
         .unwrap();
     server
         .do_store_memory(alexandria_mcp::tools::StoreMemoryParams {
+            scope: None,
+            project: None,
+            context_project: None,
             content: "OAuth tokens expire after 7 days".to_string(),
             tags: None,
             session_id: None,
@@ -1325,6 +1379,8 @@ async fn piggyback_lists_due_reminders_without_consuming() {
     let out: serde_json::Value = serde_json::from_str(
         &server
             .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+                scope: None,
+                project: None,
                 query: "token expiration".to_string(),
                 limit: Some(5),
                 session_id: None,
@@ -1356,6 +1412,9 @@ async fn piggyback_recall_broad_lists_due_reminders_without_consuming() {
         .unwrap();
     server
         .do_store_memory(alexandria_mcp::tools::StoreMemoryParams {
+            scope: None,
+            project: None,
+            context_project: None,
             content: "the search index is built with tantivy".to_string(),
             tags: None,
             session_id: None,
@@ -1368,6 +1427,8 @@ async fn piggyback_recall_broad_lists_due_reminders_without_consuming() {
     let out: serde_json::Value = serde_json::from_str(
         &server
             .do_recall(alexandria_mcp::tools::RecallParams {
+                scope: None,
+                project: None,
                 query: "search index".to_string(),
                 scope_handle: None,
             })
@@ -1402,6 +1463,8 @@ async fn piggyback_empty_retrieve_still_lists_due_reminders() {
     // comes from the empty-results early return rather than the ranked path.
     let out = server
         .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+            scope: None,
+            project: None,
             query: "nothing about this at all".to_string(),
             limit: Some(5),
             session_id: None,
@@ -1601,6 +1664,8 @@ async fn piggyback_caps_at_five_oldest_due_first() {
 
     let out = server
         .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+            scope: None,
+            project: None,
             query: "anything".to_string(),
             limit: Some(5),
             session_id: None,
@@ -1767,6 +1832,8 @@ async fn piggyback_sample_is_bounded_ordered_and_hides_undeliverable_rows() {
 
     let out = server
         .do_retrieve_memories(alexandria_mcp::tools::RetrieveMemoriesParams {
+            scope: None,
+            project: None,
             query: "anything".to_string(),
             limit: Some(3),
             session_id: None,

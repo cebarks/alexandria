@@ -18,9 +18,8 @@ use alexandria_storage::embedding_validation::{
 };
 use alexandria_storage::models::embedding::{MigrationPhase, ReembedJournal};
 use alexandria_storage::repos::{ClusterRepo, FactListQuery, MemoryRepo};
-use alexandria_storage::{Database, record_id_to_string, system_config};
+use alexandria_storage::{Database, system_config};
 use anyhow::ensure;
-use surrealdb::types::ToSql;
 
 #[derive(Debug)]
 pub enum ReembedOutcome {
@@ -159,17 +158,16 @@ async fn rewrite_target_centroids(db: &Database, journal: &ReembedJournal) -> an
         let id = cluster
             .id
             .ok_or_else(|| anyhow::anyhow!("Cluster has no ID"))?;
-        let text_id = id.to_sql();
         let members = clusters.get_reembed_members(&id).await?;
         if baseline.empty_cluster_ids.binary_search(&id).is_ok() {
             ensure!(
                 members.is_empty() && !clusters.has_reembed_references(&id).await?,
                 "Approved empty cluster acquired references"
             );
-            clusters.delete(&text_id).await?;
+            clusters.delete(&id).await?;
         } else {
             let centroid = checked_target_centroid(&members, journal.target_space.dimensions())?;
-            clusters.update_centroid(&text_id, &centroid).await?;
+            clusters.update_centroid(&id, &centroid).await?;
         }
     }
     Ok(())
@@ -274,12 +272,12 @@ pub async fn reembed(
     let mut updated = 0;
     let mut dropped = 0;
     for cluster in clusters.list().await? {
-        let Some(id) = cluster.id.as_ref().map(record_id_to_string) else {
+        let Some(id) = cluster.id.as_ref() else {
             continue;
         };
-        let members = clusters.get_members(&id).await?;
+        let members = clusters.get_members(id).await?;
         if members.is_empty() {
-            clusters.delete(&id).await?;
+            clusters.delete(id).await?;
             dropped += 1;
             continue;
         }
@@ -293,7 +291,7 @@ pub async fn reembed(
         for c in &mut centroid {
             *c /= n;
         }
-        clusters.update_centroid(&id, &centroid).await?;
+        clusters.update_centroid(id, &centroid).await?;
         updated += 1;
     }
 

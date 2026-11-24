@@ -1,13 +1,46 @@
 use anyhow::{Result, ensure};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{RecordId, RecordIdKeyRange, SurrealValue, ToSql};
+use surrealdb::types::{RecordId, RecordIdKeyRange, SurrealValue};
 use tracing::warn;
 
+use crate::Database;
+use crate::access::SystemContext;
+use crate::models::identity::{OperationId, Partition};
+use crate::models::maintenance::job as job_name;
+use crate::models::mutation::{
+    ClusterChange, ClusterDestination, MaintenanceSummary, PreparedChangeSet, effect,
+};
+use crate::models::operation_kind;
 use crate::models::{Cluster, Fact};
+#[cfg(test)]
 use crate::record_id_to_string;
+use crate::repos::MutationRepo;
 use crate::repos::maintenance_repo::AuditContext;
+use crate::repos::scope::ScopeFilter;
+
+#[derive(Debug, Clone)]
+pub struct PartitionCluster {
+    pub cluster: Cluster,
+    pub members: Vec<Fact>,
+}
+
+/// One prepared split verdict for an owned cluster: how the live members group, and the two
+/// centroids those groups imply.
+///
+/// The grouping is the engine's arithmetic, so it arrives as data — storage ranks nothing. The
+/// indices address the source's live member list in the order the partition read returned it,
+/// which is the same list [`ClusterRepo::partition_clusters`] handed the caller; the transaction
+/// re-verifies that the two groups exactly partition the live population before anything moves.
+#[derive(Debug, Clone)]
+pub struct ClusterSplit {
+    pub group_a: Vec<usize>,
+    pub group_b: Vec<usize>,
+    pub centroid_a: Vec<f32>,
+    pub centroid_b: Vec<f32>,
+}
 
 pub struct ClusterRepo<'a> {
     db: &'a Surreal<Any>,
@@ -47,7 +80,7 @@ impl<'a> ClusterRepo<'a> {
         }
     }
 
-    pub async fn create(&self, label: Option<&str>, centroid: &[f32]) -> Result<String> {
+    pub async fn create(&self, label: Option<&str>, centroid: &[f32]) -> Result<RecordId> {
         let mut response = self
             .db
             .query(
@@ -65,12 +98,12 @@ impl<'a> ClusterRepo<'a> {
         let id = cluster
             .id
             .ok_or_else(|| anyhow::anyhow!("Created cluster has no id"))?;
-        Ok(id.to_sql())
+        Ok(id)
     }
 
-    pub async fn add_member(&self, cluster_id: &str, fact_id: &str) -> Result<()> {
-        let from = RecordId::parse_simple(cluster_id)?;
-        let to = RecordId::parse_simple(fact_id)?;
+    pub async fn add_member(&self, cluster: &RecordId, fact: &RecordId) -> Result<()> {
+        let from = cluster.clone();
+        let to = fact.clone();
         self.db
             .query("RELATE $from->contains_memory->$to")
             .bind(("from", from))
@@ -80,28 +113,287 @@ impl<'a> ClusterRepo<'a> {
         Ok(())
     }
 
-    pub async fn get_members(&self, cluster_id: &str) -> Result<Vec<Fact>> {
+    pub async fn get_members(&self, cluster: &RecordId) -> Result<Vec<Fact>> {
         // The filter belongs here and not in the callers: every consumer of this method computes
         // something about the cluster as a whole (`check_cohesion` over member embeddings,
         // `check_merge` over centroids, `execute_merge` moving edges), so a row nobody can retrieve
         // silently changes all three verdicts. See `test_get_members_excludes_deleted_and_quarantined`.
+        // Typed bind, for the same reason as `delete`: `type::record(<quoted display string>)`
+        // matches nothing, so a quoted-key cluster would read as memberless and every verdict
+        // computed over its members (cohesion, merge counts) would be silently wrong.
         let mut response = self
             .db
             .query(
-                "SELECT * FROM type::record($cluster_id)->contains_memory->\
+                "SELECT * FROM $cluster->contains_memory->\
                  (fact WHERE deleted = false AND quarantined_at = NONE)",
             )
-            .bind(("cluster_id", cluster_id.to_string()))
+            .bind(("cluster", cluster.clone()))
             .await?;
         let members: Vec<Fact> = response.take(0)?;
         Ok(members)
+    }
+
+    /// Read clusters whose complete live workspace population belongs to this partition.
+    pub async fn partition_clusters(&self, partition: &Partition) -> Result<Vec<PartitionCluster>> {
+        let filter = ScopeFilter::for_partition(partition);
+        let mut response = self
+            .db
+            .query("SELECT VALUE owner FROM workspace WHERE id = $workspace LIMIT 1;")
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .await?;
+        let owners: Vec<RecordId> = response.take(0)?;
+        let Some(account) = owners.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let mut response = self
+            .db
+            .query("SELECT * FROM cluster WHERE workspace = $workspace AND account = $account ORDER BY id;")
+            .bind(("workspace", partition.workspace.as_record_id().clone()))
+            .bind(("account", account.clone()))
+            .await?;
+        let clusters: Vec<Cluster> = response.take(0)?;
+        let mut selected = Vec::new();
+        for cluster in clusters {
+            let Some(id) = cluster.id.clone() else {
+                continue;
+            };
+            let query = self.db.query(
+                "SELECT * FROM $cluster->contains_memory->(fact WHERE deleted = false AND quarantined_at = NONE AND account = $account AND workspace = $scope_workspace AND ((scope = 'personal' AND $scope_personal) OR (scope = 'unassigned' AND $scope_unassigned) OR (scope = 'project' AND project INSIDE $scope_projects)))",
+            ).bind(("cluster", id.clone())).bind(("account", account.clone()));
+            let mut response = filter.apply(query).await?;
+            let members: Vec<Fact> = response.take(0)?;
+            if members.is_empty() {
+                continue;
+            }
+            let query = self.db.query(
+                "SELECT * FROM $cluster->contains_memory->(fact WHERE account = $account AND workspace = $scope_workspace AND ((scope = 'personal' AND $scope_personal) OR (scope = 'unassigned' AND $scope_unassigned) OR (scope = 'project' AND project INSIDE $scope_projects)))",
+            ).bind(("cluster", id.clone())).bind(("account", account.clone()));
+            let mut response = filter.apply(query).await?;
+            let partition_members: Vec<Fact> = response.take(0)?;
+            let mut partition_ids: Vec<RecordId> = partition_members
+                .into_iter()
+                .filter_map(|fact| fact.id)
+                .collect();
+            let mut all_ids = self.get_member_ids(&id).await?;
+            partition_ids.sort();
+            all_ids.sort();
+            if partition_ids == all_ids {
+                selected.push(PartitionCluster { cluster, members });
+            }
+        }
+        Ok(selected)
+    }
+
+    pub async fn execute_partitioned_split(
+        &self,
+        instance: &Database,
+        system: &SystemContext,
+        partition: &Partition,
+        source: &PartitionCluster,
+        split: &ClusterSplit,
+    ) -> Result<()> {
+        let (run_id, job) = self.audit_for(job_name::CLUSTER)?;
+        let source_id = source
+            .cluster
+            .id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("split source has no id"))?;
+        let live: Vec<RecordId> = source
+            .members
+            .iter()
+            .map(|member| {
+                member
+                    .id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("split member has no id"))
+            })
+            .collect::<Result<_>>()?;
+        let mut a = split
+            .group_a
+            .iter()
+            .map(|index| {
+                live.get(*index)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("split group index is out of range"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let b = split
+            .group_b
+            .iter()
+            .map(|index| {
+                live.get(*index)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("split group index is out of range"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut assigned = a.iter().chain(&b).cloned().collect::<Vec<_>>();
+        assigned.sort();
+        let mut live_sorted = live.clone();
+        live_sorted.sort();
+        ensure!(
+            assigned == live_sorted,
+            "split groups do not partition the live members"
+        );
+        let all_members = self.get_member_ids(source_id).await?;
+        let mut hidden: Vec<_> = all_members
+            .into_iter()
+            .filter(|id| !live.contains(id))
+            .collect();
+        a.append(&mut hidden);
+
+        let seed = format!("{run_id}:{}", crate::record_id_to_string(source_id));
+        let digest = Sha256::digest(seed.as_bytes());
+        let key: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let new_id = RecordId::new("cluster", format!("owned_{key}"));
+        let mutation = MutationRepo::new(self.db);
+        let expectation = mutation
+            .cluster_expectation_system(instance, system, partition, source_id)
+            .await?;
+        let change = PreparedChangeSet::new(operation_kind::CLUSTER_CHANGE)
+            .effect(effect::CLUSTER_MEMBERSHIP)
+            .effect(effect::CLUSTER_CENTROID)
+            .cluster(ClusterChange::Restructure {
+                partition: partition.scope.clone(),
+                expectations: vec![expectation],
+                destinations: vec![
+                    ClusterDestination {
+                        cluster: Some(source_id.clone()),
+                        new_id: None,
+                        label: source.cluster.label.clone(),
+                        centroid: split.centroid_a.clone(),
+                        members: a,
+                    },
+                    ClusterDestination {
+                        cluster: None,
+                        new_id: Some(new_id.clone()),
+                        label: source.cluster.label.clone(),
+                        centroid: split.centroid_b.clone(),
+                        members: b,
+                    },
+                ],
+            })
+            .summary(MaintenanceSummary {
+                action: "split".to_string(),
+                source_id: crate::record_id_to_string(source_id),
+                target_ids: vec![
+                    crate::record_id_to_string(source_id),
+                    crate::record_id_to_string(&new_id),
+                ],
+                members_moved: split.group_b.len() as i64,
+                run_id: run_id.clone(),
+                job,
+                disposition: "split".to_string(),
+                previous_value: None,
+            });
+        mutation
+            .apply_system(
+                instance,
+                system,
+                partition,
+                &OperationId::new(format!(
+                    "cluster-split:{run_id}:{}",
+                    crate::record_id_to_string(source_id)
+                )),
+                &[],
+                &change,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn execute_partitioned_merge(
+        &self,
+        instance: &Database,
+        system: &SystemContext,
+        partition: &Partition,
+        keep: &PartitionCluster,
+        remove: &PartitionCluster,
+        merged_centroid: &[f32],
+    ) -> Result<()> {
+        let (run_id, job) = self.audit_for(job_name::MERGE)?;
+        let keep_id = keep
+            .cluster
+            .id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("merge survivor has no id"))?;
+        let remove_id = remove
+            .cluster
+            .id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("merge source has no id"))?;
+        ensure!(keep_id != remove_id, "cannot merge a cluster into itself");
+        let mut members = self.get_member_ids(keep_id).await?;
+        let moved = self.get_member_ids(remove_id).await?;
+        members.extend(moved.iter().cloned());
+        members.sort();
+        members.dedup();
+        let mutation = MutationRepo::new(self.db);
+        let expectations = vec![
+            mutation
+                .cluster_expectation_system(instance, system, partition, keep_id)
+                .await?,
+            mutation
+                .cluster_expectation_system(instance, system, partition, remove_id)
+                .await?,
+        ];
+        let change = PreparedChangeSet::new(operation_kind::CLUSTER_CHANGE)
+            .effect(effect::CLUSTER_MEMBERSHIP)
+            .effect(effect::CLUSTER_CENTROID)
+            .cluster(ClusterChange::Restructure {
+                partition: partition.scope.clone(),
+                expectations,
+                destinations: vec![ClusterDestination {
+                    cluster: Some(keep_id.clone()),
+                    new_id: None,
+                    label: keep.cluster.label.clone(),
+                    centroid: merged_centroid.to_vec(),
+                    members,
+                }],
+            })
+            .summary(MaintenanceSummary {
+                action: "merge".to_string(),
+                source_id: crate::record_id_to_string(remove_id),
+                target_ids: vec![crate::record_id_to_string(keep_id)],
+                members_moved: moved.len() as i64,
+                run_id: run_id.clone(),
+                job,
+                disposition: "merge".to_string(),
+                previous_value: None,
+            });
+        mutation
+            .apply_system(
+                instance,
+                system,
+                partition,
+                &OperationId::new(format!(
+                    "cluster-merge:{run_id}:{}:{}",
+                    crate::record_id_to_string(keep_id),
+                    crate::record_id_to_string(remove_id)
+                )),
+                &[],
+                &change,
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn audit_for(&self, expected_job: &str) -> Result<(String, String)> {
+        let (run_id, job, actor) = self.audit_binds();
+        ensure!(
+            actor.as_deref() == Some("system:dreaming") && job.as_deref() == Some(expected_job),
+            "partitioned cluster maintenance requires the matching system audit context"
+        );
+        Ok((
+            run_id.ok_or_else(|| anyhow::anyhow!("missing audit run id"))?,
+            job.ok_or_else(|| anyhow::anyhow!("missing audit job"))?,
+        ))
     }
 
     /// Owned migration population: live members first, otherwise only retained
     /// deleted members with no quarantine, missing targets or other references.
     /// This is deliberately separate from live retrieval/maintenance semantics.
     pub async fn get_reembed_members(&self, id: &RecordId) -> Result<Vec<Fact>> {
-        let live = self.get_members(&id.to_sql()).await?;
+        let live = self.get_members(id).await?;
         if !live.is_empty() {
             return Ok(live);
         }
@@ -194,27 +486,27 @@ impl<'a> ClusterRepo<'a> {
     /// soft-deleted member is still a member, and this repo's `delete` drops
     /// `contains_memory WHERE in = $id` with no fact predicate, so anything not moved here is deleted
     /// with the source cluster. Ids only — a move needs no embeddings.
-    pub async fn get_member_ids(&self, cluster_id: &str) -> Result<Vec<String>> {
+    pub async fn get_member_ids(&self, cluster: &RecordId) -> Result<Vec<RecordId>> {
         #[derive(serde::Deserialize, SurrealValue)]
         struct EdgeRow {
             out: RecordId,
         }
+        // Typed bind, for the same reason as `delete`: `type::record(<quoted display string>)`
+        // matches nothing, so a merge against a quoted-key cluster would move zero members and
+        // still report success.
         let mut response = self
             .db
-            .query("SELECT out FROM type::record($cluster_id)->contains_memory")
-            .bind(("cluster_id", cluster_id.to_string()))
+            .query("SELECT out FROM $cluster->contains_memory")
+            .bind(("cluster", cluster.clone()))
             .await?;
         let rows: Vec<EdgeRow> = response.take(0)?;
-        Ok(rows
-            .into_iter()
-            .map(|row| record_id_to_string(&row.out))
-            .collect())
+        Ok(rows.into_iter().map(|row| row.out).collect())
     }
 
     /// Remove a single fact from this cluster (delete the contains_memory edge).
-    pub async fn remove_member(&self, cluster_id: &str, fact_id: &str) -> Result<()> {
-        let from = RecordId::parse_simple(cluster_id)?;
-        let to = RecordId::parse_simple(fact_id)?;
+    pub async fn remove_member(&self, cluster: &RecordId, fact: &RecordId) -> Result<()> {
+        let from = cluster.clone();
+        let to = fact.clone();
         self.db
             .query("DELETE contains_memory WHERE in = $from AND out = $to")
             .bind(("from", from))
@@ -225,27 +517,35 @@ impl<'a> ClusterRepo<'a> {
     }
 
     /// Delete a cluster record and all its contains_memory edges.
-    pub async fn delete(&self, cluster_id: &str) -> Result<()> {
-        let id = RecordId::parse_simple(cluster_id)?;
-        // Delete edges first, then the cluster itself
+    pub async fn delete(&self, id: &RecordId) -> Result<()> {
+        // Delete edges first, then the cluster itself. Both statements bind the TYPED id: the
+        // record delete used to bind the display string through `type::record($id)`, which
+        // matches nothing for a key that needs quoting (a hyphen, a space, any non-alphanumeric),
+        // so the delete committed without deleting. The merge drain's termination guarantee is
+        // "every successful merge removes a cluster" — a surviving removed cluster made it loop
+        // forever. Real corpora never hit this (`create` mints alphanumeric keys); any quoted
+        // key did.
         self.db
             .query("DELETE contains_memory WHERE in = $id")
-            .bind(("id", id))
+            .bind(("id", id.clone()))
             .await?
             .check()?;
         self.db
-            .query("DELETE type::record($id)")
-            .bind(("id", cluster_id.to_string()))
+            .query("DELETE $id")
+            .bind(("id", id.clone()))
             .await?
             .check()?;
         Ok(())
     }
 
     /// Overwrite a cluster's centroid.
-    pub async fn update_centroid(&self, cluster_id: &str, centroid: &[f32]) -> Result<()> {
+    pub async fn update_centroid(&self, cluster: &RecordId, centroid: &[f32]) -> Result<()> {
+        // Typed bind, for the same reason as `delete`: the display string round trip no-ops on
+        // keys that need quoting, and a merge that silently kept the old centroid is a wrong
+        // cluster centre rather than a loud failure.
         self.db
-            .query("UPDATE type::record($id) SET centroid = $centroid")
-            .bind(("id", cluster_id.to_string()))
+            .query("UPDATE $id SET centroid = $centroid")
+            .bind(("id", cluster.clone()))
             .bind(("centroid", centroid.to_vec()))
             .await?
             .check()?;
@@ -261,13 +561,23 @@ impl<'a> ClusterRepo<'a> {
     /// `centroid_a` / `centroid_b` — centroids for the new clusters.
     pub async fn execute_split(
         &self,
-        cluster_id: &str,
+        source: &RecordId,
         members: &[Fact],
         group_a: &[usize],
         group_b: &[usize],
         centroid_a: &[f32],
         centroid_b: &[f32],
-    ) -> Result<(String, String)> {
+    ) -> Result<(RecordId, RecordId)> {
+        let supplied = members
+            .iter()
+            .map(|member| member.id.clone())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow::anyhow!("Legacy maintenance requires identified members"))?;
+        ensure!(
+            self.legacy_maintenance_eligible(std::slice::from_ref(source), &supplied)
+                .await?,
+            "Legacy maintenance is unavailable for owned or unverified data"
+        );
         let cid_a = self.create(None, centroid_a).await?;
         let cid_b = match self.create(None, centroid_b).await {
             Ok(id) => id,
@@ -283,45 +593,57 @@ impl<'a> ClusterRepo<'a> {
         // This ordering means a failure leaves a duplicate edge rather than an orphan.
         for &idx in group_a {
             if let Some(fact) = members.get(idx) {
-                let fid = fact
-                    .id
-                    .as_ref()
-                    .map(record_id_to_string)
-                    .unwrap_or_default();
-                if let Err(e) = self.add_member(&cid_a, &fid).await {
-                    warn!("Split: failed to add {fid} to new cluster A: {e}");
+                let Some(fid) = fact.id.as_ref() else {
+                    continue;
+                };
+                if let Err(e) = self.add_member(&cid_a, fid).await {
+                    warn!(
+                        "Split: failed to add {} to new cluster A: {e}",
+                        crate::record_id_to_string(fid)
+                    );
                     continue;
                 }
-                if let Err(e) = self.remove_member(cluster_id, &fid).await {
-                    warn!("Split: failed to remove {fid} from old cluster: {e}");
+                if let Err(e) = self.remove_member(source, fid).await {
+                    warn!(
+                        "Split: failed to remove {} from old cluster: {e}",
+                        crate::record_id_to_string(fid)
+                    );
                 }
             }
         }
         for &idx in group_b {
             if let Some(fact) = members.get(idx) {
-                let fid = fact
-                    .id
-                    .as_ref()
-                    .map(record_id_to_string)
-                    .unwrap_or_default();
-                if let Err(e) = self.add_member(&cid_b, &fid).await {
-                    warn!("Split: failed to add {fid} to new cluster B: {e}");
+                let Some(fid) = fact.id.as_ref() else {
+                    continue;
+                };
+                if let Err(e) = self.add_member(&cid_b, fid).await {
+                    warn!(
+                        "Split: failed to add {} to new cluster B: {e}",
+                        crate::record_id_to_string(fid)
+                    );
                     continue;
                 }
-                if let Err(e) = self.remove_member(cluster_id, &fid).await {
-                    warn!("Split: failed to remove {fid} from old cluster: {e}");
+                if let Err(e) = self.remove_member(source, fid).await {
+                    warn!(
+                        "Split: failed to remove {} from old cluster: {e}",
+                        crate::record_id_to_string(fid)
+                    );
                 }
             }
         }
 
         // Everyone the live list accounted for, so the pass below can tell a member it moved from a
         // member the caller could not see.
-        let moved: HashSet<String> = group_a
+        // `RecordId`'s key type can carry a range, which trips clippy's interior-mutability
+        // heuristic for the key. The set is a transient membership filter over ids already
+        // cloned out of the rows, never mutated through the set, so the flagged "risk" does not
+        // exist here.
+        #[allow(clippy::mutable_key_type)]
+        let moved: HashSet<RecordId> = group_a
             .iter()
             .chain(group_b.iter())
             .filter_map(|&idx| members.get(idx))
-            .filter_map(|fact| fact.id.as_ref())
-            .map(record_id_to_string)
+            .filter_map(|fact| fact.id.clone())
             .collect();
 
         // Hidden members follow the larger half. They cannot be routed by k-means — the split's
@@ -337,23 +659,30 @@ impl<'a> ClusterRepo<'a> {
         };
         let mut hidden_moved: i64 = 0;
         for fid in self
-            .get_member_ids(cluster_id)
+            .get_member_ids(source)
             .await?
             .iter()
-            .filter(|id| !moved.contains(id.as_str()))
+            .filter(|id| !moved.contains(id))
         {
             if let Err(e) = self.add_member(hidden_target, fid).await {
-                warn!("Split: failed to carry hidden member {fid} into {hidden_target}: {e}");
+                warn!(
+                    "Split: failed to carry hidden member {} into {}: {e}",
+                    crate::record_id_to_string(fid),
+                    crate::record_id_to_string(hidden_target)
+                );
                 continue;
             }
-            if let Err(e) = self.remove_member(cluster_id, fid).await {
-                warn!("Split: failed to remove hidden member {fid} from the split cluster: {e}");
+            if let Err(e) = self.remove_member(source, fid).await {
+                warn!(
+                    "Split: failed to remove hidden member {} from the split cluster: {e}",
+                    crate::record_id_to_string(fid)
+                );
             }
             hidden_moved += 1;
         }
 
         // Delete the old cluster (now empty)
-        self.delete(cluster_id).await?;
+        self.delete(source).await?;
 
         // Log the split. Counted from the edge writes, not from the group sizes: the groups only
         // know about the members the caller could see, and under-reporting a move is how a
@@ -367,8 +696,18 @@ impl<'a> ClusterRepo<'a> {
                  target_ids = $targets, members_moved = $count, \
                  run_id = $run_id, job = $job, actor = $actor",
             )
-            .bind(("source", cluster_id.to_string()))
-            .bind(("targets", vec![cid_a.clone(), cid_b.clone()]))
+            .bind(("source", crate::record_id_to_string(source)))
+            // The stored form is the display string (v004: target_ids array<string>) — the same
+            // canonical form the merge insert and /debug/maintenance read. Binding the typed ids
+            // fails the SCHEMAFULL insert and the warn above swallows it, so the split's audit row
+            // silently vanished when `create` became typed.
+            .bind((
+                "targets",
+                vec![
+                    crate::record_id_to_string(&cid_a),
+                    crate::record_id_to_string(&cid_b),
+                ],
+            ))
             .bind(("count", members_moved))
             .bind(("run_id", run_id))
             .bind(("job", job))
@@ -385,28 +724,41 @@ impl<'a> ClusterRepo<'a> {
     /// update the kept cluster's centroid, and delete the removed cluster.
     pub async fn execute_merge(
         &self,
-        keep_id: &str,
-        remove_id: &str,
+        keep: &RecordId,
+        remove: &RecordId,
         merged_centroid: &[f32],
     ) -> Result<()> {
+        let targets = [keep.clone(), remove.clone()];
+        ensure!(
+            self.legacy_maintenance_eligible(&targets, &[]).await?,
+            "Legacy maintenance is unavailable for owned or unverified data"
+        );
         // Ids, not `get_members`: every edge has to be carried, including the hidden rows the live
         // filter excludes, because `delete` below drops them all. The centroid the caller passes is
         // still a function of live members only — moving a hidden row does not let it decide a
         // verdict.
         let mut members_moved: i64 = 0;
-        for fid in self.get_member_ids(remove_id).await? {
-            if let Err(e) = self.add_member(keep_id, &fid).await {
-                warn!("Merge: failed to add {fid} to kept cluster {keep_id}: {e}");
+        for fid in self.get_member_ids(remove).await? {
+            if let Err(e) = self.add_member(keep, &fid).await {
+                warn!(
+                    "Merge: failed to add {} to kept cluster {}: {e}",
+                    crate::record_id_to_string(&fid),
+                    crate::record_id_to_string(keep)
+                );
                 continue;
             }
-            if let Err(e) = self.remove_member(remove_id, &fid).await {
-                warn!("Merge: failed to remove {fid} from removed cluster {remove_id}: {e}");
+            if let Err(e) = self.remove_member(remove, &fid).await {
+                warn!(
+                    "Merge: failed to remove {} from removed cluster {}: {e}",
+                    crate::record_id_to_string(&fid),
+                    crate::record_id_to_string(remove)
+                );
             }
             members_moved += 1;
         }
 
-        self.update_centroid(keep_id, merged_centroid).await?;
-        self.delete(remove_id).await?;
+        self.update_centroid(keep, merged_centroid).await?;
+        self.delete(remove).await?;
 
         // Log the merge
         let (run_id, job, actor) = self.audit_binds();
@@ -417,8 +769,8 @@ impl<'a> ClusterRepo<'a> {
                  target_ids = $targets, members_moved = $count, \
                  run_id = $run_id, job = $job, actor = $actor",
             )
-            .bind(("source", remove_id.to_string()))
-            .bind(("targets", vec![keep_id.to_string()]))
+            .bind(("source", crate::record_id_to_string(remove)))
+            .bind(("targets", vec![crate::record_id_to_string(keep)]))
             .bind(("count", members_moved))
             .bind(("run_id", run_id))
             .bind(("job", job))
@@ -491,6 +843,58 @@ impl<'a> ClusterRepo<'a> {
         Ok(row.map(|r| r.total as usize).unwrap_or(0))
     }
 
+    /// Until scoped maintenance replaces the legacy writers, admit only physically unowned
+    /// populations. This is an application gate, not a fence against privileged concurrent SQL.
+    async fn legacy_maintenance_eligible(
+        &self,
+        clusters: &[RecordId],
+        supplied_members: &[RecordId],
+    ) -> Result<bool> {
+        if clusters.is_empty() || clusters.iter().any(|id| id.table.as_str() != "cluster") {
+            return Ok(false);
+        }
+        let mut response = self
+            .db
+            .query("SELECT VALUE out FROM contains_memory WHERE in IN $clusters")
+            .bind(("clusters", clusters.to_vec()))
+            .await?;
+        let mut members: Vec<RecordId> = response.take(0)?;
+        members.extend_from_slice(supplied_members);
+        if members.iter().any(|id| id.table.as_str() != "fact") {
+            return Ok(false);
+        }
+        let mut records: Vec<RecordId> = clusters.iter().cloned().chain(members).collect();
+        records.sort();
+        records.dedup();
+        let expected = records.len();
+        let mut response = self
+            .db
+            .query(
+                "SELECT VALUE id FROM $records WHERE account = NONE AND workspace = NONE \
+             AND scope = NONE AND project = NONE",
+            )
+            .bind(("records", records))
+            .await?;
+        let admitted: Vec<RecordId> = response.take(0)?;
+        Ok(admitted.len() == expected)
+    }
+
+    /// Candidates for legacy split/merge only; hidden retained ownership also excludes a cluster.
+    /// Entry-point rechecks remain necessary because selection is not write authorization.
+    pub async fn legacy_maintenance_clusters(&self) -> Result<Vec<Cluster>> {
+        let mut eligible = Vec::new();
+        for cluster in self.list().await? {
+            if let Some(id) = &cluster.id
+                && self
+                    .legacy_maintenance_eligible(std::slice::from_ref(id), &[])
+                    .await?
+            {
+                eligible.push(cluster);
+            }
+        }
+        Ok(eligible)
+    }
+
     pub async fn list(&self) -> Result<Vec<Cluster>> {
         let mut response = self.db.query("SELECT * FROM cluster").await?;
         Ok(response.take(0)?)
@@ -501,11 +905,11 @@ impl<'a> ClusterRepo<'a> {
     /// Exists so display code can read the **stored** `centroid` — the value the background
     /// maintenance task actually splits on. Averaging members to approximate it makes two
     /// callers of `check_cohesion` disagree; see `debug::clusters::cohesion_of`.
-    pub async fn get(&self, cluster_id: &str) -> Result<Option<Cluster>> {
+    pub async fn get(&self, cluster: &RecordId) -> Result<Option<Cluster>> {
         let mut response = self
             .db
-            .query("SELECT * FROM type::record($cluster_id)")
-            .bind(("cluster_id", cluster_id.to_string()))
+            .query("SELECT * FROM $cluster")
+            .bind(("cluster", cluster.clone()))
             .await?;
         let clusters: Vec<Cluster> = response.take(0)?;
         Ok(clusters.into_iter().next())
@@ -516,13 +920,19 @@ impl<'a> ClusterRepo<'a> {
 
         let mut result = Vec::with_capacity(clusters.len());
         for cluster in clusters {
-            let id = cluster.id.as_ref().map(|r| r.to_sql()).unwrap_or_default();
-            let count = self.get_members(&id).await?.len();
+            let Some(id) = cluster.id.as_ref() else {
+                continue;
+            };
+            let count = self.get_members(id).await?.len();
             result.push((cluster, count));
         }
         Ok(result)
     }
 }
+
+#[cfg(test)]
+#[path = "cluster_repo/legacy_maintenance_gate_tests.rs"]
+mod legacy_maintenance_gate_tests;
 
 #[cfg(test)]
 mod tests {
@@ -553,7 +963,7 @@ mod tests {
         assert_ne!(other, cid);
         assert!(
             cluster_repo
-                .get(&RecordId::new("cluster", "never-created-9f2a").to_sql())
+                .get(&RecordId::new("cluster", "never-created-9f2a"))
                 .await
                 .unwrap()
                 .is_none()
@@ -568,20 +978,20 @@ mod tests {
         let memory_repo = crate::repos::MemoryRepo::new(db.inner());
 
         let cid = cluster_repo.create(Some("c1"), &[0.1, 0.1]).await.unwrap();
-        let f1 = memory_repo
-            .create_fact("f1", 0.5, &[0.1, 0.1], &[])
+        let (_f1, f1_t) = memory_repo
+            .create_fact_with_id("f1", 0.5, &[0.1, 0.1], &[])
             .await
             .unwrap();
-        let f2 = memory_repo
-            .create_fact("f2", 0.5, &[0.2, 0.2], &[])
+        let (_f2, f2_t) = memory_repo
+            .create_fact_with_id("f2", 0.5, &[0.2, 0.2], &[])
             .await
             .unwrap();
-        cluster_repo.add_member(&cid, &f1).await.unwrap();
-        cluster_repo.add_member(&cid, &f2).await.unwrap();
+        cluster_repo.add_member(&cid, &f1_t).await.unwrap();
+        cluster_repo.add_member(&cid, &f2_t).await.unwrap();
 
         assert_eq!(cluster_repo.get_members(&cid).await.unwrap().len(), 2);
 
-        cluster_repo.remove_member(&cid, &f1).await.unwrap();
+        cluster_repo.remove_member(&cid, &f1_t).await.unwrap();
         let remaining = cluster_repo.get_members(&cid).await.unwrap();
         assert_eq!(remaining.len(), 1);
     }
@@ -597,11 +1007,11 @@ mod tests {
             .create(Some("doomed"), &[0.1, 0.1])
             .await
             .unwrap();
-        let f1 = memory_repo
-            .create_fact("f1", 0.5, &[0.1, 0.1], &[])
+        let (f1, f1_t) = memory_repo
+            .create_fact_with_id("f1", 0.5, &[0.1, 0.1], &[])
             .await
             .unwrap();
-        cluster_repo.add_member(&cid, &f1).await.unwrap();
+        cluster_repo.add_member(&cid, &f1_t).await.unwrap();
 
         cluster_repo.delete(&cid).await.unwrap();
 
@@ -643,16 +1053,16 @@ mod tests {
             .create(Some("cluster one"), &[0.1, 0.1])
             .await
             .unwrap();
-        let f1 = memory_repo
-            .create_fact("f1", 0.5, &[0.1, 0.1], &[])
+        let (_f1, f1_t) = memory_repo
+            .create_fact_with_id("f1", 0.5, &[0.1, 0.1], &[])
             .await
             .unwrap();
-        let f2 = memory_repo
-            .create_fact("f2", 0.5, &[0.1, 0.1], &[])
+        let (_f2, f2_t) = memory_repo
+            .create_fact_with_id("f2", 0.5, &[0.1, 0.1], &[])
             .await
             .unwrap();
-        cluster_repo.add_member(&c1, &f1).await.unwrap();
-        cluster_repo.add_member(&c1, &f2).await.unwrap();
+        cluster_repo.add_member(&c1, &f1_t).await.unwrap();
+        cluster_repo.add_member(&c1, &f2_t).await.unwrap();
 
         let c2 = cluster_repo
             .create(Some("cluster two"), &[0.9, 0.9])
@@ -775,19 +1185,19 @@ mod tests {
         let memory = crate::repos::MemoryRepo::new(db.inner());
 
         let cid = clusters.create(Some("mixed"), &[0.1, 0.2]).await.unwrap();
-        let keep = memory
-            .create_fact("kept", 0.5, &[0.1, 0.2], &[])
+        let (_keep, keep_t) = memory
+            .create_fact_with_id("kept", 0.5, &[0.1, 0.2], &[])
             .await
             .unwrap();
-        let gone = memory
-            .create_fact("deleted", 0.5, &[0.1, 0.2], &[])
+        let (gone, gone_t) = memory
+            .create_fact_with_id("deleted", 0.5, &[0.1, 0.2], &[])
             .await
             .unwrap();
-        let secret = memory
-            .create_fact("quarantined", 0.5, &[0.1, 0.2], &[])
+        let (secret, secret_t) = memory
+            .create_fact_with_id("quarantined", 0.5, &[0.1, 0.2], &[])
             .await
             .unwrap();
-        for id in [&keep, &gone, &secret] {
+        for id in [&keep_t, &gone_t, &secret_t] {
             clusters.add_member(&cid, id).await.unwrap();
         }
 
@@ -836,15 +1246,15 @@ mod tests {
         // --- merge: the hidden row follows the live one into the kept cluster ---
         let source = clusters.create(Some("source"), &[0.1, 0.2]).await.unwrap();
         let kept = clusters.create(Some("kept"), &[0.1, 0.2]).await.unwrap();
-        let live = memory
-            .create_fact("live", 0.5, &[0.1, 0.2], &[])
+        let (live, live_t) = memory
+            .create_fact_with_id("live", 0.5, &[0.1, 0.2], &[])
             .await
             .unwrap();
-        let quarantined = memory
-            .create_fact("quarantined", 0.5, &[0.1, 0.2], &[])
+        let (quarantined, quarantined_t) = memory
+            .create_fact_with_id("quarantined", 0.5, &[0.1, 0.2], &[])
             .await
             .unwrap();
-        for id in [&live, &quarantined] {
+        for id in [&live_t, &quarantined_t] {
             clusters.add_member(&source, id).await.unwrap();
         }
         db.inner()
@@ -866,7 +1276,7 @@ mod tests {
                 .await
                 .unwrap()
                 .map(|c| c.id.as_ref().map(record_id_to_string).unwrap_or_default()),
-            Some(kept.clone()),
+            Some(crate::record_id_to_string(&kept)),
             "a quarantined member keeps its cluster through a merge, so releasing it does not orphan it"
         );
         // Positive control on the same code path: the live row moved too, so the assertion above is
@@ -877,7 +1287,7 @@ mod tests {
                 .as_ref()
                 .map(record_id_to_string)
                 .unwrap_or_default()),
-            Some(kept),
+            Some(crate::record_id_to_string(&kept)),
             "the live member moved to the kept cluster as well"
         );
 
@@ -886,16 +1296,16 @@ mod tests {
             .create(Some("splitting"), &[0.3, 0.4])
             .await
             .unwrap();
-        let left = memory
-            .create_fact("left", 0.5, &[0.3, 0.4], &[])
+        let (_left, left_t) = memory
+            .create_fact_with_id("left", 0.5, &[0.3, 0.4], &[])
             .await
             .unwrap();
-        let hidden = memory
-            .create_fact("hidden", 0.5, &[0.3, 0.4], &[])
+        let (hidden, hidden_t) = memory
+            .create_fact_with_id("hidden", 0.5, &[0.3, 0.4], &[])
             .await
             .unwrap();
-        clusters.add_member(&splitting, &left).await.unwrap();
-        clusters.add_member(&splitting, &hidden).await.unwrap();
+        clusters.add_member(&splitting, &left_t).await.unwrap();
+        clusters.add_member(&splitting, &hidden_t).await.unwrap();
         db.inner()
             .query("UPDATE type::record($id) SET quarantined_at = time::now()")
             .bind(("id", hidden.clone()))
@@ -919,7 +1329,7 @@ mod tests {
                 .as_ref()
                 .map(record_id_to_string)
                 .unwrap_or_default()),
-            Some(child_a.clone()),
+            Some(crate::record_id_to_string(&child_a)),
             "and it went to the larger half (ties to the first), not to a cluster chosen by accident"
         );
         assert_ne!(child_a, child_b, "the two children are distinct clusters");

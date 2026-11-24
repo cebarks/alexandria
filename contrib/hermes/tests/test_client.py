@@ -8,7 +8,7 @@ from _bootstrap import bootstrap_hermes
 bootstrap_hermes()
 
 from alexandria.client import AlexandriaClient, AlexandriaError, AlexandriaToolError  # noqa: E402
-from mock_server import make_server  # noqa: E402
+from mock_server import MOCK_API_TOKEN, make_server  # noqa: E402
 
 
 class ClientTestCase(unittest.TestCase):
@@ -27,7 +27,7 @@ class ClientTestCase(unittest.TestCase):
     def setUp(self):
         self.mock.memories.clear()
         self.mock.calls.clear()
-        self.client = AlexandriaClient(self.url, timeout=5)
+        self.client = AlexandriaClient(self.url, timeout=5, api_token=MOCK_API_TOKEN)
         self.addCleanup(self.client.close)
 
 
@@ -45,6 +45,15 @@ class TestHandshake(ClientTestCase):
         self.assertIn("store_memory", names)
         self.assertIn("retrieve_memories", names)
         self.assertEqual(len(tools), 13)
+
+    def test_invalid_bearer_does_not_open_a_session(self):
+        sessions = self.server.RequestHandlerClass.sessions.copy()
+        client = AlexandriaClient(self.url, timeout=5, api_token='rejected-fixture')
+        self.addCleanup(client.close)
+        with self.assertRaisesRegex(AlexandriaError, 'HTTP 401'):
+            client.list_tools()
+        self.assertIsNone(client._session_id)
+        self.assertEqual(self.server.RequestHandlerClass.sessions, sessions)
 
 
 class TestTools(ClientTestCase):
@@ -69,7 +78,7 @@ class TestTools(ClientTestCase):
         self.assertEqual(len(out["results"]), 1)
 
     def test_unreachable_server_raises_transport_error(self):
-        client = AlexandriaClient("http://127.0.0.1:1/mcp", timeout=1)
+        client = AlexandriaClient("http://127.0.0.1:1/mcp", timeout=1, api_token=MOCK_API_TOKEN)
         self.addCleanup(client.close)
         with self.assertRaises(AlexandriaError):
             client.call_tool("store_memory", {"content": "x"})

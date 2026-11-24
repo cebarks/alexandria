@@ -54,9 +54,64 @@ pub fn update_centroid(
         .collect()
 }
 
+/// The centroid a set of member embeddings implies: their arithmetic mean.
+///
+/// This is the *derived* value a cluster's membership authorises, and it is kept apart from
+/// [`update_centroid`] because the two answer different questions. The running average asks "what does the
+/// centroid I already have become when one member is added?" and is exact only while the centroid it is
+/// handed is itself the mean of the members it counts — so it silently inherits any drift in that stored
+/// value, and it cannot answer a write that has to prove its centroid from the members rather than from
+/// the number it is replacing. The mean asks "what is the centre of these members?" and is the only
+/// answer that survives a concurrent writer having moved the membership since this caller read it, which
+/// is exactly the state a derived-bookkeeping conflict leaves behind.
+///
+/// Dimension handling is deliberate, not defensive. Every embedding in a cluster was produced by one
+/// locked model, so a member of a different length is not a smaller cluster but a corrupt population, and
+/// averaging a short member against a long one would silently truncate the tail of the centroid. The
+/// caller sees the mismatch instead of a plausible number: `None` names the first member whose length
+/// differs from the first member's, and an empty population has no centre (`None`) rather than a zero
+/// vector that a caller could mistake for a real centroid.
+pub fn centroid(embeddings: &[&[f32]]) -> Option<Vec<f32>> {
+    alexandria_storage::models::cluster::mean_centroid(embeddings)
+}
+
+/// The centroid implied by a population of members together with one member being added to it.
+///
+/// One function because the store path is the only caller that needs the combination, and writing it as
+/// `centroid(members ∪ [added])` in prose keeps the arithmetic in one place: the added vector is a member
+/// of the result, so it is counted in the divisor as well as the numerator.
+///
+/// There is deliberately no removal or "move" sibling here, and a scope move does not need one: storage's
+/// `MutationRepo::move_scope` re-derives the centre of the survivors from the population it reads inside
+/// its own transaction, calling the same [`mean_centroid`] this function is a call to. A helper with no
+/// producer is the shape this repo has already deleted once (the `worker` failure variant in
+/// `docs/prompt-path-stall-attribution.md`), so none is added here on spec — but the arithmetic is shared,
+/// which is the point of `centroid` being a call rather than a copy.
+pub fn centroid_with(members: &[&[f32]], added: &[f32]) -> Option<Vec<f32>> {
+    let mut population: Vec<&[f32]> = Vec::with_capacity(members.len() + 1);
+    population.extend_from_slice(members);
+    population.push(added);
+    centroid(&population)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine's mean and the storage writer's mean are one function, pinned.
+    ///
+    /// Asserted on the shapes where a divergence would be silent in production and fatal in the journal:
+    /// the empty population, the zero-dimension population, and the mismatched-length member that must be
+    /// a refusal rather than a truncated centroid.
+    #[test]
+    fn centroid_is_storage_mean_on_every_shape_that_refuses() {
+        let empty: Vec<&[f32]> = vec![];
+        assert_eq!(centroid(&empty), None);
+        assert_eq!(centroid(&[&[]]), None);
+        assert_eq!(centroid(&[&[1.0, 1.0], &[1.0]]), None);
+        assert_eq!(centroid(&[&[0.0, 2.0], &[2.0, 0.0]]), Some(vec![1.0, 1.0]));
+        assert_eq!(centroid(&[&[0.1, 0.2]]), Some(vec![0.1, 0.2]));
+    }
 
     #[test]
     fn test_assign_to_existing_cluster() {

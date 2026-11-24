@@ -11,10 +11,34 @@ import {
 	Client,
 	StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
+import { createHash } from "node:crypto";
 import { CONFIG } from "./config.js";
-import type { SessionArgs } from "./session-args.js";
 
 let clientPromise: Promise<Client> | null = null;
+let clientIdentity: string | null = null;
+
+const UPGRADE_GUIDANCE =
+	"Alexandria server is incompatible: upgrade it to a build with resolve_project support and bearer authentication.";
+
+/** Headers for this companion only; pi's native MCP client has its own transport/configuration. */
+export function authorizationHeaders(token = CONFIG.apiToken): Record<string, string> {
+	if (!token) {
+		throw new Error(`${UPGRADE_GUIDANCE} Configure ALEXANDRIA_API_TOKEN for the companion.`);
+	}
+	return { Authorization: `Bearer ${token}` };
+}
+
+export function assertProjectResolutionSupported(toolNames: string[]): void {
+	if (!toolNames.includes("resolve_project")) throw new Error(UPGRADE_GUIDANCE);
+}
+
+function credentialKey(token: string | undefined): string {
+	return token ? createHash("sha256").update(token).digest("hex") : "missing-token";
+}
+
+function identityKey(server = CONFIG.serverUrl, account = credentialKey(CONFIG.apiToken)): string {
+	return `${server}\u0000${account}`;
+}
 
 /**
  * Budget for the connect handshake: a single cheap round trip, so a server that
@@ -47,40 +71,77 @@ export function connectionsEstablished(): number {
  * Budget for the calls made on the prompt path (`retrieve_memories`,
  * `check_reminders`). The SDK waits 60 s per request by default; both injections
  * block the turn and both are best-effort, so they give up early and warn
- * instead. Store calls keep the SDK default — they are fire-and-forget, and a
- * store that embeds a long document legitimately takes a while.
+ * instead. Explicit store_memory calls use the configured/native MCP path, not
+ * this automatic prompt dispatcher.
  */
-export const PROMPT_CALL_TIMEOUT_MS = 5000;
+export const PROMPT_CALL_TIMEOUT_MS = CONFIG.promptCallTimeoutMs;
 
 /**
  * Ceiling on the whole per-prompt path, as one abort deadline.
  *
  * The per-call budget above is exactly that — per call — and the prompt path
- * stacks several: a git probe (2 s), a handshake (5 s) and a call (5 s), with one
- * reconnect retry on top. Pi waits for `before_agent_start` before the turn
- * starts, so the wait a user actually experiences is the sum, not the 5 s a single
- * constant suggests. This is the number to quote in the docs.
+ * stacks several: a git probe (2 s), a handshake (5 s) and tool calls, with one
+ * reconnect retry on top. Pi waits for `before_agent_start` before the turn starts,
+ * so the wait a user experiences is bounded by this shared deadline, not the sum of
+ * each stage's individual timeout.
  */
-export const PROMPT_BUDGET_MS = 10_000;
+export const PROMPT_BUDGET_MS = CONFIG.promptBudgetMs;
 
 async function connect(): Promise<Client> {
 	let url: URL;
 	try {
 		url = new URL(CONFIG.serverUrl);
 	} catch {
-		throw new Error(`Invalid ALEXANDRIA_URL: ${CONFIG.serverUrl}`);
+		throw new Error("Invalid ALEXANDRIA_URL format");
 	}
 	const client = new Client({
 		name: "alexandria",
 		version: "2.1.0",
 	});
-	const transport = new StreamableHTTPClientTransport(url);
-	await client.connect(transport, { timeout: HANDSHAKE_TIMEOUT_MS });
+	const transport = new StreamableHTTPClientTransport(url, {
+		requestInit: { headers: authorizationHeaders() },
+	});
+	try {
+		await client.connect(transport, { timeout: HANDSHAKE_TIMEOUT_MS });
+		const { tools } = await client.listTools();
+		assertProjectResolutionSupported(tools.map((tool) => tool.name));
+	} catch (err) {
+		if (/401|unauthori[sz]ed/i.test(err instanceof Error ? err.message : String(err))) {
+			throw new Error(`${UPGRADE_GUIDANCE} Check ALEXANDRIA_API_TOKEN and the server auth configuration.`);
+		}
+		throw err;
+	}
 	connectionGeneration++;
 	return client;
 }
 
-export async function getClient(): Promise<Client> {
+function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Prompt path aborted"));
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			signal.removeEventListener("abort", onAbort);
+			reject(signal.reason ?? new Error("Prompt path aborted"));
+		};
+		const settle = (fn: (value: T) => void, value: T) => {
+			signal.removeEventListener("abort", onAbort);
+			fn(value);
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => settle(resolve, value),
+			(error) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+	});
+}
+
+export async function getClient(signal?: AbortSignal): Promise<Client> {
+	const identity = identityKey();
+	if (clientIdentity !== null && clientIdentity !== identity) resetClient();
+	clientIdentity = identity;
 	if (!clientPromise) {
 		const attempt = connect();
 		clientPromise = attempt;
@@ -93,7 +154,7 @@ export async function getClient(): Promise<Client> {
 			if (clientPromise === attempt) clientPromise = null;
 		});
 	}
-	return clientPromise;
+	return awaitWithSignal(clientPromise, signal);
 }
 
 /**
@@ -152,6 +213,7 @@ export async function closeClient(): Promise<void> {
 		}
 		clientPromise = null;
 	}
+	clientIdentity = null;
 }
 
 /** The transport the prompt-path modules speak through, as a type so they can take
@@ -181,27 +243,63 @@ function isStaleSessionError(err: unknown): boolean {
  * prompt the user has abandoned (or that has hit the dispatcher's overall budget)
  * should stop spending a socket rather than run to its own timeout.
  */
-export async function callToolWithRetry(
+export function callToolWithRetry(
 	name: string,
 	args: Record<string, unknown>,
 	timeoutMs?: number,
 	signal?: AbortSignal,
 ): Promise<Awaited<ReturnType<Client["callTool"]>>> {
+	return callToolForIdentity(identityKey(), name, args, timeoutMs, signal);
+}
+
+async function callToolForIdentity(
+	identity: string,
+	name: string,
+	args: Record<string, unknown>,
+	timeoutMs?: number,
+	signal?: AbortSignal,
+): Promise<Awaited<ReturnType<Client["callTool"]>>> {
+	const assertIdentity = () => {
+		if (identityKey() !== identity) {
+			throw new Error("Alexandria companion credentials or endpoint changed. Retry with the current configuration.");
+		}
+	};
 	const options = {
 		...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
 		...(signal === undefined ? {} : { signal }),
 	};
+	const attempt = async () => {
+		assertIdentity();
+		const client = await getClient(signal);
+		// A cold handshake yields control. Refuse dispatch if the snapshot
+		// no longer matches, even though the resolved client retained its headers.
+		assertIdentity();
+		return client.callTool({ name, arguments: args }, options);
+	};
 	try {
-		const client = await getClient();
-		return await client.callTool({ name, arguments: args }, options);
+		return await attempt();
 	} catch (err) {
-		if (isStaleSessionError(err)) {
-			resetClient();
-			const client = await getClient();
-			return await client.callTool({ name, arguments: args }, options);
-		}
-		throw err;
+		if (!isStaleSessionError(err) || signal?.aborted) throw err;
+		assertIdentity();
+		resetClient();
+		return attempt();
 	}
+}
+
+export interface AuthenticatedServer {
+	serverKey: string;
+	accountKey: string;
+	callTool: CallTool;
+}
+
+/** Identity and call surface shared with context resolution, never the bearer secret itself. */
+export function authenticatedServer(): AuthenticatedServer {
+	const token = CONFIG.apiToken;
+	if (!token) authorizationHeaders(token);
+	const serverKey = CONFIG.serverUrl;
+	const accountKey = credentialKey(token);
+	const identity = identityKey(serverKey, accountKey);
+	return { serverKey, accountKey, callTool: (...args) => callToolForIdentity(identity, ...args) };
 }
 
 export function extractTextContent(content: unknown): string | undefined {
@@ -237,14 +335,4 @@ export function toolErrorMessage(result: { content?: unknown; isError?: boolean 
 		/* not JSON: the text is the message */
 	}
 	return text;
-}
-
-export async function storeMemory(
-	content: string,
-	tags: string[],
-	session: SessionArgs,
-): Promise<void> {
-	const result = await callToolWithRetry("store_memory", { content, tags, ...session });
-	const err = toolErrorMessage(result);
-	if (err) throw new Error(err);
 }

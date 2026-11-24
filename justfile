@@ -49,6 +49,28 @@ artifact-ci: artifact-fmt artifact-lint artifact-test artifact-deny
 eval-test:
     python3 -m unittest discover -s tools/granite-evaluation
 
+# Offline refinement scoring against the human-reviewed Task 1 cases.
+refinement-eval-test:
+    python3 -I -B -c 'import sys, unittest; sys.exit(not unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover("tools/refinement-evaluation")).wasSuccessful())'
+
+refinement-eval:
+    python3 -I -B tools/refinement-evaluation/score.py tools/refinement-evaluation/fixtures/cases.jsonl tools/refinement-evaluation/fixtures/deterministic-proposals.jsonl
+
+# Scoped release admission: temp stores, deterministic providers and loopback only.
+refinement-admission:
+    cargo test --locked -p alexandria --test joint_admission_test --test ownership_cli_test --test refinement_cli_test
+    cargo test --locked -p alexandria-mcp --test refinement_authority_test --test refinement_inference_test --test refinement_ui_test --test refinement_worker_test --test web_auth_test
+    cargo test --locked -p alexandria-storage --test classification_test --test refinement_apply_test --test refinement_candidates_test --test refinement_policy_test --test refinement_proposal_test
+    cargo test --locked -p alexandria-mcp --example review_fixture
+
+# Claude hooks against disposable local fixtures, not a running Claude install.
+claude-test:
+    python3 -B -m unittest discover -s contrib/claude/tests -p 'test_*.py'
+
+# Disposable loopback review UI. The example does not read Alexandria configuration.
+review-fixture:
+    cargo run --locked -p alexandria-mcp --example review_fixture
+
 # Type-check and test the pi companion (node:test over tsx, hermetic)
 ext-test:
     cd contrib/pi/extensions/alexandria && npm run typecheck && npm test
@@ -63,7 +85,7 @@ hermes-test:
     python3 -m unittest discover -s contrib/hermes/tests -v
 
 # All tests, Rust and client-side
-test-all: test ext-test hermes-test
+test-all: test ext-test claude-test hermes-test
 
 # Fast type-check
 check:
@@ -106,7 +128,7 @@ verify-assets:
     done
 
 # Full CI suite locally — run before pushing
-ci: fmt lint cpu-deps test test-cpu artifact-ci eval-test ext-test hermes-test deny verify-assets
+ci: fmt lint verify-assets cpu-deps refinement-admission test test-cpu artifact-ci eval-test refinement-eval-test refinement-eval ext-test claude-test hermes-test deny
 
 # Install git hooks (pre-commit: fmt + clippy)
 install-hooks:

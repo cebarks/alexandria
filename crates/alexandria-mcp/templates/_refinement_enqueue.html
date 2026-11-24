@@ -1,0 +1,7 @@
+{% macro version_fields(controls) %}
+<input type="hidden" name="csrf" value="{{ controls.csrf }}">
+<input type="hidden" name="request_key" value="{{ controls.key }}">
+<input type="hidden" name="configured_revision" value="{{ controls.configured_revision }}">
+<input type="hidden" name="consent_revision" value="{{ controls.consent_revision }}">
+<input type="hidden" name="mode_revision" value="{{ controls.mode_revision }}">
+{% endmacro %}

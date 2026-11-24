@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{RecordId, SurrealValue};
+use surrealdb::types::SurrealValue;
 
 use crate::models::{Session, SessionListItem};
 
@@ -32,6 +32,28 @@ pub struct SessionSummary {
     pub memory_count: usize,
 }
 
+/// The **interim unscoped** session repository.
+///
+/// Not the target shape for request-facing use. Its statements key on `external_id` with no owner, which
+/// was safe only while v005's index made that handle globally unique; v010 replaced the key with
+/// `(account, external_id)`, and measured on the pinned engine an `account` of `NONE` is **not**
+/// deduplicated by it — so a concurrent first store on this path can create two rows for one handle,
+/// and `the_unscoped_path_loses_handle_deduplication_under_v010` pins that rather than hiding it.
+///
+/// **Current, disclosed state:** no `#[tool]` handler reaches this type any more — every session tool and
+/// both write tools resolve an admitted scope first, and
+/// `request_facing_modules_never_reach_an_interim_or_unscoped_surface` fails if one starts calling it
+/// again. What still calls it is the *interim* surface: `AlexandriaServer::do_store_memory` (the unscoped
+/// store arm), `do_import_document_interim`, the session-scoped arm of `do_retrieve_memories`, and
+/// `do_get_session` / `do_list_sessions` / `do_finalize_session`, which are the debug UI's and the
+/// binary's end-to-end engine tests until Task 9 replaces that population with an authenticated fixture.
+/// Sessions those paths create are unowned and enjoy no handle deduplication; the owner decision that
+/// gated the migration (which partition a `store_memory` call writes with no scope parameter on the tool)
+/// is `task-6-owner-decisions.md` D4, and the request path now implements it.
+///
+/// The scoped alternative cannot be built without an `OwnerContext`, and there is no default, no
+/// test-only constructor and no `SystemContext` substitution for one — which is the property that makes
+/// the unfinished migration a decision rather than an oversight.
 pub struct SessionRepo<'a> {
     db: &'a Surreal<Any>,
 }
@@ -153,8 +175,8 @@ impl<'a> SessionRepo<'a> {
 
     /// Create a contains_session_memory edge from session to fact.
     pub async fn add_memory(&self, session_id: &str, fact_id: &str) -> Result<()> {
-        let session_rid = RecordId::parse_simple(session_id)?;
-        let fact_rid = RecordId::parse_simple(fact_id)?;
+        let session_rid = crate::parse_record_id(session_id)?;
+        let fact_rid = crate::parse_record_id(fact_id)?;
         self.db
             .query("RELATE $sess->contains_session_memory->$fact")
             .bind(("sess", session_rid))
@@ -467,28 +489,48 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    /// What v010 did to the unscoped path, pinned rather than glossed.
+    ///
+    /// This gate used to assert that a concurrent first store yields **one** session, and it held only
+    /// because v005's index was UNIQUE over `external_id` alone. v010 replaced that key with
+    /// `(account, external_id)`, and measured on the pinned engine an `account` of `NONE` is not
+    /// deduplicated by it: two unowned rows for one handle are both accepted, with no error and no
+    /// conflict. So this path can no longer promise one session per handle — and that is exactly why no
+    /// request-facing path may write through it.
+    ///
+    /// The guarantee itself did not disappear, it moved: it is now account-local, and
+    /// `scoped_session_race_test::concurrent_same_external_id_store_returns_the_owning_accounts_session`
+    /// and `a_repeated_store_by_one_account_reuses_its_own_session` are the positive controls that prove
+    /// `(account, external_id)` is enforced for a real bound account. What is asserted here is the
+    /// *negative* half of the same fact, so a future reader cannot mistake an unowned row for one that
+    /// enjoys that protection.
     #[tokio::test]
-    async fn test_find_or_create_concurrent_first_store_yields_one_session() {
+    async fn the_unscoped_path_loses_handle_deduplication_under_v010() {
         let db = Database::connect_embedded().await.unwrap();
         crate::schema::migrate(db.inner()).await.unwrap();
         let repo = SessionRepo::new(db.inner());
 
-        // Both calls miss the SELECT; the loser of the CREATE hits the unique index on
-        // external_id and must fall back to the winner's row instead of erroring.
-        let (a, b) = tokio::join!(
-            repo.find_or_create("sess-race", Some("pi"), None),
-            repo.find_or_create("sess-race", None, Some("sonnet")),
-        );
-        assert_eq!(a.unwrap(), b.unwrap());
-
-        assert_eq!(repo.list(10, 0).await.unwrap().len(), 1);
-        let session = repo
-            .find_by_external_id("sess-race")
+        // Exercise the interleaving where both legacy callers miss before either inserts.
+        // Joining two full calls allows one to finish before the other lookup, reusing its row.
+        let handle = "sess-race";
+        for _ in 0..2 {
+            assert!(repo.find_by_external_id(handle).await.unwrap().is_none());
+        }
+        let a = repo.create(handle, Some("pi"), None).await.unwrap();
+        let b = repo
+            .create(handle, None, Some("sonnet"))
             .await
-            .unwrap()
+            .expect("v010 allows a second unowned create for the same external ID");
+        assert_ne!(a, b);
+
+        let mut response = db
+            .inner()
+            .query("SELECT * FROM `session` WHERE external_id = $handle AND account = NONE")
+            .bind(("handle", handle))
+            .await
             .unwrap();
-        assert_eq!(session.agent_id.as_deref(), Some("pi"));
-        assert_eq!(session.model.as_deref(), Some("sonnet"));
+        let rows: Vec<Session> = response.take(0).unwrap();
+        assert_eq!(rows.len(), 2, "both unowned rows are stored");
     }
 
     #[tokio::test]

@@ -117,6 +117,10 @@ class MockAlexandria:
         raise NotImplementedError(f'mock alexandria does not implement {name}')
 
 
+# Mock-only dummy token for loopback protocol tests; not a server credential.
+MOCK_API_TOKEN = 'hermes-loopback-fixture'
+
+
 class Handler(BaseHTTPRequestHandler):
     mock: MockAlexandria
     sessions: set[str]
@@ -135,10 +139,16 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_DELETE(self) -> None:
+        if self.headers.get('Authorization') != f'Bearer {MOCK_API_TOKEN}':
+            self._send(401)
+            return
         self.sessions.discard(self.headers.get('Mcp-Session-Id', ''))
         self._send(204)
 
     def do_POST(self) -> None:
+        if self.headers.get('Authorization') != f'Bearer {MOCK_API_TOKEN}':
+            self._send(401)
+            return
         try:
             msg = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
         except (json.JSONDecodeError, ValueError):

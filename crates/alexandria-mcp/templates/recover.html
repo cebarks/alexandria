@@ -1,0 +1,22 @@
+{% extends "auth_page.html" %}
+{% block title %}Recover a password{% endblock %}
+{% block content %}
+<h1>Recover a password</h1>
+<p class="lede">Paste the recovery link an administrator issued for your account and choose a new password. The link works once and the password is never shown to or chosen by the administrator.</p>
+{% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}
+{% if let Some(secret) = issued %}<p class="secret">{{ secret }}</p><p class="note">Copy that into the field below; this page will never show it again.</p>{% endif %}
+<form method="post" action="/debug/recover">
+<input type="hidden" name="page" value="{{ page }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<div>
+<label for="secret">Recovery secret</label>
+<input id="secret" name="secret" autocomplete="off" required>
+</div>
+<div>
+<label for="password">New password</label>
+<input id="password" name="password" type="password" autocomplete="new-password" required>
+</div>
+<button type="submit">Set the new password</button>
+</form>
+<p class="note">Recovering a password invalidates every session and every agent token the account held, so any connected agent needs a new token afterwards.</p>
+{% endblock %}

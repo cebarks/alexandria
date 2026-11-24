@@ -1,9 +1,14 @@
+use std::fmt::Write;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::{SurrealValue, ToSql};
+use surrealdb::types::{RecordId, SurrealValue, ToSql};
 
+use super::scope::{Bind, GuardedWrite, ScopeFilter, guarded_run};
+use crate::access::{OwnerContext, ScopedContext};
+use crate::error::StorageError;
 use crate::models::HeatState;
 
 /// Band labels for [`HeatRepo::heat_histogram`], in render order.
@@ -19,6 +24,15 @@ pub struct HeatUpdate {
     pub heat: f64,
     pub stability: f64,
     pub access_count: i64,
+}
+
+/// One exact fact that was returned by retrieval and the resulting access values.
+pub struct HeatAccess {
+    pub memory: RecordId,
+    pub heat: f64,
+    pub stability: f64,
+    pub access_count: i64,
+    pub create_if_missing: bool,
 }
 
 /// One row the sweep wants to materialise: the value to write, and the decay anchor the caller read
@@ -187,6 +201,99 @@ impl<'a> HeatRepo<'a> {
         Ok(response.take(0)?)
     }
 
+    /// Read heat only for exact returned ids still live in the admitted population.
+    pub async fn get_many_scoped(
+        &self,
+        owner: &OwnerContext,
+        scope: &ScopedContext,
+        memory_ids: &[RecordId],
+    ) -> Result<Vec<HeatState>> {
+        anyhow::ensure!(
+            owner.workspace() == scope.workspace(),
+            "mismatched workspace"
+        );
+        if memory_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = ScopeFilter::new(scope);
+        let query = self.db.query(format!(
+            "SELECT * FROM heat_state WHERE memory INSIDE $ids AND memory INSIDE (\
+             SELECT VALUE id FROM $ids WHERE account = $account AND deleted = false \
+             AND quarantined_at = NONE AND {})",
+            scope.conjunct()
+        ));
+        let mut response = scope
+            .apply(query)
+            .bind(("ids", memory_ids.to_vec()))
+            .bind(("account", owner.account().as_record_id().clone()))
+            .await?
+            .check()?;
+        Ok(response.take(0)?)
+    }
+
+    /// Batch a retrieve's access writes under one owner claim. Recheck the live population
+    /// inside the data write, including for the rows that lacked heat when retrieval read them.
+    pub async fn record_access_scoped(
+        &self,
+        owner: &OwnerContext,
+        scope: &ScopedContext,
+        updates: &[HeatAccess],
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        if owner.workspace() != scope.workspace() {
+            return Err(StorageError::NotFound);
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let scope = ScopeFilter::new(scope);
+        let names: Vec<_> = (0..updates.len())
+            .map(|i| {
+                (
+                    format!("m{i}"),
+                    format!("h{i}"),
+                    format!("s{i}"),
+                    format!("a{i}"),
+                )
+            })
+            .collect();
+        let mut sql = String::new();
+        for ((m, h, s, a), update) in names.iter().zip(updates) {
+            let eligible = format!(
+                "array::len((SELECT id FROM ${m} WHERE account = $account \
+                 AND deleted = false AND quarantined_at = NONE AND {})) = 1",
+                scope.conjunct()
+            );
+            let values = format!(
+                "heat = ${h}, stability = ${s}, access_count = ${a}, \
+                 last_touched = time::now(), last_accessed_at = time::now()"
+            );
+            write!(
+                sql,
+                "UPDATE heat_state SET {values} WHERE memory = ${m} AND {eligible} RETURN AFTER; "
+            )
+            .expect("writing to String");
+            if update.create_if_missing {
+                write!(sql,
+                    "IF {eligible} AND array::len((SELECT id FROM heat_state WHERE memory = ${m} LIMIT 1)) = 0 {{ \
+                     CREATE heat_state SET memory = ${m}, {values} RETURN NONE; }}; "
+                ).expect("writing to String");
+            }
+        }
+        let mut write = GuardedWrite::new(sql).with_scope(&scope);
+        for ((m, h, s, a), update) in names.iter().zip(updates) {
+            write = write
+                .id(m, update.memory.clone())
+                .value(h, Bind::Float(update.heat))
+                .value(s, Bind::Float(update.stability))
+                .value(a, Bind::OptInt(Some(update.access_count)));
+        }
+        guarded_run::<HeatState>(self.db, owner, &write, now)
+            .await?
+            .ok_or(StorageError::Stale)?;
+        Ok(())
+    }
+
     /// Write several accesses in **one** round trip, as one multi-statement query.
     ///
     /// The per-row statements cannot be merged into one `UPDATE ... WHERE memory IN $ids` because
@@ -283,6 +390,83 @@ impl<'a> HeatRepo<'a> {
             .query(Self::page_oldest_sql())
             .bind(("limit", limit as i64))
             .await?;
+        Ok(response.take(0)?)
+    }
+
+    /// Page the oldest anchors whose memories live in **one partition**, oldest first.
+    ///
+    /// The sweep's cursor, scoped: the partition's conjunct (`ScopeFilter::for_partition`) is applied
+    /// inside the sub-select so the page carries only rows the dispatching partition may write, and
+    /// the same compound `ORDER BY last_touched ASC, id ASC` as [`Self::page_oldest`] keeps the
+    /// walk deterministic at ties. Same deliberate non-filtering of fact liveness as the global
+    /// page, for the reason its doc records.
+    pub async fn page_oldest_in_partition(
+        &self,
+        partition: &crate::models::identity::Partition,
+        limit: usize,
+    ) -> Result<Vec<HeatState>> {
+        self.page_oldest_in_partition_after(partition, limit, None)
+            .await
+    }
+
+    /// [`Self::page_oldest_in_partition`], resuming strictly after one previously examined row.
+    ///
+    /// `after` is a heat row's own record id from a prior page's tail. Its `last_touched` is
+    /// re-read here (the persisted cursor stores only the id) and the resume predicate is the
+    /// lexicographic complement of the page's `ORDER BY last_touched ASC, id ASC`, so every row
+    /// at or before the cursor position is skipped this walk. This is what stops a page of
+    /// ineligible rows from occupying every subsequent pass: appraise does not move `last_touched`,
+    /// so without a cursor the same oldest rows are re-selected forever and later rows starve.
+    ///
+    /// An anchor that no longer exists, or whose `last_touched` is `NONE`, resumes from the head:
+    /// the position is unknowable, and re-examining rows is the safe direction (charges budget,
+    /// never skips eligible work). Rows moved by a concurrent sweep land *after* the cursor
+    /// position (their `last_touched` became now), so they are picked up later in the same walk
+    /// rather than lost.
+    pub async fn page_oldest_in_partition_after(
+        &self,
+        partition: &crate::models::identity::Partition,
+        limit: usize,
+        after: Option<&RecordId>,
+    ) -> Result<Vec<HeatState>> {
+        let anchor_touched = match after {
+            None => None,
+            Some(id) => {
+                let mut response = self
+                    .db
+                    .query("SELECT * FROM $id")
+                    .bind(("id", id.clone()))
+                    .await?;
+                let rows: Vec<HeatState> = response.take(0)?;
+                rows.into_iter().next().and_then(|row| row.last_touched)
+            }
+        };
+        let filter = crate::repos::scope::ScopeFilter::for_partition(partition);
+        let resume = match &anchor_touched {
+            // The timestamp itself is bound below from `anchor_touched`; this arm only decides
+            // that the resume predicate is present.
+            Some(_) => " AND (last_touched > $after_touched OR (last_touched = $after_touched AND \
+             id > $after_id))"
+                .to_string(),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT * FROM heat_state WHERE memory INSIDE (SELECT VALUE id FROM fact WHERE {}){} \
+             ORDER BY last_touched ASC, id ASC LIMIT $limit;",
+            filter.conjunct(),
+            resume
+        );
+        let mut prepared = self.db.query(sql).bind(("limit", limit as i64));
+        if let Some(touched) = &anchor_touched {
+            prepared = prepared.bind(("after_touched", *touched)).bind((
+                "after_id",
+                after
+                    .expect("an anchor id accompanies its timestamp")
+                    .clone(),
+            ));
+        }
+        prepared = filter.apply(prepared);
+        let mut response = prepared.await?;
         Ok(response.take(0)?)
     }
 

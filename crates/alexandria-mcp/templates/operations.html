@@ -1,0 +1,12 @@
+{% extends "layout.html" %}
+{% block title %}History{% endblock %}
+{% block body %}<h1>Your operation history</h1>
+<p>Every change you make to a memory is recorded with the exact state it left behind and the state it produced. Nothing on this page is visible to the operator: the corpus journal is keyed to your workspace, and the operator's health page shows content-free aggregates only.</p>
+<table>
+<tr><th>When</th><th>Action</th><th>Effects</th><th>Rows touched</th><th></th></tr>
+{% if rows.is_empty() %}<tr><td colspan="5" class="empty">Nothing recorded yet.</td></tr>{% endif %}
+{% for row in rows %}<tr><td>{{ row.at }}</td><td>{{ row.kind }}</td><td>{{ row.effects }}</td><td>{{ row.touched }}</td><td><a class="link" href="/debug/operations/{{ row.id|urlencode }}">before / after</a></td></tr>
+{% endfor %}</table>
+<p>This list names what each operation did, not what your memories say. The exact text appears only on the operation's own page.</p>
+<p class="muted">Showing up to the most recent {{ capped }} operations; older ones are recorded and readable by their link, but this page does not page back to them.</p>
+{% endblock %}

@@ -1,0 +1,55 @@
+{% extends "layout.html" %}
+{% import "_refinement_enqueue.html" as e %}
+{% block title %}Quality proposal{% endblock %}
+{% block body %}
+<h1>Quality proposal {{ proposal_id }}</h1>
+<p>State: {{ state }} · revision {{ revision }}</p>
+<dl class="fact-meta">
+  <dt>Source</dt><dd>{{ source }}</dd>
+  <dt>Changes</dt><dd>{{ changes }}</dd>
+  <dt>Rationale</dt><dd>{{ rationale }}</dd>
+  <dt>Uncertainty</dt><dd>{{ uncertainty }}</dd>
+  <dt>Model disclosure</dt><dd>{{ model_disclosure }} same model: {{ same_model }}. different model: {{ different_model }}.
+</dl>
+<section aria-labelledby="selected-records-heading">
+  <h2 id="selected-records-heading">All selected records</h2>
+  <p>The detail names all selected records for this proposal.</p>
+  <pre class="content-block">{{ selected_records }}</pre>
+</section>
+<p>Review is limited to the records named by this proposal. No bulk quality approval is available; selected records are not a bulk-approval control.</p>
+<p class="warning">A stale or moved proposal cannot be applied. Please reload the proposal before deciding.</p>
+{% if can_decide || can_revert %}
+<form method="post" action="/debug/refinement/proposals/{{ proposal_path|urlencode }}/approve">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="revision" value="{{ revision }}">
+  <input type="hidden" name="decision_key" value="{{ decision_key }}">
+  {% if can_decide %}
+  <button type="submit">Approve</button>
+  <button type="submit" formaction="/debug/refinement/proposals/{{ proposal_path|urlencode }}/dismiss">Dismiss</button>
+  <button type="submit" formaction="/debug/refinement/proposals/{{ proposal_path|urlencode }}/defer">Defer</button>
+  {% else %}
+  <button type="submit" formaction="/debug/refinement/proposals/{{ proposal_path|urlencode }}/revert">Revert</button>
+  {% endif %}
+</form>
+{% endif %}
+{% if enqueue.enabled %}
+<form method="post" action="/debug/refinement/enqueue">
+  {{ e::version_fields(enqueue) }}
+  <input type="hidden" name="target" value="{{ proposal_path }}">
+  <input type="hidden" name="revision" value="{{ revision }}">
+  <button type="submit" name="action" value="opinion">Request a second opinion</button>
+  <button type="submit" name="action" value="regenerate">Request regeneration</button>
+</form>
+{% endif %}
+<section aria-labelledby="application-history-heading">
+  <h2 id="application-history-heading">Private application history</h2>
+  {% if operation_id.is_empty() %}
+    <p>This proposal has no linked application operation.</p>
+  {% else %}
+    <p>Operation <a href="/debug/operations/{{ operation_id|urlencode }}">{{ operation_id }}</a>; actor {{ actor }}.</p>
+    <h3>Exact preimage</h3><pre class="content-block">{{ preimage }}</pre>
+    <h3>Exact postimage</h3><pre class="content-block">{{ postimage }}</pre>
+    <h3>Revert history</h3><p>{{ revert_history }}</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -84,7 +84,7 @@ function report(tier, check, doc, detail, severity = "error") {
 
 /**
  * The advertised MCP tool set. `PUBLIC_TOOLS` in server.rs is authoritative —
- * `test_advertised_tool_set_is_exactly_the_thirteen_public_tools` compares it
+ * `the_advertised_public_surface_is_exactly_the_seventeen_documented_tools` compares it
  * against what the router actually advertises, so it cannot drift from the
  * server. Parsing it (a flat string array) is exact, unlike regex-matching
  * `#[tool(...)]` attributes, whose descriptions contain `]`.

@@ -7,7 +7,7 @@ from http.server import ThreadingHTTPServer
 from _bootstrap import bootstrap_hermes
 bootstrap_hermes()
 from alexandria.client import AlexandriaClient
-from mock_server import Handler, MockAlexandria
+from mock_server import MOCK_API_TOKEN, Handler, MockAlexandria
 
 
 class SseContracts(unittest.TestCase):
@@ -30,7 +30,8 @@ class SseContracts(unittest.TestCase):
         thread.start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        client = AlexandriaClient(f'http://127.0.0.1:{server.server_address[1]}/mcp', timeout=0.5)
+        client = AlexandriaClient(f'http://127.0.0.1:{server.server_address[1]}/mcp',
+                                 timeout=0.5, api_token=MOCK_API_TOKEN)
         self.addCleanup(client.close)
         return client
 

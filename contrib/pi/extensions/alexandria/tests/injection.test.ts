@@ -25,6 +25,22 @@ const bad = (reason: unknown) => ({ status: "rejected" as const, reason });
 const RECALL: FeatureOutcome = { block: "RECALL-BLOCK" };
 const REMINDERS: FeatureOutcome = { block: "REMINDER-BLOCK", count: 2 };
 
+test("the resolved project ID is explicit in the agent-visible injection", () => {
+	const out = buildInjection(ok(RECALL), ok(REMINDERS), {
+		projectId: "project:owned",
+		source: "git-remote",
+	});
+	assert.match(out.message?.content ?? "", /project context: project:owned/);
+	assert.match(out.message?.content ?? "", /resolved from git-remote/);
+});
+
+test("Personal-only context is explicit when no remote exists", () => {
+	const out = buildInjection(ok({ block: null }), ok({ block: null }), {
+		source: "personal-only",
+	});
+	assert.match(out.message?.content ?? "", /Personal-only/);
+});
+
 test("both features succeed: one message, recall first, reminders second", () => {
 	const out = buildInjection(ok(RECALL), ok(REMINDERS));
 	assert.equal(out.message?.customType, "alexandria");

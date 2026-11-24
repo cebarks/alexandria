@@ -7,22 +7,35 @@ yanked = "warn"
 unmaintained = "workspace"
 ignore = [
     # Marvin Attack timing sidechannel in `rsa` crate — no upstream fix available.
-    # Existing exception via surrealdb -> jsonwebtoken -> rsa (WASM rust_crypto in 4.0.1).
-    # We don't use RSA directly.
+    # Transitive dep via surrealdb -> jsonwebtoken -> rsa. We don't use RSA directly.
     "RUSTSEC-2023-0071",
     # Two quick-xml 0.39.4 denial-of-service bugs: quadratic duplicate-attribute checking
     # (RUSTSEC-2026-0194) and unbounded `NsReader` namespace allocation (RUSTSEC-2026-0195).
-    # Existing pre-4.0 exceptions: the original 3.3 route was via object_store 0.13's
-    # cloud backends. Fixed in quick-xml 0.41; these two advisories are not encountered in
-    # the current 4.0.1 scan. Retained unchanged, not new exceptions for this upgrade.
+    # Transitive via surrealdb-core 3.3 -> object_store 0.13, which surrealdb-core builds with its
+    # cloud backends on and no feature to drop them. Fixed in quick-xml 0.41, which object_store
+    # 0.13 cannot take. We never configure object storage, so that XML parser never runs.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # Data race / double free via unsound Send/Sync in reblessive 0.4.3, reachable through
+    # surrealdb-core 3.3.0's dbs::Executor. No fix in the 3.3 line — patched in surrealdb-core
+    # 4.0.0. Tracked by the SurrealDB 4 upgrade: https://github.com/cebarks/alexandria/issues/55
+    "RUSTSEC-2026-0454",
+    # Out-of-bounds read decoding internal keys shorter than 16 bytes in surrealkv 0.21.4,
+    # reachable at the on-disk SSTable decode boundary. Fixed in surrealkv 1.2.0, which only
+    # ships with SurrealDB 4.0.0. Tracked by the SurrealDB 4 upgrade:
+    # https://github.com/cebarks/alexandria/issues/55
+    "RUSTSEC-2026-0452",
     # Explicitly accepted risk, NOT a crypto fix: official SurrealDB 4.0.1 pins
     # JWT 10.4, whose WASM rust_crypto backend retains crypto-bigint 0.5.5.
     # The inspected native Linux 4.0.1 graph uses AWS-LC instead. Reconsider if
     # WASM support is introduced or this path becomes native; remove when the
     # official dependency route admits patched crypto. See docs/dependency-advisories.md.
     "RUSTSEC-2026-0387",
+    # Temporary maintenance-risk acceptance, not dependency remediation.
+    # Remove both ignores after https://github.com/cebarks/alexandria/issues/57
+    # replaces the direct dependencies and the full audit passes without them.
+    "RUSTSEC-2026-0543", # chrono
+    "RUSTSEC-2026-0555", # chrono-tz
 ]
 
 [licenses]

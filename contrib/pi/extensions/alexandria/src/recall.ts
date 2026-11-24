@@ -8,7 +8,7 @@ import {
 	PROMPT_CALL_TIMEOUT_MS,
 	type CallTool,
 } from "./mcp-client.js";
-import { CONFIG } from "./config.js";
+import { RECALL_SETTINGS } from "./config.js";
 import type { RecallSettings } from "./recall-config.js";
 
 export interface RetrievedMemory {
@@ -35,18 +35,16 @@ export async function retrieveMemories(
 	query: string,
 	call: CallTool = callToolWithRetry,
 	signal?: AbortSignal,
-	settings: Pick<RecallSettings, "limit" | "minSimilarity"> = {
-		limit: CONFIG.recallLimit,
-		minSimilarity: CONFIG.recallMinSimilarity,
-	},
+	settings: Pick<RecallSettings, "limit" | "minSimilarity"> & { projectId?: string } =
+		RECALL_SETTINGS.get().effective,
 ): Promise<RecallCheck> {
-	const { limit, minSimilarity } = settings;
+	const { limit, minSimilarity, projectId } = settings;
 	// Bounded: this awaits before the turn starts, so a hung server must not be
 	// able to spend a minute of it. A timeout costs one prompt of recall, not a
 	// blocked turn.
 	const result = await call(
 		"retrieve_memories",
-		{ query, limit },
+		{ query, limit, ...(projectId ? { project: projectId } : {}) },
 		PROMPT_CALL_TIMEOUT_MS,
 		signal,
 	);

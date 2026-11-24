@@ -96,19 +96,21 @@ jobs:
         run: df -h .
       - run: just verify-assets
       - run: just cpu-deps
+      # Workspace tests include refinement admission and the in-memory review fixture test.
       - run: just test
       - run: just test-cpu
       # Real inference/conversion requires explicit cached artifacts and is ignored here.
       - run: just artifact-test
       - run: just eval-test
+      - run: just refinement-eval-test
+      - run: just refinement-eval
+      - run: just claude-test
       - name: Runner disk after tests
         if: always()
         run: df -h .
 
-  # The pi companion is TypeScript with its own suite, and nothing else in this
-  # workflow would notice if it stopped compiling: `just test` is cargo-only. It is
-  # also the only client that consumes reminders, so a broken type there is a broken
-  # delivery path for every user of the extension.
+  # The Pi companion needs its own gate: `just test` is cargo-only. A broken
+  # companion can disable its prompt-time recall and reminder delivery.
   extension:
     name: Pi companion
     runs-on: ubuntu-latest

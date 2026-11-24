@@ -3,6 +3,18 @@ pub struct ImportDocumentParams {
     #[schemars(description = "The document text to import")]
     pub content: String,
     #[schemars(
+        description = "Where the imported memories belong: 'personal' or 'project'. Required for a hosted request unless `context_project` names the current project; the refusal happens before any chunk is embedded, so an untargeted import writes nothing."
+    )]
+    pub scope: Option<String>,
+    #[schemars(
+        description = "Destination project for scope 'project' (opaque ID or established alias). Overrides `context_project`; never creates a project."
+    )]
+    pub project: Option<String>,
+    #[schemars(
+        description = "The resolved project context for this session, used when `scope` is omitted."
+    )]
+    pub context_project: Option<String>,
+    #[schemars(
         description = "Import mode: 'whole' (single memory) or 'chunk' (split into parts). Default: chunk"
     )]
     pub mode: Option<String>,

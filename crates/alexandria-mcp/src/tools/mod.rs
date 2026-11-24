@@ -8,6 +8,7 @@ mod list_reminders;
 mod list_sessions;
 mod recall;
 mod retrieve;
+mod scope;
 mod set_reminder;
 mod store;
 mod update;
@@ -22,6 +23,10 @@ pub use list_reminders::ListRemindersParams;
 pub use list_sessions::ListSessionsParams;
 pub use recall::RecallParams;
 pub use retrieve::RetrieveMemoriesParams;
+pub use scope::{
+    ListProjectsParams, ListUnassignedMemoriesParams, ProposeMemoryScopeParams, RemoteDescriptor,
+    ResolveProjectParams, ScopeProposalInput,
+};
 pub use set_reminder::{ReminderPatternParams, SetReminderParams};
 pub use store::StoreMemoryParams;
 pub use update::UpdateMemoryParams;

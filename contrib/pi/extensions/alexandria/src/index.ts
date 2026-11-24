@@ -5,23 +5,15 @@
  *   Queries Alexandria for memories relevant to the user's prompt and injects
  *   them into context before the agent starts. Disable: ALEXANDRIA_AUTO_RECALL=off
  *
- * Store — three layers:
- *   1. Skill (existing, separate SKILL.md): agent decides during conversation
- *   2. Heuristic detectors (this extension):
- *      - Correction detector: "no, use X" → store_memory
- *      - Preference detector: "always do X" → store_memory
- *      - Error resolution tracker: error→success pairs → store_memory
- *      - Tool dedup tracker: records agent-initiated stores for extraction dedup
- *   3. LLM extraction (this extension, session_shutdown):
- *      Serializes conversation, asks a cheap model to extract remaining durable facts
+ * Storage is explicit: agents use the Alexandria memory skill and authenticated
+ * store_memory tool when they decide a durable memory should be saved.
  *
- *   Disable all store behavior: ALEXANDRIA_AUTO_STORE=off
- *
- * Reminders (before_agent_start, alongside recall):
- *   Calls check_reminders once per prompt with a project hint, so reminders the
- *   server has no timer for actually reach the user. Due ones are injected into
- *   context (agent-visible) and surfaced as a notification (human-visible);
- *   delivery is once-only, so consuming it is what advances recurring schedules.
+ * Project context, recall, and reminders (before_agent_start):
+ *   Resolves the session cwd's sanitized origin through resolve_project, or uses the
+ *   explicit ALEXANDRIA_PROJECT_ID override. No origin means Personal-only, never a
+ *   guessed basename. The issued ID scopes recall and reminder checks and is included
+ *   in the agent-visible context. Delivery and escalation stay within the account.
+ *   Accepted due rows are injected and announced; consuming a fire advances its schedule.
  *   Disable: ALEXANDRIA_REMINDERS=off
  *
  * Recall and reminders share a single before_agent_start handler: both blocks
@@ -33,71 +25,29 @@
  *   ALEXANDRIA_AUTO_RECALL                  set to "off" to disable recall
  *   ALEXANDRIA_AUTO_RECALL_LIMIT            default: 10 (read with MIN_SIMILARITY; see docs/minilm-test-data.md)
  *   ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY   default: 0.45 (calibrated for LIMIT=10)
- *   ALEXANDRIA_AUTO_STORE                   set to "off" to disable all store behavior
- *   ALEXANDRIA_EXTRACT_MODEL                default: vertex/claude-haiku-4-5
- *   ALEXANDRIA_EXTRACT_TIMEOUT_MS           default: 5000
  *   ALEXANDRIA_REMINDERS                    set to "off" to disable reminder checks
- *   ALEXANDRIA_REMINDERS_PROJECT            project hint for reminder targeting
- *                                           (default: git repo directory name)
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CONFIG, RECALL_SETTINGS } from "./config.js";
 import { showRecallSettings } from "./recall-settings.js";
 import {
-	resetClient,
+	authenticatedServer,
 	closeClient,
-	storeMemory,
-	extractTextContent,
+	connectionsEstablished,
+	prewarm,
+	PROMPT_BUDGET_MS,
+	resetClient,
 } from "./mcp-client.js";
 import { retrieveMemories, formatMemoriesBlock } from "./recall.js";
-import { getProjectHint, checkReminders, formatDueBlock } from "./reminders.js";
+import { checkReminders, formatDueBlock } from "./reminders.js";
+import { getProjectContext } from "./project-context.js";
 import { buildInjection, type FeatureOutcome } from "./injection.js";
 import { asFailure } from "./failure.js";
-import { SessionDedupBuffer } from "./detectors/types.js";
-import { detectCorrection } from "./detectors/correction.js";
-import { detectPreference } from "./detectors/preference.js";
-import { trackToolStore } from "./detectors/tool-tracker.js";
-import { ErrorTracker } from "./detectors/error-tracker.js";
-import { PROMPT_BUDGET_MS, prewarm, connectionsEstablished } from "./mcp-client.js";
 import { recordPromptPath, startDriftProbe, outcomeLabel } from "./diag.js";
-import { runExtraction } from "./extraction.js";
-import { sessionArgs } from "./session-args.js";
-
-/**
- * Extract readable text from a tool_execution_end result.
- * Handles MCP content blocks ({content: [{type: "text", text: "..."}]}),
- * plain strings, and objects with a text/message/error field.
- */
-function extractResultText(result: unknown): string | null {
-	if (typeof result === "string") return result;
-	if (!result || typeof result !== "object") return null;
-
-	const r = result as Record<string, unknown>;
-
-	// MCP content block structure
-	const fromContent = extractTextContent(r.content);
-	if (fromContent) return fromContent;
-
-	// Direct text/message/error fields
-	for (const key of ["text", "message", "error"] as const) {
-		if (typeof r[key] === "string") return r[key] as string;
-	}
-
-	return null;
-}
-
-function notifyStoreFailed(
-	ctx: { ui: { notify(message: string, level: "warning"): void } },
-	err: unknown,
-): void {
-	ctx.ui.notify(
-		`Alexandria store_memory failed (${err instanceof Error ? err.message : String(err)})`,
-		"warning",
-	);
-}
 
 interface ExtensionDependencies {
+	authenticatedServer: typeof authenticatedServer;
 	prewarm: typeof prewarm;
 	retrieveMemories: typeof retrieveMemories;
 	checkReminders: typeof checkReminders;
@@ -105,12 +55,8 @@ interface ExtensionDependencies {
 
 export default function alexandriaExtension(
 	pi: ExtensionAPI,
-	dependencies: ExtensionDependencies = { prewarm, retrieveMemories, checkReminders },
+	dependencies: ExtensionDependencies = { authenticatedServer, prewarm, retrieveMemories, checkReminders },
 ) {
-	// Session-scoped state — reset on each session
-	let dedupBuffer = new SessionDedupBuffer();
-	let errorTracker = new ErrorTracker();
-
 	pi.registerCommand("alexandria", {
 		description: "Configure Alexandria auto-recall",
 		handler: async (_args, ctx) => {
@@ -151,7 +97,8 @@ export default function alexandriaExtension(
 			};
 
 			// One deadline for the whole prompt path, not one per attempt. Each call
-			// is already bounded (5 s) but they stack — git probe, handshake, call, and
+			// is already bounded by its configured per-call limit but they stack — git probe,
+			// handshake, call, and
 			// a reconnect retry — and pi waits for this handler before the turn starts,
 			// so the number a user actually experiences is the sum. Aborting also stops
 			// spending a socket on a prompt that is no longer wanted.
@@ -160,9 +107,9 @@ export default function alexandriaExtension(
 				() => budget.abort(new Error(`Alexandria prompt budget (${PROMPT_BUDGET_MS} ms) exceeded`)),
 				PROMPT_BUDGET_MS,
 			);
-			ctx.signal?.addEventListener("abort", () => budget.abort(ctx.signal?.reason), {
-				once: true,
-			});
+			const abortFromPi = () => budget.abort(ctx.signal?.reason);
+			if (ctx.signal?.aborted) abortFromPi();
+			else ctx.signal?.addEventListener("abort", abortFromPi, { once: true });
 
 			/**
 			 * Which abort source fired, read at catch time — both signals are still
@@ -184,17 +131,28 @@ export default function alexandriaExtension(
 				return { aborted, budgetExceeded: budget.signal.aborted && !aborted };
 			};
 
+			// One authenticated project context feeds both tool calls and the injection;
+			// if resolution fails, neither feature is allowed to widen to an unscoped read.
+			const projectContextTask = Promise.resolve().then(async () => {
+				const server = dependencies.authenticatedServer();
+				const project = await getProjectContext(ctx, server, budget.signal);
+				return { project, call: server.callTool };
+			});
+
 			// Settled, not awaited: one feature failing must never suppress the
 			// other's injection or its notification.
 			const recallTask: Promise<FeatureOutcome> =
 				recallSettings.enabled && query
 					? (async () => {
 							try {
+								const { project, call } = await projectContextTask;
 								const { items, error } = await dependencies.retrieveMemories(
 									query,
-									undefined,
+									call,
 									budget.signal,
-									recallSettings,
+									project.projectId
+										? { ...recallSettings, projectId: project.projectId }
+										: recallSettings,
 								);
 								return {
 									block: items.length > 0 ? formatMemoriesBlock(items) : null,
@@ -210,10 +168,10 @@ export default function alexandriaExtension(
 				? Promise.resolve({ block: null, count: 0 })
 				: (async () => {
 						try {
-							const project = await getProjectHint(ctx.cwd);
+							const { project, call } = await projectContextTask;
 							const { items, error } = await dependencies.checkReminders(
-								project,
-								undefined,
+								project.projectId,
+								call,
 								budget.signal,
 							);
 							return {
@@ -226,11 +184,13 @@ export default function alexandriaExtension(
 						}
 					})();
 
-			const [recallRes, remindersRes] = await Promise.allSettled([
+			const [recallRes, remindersRes, projectContextRes] = await Promise.allSettled([
 				recallTask,
 				remindersTask,
+				projectContextTask,
 			]);
 			clearTimeout(timer);
+			ctx.signal?.removeEventListener("abort", abortFromPi);
 			// Stopped here rather than at the record below, so the probe cannot outlive
 			// the awaits it measures: everything after this point is synchronous, and a
 			// throw in it would otherwise leak one interval per prompt. The window that
@@ -242,7 +202,11 @@ export default function alexandriaExtension(
 			// for each failure mode all live in `buildInjection` — extracted so the
 			// cross-product of settled outcomes is testable without a server, which
 			// is the claim this dispatcher exists to make.
-			const injection = buildInjection(recallRes, remindersRes);
+			const injection = buildInjection(
+				recallRes,
+				remindersRes,
+				projectContextRes.status === "fulfilled" ? projectContextRes.value.project : undefined,
+			);
 			if (injection.resetClient) {
 				// Only a failure that implicates the connection reaches here —
 				// `buildInjection` has already excluded cancellations and prompt-budget
@@ -273,99 +237,8 @@ export default function alexandriaExtension(
 		});
 	}
 
-	// ── Store: Heuristic detectors ──────────────────────────────────────
-	if (!CONFIG.storeDisabled) {
-		// Correction + preference detection on user prompts
-		pi.on("before_agent_start", async (event, ctx) => {
-			const prompt = event.prompt?.trim();
-			if (!prompt) return;
-
-			const detections = [
-				detectCorrection(prompt, dedupBuffer),
-				detectPreference(prompt, dedupBuffer),
-			].filter((d): d is NonNullable<typeof d> => d !== null);
-
-			// Fire-and-forget stores — don't block the agent turn
-			for (const detection of detections) {
-				// storeMemory uses callToolWithRetry internally, so stale
-				// sessions are recovered automatically.
-				storeMemory(detection.content, detection.tags, sessionArgs(ctx)).catch((err) =>
-					notifyStoreFailed(ctx, err),
-				);
-			}
-		});
-
-		// Tool dedup tracker — watch for agent-initiated store_memory calls
-		pi.on("tool_result", async (event) => {
-			// ToolResultEvent variants all extend ToolResultEventBase which has
-			// toolName, input, and isError. CustomToolResultEvent covers MCP tools.
-			try {
-				trackToolStore(
-					{
-						toolName: "toolName" in event ? (event.toolName as string) : "",
-						input: "input" in event ? (event.input as Record<string, unknown>) : {},
-						isError: event.isError,
-					},
-					dedupBuffer,
-				);
-			} catch {
-				/* never fail on tracking */
-			}
-		});
-
-		// Error resolution tracker — accumulate errors and successes
-		pi.on("tool_execution_end", async (event) => {
-			const text = extractResultText(event.result);
-			if (!text) return;
-
-			if (event.isError) {
-				errorTracker.recordError(event.toolName, text);
-			} else {
-				errorTracker.recordSuccess(event.toolName, text);
-			}
-		});
-
-		// Flush error resolutions at agent_end
-		pi.on("agent_end", async (_event, ctx) => {
-			const resolutions = errorTracker.flush();
-			for (const mem of resolutions) {
-				storeMemory(mem.content, mem.tags, sessionArgs(ctx)).catch((err) =>
-					notifyStoreFailed(ctx, err),
-				);
-			}
-		});
-	}
-
 	// ── Session shutdown ────────────────────────────────────────────────
-	pi.on("session_shutdown", async (event, ctx) => {
-		// LLM extraction — skip on reload (no meaningful conversation boundary)
-		if (!CONFIG.storeDisabled && event.reason !== "reload") {
-			try {
-				const extracted = await runExtraction(ctx, dedupBuffer);
-				for (const mem of extracted) {
-					await storeMemory(mem.content, [...mem.tags, "extracted"], sessionArgs(ctx)).catch((err) =>
-						notifyStoreFailed(ctx, err),
-					);
-				}
-			} catch (err) {
-				ctx.ui.notify(
-					`Alexandria extraction failed (${err instanceof Error ? err.message : String(err)}); skipping.`,
-					"warning",
-				);
-			}
-		}
-
-		// Reset session state
-		dedupBuffer = new SessionDedupBuffer();
-		errorTracker = new ErrorTracker();
-
-		// Close MCP client
+	pi.on("session_shutdown", async () => {
 		await closeClient();
-	});
-
-	// Reset state on session_start (handles /new, /resume, /fork)
-	pi.on("session_start", async () => {
-		dedupBuffer = new SessionDedupBuffer();
-		errorTracker = new ErrorTracker();
 	});
 }

@@ -31,17 +31,22 @@ async fn test_cluster_split_mechanics() {
         vec![0.02, 0.98, 0.0],
     ];
     for (i, emb) in embeddings.iter().enumerate() {
-        let fid = memory_repo
-            .create_fact(&format!("fact{i}"), 0.5, emb, &[])
+        let (_fid, fid_t) = memory_repo
+            .create_fact_with_id(&format!("fact{i}"), 0.5, emb, &[])
             .await
             .unwrap();
-        cluster_repo.add_member(&cid, &fid).await.unwrap();
+        cluster_repo.add_member(&cid, &fid_t).await.unwrap();
     }
 
     // Verify cohesion check says split
     let members = cluster_repo.get_members(&cid).await.unwrap();
     let member_embeddings: Vec<Vec<f32>> = members.iter().map(|f| f.embedding.clone()).collect();
-    let action = check_cohesion(&cid, &[0.5, 0.5, 0.0], &member_embeddings, 0.85);
+    let action = check_cohesion(
+        &alexandria_storage::record_id_to_string(&cid),
+        &[0.5, 0.5, 0.0],
+        &member_embeddings,
+        0.85,
+    );
     let (group_a, group_b, centroid_a, centroid_b) = match action {
         MaintenanceAction::Split {
             group_a,
@@ -89,20 +94,28 @@ async fn test_cluster_merge_mechanics() {
         .await
         .unwrap();
 
-    let f1 = memory_repo
-        .create_fact("in c1", 0.5, &[1.0, 0.0, 0.0], &[])
+    let (_f1, f1_t) = memory_repo
+        .create_fact_with_id("in c1", 0.5, &[1.0, 0.0, 0.0], &[])
         .await
         .unwrap();
-    let f2 = memory_repo
-        .create_fact("in c2", 0.5, &[0.98, 0.02, 0.0], &[])
+    let (_f2, f2_t) = memory_repo
+        .create_fact_with_id("in c2", 0.5, &[0.98, 0.02, 0.0], &[])
         .await
         .unwrap();
-    cluster_repo.add_member(&c1, &f1).await.unwrap();
-    cluster_repo.add_member(&c2, &f2).await.unwrap();
+    cluster_repo.add_member(&c1, &f1_t).await.unwrap();
+    cluster_repo.add_member(&c2, &f2_t).await.unwrap();
 
     // check_merge says merge (equal counts, c1 kept by convention)
-    let merge = check_merge(&c1, &[1.0, 0.0, 0.0], 1, &c2, &[0.98, 0.02, 0.0], 1, 0.9);
-    let (keep_id, remove_id, merged_centroid) = match merge {
+    let merge = check_merge(
+        &alexandria_storage::record_id_to_string(&c1),
+        &[1.0, 0.0, 0.0],
+        1,
+        &alexandria_storage::record_id_to_string(&c2),
+        &[0.98, 0.02, 0.0],
+        1,
+        0.9,
+    );
+    let (keep_id, _remove_id, merged_centroid) = match merge {
         MergeCheck::Merge {
             keep_id,
             remove_id,
@@ -111,9 +124,15 @@ async fn test_cluster_merge_mechanics() {
         MergeCheck::Distinct => panic!("Expected merge"),
     };
 
-    // Execute merge via the extracted method
+    // Execute merge via the extracted method: the engine's verdict labels are display strings,
+    // the typed ids the fixture minted are the authority.
+    let (keep, remove) = if keep_id == alexandria_storage::record_id_to_string(&c1) {
+        (&c1, &c2)
+    } else {
+        (&c2, &c1)
+    };
     cluster_repo
-        .execute_merge(&keep_id, &remove_id, &merged_centroid)
+        .execute_merge(keep, remove, &merged_centroid)
         .await
         .unwrap();
 
@@ -148,11 +167,11 @@ async fn test_split_leaves_no_orphan_on_partial_failure() {
         } else {
             vec![0.0, 1.0]
         };
-        let fid = memory_repo
-            .create_fact(&format!("f{i}"), 0.5, &emb, &[])
+        let (fid, fid_t) = memory_repo
+            .create_fact_with_id(&format!("f{i}"), 0.5, &emb, &[])
             .await
             .unwrap();
-        cluster_repo.add_member(&cid, &fid).await.unwrap();
+        cluster_repo.add_member(&cid, &fid_t).await.unwrap();
         fact_ids.push(fid);
     }
 
@@ -168,14 +187,12 @@ async fn test_split_leaves_no_orphan_on_partial_failure() {
         let cluster = memory_repo.cluster_for_fact(fid).await.unwrap();
         assert!(cluster.is_some(), "Fact {fid} has no cluster assignment");
         let cluster = cluster.unwrap();
-        let cluster_id = cluster
-            .id
-            .as_ref()
-            .map(record_id_to_string)
-            .unwrap_or_default();
+        // cid_a/cid_b are typed now; compare the typed ids directly.
+        let cluster_id = cluster.id.as_ref();
         assert!(
-            cluster_id == cid_a || cluster_id == cid_b,
-            "Fact {fid} assigned to unexpected cluster {cluster_id}"
+            cluster_id == Some(&cid_a) || cluster_id == Some(&cid_b),
+            "Fact {fid} assigned to unexpected cluster {:?}",
+            cluster_id.map(record_id_to_string)
         );
     }
 }

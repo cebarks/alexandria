@@ -7,7 +7,7 @@ Alexandria loads server config with this precedence:
    - `ALEXANDRIA_CONFIG` env var (explicit path override)
    - `$XDG_CONFIG_HOME/alexandria/config.toml` (default: `~/.config/alexandria/config.toml` on Linux, `~/Library/Application Support/alexandria/config.toml` on macOS)
    - `~/.alexandria/config.toml` (legacy fallback, logged with a warning)
-3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_EMBEDDING_BATCH_SIZE`, `ALEXANDRIA_EMBEDDING_MAX_TOKENS`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
+3. **Individual env vars** — `ALEXANDRIA_SERVER_TRANSPORT`, `ALEXANDRIA_SERVER_HOST`, `ALEXANDRIA_SERVER_PORT`, `ALEXANDRIA_SERVER_PUBLIC_ORIGIN`, `ALEXANDRIA_SERVER_LOOPBACK_DEVELOPMENT`, `ALEXANDRIA_DATA_DIR`, `ALEXANDRIA_EMBEDDING_MODEL`, `ALEXANDRIA_EMBEDDING_DEVICE`, `ALEXANDRIA_EMBEDDING_BATCH_SIZE`, `ALEXANDRIA_EMBEDDING_MAX_TOKENS`, `ALEXANDRIA_REMINDERS_TIMEZONE`, `ALEXANDRIA_REMINDERS_ESCALATION_HOURS`
 
 ## Storage engine upgrades
 
@@ -27,10 +27,13 @@ or identity overrides to bypass a physical-format refusal.
 transport = "http"            # "stdio" or "http" (default: "stdio")
 host = "127.0.0.1"            # HTTP bind address (default: "127.0.0.1")
 port = 3000                   # HTTP port (default: 3000)
-allowed_origins = ["*"]       # CORS origins; ["*"] disables validation (default: ["*"])
-allowed_hosts = ["*"]         # Allowed Host headers; ["*"] disables validation (default: ["*"])
+public_origin = "https://memory.example.com" # external origin at the TLS reverse proxy
+allowed_origins = ["https://memory.example.com"]
+allowed_hosts = ["memory.example.com"]
+loopback_development = false  # explicit local-only HTTP exception, described below
 sse_keep_alive_secs = 15      # SSE keep-alive interval in seconds (default: 15)
 
+# For stdio only, in a separate config: [auth] with stdio_account = "owner".
 [database]
 # data_dir = "/home/you/.local/share/alexandria/data"  # Storage path; ":memory:" for ephemeral (default: $XDG_DATA_HOME/alexandria/data)
 
@@ -60,7 +63,7 @@ cluster_interval_secs = 300        # Cohesion check → split cadence (default: 
 merge_interval_secs = 300          # Centroid similarity → merge cadence (default: 300 = 5 minutes)
 collapse_interval_secs = 86400     # Byte-identical duplicate collapse cadence (default: 86400 = 1 day)
 appraise_interval_secs = 86400     # Cold-row demotion cadence (default: 86400 = 1 day)
-max_rows_per_run = 500             # Rows one job may write per run (default: 500)
+max_rows_per_run = 500             # Rows one capped job may write per pass, across all partitions (default: 500)
 cold_heat_floor = 0.05             # Projected heat at or below which a memory counts as cold (default: 0.05)
 demote_confidence_ceiling = 0.5    # Confidence at or below which a cold, never-accessed memory is demotable (default: 0.5)
 
@@ -81,9 +84,60 @@ escalation_hours = 48              # Project-targeted reminders escalate to glob
 | `transport` | string | `"stdio"` | Transport protocol. `"stdio"` for direct pipe, `"http"` for persistent HTTP service. |
 | `host` | string | `"127.0.0.1"` | Bind address for HTTP mode. Use `"0.0.0.0"` to listen on all interfaces. |
 | `port` | u16 | `3000` | Port for HTTP mode. |
-| `allowed_origins` | string[] | `["*"]` | CORS allowed origins. `["*"]` disables origin validation. Set to specific origins (e.g. `["http://localhost:3000"]`) in production. |
-| `allowed_hosts` | string[] | `["*"]` | Allowed HTTP Host header values. `["*"]` disables host validation. |
+| `allowed_origins` | string[] | `["*"]` (unused in stdio) | Explicit CORS origins for HTTP. Must include `public_origin`; empty or wildcard entries are refused at HTTP startup. |
+| `allowed_hosts` | string[] | `["*"]` (unused in stdio) | Explicit HTTP Host allowlist, including the public origin's host. Entries match with or without the port. Empty or wildcard entries are refused at HTTP startup. |
+| `public_origin` | string | *none* | **Required when `transport = "http"`.** The `https` origin browsers actually reach, as `scheme://host[:port]` with no path, query, credentials or trailing slash — `https://memory.example.com`, or `https://example.com:8443`. It is the value a browser mutation's `Origin` header is compared against; it does not set a cookie domain. `http` is refused except on the loopback exception below. A missing or malformed value stops startup with a message naming the three keys to set. |
+| `loopback_development` | bool | `false` | The one exception to the `https` rule: session cookies are sent without `Secure` so a developer can sign in over plain `http` on `127.0.0.1`/`::1`/`localhost`. Honoured **only** when `host` is a loopback address — setting it with `host = "0.0.0.0"` is a startup error, not a warning, because the flag's whole meaning is "there is nobody between me and the browser". It never turns off the CSRF pair, the `Host` check or authentication. |
 | `sse_keep_alive_secs` | u64 | `15` | SSE keep-alive interval in seconds. Controls how often the server sends keep-alive pings on Streamable HTTP connections. |
+
+#### HTTP origins, hosts and what a proxy may not decide
+
+**HTTP upgrade:** previous wildcard defaults no longer admit HTTP startup. Set all three keys in
+`[server]` before restart. For TLS at a reverse proxy, pass the public Host through or allow the
+actual rewritten Host as well:
+
+```toml
+[server]
+transport = "http"
+public_origin = "https://memory.example.com"
+allowed_hosts = ["memory.example.com"]
+allowed_origins = ["https://memory.example.com"]
+```
+
+Startup stops before opening the store and lists the offending keys, ending with `fix the keys above in [server]; transport = "stdio" needs none of them`. For **local browser development only**, set `host = "127.0.0.1"`, `public_origin = "http://127.0.0.1:3000"`, `allowed_hosts = ["127.0.0.1"]`, `allowed_origins = ["http://127.0.0.1:3000"]`, and `loopback_development = true`. This does not waive authentication, Host or CSRF checks. The full rules:
+
+- **`public_origin` is mandatory, and it is not derived.** The server will not infer it from the bind
+  address or from a `Host` header. A mismatch can cause browser mutations to be refused. The
+  session and CSRF cookies are host-only: there is no `Domain` attribute, so the browser uses
+  the host that returned the response, not a cookie domain derived from `public_origin`.
+- **`allowed_origins` must contain `public_origin` exactly.** Scheme and host are compared
+  case-insensitively, and the port is preserved as written. An explicit default port does
+  not match an omitted port. Omit default ports in browser-facing origin settings so the
+  configured value matches the browser's serialized `Origin`.
+- **`allowed_hosts` must contain the request `Host`.** Entries match with or without the port. A request
+  with no `Host` header at all is refused once the boundary is armed — including by `curl`, which sends
+  one; the refusal is the DNS-rebinding defence (S1 in `docs/security-findings.md`), and it holds even
+  when the port is bound to loopback.
+- **Forwarded headers are never consulted.** `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-For`
+  and `Forwarded` cannot establish the origin, the host, or the loopback exception, because any client
+  that can reach the port can set all four. TLS terminates at the reverse proxy you configure; the
+  server's view of the origin is the one you wrote in `public_origin`, and nothing a request carries can
+  override it. If the proxy rewrites `Host` instead of passing it through, put the rewritten value in
+  `allowed_hosts` — the boundary checks the header it will actually receive.
+- **`stdio` needs none of this.** There is no browser, no origin and no cookie in stdio mode, so
+  `public_origin` is not read and the boundary is never armed.
+- **A fresh store cannot self-bootstrap over HTTP.** Accounts are created by invitation from an existing
+  administrator, so the first account and the first administrator arrive through the operator command,
+  not through `/debug/login`. An empty store served over HTTP is reachable and correctly says it cannot
+  sign anybody in.
+
+### `[auth]`
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `stdio_account` | string | `""` | Enrolled active account login for trusted-local stdio, and the identity for explicit offline refinement commands. Unset does not grant an identity. Do not set it in the HTTP service config: serving HTTP refuses it and authenticates each request instead. No env override. |
+
+See [bootstrap and offline adoption](ownership-and-refinement.md#choose-the-boundary-and-enroll-an-owner). Stdio needs no hosted origin settings.
 
 ### `[database]`
 
@@ -198,6 +252,20 @@ Controls automatic cluster assignment, splitting, and merging. The cadences them
 The background housekeeping scheduler: **one loop, five independently-due jobs**. HTTP mode only —
 stdio has no long-lived process to run a clock in, so nothing here applies to a stdio server.
 
+**Temporary split/merge boundary on owned data:** the legacy `cluster` and `merge` jobs only
+select clusters whose records and complete physically retained populations have no account,
+workspace, scope, or project markers. Deleted and quarantined members still participate in this
+eligibility check. Missing targets and partial ownership fail closed. Storage rechecks eligibility
+at the split/merge entry points before any child cluster, membership, centroid, deletion, or audit
+write; an earlier candidate selection is not authorization to mutate a now-owned population.
+Eligible unowned maintenance remains enabled. Owned/mixed split and merge are deferred until
+account-scoped maintenance is implemented; changing thresholds does not override this gate.
+
+This is a supported-writer application boundary, not predicate/phantom locking against arbitrary
+privileged database writes or concurrent ownership rewrites. Ownership migration remains offline.
+Other housekeeping jobs are unchanged by this gate; it is not a claim that the complete multi-user
+maintenance rollout is finished.
+
 Each job carries its own interval and its own last-run stamp, so one job failing or running long
 affects only itself. A process that was down for three intervals catches up with **one** run of each
 job, not three: a missed tick costs latency, never correctness. The loop sleeps until the soonest
@@ -219,7 +287,7 @@ job is due rather than waking on a fixed tick.
 | `merge_interval_secs` | u64 | `300` | Merge cadence, seconds. Split from `cluster` because merge is the expensive half — an operator who wants merges rarer should not pay for it in slower splits. |
 | `collapse_interval_secs` | u64 | `86400` | Duplicate-collapse cadence, seconds. |
 | `appraise_interval_secs` | u64 | `86400` | Demotion cadence, seconds. |
-| `max_rows_per_run` | u64 | `500` | Rows one job may **write** per run. Not a bound on reads: `collapse` reads every live fact to group duplicates, and `appraise` reads every live fact's confidence and store time while paging only this many heat rows. `examined` in the job's trace line is what was read, so `examined: 12000, acted: 3` is a normal collapse. Must be ≥ 1. |
+| `max_rows_per_run` | u64 | `500` | One allowance per capped job (`sweep`, `collapse`, `appraise`) per pass across all active-account assigned partitions, not per partition. The dispatcher rotates fairly and persists progress, so a restarted CLI pass resumes the walk. `appraise` also persists an advancing row cursor and wraps it after exhausting the current cycle. This is not a read or runtime bound: `collapse` can inspect every live fact in a visited partition, and `examined` reports reads (`examined: 12000, acted: 3` can be normal). `cluster` and `merge` are uncapped: each runs its legacy whole-store body once per pass for workspace-less clusters and visits active-account partitions using the owned, partition-scoped maintenance path. Must be ≥ 1. |
 | `cold_heat_floor` | f64 | `0.05` | Projected heat at or below which a memory counts as cold. **Provisional**: a fraction of the `1.0` a fresh access writes, not a number derived from retrieval measurements. |
 | `demote_confidence_ceiling` | f64 | `0.5` | Stored confidence at or below which a cold, never-accessed memory is demotable. Defaults to the confidence `store_memory` writes when the caller supplies none, so the rule reaches only memories nobody asserted more strongly AND nobody retrieved while recording was armed. Must be above `0.2`, the value demoted memories are written at. **Provisional**, as above. |
 
@@ -241,12 +309,17 @@ a complete set would answer. `dreaming` is not the only section in that position
 is the complete list of what the server reads from the environment, not an excerpt of a scheme that
 covers every section.
 
+The owned paths for all five jobs dispatch over active-account assigned partitions; Unassigned data is intentionally outside maintenance. The capped jobs charge selected rows (`sweep`, `appraise`) or retired duplicates (`collapse`) against one global allowance per job per pass, not per account or partition. Mixed-membership clusters (members spanning owned and physically unowned records) are not restructured by either path: they remain surfaced for owner classification rather than being treated as personal data or silently repaired.
+
 Job runs are logged at `debug` with `examined` and `acted` counts. `cluster`, `merge`, `collapse` and
-`appraise` each write a row to `maintenance_log` — visible at `/debug/maintenance` — and `sweep`
-deliberately does not.
+`appraise` emit audit rows for changes in `maintenance_log` — aggregate counts at `/debug/maintenance` — and `sweep`
+deliberately does not. `appraise`, `collapse` and semantic `cluster_change` writes pass through the
+mutation kernel and create `semantic_operation` rows with preimages; system operations use the
+schema's `initiator = NONE`, with readable `system:dreaming` attribution on the linked maintenance
+summary. Sweep materializes heat only and deliberately writes neither journal rows nor audit rows.
 
 **Running a job on demand: `alexandria dream`.** You do not need to touch this section to make a job
-run now. `alexandria dream --job NAME` (or with no `--job`, all five) runs the same job bodies the
+run now. `alexandria dream --job NAME` (or with no `--job` or `--job all`, all five housekeeping jobs) runs the same job bodies the
 scheduler runs, once, and prints one `job=… examined=… acted=… skipped=…` line per job — the same
 counters the log line carries, plus `skipped`, which the loop does not log — then the run id and how
 many audit rows were found under it. The old workaround was to set all five `*_interval_secs` to `1`
@@ -261,8 +334,8 @@ what that key switches off is the background clock, not the jobs' legitimacy.
 
 > SurrealKV is single-writer, so `alexandria dream` refuses while the service holds the data dir: one
 > line naming the directory, exit status non-zero, and no job examined or wrote anything. Stop the
-> service first, or set `ALEXANDRIA_DATA_DIR` to a copy of the directory and run it against that. It
-> loads no embedding model and needs no HNSW index. Before schema or job writes it reads stored
+> service first, or set `ALEXANDRIA_DATA_DIR` to a copy of the directory and run it against that. The
+> five housekeeping jobs load no embedding model and need no HNSW index. Before schema or job writes it reads stored
 > embedding readiness/identity and refuses unfinished or corrupt migration targets. It does not
 > provision artifacts, stamp an embedding lock or require the configured model to match stored
 > vectors; a fresh store without an identity table remains valid for a model-free pass.
@@ -285,6 +358,58 @@ one-shot CLI would mean something false. So `appraise` on a store that has never
 demotes nothing and logs why, which is the fail-closed gate above working rather than the command
 failing.
 
+### `[refinement]`
+
+Refinement has no routes by default. Only the operator can configure destinations and the approval ceiling. Startup reconciles the configured policy with the store before serving; removing the proposer disables inference without deleting prior consent. In HTTP mode with routes configured, a worker processes the durable refinement queue separately from housekeeping. The dreaming scheduler requests assigned-scope passes on `interval_secs` when enabled. Configuring routes does **not** grant consent: only currently opted-in accounts may send evidence, and automatic application additionally requires the owner's `secondary_llm` preference, an operator ceiling that permits it, and exact secondary approval. Existing owner-reviewed proposals can still be applied locally after egress is revoked.
+
+```toml
+[refinement]
+interval_secs = 86400             # positive seconds; separate assigned-scope enqueue cadence
+approval_mode_ceiling = "human"  # default; "secondary_llm" permits an owner to select that mode
+
+[refinement.proposer]
+protocol = "open_ai_chat_completions"  # or "anthropic_messages"
+api_prefix = "https://inference.example.com/gateway/v1"
+model = "proposer-model"
+credential_ref = "ALEXANDRIA_REFINEMENT_PRIMARY_KEY"  # environment variable name, not its value
+output_limit_field = "max_completion_tokens"         # optional protocol-specific override
+
+# Optional custom headers also take environment variable names, never literal values.
+[refinement.proposer.header_refs]
+x-gateway-key = "ALEXANDRIA_REFINEMENT_GATEWAY_KEY"
+```
+
+`interval_secs` defaults to `86400`; `approval_mode_ceiling` defaults to `human`. Both route blocks are absent by default. There are no section environment overrides; the values named by credential/header references are read only for requests. Fixed worker ceilings include 20 focal records per pass, up to 8 neighbors per focal, 40 inference attempts per pass, 100 per account and 500 global per rolling day (40 interactive per account), 20 queued interactive items per account and 200 items globally, 32 KiB request and 64 KiB response, 4,096 output tokens, 120 seconds per request and 600 seconds of active pass time. They are not throughput or cost guarantees.
+
+A route requires `protocol`, `api_prefix`, and a nonblank `model`. `output_limit_field` defaults to `max_tokens`; OpenAI also accepts `max_completion_tokens`, Anthropic only `max_tokens`. The HTTP(S) URL keeps its gateway path prefix; userinfo, query strings, and fragments are refused. `credential_ref` and each `header_refs` value, if present, must be a name matching `[A-Za-z_][A-Za-z0-9_]*`. Startup does not read the referenced values. To use a different reviewer, supply a complete `[refinement.reviewer]` route with its own references. Omit it to inherit the proposer route, including its model and references; a reviewer without a proposer is invalid.
+
+Consent is per account and covers the disclosed destinations (protocol, origin, and API prefix). A destination change requires a fresh grant. Changing only the model does not require consent renewal, but it changes the inference policy ID; the current model is shown in disclosure. Credential rotation alone changes neither the destination nor the policy ID.
+
+**Trusted-local commands (Linux, stopped persistent store).** Configure `[auth] stdio_account`
+with an active enrolled account. These commands never accept an account override and do not load
+models or contact providers:
+
+- `alexandria refinement routes` prints the effective endpoints and models, the egress disclosure,
+  `policy_revision` and `consent_revision`. Review these before granting consent; a local route can
+  still receive full selected memory text.
+- `alexandria refinement consent grant --policy-revision N --consent-revision N` requires the two
+  displayed revisions. `alexandria refinement consent revoke --consent-revision N` revokes that
+  revision. Re-run `routes` after a stale refusal; an old grant does not revive if an old URL returns.
+- `alexandria refinement approval human|secondary-llm` changes the local account's preference.
+  Human is the default; selecting `secondary-llm` requires the operator ceiling to allow it.
+
+`alexandria dream --job refine --workspace WORKSPACE_ID --scope personal` (or `--scope project:ID`,
+for example `project:7`) is explicit-only. It needs the trusted-local account's administrator role,
+its own workspace, a ready owned store with matching embedding identity, and current consent.
+It cannot be combined with other jobs or `--max-rows`, never uses Unassigned, and is never part of
+bare `dream` or `--job all`. It loads the locked embedding provider, then runs one bounded worker
+turn and reports a run ID, a durable attempt ID, and any pending or applied proposal. A continuation
+uses the saved cursor on the next explicit pass. Human-mode results remain pending; an exact secondary
+approval under current policy can apply in the same turn. A failed embedding preparation records a failed
+attempt without applying the proposal or leaving reusable automatic approval. Revert refuses if any
+semantic postimage or incident reference changed and does not rewind later access heat. The command checks
+an existing `LOCK` read-only before the engine open; keep other openers stopped through that handoff.
+
 ### `[retrieve]`
 
 Controls server-side filtering of `retrieve_memories` results.
@@ -302,12 +427,23 @@ re-measure by editing the const and this table together.
 
 ### `[reminders]`
 
-Controls how reminder schedules are interpreted and how project-targeted reminders are guaranteed to arrive. These keys affect the reminder tools only.
+Controls reminder schedule interpretation and overdue escalation for valid owned project targets.
+These keys affect the reminder tools only. Escalation never crosses an account boundary or releases a
+migration hold. `set_reminder.target_project`, `check_reminders.project`, and
+`list_reminders.target_project` take an existing owned `project:<opaque-id>` handle, not an alias,
+project name or repository basename. Copy the project tool's canonical record text verbatim, including
+quoting/escaping; numeric and string keys are distinct. Parsing is synchronous/local, accepts only an
+exact project record literal (not a range or expression), and still requires owned lookup.
+Unknown/foreign handles are errors even if no reminders are due;
+omit a check context when none is known. New reminders store a typed project link. Historical text
+without a resolved typed target stays pending and suppressed before sampling/claiming, regardless of
+age; these settings do not map it or turn it global. Owned held/unresolved history remains available
+through unfiltered `list_reminders` (unresolved `target` is null, with legacy provenance separate).
 
 | Key | Type | Default | Description |
 | ----- | ------ | --------- | ------------- |
 | `timezone` | string | `""` (system-local) | IANA timezone name (e.g. `"Europe/Stockholm"`) used to interpret naive datetimes passed to `set_reminder` and to evaluate recurring `pattern`/`cron` schedules (wall-clock semantics — a daily 09:00 stays 09:00 local across DST). Empty = the system-local timezone detected at startup, falling back to UTC if detection fails; an invalid IANA name is a startup error. Explicit ISO-8601 offsets in `due_at` are always honored regardless. Across a transition: a wall time removed by the spring-forward gap has no fire that day, and a time duplicated by a fall-back fold fires **once**, on the first pass — one wall-clock reading is one occurrence. Naive one-shot inputs that land in either zone are rejected at set time with a message naming the fix. |
-| `escalation_hours` | u64 | `48` | How long a project-targeted reminder may stay overdue before `check_reminders` delivers it regardless of the caller's project (labeled `escalated: true`), so a project that stops being visited can never silently swallow its reminders. The boundary is inclusive: a reminder escalates once it is *at least* this many hours overdue, which is what makes `0` escalate every overdue project reminder. An unparseable value in the env override is a startup error, and so is a value too large to represent as a duration — the delivery path would otherwise hold project reminders forever, on every check. One default, `alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS`, shared with the MCP server's fallback. |
+| `escalation_hours` | u64 | `48` | How long a valid typed project-targeted reminder may stay overdue before `check_reminders` delivers it within its owner's account regardless of a valid supplied project context (labeled `escalated: true`). Held/unresolved legacy targets are excluded, not escalated. The boundary is inclusive: a reminder escalates once it is *at least* this many hours overdue, which is what makes `0` escalate every overdue project reminder. An unparseable value in the env override is a startup error, and so is a value too large to represent as a duration — the delivery path would otherwise hold project reminders forever, on every check. One default, `alexandria_engine::reminders::DEFAULT_ESCALATION_HOURS`, shared with the MCP server's fallback. |
 
 ## Environment Variable Overrides
 
@@ -319,6 +455,8 @@ These env vars override individual config values after the TOML file is loaded:
 | `ALEXANDRIA_SERVER_TRANSPORT` | `server.transport` (`"stdio"` or `"http"`) |
 | `ALEXANDRIA_SERVER_HOST` | `server.host` |
 | `ALEXANDRIA_SERVER_PORT` | `server.port` — a non-numeric value fails startup with an error naming the variable |
+| `ALEXANDRIA_SERVER_PUBLIC_ORIGIN` | `server.public_origin` — the published `https` origin the debug UI is bound to. Required for `transport = "http"` by the validator, whichever way the value arrived |
+| `ALEXANDRIA_SERVER_LOOPBACK_DEVELOPMENT` | `server.loopback_development` (`true`/`1` enable) — the loopback-only `Secure`-cookie exception |
 | `ALEXANDRIA_DATA_DIR` | `database.data_dir` |
 | `ALEXANDRIA_EMBEDDING_MODEL` | `embedding.model` |
 | `ALEXANDRIA_EMBEDDING_DEVICE` | `embedding.device` |
@@ -328,26 +466,23 @@ These env vars override individual config values after the TOML file is loaded:
 | `ALEXANDRIA_REMINDERS_TIMEZONE` | `reminders.timezone` |
 | `ALEXANDRIA_REMINDERS_ESCALATION_HOURS` | `reminders.escalation_hours` — a non-numeric value fails startup with an error naming the variable |
 
-The `ALEXANDRIA_SERVER_*` variables exist so a container can be configured entirely by environment
-(the bundled [Containerfile](../Containerfile) uses them to default to HTTP on `0.0.0.0:3000`) without
-shipping a config file.
-
-Everything else — `[heat]`, `[activation]`, `[cluster]`, `[retrieve]`, CORS, and SSE keep-alive —
-can only be set via the TOML file.
+The bundled [Containerfile](../Containerfile) selects HTTP and a bind address by environment. The explicit Host and CORS allowlists are TOML-only; an HTTP container must be supplied with that configuration. `[auth]`, `[heat]`, `[activation]`, `[cluster]`, `[dreaming]`, `[refinement]`, `[retrieve]`, and SSE keep-alive have no section environment overrides.
 
 ---
 
 ## Client Configuration
 
-The Pi companion extension (recall / store / reminders) loads its own JSON config from
-`$XDG_CONFIG_HOME/alexandria/client.json`. It is a separate file with separate keys — the server
-never reads it and the extension never reads `config.toml`. When `XDG_CONFIG_HOME` is unset, the
-client uses `~/.config` on Linux or `~/Library/Application Support` on macOS.
+The Pi companion extension (recall and reminders, no automatic memory writers) loads its own JSON
+config from `$XDG_CONFIG_HOME/alexandria/client.json`. The server never reads it and the extension
+never reads `config.toml`. When `XDG_CONFIG_HOME` is unset, the client uses `~/.config` on Linux or
+`~/Library/Application Support` on macOS. Claude's hook uses its own fixed timeouts; see the
+[Claude guide](../contrib/claude/README.md).
 
 The file is selected by `ALEXANDRIA_CLIENT_CONFIG`, if set, or by the default path. Precedence is
-built-in defaults → selected JSON file → individual `ALEXANDRIA_*` env vars. Blank env overrides
-are treated as unset; invalid numeric overrides fall back to the file/default. An unreadable or
-invalid JSON file warns and falls back to defaults at startup.
+built-in defaults → selected JSON file → individual `ALEXANDRIA_*` env vars. Blank recall and
+reminder overrides are treated as unset; invalid numeric recall overrides fall back to the file/default.
+Transport values are validated separately below. An unreadable or invalid JSON file warns and
+falls back to defaults at startup.
 
 **Breaking change:** The companion no longer reads `client.toml`. Convert any existing client file
 manually to JSON, preserving its keys, and point `ALEXANDRIA_CLIENT_CONFIG` to the JSON file if set.
@@ -384,12 +519,8 @@ formatting may be normalized when saved.
 {
   "server": { "url": "http://127.0.0.1:3000/mcp" },
   "recall": { "enabled": true, "limit": 10, "min_similarity": 0.45 },
-  "store": {
-    "enabled": true,
-    "extract_model": "vertex/claude-haiku-4-5",
-    "extract_timeout_ms": 5000
-  },
-  "reminders": { "enabled": true, "project": "alexandria" }
+  "transport": { "prompt_call_timeout_ms": 5000, "prompt_budget_ms": 10000 },
+  "reminders": { "enabled": true }
 }
 ```
 
@@ -399,6 +530,10 @@ formatting may be normalized when saved.
 |-----|------|---------|-------------|-------------|
 | `url` | string | `"http://127.0.0.1:3000/mcp"` | `ALEXANDRIA_URL` | Alexandria MCP server endpoint URL. |
 
+Set `ALEXANDRIA_API_TOKEN` in the client environment for HTTP bearer authentication, not in JSON.
+`ALEXANDRIA_PROJECT_ID` can override remote-based resolution with a known owned project handle.
+See the [Pi guide](../contrib/pi/README.md#project-context).
+
 ### `recall`
 
 | Key | Type | Default | Env Override | Description |
@@ -407,24 +542,29 @@ formatting may be normalized when saved.
 | `limit` | number | `10` | `ALEXANDRIA_AUTO_RECALL_LIMIT` | Max memories to retrieve per prompt. It is not merely a cap — a target ranked below it cannot be surfaced by any threshold, so it is a recall lever in its own right, and the stronger of the two. A judgement call on a small hand-authored question set, not a measurement — the questions were written against facts already in the corpus and none lacks a target (see [docs/minilm-test-data.md](minilm-test-data.md), "Limitations"). What the 2026-09-09 limit × threshold grid on an 880-fact corpus showed ("Result limit"): delivery saturates at `10`, because the worst of the 12 benchmark target ranks is 9, so `15` and `20` add non-target memories and no hits. Was `5` until that pass, which hid 3 of the 11 targets that cleared the then-default threshold on score. Lowering it below `3` also silently narrows spreading activation (`activation.top_n`). |
 | `min_similarity` | number | `0.45` | `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | Minimum cosine similarity to include an auto-recalled memory. A judgement call read off the same grid, with the same caveats; the grid counts how many of 12 known targets a threshold actually delivers *through* `limit`. **Read it together with `limit` — the two are not independent.** At `limit = 10`: `0.45` delivers 8/12 at ~1.0 non-targets per prompt, `0.35` delivers 11/12 at ~4.7, `0.50` delivers 7/12 at ~0.5, and the old `0.58` Pi default delivers only 4/12 — it assumed genuine matches score 0.6+ and drops two thirds of real hits. `0.40` was dominated on that 12-question grid (same 8 delivered as `0.45`, roughly double the noise); with the 20-question set it delivers 16/20 at ~3.0 against `0.45`'s 14/20 at ~1.65, a genuine trade that the strict-dominance rule used to pick the pair does not take. `0.45` is chosen as the frontier pick: paired with `limit = 10` it delivers what the previous `5`/`0.35` pair did at a third of the injection. Note that `0.45` is only on the frontier *because* the limit is 10 — at `limit = 5` it was dominated by `0.50`, so do not lower one without revisiting the other. It is not free: the weakest target scores 0.338 and falls below it. |
 
-### `store`
+### `transport`
 
-| Key | Type | Default | Env Override | Description |
-| ----- | ------ | --------- | ------------- | ------------- |
-| `enabled` | bool | `true` | `ALEXANDRIA_AUTO_STORE=off` | Enable heuristic store detectors and LLM extraction. |
-| `extract_model` | string | `"vertex/claude-haiku-4-5"` | `ALEXANDRIA_EXTRACT_MODEL` | Model for session-end LLM extraction. Falls back to session model if unavailable. |
-| `extract_timeout_ms` | number | `5000` | `ALEXANDRIA_EXTRACT_TIMEOUT_MS` | Timeout for the extraction LLM call in milliseconds. |
+| Key | Default | Env Override |
+| --- | --- | --- |
+| `prompt_call_timeout_ms` | `5000` ms | `ALEXANDRIA_PROMPT_CALL_TIMEOUT_MS` |
+| `prompt_budget_ms` | `10000` ms | `ALEXANDRIA_PROMPT_BUDGET_MS` |
+
+Values must be positive and finite, with call timeout ≤ shared prompt budget ≤ `120000` ms. The shared deadline includes project resolution, any in-path handshake, recall, reminder checks and reconnect; native Pi MCP tools are independent. The companion also prewarms its connection; its SDK handshake has a 5 s ceiling. These are timeout settings, not measured hosted latency. Legacy `store` settings and the old extraction environment variables are ignored with a warning; explicit agent stores remain available.
 
 ### `reminders`
 
-Client-side delivery keys. The server-side `[reminders]` section above configures how
-schedules are interpreted; this section only says whether the extension asks for due reminders, and
-what project hint it sends with the question.
+Client-side delivery setting. The server-side `[reminders]` section above configures how
+schedules are interpreted; this setting controls whether the companion checks them automatically.
 
 | Key | Type | Default | Env Override | Description |
 | ----- | ------ | --------- | ------------- | ------------- |
 | `enabled` | bool | `true` | `ALEXANDRIA_REMINDERS=off` | Call `check_reminders` on every prompt and inject whatever is due. The server runs no timer, so turning this off means reminders reach the user only if the agent calls `check_reminders` itself. |
-| `project` | string | (git repo dir name) | `ALEXANDRIA_REMINDERS_PROJECT` | Project hint sent with each check, matched exactly (case-sensitive) against the `target_project` set by `set_reminder`. Defaults to the basename of `git rev-parse --show-toplevel`; set it when the checkout directory is not the project name, as with a git worktree. Unset and outside a repo, only global and escalated reminders are delivered. |
+
+The authenticated dispatcher passes the same issued project ID to recall and reminder checks.
+It refuses pending dispatches or retries if the resolved endpoint or bearer identity has changed.
+Without project context, a check receives only that account's global and eligible escalated reminders.
+The legacy `reminders.project` / `ALEXANDRIA_REMINDERS_PROJECT` inputs do not select a project for
+this dispatcher. Use `ALEXANDRIA_PROJECT_ID` with an issued ID if an override is needed.
 
 ---
 
@@ -438,11 +578,11 @@ for Alexandria-only curated memory. Set `memory.provider: alexandria`,
 the `memory` toolset. These native-store flags do not disable the external provider or
 redirect Hermes' SQLite conversation history.
 
-The provider's `auto_store`, `extract`, and `store_session` settings are booleans. Explicit
-`true`/`false` strings are normalized for older saved settings; malformed values are refused.
-`auto_store` controls heuristic/error-resolution capture, independently of LLM `extract`;
-explicit native tool writes are unaffected. `store_session` attributes writes but never
-restricts default recall to the current conversation. No built-in-memory mirroring is performed.
+The provider requires `ALEXANDRIA_API_TOKEN` from the Hermes process environment. Optional
+`ALEXANDRIA_PROJECT_ID` supplies an issued project ID; without one, recall and explicit stores
+are confined to Personal. The former `auto_store`, `extract`, and `store_session` settings are ignored.
+Turn and session hooks never capture memories, submit transcripts, or persist Alexandria sessions.
+Writes require explicit native tool calls. No built-in-memory mirroring is performed.
 Automatic reminder consumption is primary-foreground-only and never cached. Hermes currently
 skips provider prefetch on trivial prompts, so automatic delivery waits for a nontrivial foreground
 prompt; explicit `alexandria_check_reminders` remains available. Host timeouts still make

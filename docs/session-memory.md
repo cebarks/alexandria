@@ -9,11 +9,13 @@ one behave exactly as they always have.
 
 ## Data model
 
-Schema `v005_session.surql`, amended by `v006_drop_session_memory_count.surql`:
+Schema `v005_session.surql`, amended by `v006_drop_session_memory_count.surql` and account-qualified by `v010_scoped_sessions.surql`:
 
 ```text
 session
-├── external_id    string       -- client-supplied handle; UNIQUE index
+├── account        record       -- owner; external_id is unique within this account
+├── workspace      record
+├── external_id    string       -- client-supplied handle
 ├── agent_id       option<string>
 ├── model          option<string>
 ├── started_at     datetime     -- default time::now()
@@ -30,21 +32,23 @@ never moves or copies the fact.
 
 There is **no stored `memory_count`**. Migration v006 dropped the column: `delete_memory` soft-deletes
 a fact and cannot decrement a counter that was set at store time, so any stored tally drifts. Counts
-are **derived** from the `contains_session_memory` traversal, with the same `deleted = false` filter
-`get_memories()` applies, which is why `SessionRepo::list` can never claim a memory that the session
-detail view would hide.
+are **derived** from the owned `contains_session_memory` traversal. In scoped views, counts follow
+live fact eligibility and the resolved partition, not an archive-wide tally.
 
 `external_id` is the only identity that matters to clients. It is an opaque string the caller
 chooses (pi's session UUID, a ticket number, `"2026-08-27-auth-refactor"` — anything), and it is
-what you pass to every session tool below. SurrealDB's own record ID for the session is internal.
+what you pass to every session tool below. Two accounts can reuse the same handle without sharing
+anything. SurrealDB's account-qualified record key is internal. Legacy adoption re-keys sessions and
+preserves their links for the nominated owner.
 
 ## Lifecycle
 
 ```text
-store_memory(session_id="s1")   # implicit create of `s1`, edge to the new fact
-store_memory(session_id="s1")   # edge
-retrieve_memories(session_id="s1")   # search scoped to s1's facts
-get_session(session_id="s1")         # metadata + every fact, oldest first
+store_memory(content="…", scope="personal", session_id="s1") # create `s1`, link new fact
+store_memory(content="…", scope="personal", session_id="s1") # add another link
+retrieve_memories(query="…", session_id="s1") # within session AND resolved partitions
+get_session(session_id="s1")                 # scoped memories, no archive summary/tags
+get_session(session_id="s1", view="archive") # private summary/tags, no memory bodies
 list_sessions(agent_id="pi", finalized=false)   # find a session id you don't have
 finalize_session(session_id="s1", summary=..., tags=[...])   # close it out
 ```
@@ -58,8 +62,7 @@ whether a session was finalized. Check `summary`: an unfinalized session has `su
 
 **Listing order is total.** `SessionRepo::list` orders by `ended_at DESC, external_id ASC`.
 A null `ended_at` (a session created but never touched) sorts below every datetime, so never-active
-sessions land in the tail — but `external_id` is the load-bearing half: it is UNIQUE-indexed, so the
-pair is a total order. Ordering by `ended_at` alone left the ties unspecified, and because the debug
+sessions land in the tail. `external_id` breaks ties because it is unique within the account being listed. Ordering by `ended_at` alone left the ties unspecified, and because the debug
 UI pages with `LIMIT`/`START` that is a correctness bug, not a cosmetic one — page 2 could repeat a
 session page 1 showed while silently dropping another.
 
@@ -76,11 +79,14 @@ client name, or use UUIDs) when more than one agent connects.
 
 | Tool | Session behavior |
 | --- | --- |
-| `store_memory` | Optional `session_id`. Auto-creates the session and relates the new fact to it. |
-| `retrieve_memories` | Optional `session_id` scopes the candidate set to that session's facts before ranking. |
-| `get_session` | Takes `session_id`; returns session metadata plus every linked memory (id, content, tags, confidence, `created_at`), ordered oldest first. The reported `memory_count` is the length of that live list, not a stored column. Errors if the id is unknown. |
-| `list_sessions` | All optional: `agent_id`, `tag`, `finalized` (`true` = has a summary, `false` = open), `limit` (default 20), `offset`. Returns sessions newest-first by `started_at`, each with the same metadata block as `get_session` and a live non-deleted `memory_count`, in one query. |
+| `store_memory` | Optional `session_id`. Auto-creates the session and relates the new fact to it. The create is a guarded write: if the caller's credential is revoked between claim and commit, the transaction conflicts and no session row appears. |
+| `retrieve_memories` | Optional `session_id` narrows the candidate set to that session's facts before ranking. It narrows, it does not widen: the rows are read through the caller's **resolved partitions**, so an `auto` read with no project over a session that also holds project rows answers with the personal ones. |
+| `get_session` | Takes `session_id`, plus `project` and `view` — there is no `scope` parameter on either session tool. Default `view: "scoped"` returns the session's memories (id, content, tags, confidence, `created_at`) **inside the resolved population**, oldest first, with `summary` and `tags` withheld and `memory_count` counted in that same population. `view: "archive"` is the deliberate whole-session read: the owner's own prose included, across the owned scopes, and no memory body at all. Errors if the id is unknown, and an unknown id — including somebody else's — answers the same way. |
+| `list_sessions` | All optional: `view`, `project`, `agent_id`, `tag`, `finalized` (`true` = has a summary, `false` = open), `limit` (default 20), `offset`. Returns sessions newest-first by `ended_at` (then `external_id`, the tie-break that makes the order total — see above), each with a live non-deleted `memory_count` counted inside the resolved population. `tag` is accepted only with `view: "archive"`; asking a scoped page to filter by prose it does not expose is refused rather than quietly answered with nothing. |
 | `finalize_session` | Takes `session_id` and optional `summary` / `tags`; sets `ended_at = time::now()` plus whichever fields were supplied. Errors if the id is unknown. |
+
+`view` is a separate decision from `session_id`: a scoped read never exposes archive summary/tags.
+An explicit archive read is account-private, not a way to retrieve fact bodies across projects.
 
 Both `Option` fields on `finalize_session` are genuinely optional: calling it with only
 `session_id` sets `ended_at` without recording a summary — which leaves the session counting as
@@ -93,13 +99,10 @@ These are real gaps in the shipped implementation, not usage advice:
 - **Sessions are not reachable through `recall`** (which walks clusters, not sessions), and
   `list_sessions` has no search — it filters on `agent_id`, `tag`, and finalized state only, so
   finding a session by what its summary says means paging through the list. Browsing is the debug
-  UI's other route: `/debug/sessions` (list, in the total order above) and
-  `/debug/sessions/{external_id}` (detail: summary, tags, the session's memories), HTTP mode only — or
-  query the `session` table directly.
-- **The pi extension groups but does not finalize.** `contrib/pi/` sends pi's session id,
-  `agent_id = "pi"` and the model with every auto-store, so those writes are grouped; the extension
-  itself never calls `finalize_session`, so sessions created by auto-store have no summary unless the
-  agent calls it directly — which the pi skill does document.
+  UI's other route: `/debug/sessions` and its owner-scoped detail, in HTTP mode.
+- **Clients do not auto-store or finalize.** An agent can opt into grouping with a client session ID
+  on explicit stores, and explicitly finalize a useful session. Recall does not implicitly read the
+  archive.
 
 ## SurrealDB gotchas in this code path
 

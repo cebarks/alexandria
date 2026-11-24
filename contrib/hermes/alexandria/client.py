@@ -14,9 +14,9 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import os
 import re
 import threading
-import uuid
 from typing import Any, Optional
 
 import httpx
@@ -47,11 +47,29 @@ class AlexandriaClient:
     re-established once automatically if the server drops it (404/410).
     """
 
-    def __init__(self, url: str, *, timeout: float = 10.0, client_name: str = "hermes-alexandria"):
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout: float = 10.0,
+        client_name: str = "hermes-alexandria",
+        api_token: Optional[str] = None,
+    ):
+        token = (os.environ.get("ALEXANDRIA_API_TOKEN", "") if api_token is None else api_token).strip()
+        if not token or any(not "!" <= c <= "~" for c in token):
+            raise AlexandriaError("a valid ALEXANDRIA_API_TOKEN is required")
+        try:
+            endpoint = httpx.URL(url)
+        except (httpx.InvalidURL, ValueError):
+            raise AlexandriaError("invalid Alexandria MCP endpoint") from None
+        loopback_http = endpoint.scheme == "http" and endpoint.host in {"localhost", "127.0.0.1", "::1"}
+        if not endpoint.is_absolute_url or endpoint.userinfo or not (endpoint.scheme == "https" or loopback_http):
+            raise AlexandriaError("Alexandria MCP requires HTTPS or an HTTP loopback endpoint, without URL credentials")
         self.url = url
         self.timeout = timeout
         self._client_name = client_name
-        self._http = httpx.Client(timeout=timeout)
+        self._api_token = token
+        self._http = httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False)
         self._lock = threading.RLock()
         self._req_id = itertools.count(1)
         self._session_id: Optional[str] = None
@@ -62,6 +80,7 @@ class AlexandriaClient:
 
     def _headers(self) -> dict[str, str]:
         headers = {
+            "Authorization": f"Bearer {self._api_token}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
@@ -89,8 +108,8 @@ class AlexandriaClient:
             return None
         try:
             msg = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise AlexandriaError(f"non-JSON response from {resp.request.url}: {body[:200]!r}") from exc
+        except json.JSONDecodeError:
+            raise AlexandriaError("Alexandria returned a non-JSON response") from None
         if expected_id is not None and (not isinstance(msg, dict) or msg.get("id") != expected_id):
             raise AlexandriaError("JSON-RPC response id does not match request")
         return msg if isinstance(msg, dict) else None
@@ -98,14 +117,14 @@ class AlexandriaClient:
     def _post(self, message: dict[str, Any], *, want_reply: bool) -> Optional[dict[str, Any]]:
         try:
             resp = self._http.post(self.url, headers=self._headers(), json=message)
-        except httpx.HTTPError as exc:
-            raise AlexandriaError(f"alexandria unreachable at {self.url}: {exc}") from exc
+        except httpx.HTTPError:
+            raise AlexandriaError("Alexandria transport request failed") from None
         if resp.status_code in (202, 204) and not want_reply:
             return None
         if resp.status_code in (404, 410):
             raise _SessionLost(f"session rejected ({resp.status_code})")
-        if resp.status_code >= 400:
-            raise AlexandriaError(f"HTTP {resp.status_code} from {self.url}: {resp.text[:200]!r}")
+        if resp.status_code >= 300:
+            raise AlexandriaError(f"Alexandria HTTP {resp.status_code}")
         msg = self._decode_body(resp, message.get("id"))
         if want_reply and msg is None:
             raise AlexandriaError("no JSON-RPC reply in response body")
@@ -127,22 +146,23 @@ class AlexandriaClient:
             }
             try:
                 resp = self._http.post(self.url, headers=self._headers(), json=req)
-            except httpx.HTTPError as exc:
-                raise AlexandriaError(f"alexandria unreachable at {self.url}: {exc}") from exc
-            if resp.status_code >= 400:
-                raise AlexandriaError(f"initialize failed: HTTP {resp.status_code} {resp.text[:200]!r}")
+            except httpx.HTTPError:
+                raise AlexandriaError("Alexandria initialization transport failed") from None
+            if resp.status_code >= 300:
+                raise AlexandriaError(f"Alexandria initialization HTTP {resp.status_code}")
             msg = self._decode_body(resp, req["id"]) or {}
             if "error" in msg:
-                raise AlexandriaError(f"initialize error: {msg['error']}")
+                raise AlexandriaError("Alexandria initialization rejected")
             result = msg.get("result", {})
             self._session_id = resp.headers.get("mcp-session-id") or None
             self._protocol_version = result.get("protocolVersion", PROTOCOL_VERSION)
             self.server_info = result.get("serverInfo", {})
             try:
                 self._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, want_reply=False)
-            except AlexandriaError as exc:
-                logger.debug("alexandria initialized-notification not acknowledged: %s", exc)
-            logger.info("alexandria session %s established (%s)", self._session_id, self.server_info)
+            except AlexandriaError:
+                self._session_id = None
+                raise
+            logger.debug("Alexandria MCP session established")
 
     def ensure_ready(self) -> None:
         with self._lock:
@@ -164,7 +184,7 @@ class AlexandriaClient:
                 req["id"] = str(next(self._req_id))
                 msg = self._post(req, want_reply=True)
         if msg and "error" in msg:
-            raise AlexandriaError(f"{method} failed: {msg['error']}")
+            raise AlexandriaError(f"Alexandria {method} rejected")
         return (msg or {}).get("result", {})
 
     def list_tools(self) -> list[dict[str, Any]]:
@@ -192,7 +212,7 @@ class AlexandriaClient:
             message = raw or f"tool {name} failed"
             if isinstance(payload, dict):
                 message = str(payload.get("error") or payload.get("message") or message)
-            raise AlexandriaToolError(message, payload)
+            raise AlexandriaToolError(message.replace(self._api_token, "[redacted]"), payload)
         return payload
 
     def close(self) -> None:

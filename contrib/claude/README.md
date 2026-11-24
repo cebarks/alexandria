@@ -1,180 +1,76 @@
-# Claude Code client-side integrations
+# Alexandria client-side integrations for Claude Code
 
-Optional companions for using Alexandria from [Claude Code](https://claude.com/claude-code).
-Not part of the MCP server; they exist to make the agent reach for memory more proactively.
-See "Getting agents to actually use memory" in the root [README.md](../../README.md).
+Optional client-side pieces for Alexandria; they are not part of the MCP server and do not install automatically. The memory skill guides tool use. The hooks provide automatic recall, but do not automatically store observations or extract transcripts.
 
-Nothing here auto-installs.
+Get your own agent token from the hosted Account page after enrollment; see the [ownership and refinement guide](../../docs/ownership-and-refinement.md). The hooks do not grant consent or submit, approve or classify refinement work. Application admin views do not expose other owners' content directly. Administrators can issue and use password-recovery links to reset another account's credentials and sign in as that owner. Issuance is audit-logged (v016); the issuer receives the usable link. Separately, host administrators can read disk and backups. This is not end-to-end encryption.
 
-## `skills/alexandria-memory/`
+## Memory skill
 
-Same guidance as the Pi skill, using Claude Code's `mcp__alexandria__<tool>` names.
+The skill uses Claude Code's native MCP tool names (`mcp__alexandria__<tool>`) and provides explicit guidance for recalling, storing, updating, importing, and managing reminders.
 
 ```bash
 cp -r contrib/claude/skills/alexandria-memory ~/.claude/skills/
 ```
 
-## `hooks/`
+For project-specific work, first resolve the project using `resolve_project` and pass its issued project ID. If there is no explicit project ID, the Claude recall hook is Personal-only. If you previously relied on regex-based prompt writes or transcript extraction, call `store_memory` explicitly for each durable observation (or `import_document` for a document) using the skill guidance.
 
-Equivalent of the Pi auto-recall extension. Needs `bash`, `curl` ≥ 8, `jq`, and (for
-extraction) the `claude` CLI — plus the coreutils/util-linux commands the hooks shell out to:
-`setsid` (detaches the extraction run), `timeout`, `find`, `mktemp`, and GNU `stat -c %s` rather than
-the BSD `stat -f %z` form.
+## Hooks
 
-`alexandria-recall.sh` is a `UserPromptSubmit` hook. On every prompt it opens one MCP session and:
+The optional `alexandria-recall.sh` hook runs on `UserPromptSubmit`. It authenticates with `ALEXANDRIA_API_TOKEN`, resolves `ALEXANDRIA_PROJECT_ID` if supplied, and retrieves relevant memories. Without the override, it sends a Personal-scope request; it does not inspect or normalize git remotes. If project resolution or authentication fails, it refuses the operation rather than retrying unscoped. The hook does not write memories from correction/preference phrasing.
 
-- calls `retrieve_memories` and returns hits above a similarity threshold as `additionalContext`,
-  which Claude Code appends to the prompt;
-- scans the prompt for correction ("no, use X", "that's wrong, ...", "actually ...") and preference
-  ("always ...", "never ...", "from now on ...", "use X instead of Y") phrasing, same patterns as the
-  Pi detectors, and stores unambiguous hits as `User correction: ...` / `User preference: ...` with
-  tags `correction`/`preference` + `auto-detected` + `source:regex` and the session id. A preference is
-  stored from its trigger word on, so a prohibition keeps its negation (`never commit Cargo.lock`), and
-  one with a negation earlier in its clause is not stored at all. Deduped per session via
-  `$XDG_STATE_HOME/alexandria/<session_id>.stored`. The Pi error-resolution tracker is not ported;
-  failed tool results can be fed to the extraction pass instead (opt-in, below). Every request shares
-  one 8 s budget, so a wedged server delays the prompt by that much at most.
+The `alexandria-session.sh` hook can add the Claude session ID and `agent_id: "claude-code"` to the agent's explicit `store_memory` and `import_document` calls. The former Stop-hook entrypoint, `alexandria-extract.sh`, is now a deprecated no-op retained only to give existing hook configurations an upgrade warning; remove it from Claude settings. Automatic transcript extraction and tool-error capture are no longer supported.
 
-`alexandria-extract.sh` is a `Stop` hook. After each assistant turn it serializes the transcript lines
-added since its last run (user text and assistant text; tool output, thinking, and injected system
-lines are dropped), and once at least `ALEXANDRIA_EXTRACT_MIN_CHARS` of new text exists it
-asks `claude -p --model haiku` for standalone durable facts using the Pi extraction prompt, with the
-session's already-stored memories and the auto-recall hits the transcript carries for this chunk's
-prompts listed for dedup (so a gotcha already stored by an earlier session is not stored again, as long
-as some prompt recalled it). Results are stored with the session id and an
-`extracted` tag. Short turns cost nothing; one haiku call covers several turns. A marker file
-`$XDG_STATE_HOME/alexandria/<session_id>.extracted` holds the transcript line count and is written
-before the LLM call, so a failed or slow turn is never retried: one haiku call per turn, 80 s
-timeout. The child `claude` runs with
-`ALEXANDRIA_HOOK_CHILD=1`, which makes every hook here exit immediately (no recursion). Measured
-2026-09-08 on a ~40-line transcript: about 15 s wall time, haiku correctly returned no memories for a
-purely tactical session.
-
-**Tool errors are opt-in.** With `ALEXANDRIA_EXTRACT_TOOL_ERRORS=on` the first 300 characters of each
-failed tool result join that text as `[Tool error]: <tool name> <executable or file path> -- <error>`,
-so a silent fix-and-retry still shows the model the root cause and which call produced it
-(`<tool_use_error>` harness refusals stay out). It is off by default because this is the one place
-tool output leaves the machine: the text goes to the `claude -p` call, can be stored as a memory, and a
-stored memory is re-injected into later prompts. Before inclusion the hook redacts `Bearer <token>`,
-`key=value`/`key: value` pairs whose key contains `token`, `secret`, `password`, `passwd`, `api_key` or
-`auth`, `scheme://user:pass@` credentials and PEM blocks, and keeps only the executable name of the
-failing command (no `VAR=value` prefix, no arguments). The prompt tells the model the lines are
-untrusted program output. The pattern list is best-effort, not a secret scanner: leave this off on a
-machine whose failures print secrets in other shapes. Nothing collapses error variants either — the
-text differs per run, so each variant the model finds worth keeping becomes its own memory.
-
-`alexandria-session.sh` is a `PreToolUse` hook matched on `mcp__alexandria__store_memory` and
-`mcp__alexandria__import_document`. When the agent calls either without a `session_id` or
-`agent_id`, it rewrites the call to include the Claude Code session id and `agent_id: "claude-code"`,
-so memories and imported chunks are grouped per session and attributed without relying on the model
-to remember. The recall and extract hooks stamp the same `agent_id` on the stores they make themselves.
-
-All three fail open. If the server is unreachable or errors, the recall hook returns a `systemMessage`
-("Alexandria memory unavailable: ...") so you can see it, and the prompt proceeds with nothing
-injected. The session hook never blocks a tool call. The extract hook logs one line to stderr and
-exits 0.
-
-**Install:**
+Install the active hooks:
 
 ```bash
-ln -sf "$PWD"/contrib/claude/hooks/alexandria-{recall,session,extract}.sh ~/.claude/hooks/
+ln -sf "$PWD"/contrib/claude/hooks/alexandria-{recall,session}.sh ~/.claude/hooks/
 ```
 
-Symlinks, not copies: the installed hooks then track the repo, and the extract hook resolves its
-sibling through `readlink -f`, so it still finds `alexandria-recall.sh` next to the real file.
-
-Then add to `~/.claude/settings.json` (merge with any existing `hooks` block):
+Add the prompt hook and optional explicit-store attribution hook to `~/.claude/settings.json` (merge with existing settings):
 
 ```json
 {
   "hooks": {
     "UserPromptSubmit": [
-      {
-        "hooks": [
-          { "type": "command", "command": "/home/you/.claude/hooks/alexandria-recall.sh" }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "/home/you/.claude/hooks/alexandria-recall.sh" }] }
     ],
     "PreToolUse": [
       {
         "matcher": "mcp__alexandria__(store_memory|import_document)",
-        "hooks": [
-          { "type": "command", "command": "/home/you/.claude/hooks/alexandria-session.sh" }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "/home/you/.claude/hooks/alexandria-extract.sh" }
-        ]
+        "hooks": [{ "type": "command", "command": "/home/you/.claude/hooks/alexandria-session.sh" }]
       }
     ]
   }
 }
 ```
 
-The extract hook must live under `Stop`, not `SessionEnd`: `SessionEnd` hooks share a 1.5 s budget,
-far too short for an LLM call. Stop hooks block the next turn until they exit, and Claude Code
-kills hooks still running when the session ends, so the script re-execs itself with `setsid -f`
-(own session and process group, no inherited pipes) and returns in milliseconds; the detached copy
-does the 15–80 s LLM call, never holds your next turn, and finishes even if you quit right after
-your last turn (verified 2026-09-08: a 10 s stub completed 11 s after the headless session exited).
-The script's own 80 s budget bounds a wedged `claude -p`. No `"async": true` is needed. Its stderr
-goes to `$XDG_STATE_HOME/alexandria/extract.log` (default `~/.local/state/alexandria/`), rotated to
-`extract.log.1` once it passes 1 MiB; marker files in the same directory idle for over
-`ALEXANDRIA_MARKER_MAX_AGE_DAYS` days (default 7) are pruned at the same time, and by the recall hook on
-every prompt; the running session's own markers are never pruned, so a resumed session is not
-re-extracted. The directory is `0700`. Markers from before the move (`$XDG_RUNTIME_DIR/alexandria/` or
-`/tmp/alexandria/`) are deleted by whichever hook first creates the new directory; a session spanning
-that upgrade is re-extracted once.
+Set `ALEXANDRIA_API_TOKEN` and optional `ALEXANDRIA_URL` / `ALEXANDRIA_PROJECT_ID` in the Claude hook environment (for example, the relevant settings `env` block). The token is the hook's bearer credential; it is separate from model-provider credentials and is not forwarded to a provider. A native MCP client connection is configured separately and must also supply an authorized bearer credential when connecting to an authenticated server.
 
-**Config (env vars, all optional):**
+The hook requires `bash`, `curl` 8 or later, `jq`, and `setsid`, `timeout`, `find`, `mktemp`, and GNU `stat -c %s`. The recall hook has a fixed 8-second overall budget and at most a 5-second individual HTTP request timeout. It does not read the Pi companion's TOML `[transport]` settings or `ALEXANDRIA_PROMPT_*` environment variables; those configurable timeouts apply to the Pi companion only.
+
+Configuration:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | Alexandria MCP server URL |
-| `ALEXANDRIA_AUTO_RECALL_LIMIT` | `10` | Max memories retrieved per prompt. A recall lever, not just a cap — measured jointly with `MIN_SIMILARITY` (see [docs/minilm-test-data.md](../../docs/minilm-test-data.md)) |
-| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.45` | Minimum similarity to inject a hit (measured at `LIMIT=10` and only valid there — see [docs/minilm-test-data.md](../../docs/minilm-test-data.md) and `[recall]` in [docs/configuration.md](../../docs/configuration.md)) |
-| `ALEXANDRIA_AUTO_RECALL` | (unset) | Set to `off` to disable recall |
-| `ALEXANDRIA_AUTO_STORE` | (unset) | Set to `off` to disable the detectors and extraction. Sessions with no human at the prompt (`claude -p`, Agent SDK, `claude mcp serve`, bench, GitHub Action, triggers, Cowork; see `CLAUDE_CODE_ENTRYPOINT` below) default to off so scripted experiments never land in the real database; set `on` to enable there |
-| `ALEXANDRIA_EXTRACT_TOOL_ERRORS` | (unset) | Set to `on` to feed redacted failed tool results to extraction (see "Tool errors are opt-in") |
-| `ALEXANDRIA_EXTRACT_MODEL` | `haiku` | Model passed to `claude -p --model` for extraction |
-| `ALEXANDRIA_EXTRACT_MIN_CHARS` | `1500` | New transcript text required before an extraction call |
-| `ALEXANDRIA_EXTRACT_FLUSH_WAIT` | `1` | Seconds to wait before reading the transcript; Stop fires ~50 ms before the last assistant message is flushed (tests set `0`) |
-| `ALEXANDRIA_EXTRACT_CMD` | (unset) | Replace the `claude -p ...` command (prompt on stdin, JSON on stdout); used by tests |
-| `ALEXANDRIA_MARKER_MAX_AGE_DAYS` | `7` | Per-session marker files idle longer than this are pruned by either hook |
-| `ALEXANDRIA_HOOK_CHILD` | (unset) | Set by the extract hook on its `claude -p` child; every hook exits immediately when set |
-| `ALEXANDRIA_DETACHED` | (unset) | Set by the extract hook on its detached copy; set it yourself to run the hook inline (tests do) |
+| `ALEXANDRIA_URL` | `http://127.0.0.1:3000/mcp` | MCP server endpoint |
+| `ALEXANDRIA_API_TOKEN` | unset (required) | Bearer token for hook MCP requests |
+| `ALEXANDRIA_PROJECT_ID` | unset | Existing owned project handle; resolved before project-scoped recall |
+| `ALEXANDRIA_AUTO_RECALL` | enabled | Set to `off` to disable recall |
+| `ALEXANDRIA_AUTO_RECALL_LIMIT` | `10` | Maximum results per prompt |
+| `ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY` | `0.45` | Injection threshold, measured with limit 10 |
+| `ALEXANDRIA_AUTO_STORE` / `ALEXANDRIA_EXTRACT_*` | obsolete | No longer configure writers; remove them and the old Stop hook |
 
-**Upgrading:** auto-store used to run in every session. If memories stopped arriving from `claude -p`
-scripts or Agent SDK runs, that is this default; set `ALEXANDRIA_AUTO_STORE=on` there.
+The hook uses `resolve_project` only for the explicit `ALEXANDRIA_PROJECT_ID` override. No override means Personal-only; unlike the Pi companion, the Claude hook has no git-remote descriptor resolution. It does not silently widen a failed project-scoped operation.
 
-`CLAUDE_CODE_ENTRYPOINT` is an internal Claude Code variable, not in the documented settings list. The
-gate turns auto-store off for `sdk-*` (`sdk-cli` for `claude -p`, `sdk-ts` and `sdk-py` for the Agent SDKs),
-`mcp` (`claude mcp serve`), `bench`, `claude-code-github-action`, `claude-security`, `*_trigger`, and Cowork
-(`local-agent`, `local_agent`, `claude-coworker*`, `remote_cowork`), and leaves every other value on: `cli`,
-`claude-vscode`, `claude-desktop`, and the `remote*` / Slack / Teams family (the remote ones cannot reach a
-local server anyway). The list is the validator table in the 2.1.280 bundle, which knows 26 values. If a
-release renames one, the hooks silently fall back to always-on. After upgrading, re-check with
+The hooks fail open with an availability message when recall cannot complete; they do not block the prompt. The deprecated extraction hook consumes its input and exits without calling the server. The helper can still make a deliberate one-shot MCP call for diagnostics or explicit use:
 
 ```bash
-claude -p 'Run with the Bash tool and reply with only its output: echo ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT' --allowedTools Bash
+ALEXANDRIA_API_TOKEN=... ALEXANDRIA_URL=http://127.0.0.1:3000/mcp \
+  contrib/claude/hooks/alexandria-recall.sh retrieve_memories '{"query":"which database","limit":3}'
 ```
 
-which prints the value the hooks see (a Bash tool call inherits the env; no stub needed). The prompt
-must come before `--allowedTools`, which otherwise swallows it as a tool name.
-
-The hooks are configured by env vars only; they do not read `client.toml` (bash has no TOML parser,
-and a `yq`/`tomlq` dependency for a handful of values is worse than a handful of env vars). Set them
-in the `env` block of `~/.claude/settings.json`, or in the hook command itself, e.g.
-`"command": "ALEXANDRIA_AUTO_RECALL_LIMIT=3 /home/you/.claude/hooks/alexandria-recall.sh"`.
-
-**Debugging:** the script doubles as a one-shot MCP tool caller:
+The hermetic hook suite uses a local mock server and token fixture:
 
 ```bash
-contrib/claude/hooks/alexandria-recall.sh retrieve_memories '{"query":"which database","limit":3}'
+python3 -B -m unittest discover -s contrib/claude/tests -p 'test_*.py'
 ```
-
-`hooks/alexandria-claude-test.sh` is a manual end-to-end check against a running server
-(`ALEXANDRIA_URL=... contrib/claude/hooks/alexandria-claude-test.sh`).

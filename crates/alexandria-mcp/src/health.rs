@@ -2,10 +2,10 @@
 //! healthchecks, agent memory-status panels).
 //!
 //! Deliberately separate from the debug UI: the dashboard is a human-facing surface
-//! with templates and state, while `/health` is a machine contract — stable shape,
-//! no auth (this server has none anywhere), and nothing sensitive in the body.
-//! A 200 means one trivial query round-tripped through the engine at request time,
-//! not that the process merely exists; a wedged or closed store answers 503.
+//! with templates and state, while `/health` is a public machine contract with a
+//! stable response and fixed diagnostics. MCP and private web routes have their own
+//! admission checks. A 200 means a storage query round-tripped at request time;
+//! an unavailable store answers 503.
 
 use std::{future::Future, sync::Arc, time::Duration};
 
@@ -29,33 +29,31 @@ pub fn router(db: Arc<Database>) -> Router {
 }
 
 async fn check(db: Arc<Database>) -> Response {
-    probe_response(
-        async { db.ping().await.map_err(|err| err.to_string()) },
-        Duration::from_secs(1),
-    )
-    .await
+    probe_response(db.ping(), Duration::from_secs(1)).await
 }
 
-async fn probe_response(
-    probe: impl Future<Output = Result<(), String>>,
+async fn probe_response<E>(
+    probe: impl Future<Output = Result<(), E>>,
     deadline: Duration,
 ) -> Response {
-    let result = tokio::time::timeout(deadline, probe)
-        .await
-        .unwrap_or_else(|_| Err("storage health probe timed out".to_owned()));
-    let (status, body) = match result {
-        Ok(()) => (
+    let error = match tokio::time::timeout(deadline, probe).await {
+        Ok(Ok(())) => None,
+        Ok(Err(_)) => Some("storage health probe failed"),
+        Err(_) => Some("storage health probe timed out"),
+    };
+    let (status, body) = match error {
+        None => (
             StatusCode::OK,
             serde_json::json!({
                 "status": "ok",
                 "version": env!("CARGO_PKG_VERSION"),
             }),
         ),
-        Err(err) => (
+        Some(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             serde_json::json!({
                 "status": "unavailable",
-                "error": err.to_string(),
+                "error": error,
             }),
         ),
     };
@@ -122,11 +120,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_failure_does_not_disclose_backend_diagnostics() {
+        let response = probe_response(
+            async { Err("test-only backend detail".to_owned()) },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"status": "unavailable", "error": "storage health probe failed"})
+        );
+    }
+
+    #[tokio::test]
     async fn health_is_503_when_the_engine_stops_answering() {
         let db = Arc::new(Database::connect_embedded().await.unwrap());
-        // 3.3's client API has no close(); repointing the handle at a namespace that
-        // does not exist makes every subsequent query fail — the wedged-engine
-        // stand-in this endpoint must catch.
+        // Point the disposable handle at a missing namespace to make its probe fail.
         db.inner()
             .use_ns("alexandria-health-probe-missing")
             .await
@@ -135,6 +149,6 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["status"], "unavailable");
-        assert!(json["error"].is_string());
+        assert_eq!(json["error"], "storage health probe failed");
     }
 }

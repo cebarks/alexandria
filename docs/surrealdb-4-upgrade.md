@@ -1,5 +1,9 @@
 # Offline SurrealDB 3.3 → 4.0.1 upgrade
 
+The operator receipts below were collected on the main-branch engine upgrade, not on an
+installed multi-user/refinement store. They do not authorize live migration or cutover of
+the combined feature.
+
 This is a **Linux, offline, copy-first operator procedure**, not an automatic
 Alexandria migration or a cutover command. It was exercised with the official
 3.3.0 and 4.0.1 Linux amd64 operators and a separate-process 3.3 application

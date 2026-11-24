@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 surrealdb = { workspace = true }
+surrealdb-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
@@ -18,6 +19,12 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 sha2 = { version = "=0.10.9", default-features = false, features = ["std"] }
 tokio = { workspace = true }
+# Argon2id for password digests. Already resolved in `Cargo.lock` through the SurrealDB family, so this
+# adds a direct-dependency edge and no new package. Exact-pinned like `sha2`/`surrealdb`: the cost policy
+# in `repos/auth_repo.rs` is written against this crate's PHC output, and a silent version change there
+# is a credential-format decision, not a dependency bump. `std` switches on the PHC string API
+# (`password-hash/std`) and `rand` the `password-hash/rand_core` re-export the salt generator needs.
+argon2 = { version = "=0.5.3", default-features = false, features = ["std", "rand"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

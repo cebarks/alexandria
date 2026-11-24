@@ -65,6 +65,19 @@ test("a payload problem comes back as an error, not as silence", async () => {
 	assert.match(errored.error ?? "", /index unavailable/);
 });
 
+test("resolved project IDs scope automatic recall", async () => {
+	let seen: Record<string, unknown> | undefined;
+	const spy: CallTool = async (_name, args) => {
+		seen = args;
+		return { content: [{ type: "text", text: '{"results":[]}' }] };
+	};
+	const settings = { limit: 10, minSimilarity: 0.45 };
+	await retrieveMemories("q", spy, undefined, { ...settings, projectId: "project:owned" });
+	assert.deepEqual(seen, { query: "q", limit: 10, project: "project:owned" });
+	await retrieveMemories("q", spy, undefined, settings);
+	assert.deepEqual(seen, { query: "q", limit: 10 });
+});
+
 test("a pending recall uses its original limit and threshold after settings change", async () => {
 	const dir = await makeScratchDir("alexandria-recall-snapshot-");
 	const path = join(dir, "client.json");

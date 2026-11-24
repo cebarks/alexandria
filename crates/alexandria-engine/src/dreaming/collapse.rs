@@ -10,8 +10,8 @@ use std::collections::HashMap;
 /// A live fact as `Collapse` sees it. Deliberately not the storage row: the engine must not depend
 /// on storage types, and the job does not need the embedding to group by content.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Candidate {
-    pub id: String,
+pub struct Candidate<Id = String> {
+    pub id: Id,
     pub content: String,
     pub confidence: f64,
     /// Creation time in seconds since the epoch, or [`UNKNOWN_CREATED_AT`].
@@ -25,10 +25,10 @@ pub const UNKNOWN_CREATED_AT: i64 = i64::MAX;
 
 /// One group of byte-identical facts: which row survives, and which are collapsed into it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DuplicateGroup {
-    pub survivor: String,
+pub struct DuplicateGroup<Id = String> {
+    pub survivor: Id,
     /// Sorted by id, so a run's audit rows come out in a stable order.
-    pub collapsed: Vec<String>,
+    pub collapsed: Vec<Id>,
 }
 
 /// Group `candidates` by content and pick a survivor per group.
@@ -45,7 +45,14 @@ pub struct DuplicateGroup {
 /// permuting the input produces the same groups, which `grouping_is_independent_of_input_order`
 /// pins. A job that runs hourly over a re-ordered read must not produce different audit rows.
 pub fn duplicate_groups(candidates: &[Candidate]) -> Vec<DuplicateGroup> {
-    let mut by_content: HashMap<&str, Vec<&Candidate>> = HashMap::new();
+    duplicate_groups_by_id(candidates)
+}
+
+/// Group duplicates without erasing the caller's typed id.
+pub fn duplicate_groups_by_id<Id: Ord + Clone>(
+    candidates: &[Candidate<Id>],
+) -> Vec<DuplicateGroup<Id>> {
+    let mut by_content: HashMap<&str, Vec<&Candidate<Id>>> = HashMap::new();
     for candidate in candidates {
         by_content
             .entry(candidate.content.as_str())
@@ -53,7 +60,7 @@ pub fn duplicate_groups(candidates: &[Candidate]) -> Vec<DuplicateGroup> {
             .push(candidate);
     }
 
-    let mut groups: Vec<DuplicateGroup> = by_content
+    let mut groups: Vec<DuplicateGroup<Id>> = by_content
         .into_values()
         .filter(|members| members.len() > 1)
         .map(|mut members| {
@@ -64,7 +71,7 @@ pub fn duplicate_groups(candidates: &[Candidate]) -> Vec<DuplicateGroup> {
                     .then(a.id.cmp(&b.id))
             });
             let survivor = members[0].id.clone();
-            let mut collapsed: Vec<String> = members[1..].iter().map(|m| m.id.clone()).collect();
+            let mut collapsed: Vec<Id> = members[1..].iter().map(|m| m.id.clone()).collect();
             collapsed.sort();
             DuplicateGroup {
                 survivor,

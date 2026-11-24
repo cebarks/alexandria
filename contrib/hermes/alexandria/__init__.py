@@ -1,21 +1,12 @@
 """Alexandria memory provider for Hermes Agent.
 
 Semantic long-term memory via a running Alexandria MCP server (StreamableHTTP).
-Recall is injected automatically before each turn; capture runs the ported pi-companion
-heuristics (corrections, preferences, error→resolution pairs) during the session and an
-LLM extraction pass at session end, sharing one session-scoped dedup buffer.
+Recall is injected before substantive turns; only explicit tool calls store
+memories. Turn and session hooks never capture or extract data.
 
-Config lives in ``memory.alexandria`` (config.yaml):
-
-    memory:
-      provider: alexandria
-      alexandria:
-        url: "http://127.0.0.1:3000/mcp"
-        recall_limit: 5
-        min_similarity: 0.45
-        auto_store: true      # heuristic capture during sessions
-        extract: true         # LLM extraction pass at session end
-        store_session: true   # group memories under the Hermes session id
+Configure ``memory.alexandria.url`` in Hermes config, the bearer credential in
+``ALEXANDRIA_API_TOKEN``, and optionally an issued project ID in
+``ALEXANDRIA_PROJECT_ID``. Without a project, memory scope is Personal-only.
 """
 
 from __future__ import annotations
@@ -23,6 +14,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -36,14 +28,6 @@ from agent.memory_provider import (
 )
 
 from .client import AlexandriaClient, AlexandriaError, AlexandriaToolError
-from .detectors import (
-    ErrorTracker,
-    SessionDedupBuffer,
-    detect_correction,
-    detect_preference,
-    track_tool_store,
-)
-from .extraction import run_extraction
 from .tools import tool_schemas
 
 logger = logging.getLogger(__name__)
@@ -53,25 +37,13 @@ DEFAULTS: dict[str, Any] = {
     "timeout": 10.0,
     "recall_limit": 5,
     "min_similarity": 0.45,
-    "auto_store": True,
-    "extract": True,
-    "store_session": True,
     "cache_ttl": 60.0,
 }
 
-# agent_context values that must not trigger automatic writes (cron runs and
-# delegate_task children pollute the corpus with derived context).
+# These host contexts must not claim foreground reminder deliveries.
 _NON_PRIMARY_CONTEXTS = {"cron", "subagent", "flush"}
 
 _TOOL_PREFIX = "alexandria_"
-
-
-def _config_bool(value: Any, key: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
-        return value.strip().lower() == "true"
-    raise ValueError(f"memory.alexandria.{key} must be a boolean")
 
 
 def _load_plugin_config() -> dict[str, Any]:
@@ -84,81 +56,6 @@ def _load_plugin_config() -> dict[str, Any]:
     return dict(block) if isinstance(block, dict) else {}
 
 
-def _extract_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(
-            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
-        )
-    return ""
-
-
-def _classify_tool_result(content: str) -> tuple[bool, str]:
-    """Classify provider errors and Hermes terminal envelopes.
-
-    Nonzero terminal exits cannot resolve a prior failure. Informational exits
-    carry no error text; other failures still pass ErrorTracker's signal filter.
-    """
-    stripped = content.strip()
-    if not stripped:
-        return False, ""
-    try:
-        data = json.loads(stripped)
-    except json.JSONDecodeError:
-        return stripped.lower().startswith("error"), stripped
-    if isinstance(data, dict):
-        if data.get("error"):
-            return True, str(data["error"])
-        code = data.get("exit_code")
-        if isinstance(code, int) and not isinstance(code, bool) and "output" in data:
-            output = str(data.get("output") or "")
-            if code != 0:
-                meaning = str(data.get("exit_code_meaning") or "").lower()
-                return True, "" if "not an error" in meaning else output
-            return False, output
-    return False, stripped
-
-
-def _iter_tool_events(messages: list[dict[str, Any]]):
-    """Yield ``(identity, tool_name, args, result_text, is_error, error_text)`` for each tool
-    result in an OpenAI-style message slice."""
-    calls: dict[str, tuple[str, dict[str, Any]]] = {}
-    for msg in messages:
-        if not isinstance(msg, dict) or msg.get("role") != "assistant":
-            continue
-        for tc in msg.get("tool_calls") or []:
-            if not isinstance(tc, dict):
-                continue
-            tc_id = str(tc.get("id") or "")
-            if not tc_id:
-                continue
-            fn = tc.get("function") or {}
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except (json.JSONDecodeError, TypeError):
-                args = {}
-            calls[tc_id] = (str(fn.get("name", "")), args if isinstance(args, dict) else {})
-    for msg in messages:
-        if not isinstance(msg, dict) or msg.get("role") != "tool":
-            continue
-        name, args = calls.get(str(msg.get("tool_call_id") or ""), ("unknown", {}))
-        text = _extract_text(msg.get("content"))
-        is_error, error_text = _classify_tool_result(text)
-        identity = (str(msg.get("tool_call_id") or ""), text)
-        yield identity, name, args, text, is_error, error_text
-
-
-class _SessionState:
-    __slots__ = ("buffer", "errors", "seen_events", "linked_write")
-
-    def __init__(self) -> None:
-        self.buffer = SessionDedupBuffer()
-        self.errors = ErrorTracker()
-        self.seen_events: set[tuple[str, str]] = set()
-        self.linked_write = False
-
-
 class AlexandriaMemoryProvider(MemoryProvider):
     """MemoryProvider backed by an Alexandria MCP server. All state is instance-bound
     (multiplexing contract): one instance per profile, bound at initialize()."""
@@ -168,11 +65,13 @@ class AlexandriaMemoryProvider(MemoryProvider):
         *,
         config: Optional[dict[str, Any]] = None,
         client_factory: Optional[Callable[[str, float], Any]] = None,
-        llm: Any = None,
     ):
         self._config_override = config
-        self._client_factory = client_factory or (lambda url, timeout: AlexandriaClient(url, timeout=timeout))
-        self._llm = llm  # PluginLlm-compatible; None -> constructed lazily in extraction
+        self._api_token = os.environ.get("ALEXANDRIA_API_TOKEN", "").strip()
+        self._project = os.environ.get("ALEXANDRIA_PROJECT_ID", "").strip() or None
+        self._client_factory = client_factory or (
+            lambda url, timeout: AlexandriaClient(url, timeout=timeout, api_token=self._api_token)
+        )
 
         self._cfg: dict[str, Any] = dict(DEFAULTS)
         self._session_id = ""
@@ -181,8 +80,6 @@ class AlexandriaMemoryProvider(MemoryProvider):
         self._client_lock = threading.Lock()
         self._transport_lock = threading.RLock()
         self._admission_lock = threading.Lock()
-        self._states: dict[str, _SessionState] = {}
-        self._states_lock = threading.Lock()
         self._recall_cache: dict[str, tuple[float, str, int]] = {}
         self._last_recall_count: Optional[int] = None
         self._jobs: queue.Queue = queue.Queue()
@@ -196,12 +93,11 @@ class AlexandriaMemoryProvider(MemoryProvider):
         return "alexandria"
 
     def is_available(self) -> bool:
-        """Config-only check (no network per contract). The URL always resolves via
-        defaults, so activation is gated by ``memory.provider`` alone."""
-        return True
+        """Config-only check; do not contact Alexandria to determine availability."""
+        return bool(self._api_token)
 
     def unavailable_reason(self) -> str:
-        return ""
+        return "" if self._api_token else "ALEXANDRIA_API_TOKEN is required"
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -210,25 +106,11 @@ class AlexandriaMemoryProvider(MemoryProvider):
         self._bound_home = str(home) if home else ""
         self._session_id = session_id
         self._agent_context = str(kwargs.get("agent_context") or "primary")
-        cfg = dict(DEFAULTS)
-        cfg.update(self._config_override if self._config_override is not None else _load_plugin_config())
-        for key in ("auto_store", "extract", "store_session"):
-            cfg[key] = _config_bool(cfg[key], key)
-        self._cfg = cfg
         if not self._shutdown and self._worker is None:
+            configured = self._config_override if self._config_override is not None else _load_plugin_config()
+            self._cfg.update({key: configured[key] for key in DEFAULTS if key in configured})
             self._worker = spawn_context_thread(self._worker_loop, name="alexandria-sync")
             self._worker.start()
-
-    def _writes_allowed(self) -> bool:
-        return self._agent_context not in _NON_PRIMARY_CONTEXTS
-
-    def _state(self, session_id: str) -> _SessionState:
-        key = session_id or self._session_id
-        with self._states_lock:
-            st = self._states.get(key)
-            if st is None:
-                st = self._states[key] = _SessionState()
-            return st
 
     def _get_client(self):
         with self._client_lock:
@@ -240,7 +122,14 @@ class AlexandriaMemoryProvider(MemoryProvider):
         with self._transport_lock:
             if self._shutdown and threading.current_thread() is not self._worker:
                 raise AlexandriaError("provider is shutting down")
+            if name in ("retrieve_memories", "recall"):
+                args = {**args, **self._memory_scope(project_scope="auto")}
             return self._get_client().call_tool(name, args)
+
+    def _memory_scope(self, *, project_scope: str) -> dict[str, str]:
+        if self._project:
+            return {"scope": project_scope, "project": self._project}
+        return {"scope": "personal"}
 
     def _close_client(self) -> None:
         with self._transport_lock, self._client_lock:
@@ -314,20 +203,27 @@ class AlexandriaMemoryProvider(MemoryProvider):
         return (
             "# Alexandria memory\n"
             "Active (semantic long-term memory). Relevant memories are auto-injected each turn. "
-            "Use alexandria_store_memory proactively for durable facts the user states or corrects "
+            "Use alexandria_store_memory explicitly for durable facts the user wants retained "
             "(preferences, conventions, gotchas, root causes); alexandria_search_memories / "
             "alexandria_recall to look things up beyond the injected context; "
             "alexandria_set_reminder / alexandria_list_reminders for follow-ups."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        reminder_text = self._check_reminders() if self._writes_allowed() else ""
+        foreground = self._agent_context not in _NON_PRIMARY_CONTEXTS
+        reminder_text = self._check_reminders() if foreground else ""
+        if reminder_text is None:
+            self._recall_cache.clear()
+            self._last_recall_count = None
+            return ""
         if is_trivial_prompt(query):
             self._last_recall_count = None
             return reminder_text
         now = time.time()
         key = session_id or self._session_id
-        cached = self._recall_cache.get(key)
+        # Cached foreground recall needs a fresh successful authenticated request.
+        # Non-foreground contexts must not consume reminders to obtain that proof.
+        cached = self._recall_cache.get(key) if foreground else None
         if cached and now - cached[0] < float(self._cfg["cache_ttl"]):
             text, count = cached[1], cached[2]
         else:
@@ -335,8 +231,10 @@ class AlexandriaMemoryProvider(MemoryProvider):
                 text, count = self._recall(query, key)
             except Exception as exc:  # noqa: BLE001 - failure must never break the turn
                 logger.info("alexandria prefetch failed: %s", exc)
-                text, count = (cached[1], cached[2]) if cached else ("", 0)
-            self._recall_cache[key] = (now, text, count)
+                self._recall_cache.pop(key, None)
+                text, count = "", 0
+            else:
+                self._recall_cache[key] = (now, text, count)
         self._last_recall_count = count
         return "\n\n".join(part for part in (text, reminder_text) if part)
 
@@ -350,6 +248,7 @@ class AlexandriaMemoryProvider(MemoryProvider):
             try:
                 text, count = self._recall(query, sid)
             except Exception:  # noqa: BLE001
+                self._recall_cache.pop(sid, None)
                 return
             self._recall_cache[sid] = (time.time(), text, count)
 
@@ -361,7 +260,7 @@ class AlexandriaMemoryProvider(MemoryProvider):
         return RecallStatus(provider_label="alexandria", count=self._last_recall_count)
 
     def _recall(self, query: str, session_id: str) -> tuple[str, int]:
-        """Non-consuming global retrieval, safe for background refresh and caching."""
+        """Non-consuming scoped retrieval, including for background refresh."""
         args: dict[str, Any] = {
             "query": query,
             "limit": int(self._cfg["recall_limit"]),
@@ -392,10 +291,13 @@ class AlexandriaMemoryProvider(MemoryProvider):
                 and isinstance(item.get("similarity", item.get("score")), (int, float))
                 and item.get("similarity", item.get("score")) >= floor]
 
-    def _check_reminders(self) -> str:
+    def _check_reminders(self) -> Optional[str]:
         try:
-            payload = self._client_call("check_reminders", {})
-            due = payload.get("delivered", []) if isinstance(payload, dict) else []
+            args = {"project": self._project} if self._project else {}
+            payload = self._client_call("check_reminders", args)
+            if not isinstance(payload, dict) or not isinstance(payload.get("delivered"), list):
+                return None
+            due = payload["delivered"]
             lines = []
             for reminder in due:
                 message = reminder.get("message") if isinstance(reminder, dict) else None
@@ -415,11 +317,11 @@ class AlexandriaMemoryProvider(MemoryProvider):
                     if reminder.get("note"):
                         lines.append(f"  Note: {reminder['note']}")
             return "## Due reminders\n" + "\n".join(lines) if lines else ""
-        except Exception as exc:  # noqa: BLE001 - foreground recall must fail open
+        except Exception as exc:  # noqa: BLE001 - failure does not authorize cached recall
             logger.info("alexandria check_reminders failed: %s", exc)
-            return ""
+            return None
 
-    # -- per-turn capture ----------------------------------------------------------
+    # -- host lifecycle (no implicit memory writes) ----------------------------------
 
     def sync_turn(
         self,
@@ -430,104 +332,21 @@ class AlexandriaMemoryProvider(MemoryProvider):
         messages: Optional[list[dict[str, Any]]] = None,
         turn_author: Optional[dict[str, Any]] = None,
     ) -> None:
-        # turn_author is accepted for ABC compatibility; capture is content-based.
-        snapshot = copy.deepcopy(messages or [])
-        sid = session_id or self._session_id
-        self._enqueue(lambda: self._handle_turn(sid, user_content, snapshot))
-
-    def _handle_turn(self, session_id: str, user_text: str, messages: list[dict[str, Any]]) -> None:
-        st = self._state(session_id)
-        if self._cfg["auto_store"] and self._writes_allowed():
-            for detected in (detect_correction(user_text, st.buffer), detect_preference(user_text, st.buffer)):
-                if detected and not self._store(detected, session_id):
-                    st.buffer.discard_heuristic_store(detected["content"])
-        for identity, name, args, text, is_error, error_text in _iter_tool_events(messages):
-            if identity in st.seen_events:
-                continue
-            st.seen_events.add(identity)
-            track_tool_store(name, args.get("content"), is_error, st.buffer)
-            if not self._cfg["auto_store"] or not self._writes_allowed():
-                continue
-            if is_error:
-                st.errors.record_error(name, error_text)
-                continue
-            st.errors.record_success(name, error_text)
-
-    def _store(self, memory: dict[str, Any], session_id: str, extra_tags: Optional[list[str]] = None) -> bool:
-        tags = list(memory.get("tags") or [])
-        if extra_tags:
-            tags.extend(extra_tags)
-        args = self._store_args({"content": memory["content"], "tags": tags}, session_id)
-        try:
-            self._client_call("store_memory", args)
-            st = self._state(session_id)
-            st.buffer.add_tool_store(memory["content"])
-            st.linked_write = st.linked_write or "session_id" in args
-            return True
-        except (AlexandriaError, AlexandriaToolError) as exc:
-            logger.info("alexandria store failed (%s): %s", memory["content"][:60], exc)
-            return False
-
-    def _store_args(self, memory: dict[str, Any], session_id: str) -> dict[str, Any]:
-        args = {"content": memory["content"], "tags": list(memory.get("tags") or [])}
-        sid = session_id or self._session_id
-        if self._cfg["store_session"] and sid:
-            args["session_id"] = sid
-        return args
-
-    # -- session boundaries -----------------------------------------------------------
+        """Do not persist, capture or extract anything from implicit host callbacks."""
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, rewound: bool = False, **kwargs) -> None:
         self._session_id = new_session_id
         if reset:
-            def clear() -> None:
-                with self._states_lock:
-                    self._states.pop(new_session_id, None)
-                self._recall_cache.pop(new_session_id, None)
-            try:
-                self._run_ordered(clear)
-            except AlexandriaError as exc:
-                logger.info("alexandria reset deferred: %s", exc)
-        # Stable event identities survive a shortened/rewound transcript. Keep
-        # confirmed dedup so replaying an existing tool result cannot store it twice.
+            self._drop_recall(new_session_id)
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
-        sid = self._session_id
-        snapshot = copy.deepcopy(messages)
-        try:
-            self._run_ordered(lambda: self._finish_session(sid, snapshot))
-        except Exception as exc:  # noqa: BLE001 - worker retains unfinished state
-            logger.info("alexandria session end incomplete: %s", exc)
+        self._drop_recall(self._session_id)
 
-    def _finish_session(self, sid: str, messages: list[dict[str, Any]]) -> None:
-        st = self._state(sid)
-        failed = False
-        if self._writes_allowed():
-            if self._cfg["auto_store"]:
-                for memory in st.errors.pending_resolutions():
-                    if self._store(memory, sid):
-                        st.errors.acknowledge(memory)
-                    else:
-                        failed = True
-            if self._cfg["extract"]:
-                memories = run_extraction(
-                    messages, st.buffer.get_all_stored_contents(), llm=self._llm,
-                    timeout=float(self._cfg["timeout"]) * 3,
-                )
-                for memory in memories:
-                    if not st.buffer.contains(memory["content"]):
-                        failed = not self._store(memory, sid, extra_tags=["extracted", "source:llm"]) or failed
-                if memories and sid and self._cfg["store_session"] and st.linked_write:
-                    try:
-                        self._client_call("finalize_session", {
-                            "session_id": sid, "summary": memories[0]["content"][:500], "tags": ["hermes"],
-                        })
-                    except (AlexandriaError, AlexandriaToolError) as exc:
-                        logger.debug("alexandria finalize_session skipped: %s", exc)
-        if not failed:
-            with self._states_lock:
-                self._states.pop(sid, None)
-        self._recall_cache.pop(sid, None)
+    def _drop_recall(self, session_id: str) -> None:
+        try:
+            self._run_ordered(lambda: self._recall_cache.pop(session_id, None))
+        except AlexandriaError as exc:
+            logger.info("alexandria recall invalidation deferred: %s", exc)
 
     # -- tools ---------------------------------------------------------------------------
 
@@ -535,14 +354,13 @@ class AlexandriaMemoryProvider(MemoryProvider):
         return tool_schemas()
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
-        sid = self._session_id
         snapshot = copy.deepcopy(args)
         try:
-            return self._run_ordered(lambda: self._handle_tool(tool_name, snapshot, sid))
+            return self._run_ordered(lambda: self._handle_tool(tool_name, snapshot))
         except Exception as exc:  # noqa: BLE001 - an accepted write may still finish
             return json.dumps({"error": str(exc)})
 
-    def _handle_tool(self, tool_name: str, args: dict[str, Any], sid: str) -> str:
+    def _handle_tool(self, tool_name: str, args: dict[str, Any]) -> str:
         schemas = {schema["name"]: schema["parameters"] for schema in self.get_tool_schemas()}
         schema = schemas.get(tool_name)
         if schema is None:
@@ -555,20 +373,16 @@ class AlexandriaMemoryProvider(MemoryProvider):
             name = tool_name[len(_TOOL_PREFIX):]
             call_args = dict(args)
             if name == "store_memory":
-                call_args = self._store_args(args, sid)
+                call_args.update(self._memory_scope(project_scope="project"))
+                call_args["tags"] = list(args.get("tags") or [])
             elif name == "search_memories":
                 name = "retrieve_memories"
                 call_args.setdefault("limit", int(self._cfg["recall_limit"]))
             elif name == "list_reminders":
                 call_args.setdefault("status", "pending")
-            elif name == "set_reminder" and self._cfg["store_session"] and sid:
-                call_args["session_id"] = sid
+            elif name == "check_reminders" and self._project:
+                call_args.setdefault("project", self._project)
             payload = self._client_call(name, call_args)
-            if name in ("store_memory", "update_memory") and isinstance(args.get("content"), str):
-                st = self._state(sid)
-                st.buffer.add_tool_store(args["content"])
-                if name == "store_memory" and "session_id" in call_args:
-                    st.linked_write = True
             if name == "retrieve_memories" and isinstance(payload, dict):
                 payload = {**payload, "results": self._filtered_results(payload)}
             return json.dumps({"result": payload}, default=str)
@@ -582,24 +396,14 @@ class AlexandriaMemoryProvider(MemoryProvider):
     # -- setup UX ---------------------------------------------------------------------------
 
     def get_config_schema(self) -> list[dict[str, Any]]:
-        return [
-            {"key": "url", "description": "Alexandria MCP endpoint", "default": DEFAULTS["url"]},
-            {"key": "auto_store", "description": "Auto-capture corrections, preferences and error resolutions",
-             "type": "boolean", "default": True},
-            {"key": "extract", "description": "LLM extraction pass at session end",
-             "type": "boolean", "default": True},
-        ]
+        return [{"key": "url", "description": "Alexandria MCP endpoint", "default": DEFAULTS["url"]}]
 
     def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
         from hermes_cli.config import load_config, save_config as write_config
         config = load_config()
         memory = config.setdefault("memory", {})
         block = memory.setdefault("alexandria", {})
-        normalized = dict(values)
-        for key in ("auto_store", "extract", "store_session"):
-            if key in normalized:
-                normalized[key] = _config_bool(normalized[key], key)
-        block.update(normalized)
+        block.update({key: values[key] for key in DEFAULTS if key in values})
         write_config(config, merge_existing=True)
 
 

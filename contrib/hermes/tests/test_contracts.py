@@ -1,13 +1,15 @@
 """Real-shaped MCP payload regressions for provider behavior, not ranking."""
 import json
+import os
 import threading
 import unittest
+from unittest.mock import patch
 from _bootstrap import bootstrap_hermes
 
 bootstrap_hermes()
 from alexandria import AlexandriaMemoryProvider
 from alexandria.client import AlexandriaClient, AlexandriaToolError
-from mock_server import make_server
+from mock_server import MOCK_API_TOKEN, make_server
 
 
 class RecordingClient:
@@ -33,7 +35,8 @@ class RecordingClient:
 class RecallContracts(unittest.TestCase):
     def setUp(self):
         self.client = RecordingClient()
-        self.provider = AlexandriaMemoryProvider(client_factory=lambda *_: self.client)
+        with patch.dict(os.environ, {'ALEXANDRIA_API_TOKEN': MOCK_API_TOKEN, 'ALEXANDRIA_PROJECT_ID': ''}):
+            self.provider = AlexandriaMemoryProvider(config={}, client_factory=lambda *_: self.client)
         self.provider.initialize('new-session')
         self.addCleanup(self.provider.shutdown)
 
@@ -47,10 +50,13 @@ class RecallContracts(unittest.TestCase):
         args = next(a for n, a in self.client.calls if n == 'retrieve_memories')
         self.assertNotIn('session_id', args)
         self.assertNotIn('min_similarity', args)
+        self.assertEqual(args['scope'], 'personal')
+        self.assertNotIn('project', args)
 
-    def test_native_store_is_session_attributed(self):
-        self.provider.handle_tool_call('alexandria_store_memory', {'content': 'fact'})
-        self.assertEqual(self.client.calls[-1][1].get('session_id'), 'new-session')
+    def test_native_store_is_explicit_personal_without_a_project(self):
+        reply = json.loads(self.provider.handle_tool_call('alexandria_store_memory', {'content': 'fact'}))
+        self.assertIn('result', reply)
+        self.assertEqual(self.client.calls, [('store_memory', {'content': 'fact', 'tags': [], 'scope': 'personal'})])
 
     def test_client_floor_filters_low_similarity(self):
         self.client.results = [{'content': 'too weak', 'similarity': 0.1},
@@ -126,10 +132,11 @@ class MockContracts(unittest.TestCase):
         self.server, self.mock = make_server()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
-        self.client = AlexandriaClient(f'http://127.0.0.1:{self.server.server_address[1]}/mcp', timeout=0.3)
-        self.addCleanup(self.client.close)
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
+        self.client = AlexandriaClient(f'http://127.0.0.1:{self.server.server_address[1]}/mcp',
+                                       timeout=0.3, api_token=MOCK_API_TOKEN)
+        self.addCleanup(self.client.close)
 
     def test_recall_completes_over_http(self):
         self.client.call_tool('store_memory', {'content': 'deploy policy'})

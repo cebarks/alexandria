@@ -1,3 +1,8 @@
+mod refinement;
+
+pub use refinement::RefinementConfig;
+pub(crate) use refinement::reconcile_refinement_policy;
+
 use std::path::PathBuf;
 
 use alexandria_engine::clusters::maintenance::DEFAULT_COHESION_FLOOR;
@@ -32,6 +37,30 @@ pub struct Config {
     pub dreaming: DreamingConfig,
     pub retrieve: RetrieveConfig,
     pub reminders: RemindersConfig,
+    pub auth: AuthConfig,
+    #[serde(deserialize_with = "refinement::deserialize")]
+    pub refinement: RefinementConfig,
+}
+
+/// `[auth]` — the trusted-local identity, and deliberately nothing else.
+///
+/// The admission tunables are *not* here. Owner decision A2 refused a config knob for the Argon2 costs
+/// because a knob is a way to weaken a control by accident, and the same argument covers the body limit,
+/// the per-account budget and the attempt rate: they are `alexandria_mcp::auth::admission` constants that
+/// change with a measurement and a review, not with a deployment file. A key here would also be a second
+/// home for a number the transport enforces, which is the drift `min_similarity` once had.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// The login of the account the **stdio** transport acts as.
+    ///
+    /// Empty — the default — means no trusted-local identity is issued, which is also the safe answer: a
+    /// hosted request that presents no credential must never be resolved to "the local operator", and the
+    /// only way to get a local identity at all is to name an account that exists and is active in this
+    /// store. Setting it while `transport = "http"` is refused at startup rather than ignored, because a
+    /// key that silently does nothing on the hosted path is exactly how an operator comes to believe a
+    /// deployment is scoped when it is not.
+    pub stdio_account: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,6 +76,19 @@ pub struct ServerConfig {
     pub allowed_origins: Vec<String>,
     /// Allowed hosts for HTTP. Empty = allow all. Default: ["*"].
     pub allowed_hosts: Vec<String>,
+    /// The one origin this deployment is published at, e.g. `https://memory.example.com`.
+    ///
+    /// Required when `transport = "http"` unless [`loopback_development`](Self::loopback_development) is
+    /// set, and it is a **security contract rather than a display string**: the browser boundary compares
+    /// a mutation's `Origin` header against it, so a wrong value either refuses every real form or
+    /// accepts a cross-site one. stdio never reads it.
+    pub public_origin: String,
+    /// The explicit loopback-development exception.
+    ///
+    /// The only state in which `public_origin` may be `http://`, and the only one in which session
+    /// cookies go out without `Secure`. Refused unless the bind `host` is itself loopback, because the
+    /// alternative is a plain-HTTP deployment that believes it is a development one.
+    pub loopback_development: bool,
     /// SSE keep-alive interval in seconds. Default: 15.
     pub sse_keep_alive_secs: u64,
 }
@@ -59,6 +101,8 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             allowed_origins: vec!["*".to_string()],
             allowed_hosts: vec!["*".to_string()],
+            public_origin: String::new(),
+            loopback_development: false,
             sse_keep_alive_secs: 15,
         }
     }
@@ -436,6 +480,66 @@ pub(crate) fn removed_key_warnings(raw: &toml::Value) -> Vec<&'static str> {
     warnings
 }
 
+impl ServerConfig {
+    /// The hosted HTTP origin policy, validated. Called by `main.rs` before anything is opened.
+    ///
+    /// An empty `Err` list is the only success answer. The text names every key that is wrong, the
+    /// loopback exception, and the forwarded-header rule — one function so a check can never gain a
+    /// message of its own and drift from the refusal an operator actually reads.
+    pub fn hosted_origin_problems(&self) -> Vec<String> {
+        if self.transport != "http" {
+            return Vec::new();
+        }
+        // The policy type owns the rules; this only feeds it the bind host, which the exception also
+        // constrains and which `WebPolicy` cannot see.
+        let problems = match alexandria_mcp::debug::WebPolicy::hosted(
+            &self.public_origin,
+            &self.allowed_hosts,
+            &self.allowed_origins,
+            self.loopback_development,
+        ) {
+            Ok(_) => Vec::new(),
+            Err(problems) => problems,
+        };
+        let loopback_bind = matches!(
+            self.host.as_str(),
+            "localhost" | "127.0.0.1" | "::1" | "[::1]"
+        );
+        if self.loopback_development && !loopback_bind {
+            return with_forwarded_note(
+                problems
+                    .into_iter()
+                    .chain(std::iter::once(format!(
+                        "server.host = `{}` is not a loopback address, so server.loopback_development \
+                         = true cannot apply to it",
+                        self.host
+                    )))
+                    .collect(),
+            );
+        }
+        with_forwarded_note(problems)
+    }
+}
+
+/// The sentence every hosted refusal ends with.
+///
+/// Forwarded headers are the client's, and an operator behind a proxy can always believe
+/// `X-Forwarded-Proto: https` is what makes a deployment HTTPS. It is not: the boundary reads the
+/// configured origin and the connection's own `Host`, so this belongs on the message rather than in a
+/// doc someone has to find.
+fn with_forwarded_note(mut problems: Vec<String>) -> Vec<String> {
+    if problems.is_empty() {
+        return problems;
+    }
+    problems.push(
+        "forwarded headers (X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-For, Forwarded) never \
+         establish the origin, the host or the loopback exception; TLS terminates at the reverse \
+         proxy you configure"
+            .to_string(),
+    );
+    problems
+}
+
 impl Config {
     /// Load configuration with the standard precedence chain:
     /// defaults → config file → env overrides
@@ -459,7 +563,14 @@ impl Config {
             // for a breaking change — the operator's tuned value stops applying and nothing says
             // so. The warning names the replacements, so grepping the service log for the old key
             // finds the migration path.
-            let raw: toml::Value = toml::from_str(&contents)?;
+            // TOML syntax errors may quote the submitted line, including accidental secret values.
+            let raw: toml::Value = toml::from_str(&contents).map_err(|error| {
+                let path = config_path.display();
+                match error.span() {
+                    Some(span) => anyhow::anyhow!("invalid TOML in {path} at byte {}", span.start),
+                    None => anyhow::anyhow!("invalid TOML in {path}"),
+                }
+            })?;
             for warning in removed_key_warnings(&raw) {
                 tracing::warn!("{warning}");
             }
@@ -478,6 +589,12 @@ impl Config {
             config.server.port = port
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid ALEXANDRIA_SERVER_PORT `{port}`: {e}"))?;
+        }
+        if let Some(origin) = env("ALEXANDRIA_SERVER_PUBLIC_ORIGIN") {
+            config.server.public_origin = origin;
+        }
+        if let Some(allow) = env("ALEXANDRIA_SERVER_LOOPBACK_DEVELOPMENT") {
+            config.server.loopback_development = allow == "true" || allow == "1";
         }
         if let Some(dir) = env("ALEXANDRIA_DATA_DIR") {
             config.database.data_dir = PathBuf::from(dir);
@@ -518,6 +635,7 @@ impl Config {
             "embedding.batch_size must be between 1 and 4096"
         );
         validate_max_tokens(&config.embedding.model, config.embedding.max_tokens)?;
+        config.refinement.resolve()?;
         // The scheduler's own arithmetic treats a zero interval as "due on every tick", so a typo
         // here would turn a daily pass into a hot loop that never sleeps. Refusing to start says
         // which key is wrong instead of burning a core.
@@ -597,6 +715,246 @@ mod tests {
         move |k| map.get(k).cloned()
     }
 
+    /// A `[server]` block for the tests: hosted unless stated otherwise, with the three origin keys
+    /// spelled the way an operator will read them in `docs/configuration.md`.
+    fn server(toml: &str) -> crate::config::ServerConfig {
+        crate::config::Config::from_toml(&format!("[server]\n{toml}"))
+            .expect("the fragment parses")
+            .server
+    }
+
+    /// The hosted configuration that must start: an explicit HTTPS origin, and both lists naming it.
+    const HOSTED: &str = r#"transport = "http"
+public_origin = "https://memory.example.com"
+allowed_hosts = ["memory.example.com"]
+allowed_origins = ["https://memory.example.com"]
+"#;
+
+    #[test]
+    fn hosted_wildcard_or_missing_origin_refuses_startup() {
+        // The upgrade this task makes deliberate: the shipped `["*"]` default is now a refusal on the
+        // hosted transport rather than a configuration, because a wildcard Host is the DNS-rebinding
+        // hole and an empty origin list leaves a cookie-bearing mutation with no origin to compare
+        // against.
+        for (label, fragment) in [
+            (
+                "missing origin",
+                r#"transport = "http"
+allowed_hosts = ["memory.example.com"]
+allowed_origins = ["https://memory.example.com"]
+"#,
+            ),
+            (
+                "wildcard hosts",
+                r#"transport = "http"
+public_origin = "https://memory.example.com"
+allowed_hosts = ["*"]
+allowed_origins = ["https://memory.example.com"]
+"#,
+            ),
+            (
+                "empty origins list",
+                r#"transport = "http"
+public_origin = "https://memory.example.com"
+allowed_hosts = ["memory.example.com"]
+allowed_origins = []
+"#,
+            ),
+            (
+                "plain http origin",
+                r#"transport = "http"
+public_origin = "http://memory.example.com"
+allowed_hosts = ["memory.example.com"]
+allowed_origins = ["http://memory.example.com"]
+"#,
+            ),
+            (
+                "origin with a path",
+                r#"transport = "http"
+public_origin = "https://memory.example.com/ui"
+allowed_hosts = ["memory.example.com"]
+allowed_origins = ["https://memory.example.com/ui"]
+"#,
+            ),
+            (
+                "host list that omits the origin host",
+                r#"transport = "http"
+public_origin = "https://memory.example.com"
+allowed_hosts = ["other.example.com"]
+allowed_origins = ["https://memory.example.com"]
+"#,
+            ),
+        ] {
+            let problems = server(fragment).hosted_origin_problems();
+            assert!(
+                !problems.is_empty(),
+                "{label}: the configuration was accepted"
+            );
+        }
+
+        // And the accepted shape really is accepted, so none of the refusals above is the validator
+        // failing to parse anything at all.
+        assert!(server(HOSTED).hosted_origin_problems().is_empty());
+    }
+
+    #[test]
+    fn hosted_origin_upgrade_error_is_actionable() {
+        // Every key an operator has to edit, and the exception, are named in the one message — the
+        // requirement is not that the words exist somewhere but that a single refusal tells the whole
+        // story. A blank `[server]` on the hosted transport is the worst case: everything is wrong.
+        let problems = server(r#"transport = "http""#).hosted_origin_problems();
+        let joined = problems.join("\n");
+        for key in [
+            "server.public_origin",
+            "server.allowed_hosts",
+            "server.allowed_origins",
+            "server.loopback_development",
+        ] {
+            assert!(
+                joined.contains(key),
+                "the refusal never named {key}: {joined}"
+            );
+        }
+        assert!(
+            joined.contains("X-Forwarded-Proto"),
+            "the refusal must say forwarded headers decide nothing: {joined}"
+        );
+        assert!(
+            problems.len() >= 3,
+            "one message per wrong key, not one for all of them: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn loopback_development_exception_starts() {
+        let loopback = server(
+            r#"transport = "http"
+host = "127.0.0.1"
+public_origin = "http://localhost:3000"
+allowed_hosts = ["localhost"]
+allowed_origins = ["http://localhost:3000"]
+loopback_development = true
+"#,
+        );
+        assert!(
+            loopback.hosted_origin_problems().is_empty(),
+            "{:?}",
+            loopback.hosted_origin_problems()
+        );
+        // A port is part of an origin, so a mismatched one is not the configured deployment.
+        let mismatched = server(
+            r#"transport = "http"
+host = "127.0.0.1"
+public_origin = "http://localhost:3000"
+allowed_hosts = ["localhost"]
+allowed_origins = ["http://localhost"]
+loopback_development = true
+"#,
+        );
+        assert!(!mismatched.hosted_origin_problems().is_empty());
+    }
+
+    #[test]
+    fn loopback_exception_refused_on_a_public_bind() {
+        // The exception is a statement about this machine's listener, not a way to opt out of TLS: a
+        // public bind with plain HTTP would serve a session cookie in the clear to the internet.
+        let on_public_bind = server(
+            r#"transport = "http"
+host = "0.0.0.0"
+public_origin = "http://localhost:3000"
+allowed_hosts = ["localhost"]
+allowed_origins = ["http://localhost:3000"]
+loopback_development = true
+"#,
+        );
+        let problems = on_public_bind.hosted_origin_problems().join("\n");
+        assert!(
+            problems.contains("server.host"),
+            "the refusal must name the bind key: {problems}"
+        );
+        // And a loopback bind with a public origin is the same trap wearing a different hat.
+        let public_origin = server(
+            r#"transport = "http"
+host = "127.0.0.1"
+public_origin = "http://memory.example.com"
+allowed_hosts = ["memory.example.com"]
+allowed_origins = ["http://memory.example.com"]
+loopback_development = true
+"#,
+        );
+        assert!(!public_origin.hosted_origin_problems().is_empty());
+    }
+
+    #[test]
+    fn stdio_needs_no_hosted_origin_settings() {
+        // The shipped default is stdio with the wildcard lists, and it must keep starting: the origin
+        // keys are about a published HTTP surface that stdio does not have.
+        let defaults = crate::config::ServerConfig::default();
+        assert_eq!(defaults.transport, "stdio");
+        assert!(defaults.public_origin.is_empty());
+        assert!(!defaults.loopback_development);
+        assert!(
+            defaults.hosted_origin_problems().is_empty(),
+            "stdio was asked for hosted settings: {:?}",
+            defaults.hosted_origin_problems()
+        );
+        // A stdio transport with the hosted keys left wildcards is still stdio.
+        let stdio = server(r#"transport = "stdio""#);
+        assert!(stdio.hosted_origin_problems().is_empty());
+        // And the env override reaches the same place the TOML key does, so the two cannot disagree
+        // about which transport is being validated.
+        let from_env = Config::load_from(&env(&[("ALEXANDRIA_SERVER_TRANSPORT", "http")]))
+            .expect("defaults plus the transport override");
+        assert!(!from_env.server.hosted_origin_problems().is_empty());
+        let from_env = Config::load_from(&env(&[
+            ("ALEXANDRIA_SERVER_TRANSPORT", "http"),
+            ("ALEXANDRIA_SERVER_HOST", "localhost"),
+            ("ALEXANDRIA_SERVER_LOOPBACK_DEVELOPMENT", "true"),
+            ("ALEXANDRIA_SERVER_PUBLIC_ORIGIN", "http://localhost:3000"),
+        ]))
+        .expect("the loopback override loads");
+        assert!(from_env.server.loopback_development);
+        assert_eq!(from_env.server.public_origin, "http://localhost:3000");
+    }
+
+    #[test]
+    fn forwarded_headers_are_not_consulted_by_the_validator() {
+        // The validator has no request to read, which is the structural half of this rule; what this
+        // pins is that the refusal says it out loud in every case, so an operator behind a proxy is
+        // told the header is not the switch they are looking for.
+        for fragment in [
+            r#"transport = "http""#,
+            r#"transport = "http"
+public_origin = "http://memory.example.com"
+allowed_hosts = ["*"]
+allowed_origins = ["*"]
+"#,
+        ] {
+            let problems = server(fragment).hosted_origin_problems();
+            assert!(
+                problems.iter().any(|problem| {
+                    problem.contains("X-Forwarded-Proto")
+                        && problem.contains("never establish the origin")
+                }),
+                "the forwarded-header sentence is missing: {problems:?}"
+            );
+        }
+        // A loopback configuration that starts carries no note, because there is nothing to explain.
+        assert!(
+            server(
+                r#"transport = "http"
+host = "localhost"
+public_origin = "http://localhost:3000"
+allowed_hosts = ["localhost"]
+allowed_origins = ["http://localhost:3000"]
+loopback_development = true
+"#
+            )
+            .hosted_origin_problems()
+            .is_empty()
+        );
+    }
+
     #[test]
     fn test_defaults() {
         let config = Config::default();
@@ -616,7 +974,70 @@ mod tests {
     /// diverge — both derive from engine consts. This is the regression that let
     /// `retrieve.min_similarity` be 0.10 in production and 0.30 everywhere else.
     #[test]
+    fn test_auth_defaults_are_the_safe_ones_and_the_section_parses() {
+        // The default is no trusted-local identity at all, and the transport that default belongs to.
+        let auth = AuthConfig::default();
+        assert!(auth.stdio_account.is_empty());
+        assert_eq!(ServerConfig::default().transport, "stdio");
+
+        // The section parses, and an absent section keeps the default rather than becoming something.
+        let config = Config::load_from(&env(&[])).expect("defaults load");
+        assert!(config.auth.stdio_account.is_empty());
+
+        let parsed = Config::from_toml("[auth]\nstdio_account = '  Local Operator  '\n")
+            .expect("the section must parse");
+        assert_eq!(parsed.auth.stdio_account, "  Local Operator  ");
+        // Whatever is set is carried verbatim: normalisation belongs to the login path, which shares
+        // storage's own normaliser, and not to the configuration layer.
+        let bare = Config::from_toml("[server]\ntransport = 'http'\n")
+            .expect("a sectionless config parses");
+        assert!(bare.auth.stdio_account.is_empty());
+    }
+
+    #[test]
+    fn dreaming_refinement_interval_must_be_positive_even_without_routes() {
+        let default = Config::from_toml("").unwrap();
+        assert_eq!(default.refinement.interval_secs, 86_400);
+        let custom = Config::from_toml("[refinement]\ninterval_secs = 123\n").unwrap();
+        assert_eq!(custom.refinement.interval_secs, 123);
+        assert!(custom.refinement.resolve().is_ok());
+        let zero = Config::from_toml("[refinement]\ninterval_secs = 0\n");
+        assert!(
+            zero.and_then(|config| config.refinement.resolve()).is_err(),
+            "a zero interval would hot-loop the refinement enqueue tick"
+        );
+    }
+
+    #[test]
     fn test_server_fallback_defaults_match_config_defaults() {
+        use alexandria_engine::refinement::{budget, schedule};
+        use alexandria_mcp::refinement::worker::WorkerSettings;
+
+        assert_eq!(
+            RefinementConfig::default().interval_secs,
+            schedule::DEFAULT_INTERVAL_SECS
+        );
+        let refinement = WorkerSettings::default();
+        assert_eq!(refinement.calls.pass, budget::MAX_ATTEMPTS_PER_PASS);
+        assert_eq!(refinement.calls.account, budget::MAX_ATTEMPTS_PER_ACCOUNT);
+        assert_eq!(
+            refinement.calls.interactive,
+            budget::MAX_INTERACTIVE_ATTEMPTS_PER_ACCOUNT
+        );
+        assert_eq!(refinement.calls.global, budget::MAX_GLOBAL_ATTEMPTS);
+        assert_eq!(refinement.max_focals_per_pass, budget::MAX_FOCALS_PER_PASS);
+        assert_eq!(
+            refinement.max_neighbors_per_focal,
+            budget::MAX_NEIGHBORS_PER_FOCAL
+        );
+        assert_eq!(refinement.max_request_bytes, budget::MAX_REQUEST_BYTES);
+        assert_eq!(refinement.max_response_bytes, budget::MAX_RESPONSE_BYTES);
+        assert_eq!(refinement.max_output_tokens, budget::MAX_OUTPUT_TOKENS);
+        assert_eq!(
+            refinement.request_deadline_secs,
+            budget::REQUEST_DEADLINE_SECS
+        );
+        assert_eq!(refinement.pass_active_secs, budget::PASS_ACTIVE_SECS);
         assert_eq!(
             RetrieveConfig::default().min_similarity,
             alexandria_engine::search::DEFAULT_MIN_SIMILARITY

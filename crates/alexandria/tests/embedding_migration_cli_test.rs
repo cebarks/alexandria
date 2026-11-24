@@ -22,6 +22,39 @@ fn command(root: &Path, source: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+async fn fixture_owner(
+    db: &alexandria_storage::Database,
+) -> alexandria_storage::models::auth::PrincipalIds {
+    alexandria_storage::repos::IdentityRepo::new(db.inner())
+        .bootstrap_owner(
+            "embedding-migration-fixture",
+            "digest-embedding-migration-fixture-padding",
+            &alexandria_storage::models::OperationId::new("embedding-migration-fixture-owner"),
+        )
+        .await
+        .unwrap()
+}
+
+async fn create_assigned_fact(
+    db: &alexandria_storage::Database,
+    owner: &alexandria_storage::models::auth::PrincipalIds,
+    content: &str,
+) {
+    let (_, fact_id) = alexandria_storage::repos::MemoryRepo::new(db.inner())
+        .create_fact_with_id(content, 0.6, &[1.0, 0.0], &[])
+        .await
+        .unwrap();
+    db.inner()
+        .query("UPDATE $fact SET account = $account, workspace = $workspace, scope = 'personal';")
+        .bind(("fact", fact_id))
+        .bind(("account", owner.account.as_record_id().clone()))
+        .bind(("workspace", owner.workspace.as_record_id().clone()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+}
+
 #[tokio::test]
 #[ignore = "parent seeds isolated stores and ends the child process without database drop"]
 async fn fixture_child() {
@@ -42,15 +75,11 @@ async fn fixture_child() {
         system_config::check_embedding_space(db.inner(), &source)
             .await
             .unwrap();
-        alexandria_storage::repos::MemoryRepo::new(db.inner())
-            .create_fact("public one", 0.6, &[1.0, 0.0], &[])
-            .await
-            .unwrap();
+        let owner = fixture_owner(&db).await;
+        create_assigned_fact(&db, &owner, "public one").await;
     } else if mode == "duplicate" {
-        alexandria_storage::repos::MemoryRepo::new(db.inner())
-            .create_fact("public one", 0.6, &[1.0, 0.0], &[])
-            .await
-            .unwrap();
+        let owner = fixture_owner(&db).await;
+        create_assigned_fact(&db, &owner, "public one").await;
     } else if mode == "lower-schema-version" {
         system_config::set_config(db.inner(), "schema_version", "0")
             .await
@@ -82,6 +111,17 @@ async fn fixture_child() {
                 .await
                 .unwrap()
         );
+        let mut response = db
+            .inner()
+            .query(
+                "SELECT * FROM fact WHERE scope = 'personal' AND workspace != NONE AND account != NONE AND deleted = false;",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let assigned: Vec<alexandria_storage::models::Fact> = response.take(0).unwrap();
+        println!("ASSIGNED={}", assigned.len());
         println!(
             "AUDIT={}",
             alexandria_storage::repos::ClusterRepo::new(db.inner())
@@ -418,6 +458,12 @@ fn dream_uses_ready_legacy_or_granite_vectors_without_model_or_config_identity_m
                 alexandria_storage::offline_copy::OfflineStoreGuard::acquire(&source).unwrap();
             guard.copy_to(&target).unwrap();
             fixture_process("complete", &target);
+            let copied = fixture_process("inspect", &target);
+            assert!(
+                String::from_utf8_lossy(&copied.stdout).contains("LIVE=2\nASSIGNED=2"),
+                "offline copy/re-embed must preserve both assigned fixture facts: {}",
+                String::from_utf8_lossy(&copied.stdout)
+            );
             &target
         } else {
             &source
@@ -435,7 +481,10 @@ fn dream_uses_ready_legacy_or_granite_vectors_without_model_or_config_identity_m
         let inspected = fixture_process("inspect", path);
         let text = String::from_utf8(inspected.stdout).unwrap();
         assert!(
-            text.contains("LIVE=1") && text.contains("AUDIT=1") && text.contains("ARMED=false"),
+            text.contains("LIVE=1")
+                && text.contains("ASSIGNED=1")
+                && text.contains("AUDIT=1")
+                && text.contains("ARMED=false"),
             "{mode}: {text}"
         );
         assert!(!root.path().join("cache").exists());

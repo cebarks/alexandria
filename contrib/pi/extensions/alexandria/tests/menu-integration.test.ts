@@ -15,8 +15,7 @@ writeFileSync(path, JSON.stringify({
 }));
 process.env.ALEXANDRIA_CLIENT_CONFIG = path;
 process.env.XDG_STATE_HOME = dir;
-process.env.ALEXANDRIA_AUTO_STORE = "off";
-for (const key of ["ALEXANDRIA_AUTO_RECALL", "ALEXANDRIA_AUTO_RECALL_LIMIT", "ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY", "ALEXANDRIA_REMINDERS"]) {
+for (const key of ["ALEXANDRIA_AUTO_RECALL", "ALEXANDRIA_AUTO_RECALL_LIMIT", "ALEXANDRIA_AUTO_RECALL_MIN_SIMILARITY", "ALEXANDRIA_REMINDERS", "ALEXANDRIA_PROJECT_ID"]) {
 	delete process.env[key];
 }
 
@@ -36,6 +35,11 @@ const pi = {
 // External MCP calls are the only fakes; command registration, settings I/O,
 // dispatch, and injection formatting are the real extension code.
 extension(pi, {
+	authenticatedServer: () => ({
+		serverKey: "menu-fixture",
+		accountKey: "menu-account",
+		callTool: async () => assert.fail("Personal-only context must not call resolve_project"),
+	}),
 	prewarm: () => { prewarms++; },
 	retrieveMemories: async (query, _call, _signal, settings) => {
 		recalled.push({ query, settings: settings as RecallSettings });

@@ -32,6 +32,17 @@ Open code items. Rationale for settled decisions lives in the docs and commit hi
   `get_members()` for each cluster. Batch it when cluster counts grow.
 - [-] **`recall` walks clusters, not sessions.** Sessions are reachable only through the session
   tools and `/debug/sessions`.
+- [-] **Evaluate a cross-encoder reranker for retrieval precision (deferred from memory refinement).**
+  Compare candidate recall and final ordering on the retrieval question set before choosing a model:
+  a reranker can improve ordering, but cannot recover a relevant memory omitted from its candidate pool.
+  Start with a bounded top-10–20 candidate experiment, an opt-in configuration, isolated model execution,
+  and measured CPU/memory/prompt-path latency. Apply authorization filters before candidate text reaches
+  the model, and record access/activation only for the final returned results. Preserve a deadline and
+  fallback to existing order on inference failure; a timeout alone does not cancel queued inference.
+  Calibrate reranker scores separately from embedding cosine thresholds. Pin and verify its artifacts
+  and licensing; a query-time reranker need not change stored embedding identity or re-embed the corpus.
+  Ranking benefit and acceptable latency remain unmeasured — the existing noise-floor/truncation
+  findings neither prove nor rule out a ranking problem.
 - [-] **The model fetcher (`alexandria-pipeline/src/embedding/hub.rs`) is snapshot-only.** No
   `blobs/` symlinks or `.no_exist` markers in the cache layout (locks *are* handled: a cache miss
   takes an advisory lock on `<repo>/.lock` and re-checks); revision `main` only; no

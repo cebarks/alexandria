@@ -1,8 +1,10 @@
+use crate::access::OwnerContext;
+use crate::error::StorageError;
+use crate::models::identity::{OperationId, ProjectId, Version};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::RecordId;
 
 use crate::models::Reminder;
 
@@ -31,6 +33,12 @@ pub struct ReminderRepo<'a> {
 impl<'a> ReminderRepo<'a> {
     pub fn new(db: &'a Surreal<Any>) -> Self {
         Self { db }
+    }
+
+    /// The engine handle, so the account-bound wrapper can build statements against the same store
+    /// without duplicating this repo's schedule parsing. Crate-visible only.
+    pub(crate) fn db(&self) -> &'a Surreal<Any> {
+        self.db
     }
 
     /// Create a reminder. State fields are initialized here (status = 'pending',
@@ -79,8 +87,30 @@ impl<'a> ReminderRepo<'a> {
         Ok(crate::record_id_to_string(&id))
     }
 
+    /// Release an owner-reviewed legacy target mapping through the same transaction and semantic
+    /// journal used by other owner mutations. The record ID is parsed as one complete typed record
+    /// literal before the mutation repository sees it.
+    pub async fn release_migration_hold(
+        &self,
+        owner: &OwnerContext,
+        reminder_id: &str,
+        expected: Version,
+        target: Option<ProjectId>,
+        operation: &OperationId,
+    ) -> std::result::Result<(), StorageError> {
+        let reminder_id = crate::parse_record_id(reminder_id)?;
+        if reminder_id.table.as_str() != "reminder" {
+            return Err(StorageError::InvalidInput(
+                "malformed reminder id".to_string(),
+            ));
+        }
+        super::MutationRepo::new(self.db)
+            .release_reminder_mapping(owner, &reminder_id, expected, target, operation)
+            .await
+    }
+
     pub async fn get(&self, id: &str) -> Result<Option<Reminder>> {
-        let rid = RecordId::parse_simple(id)?;
+        let rid = crate::parse_record_id(id)?;
         let mut response = self
             .db
             .query("SELECT * FROM type::record($id)")
@@ -228,7 +258,7 @@ impl<'a> ReminderRepo<'a> {
         new_next_due_at: Option<DateTime<Utc>>,
         seen_next_due_at: Option<DateTime<Utc>>,
     ) -> Result<bool> {
-        let rid = RecordId::parse_simple(id)?;
+        let rid = crate::parse_record_id(id)?;
         let set_clause = match new_next_due_at {
             Some(_) => {
                 "last_delivered_at = time::now(), \
@@ -264,7 +294,7 @@ impl<'a> ReminderRepo<'a> {
     }
 
     pub async fn cancel(&self, id: &str) -> Result<()> {
-        let rid = RecordId::parse_simple(id)?;
+        let rid = crate::parse_record_id(id)?;
         self.db
             .query("UPDATE type::record($id) SET status = 'cancelled', cancelled_at = time::now()")
             .bind(("id", rid))

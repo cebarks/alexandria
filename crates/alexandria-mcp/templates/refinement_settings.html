@@ -1,0 +1,42 @@
+{% extends "layout.html" %}
+{% block title %}Refinement settings{% endblock %}
+{% block body %}
+<h1>Refinement consent and review</h1>
+<section aria-labelledby="consent-heading">
+  <h2 id="consent-heading">Inference destination consent</h2>
+  <p>Consent: {{ consent }} · revision {{ consent_revision }}.</p>
+  <p>Configured endpoint disclosure: {{ destination }}</p>
+  <p>The endpoint and model names are disclosed, not secrets; credentials are never shown.</p>
+  <p>same model: {{ same_model }}. A changed model or destination requires renewed consent.</p>
+  <form method="post" action="/debug/refinement/consent">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="revision" value="{{ consent_revision }}">
+    <input type="hidden" name="policy_revision" value="{{ policy_revision }}">
+    <button type="submit" name="choice" value="grant">Grant consent to disclosed endpoint</button>
+    <button type="submit" name="choice" value="revoke">Revoke consent</button>
+  </form>
+</section>
+<section aria-labelledby="approval-heading">
+  <h2 id="approval-heading">Approval mode</h2>
+  <p>{{ approval_mode }}. Human approval is the default; automatic secondary review is opt-in and separately disclosed.</p>
+  <p>Configured policy revision {{ policy_revision }} · consent revision {{ consent_revision }} · mode revision {{ mode_revision }}.</p>
+  <form method="post" action="/debug/refinement/mode">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="configured_revision" value="{{ configured_revision }}">
+    <input type="hidden" name="consent_revision" value="{{ consent_revision }}">
+    <input type="hidden" name="mode_revision" value="{{ mode_revision }}">
+    <label for="review-mode">Review mode</label>
+    <select id="review-mode" name="mode">
+      <option value="human" {% if selected_mode == "human" %}selected{% endif %}>Human approval (default)</option>
+      <option value="secondary_llm" {% if selected_mode == "secondary_llm" %}selected{% endif %}>Automatic secondary review</option>
+    </select>
+    <button type="submit">Save review mode</button>
+  </form>
+</section>
+<section aria-labelledby="quota-attempt-heading">
+  <h2 id="quota-attempt-heading">Quota and attempt status</h2>
+  <p>quota: {{ quota_status }}</p>
+  <p>attempt: {{ attempt_status }}</p>
+  <p class="note">These counts are this account's real rolling usage, never estimates or fabricated totals. This page does not start or imply an attempt.</p>
+</section>
+{% endblock %}

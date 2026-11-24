@@ -6,7 +6,7 @@ def tool_schemas() -> list[dict]:
     tags = {"type": "array", "items": text}
     integer = {"type": "integer"}
     specs = [
-        ("store_memory", "Store durable facts proactively: preferences, corrections, conventions and resolved root causes.",
+        ("store_memory", "Explicitly store a durable fact in the configured project, or Personal if no project is configured. Only retain facts the user wants remembered.",
          {"content": text, "tags": tags}, ["content"]),
         ("search_memories", "Search long-term memory beyond automatic recall.",
          {"query": text, "limit": integer}, ["query"]),

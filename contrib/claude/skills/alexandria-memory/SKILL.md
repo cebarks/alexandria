@@ -61,27 +61,27 @@ Tool choice:
 
 ## Sessions
 
-`mcp__alexandria__store_memory` accepts an optional `session_id` — an opaque handle you choose,
-typically this conversation's identifier or a task name — which groups that memory under a session and
-creates the session on first use. Worth doing when the grouping itself is the useful thing:
-"everything we learned about the auth refactor" stays retrievable as a unit even though the memories
-are topically scattered across clusters.
+`mcp__alexandria__store_memory` accepts an optional `session_id` — an opaque handle you choose, typically
+this conversation's identifier or a task name — which groups that memory under a session and creates
+the session on first use. Worth doing when the grouping itself is the useful thing: "everything we
+learned about the auth refactor" stays retrievable as a unit even though the memories are
+topically scattered across clusters.
 
-- **`mcp__alexandria__list_sessions`** — enumerate sessions newest-first, filterable by `agent_id`,
-  `tag` and whether they were finalized, with `limit`/`offset` paging. This is how you find a session
-  whose id you did not keep.
+- **`mcp__alexandria__list_sessions`** — enumerate sessions newest-first, filterable by `agent_id`, `tag`
+  and whether they were finalized, with `limit`/`offset` paging. This is how you find a session whose
+  id you did not keep.
 - **`mcp__alexandria__get_session`** — review everything stored in one session, oldest first, with its
   metadata. Use when the user asks what was captured in a specific past conversation, or before
   writing a session summary so you don't restate something already stored.
-- **`mcp__alexandria__finalize_session`** — set the session's summary, tags, and end timestamp. Call
-  once as work wraps up; it is what makes a session skimmable later instead of a pile of fragments.
+- **`mcp__alexandria__finalize_session`** — set the session's summary, tags, and end timestamp. Call once
+  as work wraps up; it is what makes a session skimmable later instead of a pile of fragments.
 
 Rules that matter: a session's `ended_at` is refreshed by every store, so it tracks last activity,
 not closure — an unfinalized session still has `ended_at` set, and `summary: null` is the real signal
 that it was never closed. Sessions are not searchable by *content*: `mcp__alexandria__list_sessions`
-enumerates them by metadata, and `mcp__alexandria__get_session` needs an id you already have or one you
-just got from the list. Still worth recording the id you chose somewhere durable if you expect to
-revisit it. See `docs/session-memory.md` in the Alexandria repo for details.
+enumerates them by metadata, and `mcp__alexandria__get_session` needs an id you already have or one you just
+got from the list. Still worth recording the id you chose somewhere durable if you expect to revisit
+it. See `docs/session-memory.md` in the Alexandria repo for details.
 
 ## Reminders
 
@@ -100,13 +100,13 @@ When to set (do this unprompted, like writes):
 
 Tool choice:
 
-- **`mcp__alexandria__set_reminder`** — schedule a one-shot or recurring message; exactly one of the
-  three kinds below. Write `message` so it still makes sense in a session with none of today's context.
+- **`mcp__alexandria__set_reminder`** — schedule a one-shot or recurring message; exactly one of the three
+  kinds below. Write `message` so it still makes sense in a session with none of today's context.
 - **`mcp__alexandria__list_reminders`** — what is scheduled and when it fires; filter by `status`
   (`pending` default, `delivered`, `cancelled`, `all`) and `target_project`. This is where you find an
   id to cancel.
-- **`mcp__alexandria__cancel_reminder`** — soft-cancel by id when the user says it's no longer needed,
-  or after a delivery for a recurring reminder the user now wants stopped.
+- **`mcp__alexandria__cancel_reminder`** — soft-cancel by id when the user says it's no longer needed, or
+  after a delivery for a recurring reminder the user now wants stopped.
 
 Schedule kinds — give exactly one:
 
@@ -135,41 +135,87 @@ not what you meant (a restricted day-of-month with a restricted day-of-week, a `
 turn** — a mis-parsed "every Friday" is cheapest to fix while they're still there. Optional `note` and
 provenance fields ride along at delivery for context.
 
-Targeting: reminders are **global** by default (delivered in any context). Use `target_project` for
-repo-bound follow-ups; delivery matches the project name exactly and case-sensitively. A targeted
-reminder in a project that stops being visited is not lost — once it is at least the server's
-escalation window overdue (`[reminders].escalation_hours`) it delivers everywhere, flagged
-`escalated: true`.
+Targeting: reminders are **account-bound**. For a project-specific follow-up, use an existing owned,
+issued `project:<opaque-id>` returned by `mcp__alexandria__resolve_project` or
+`mcp__alexandria__list_projects`. Copy that handle exactly into `set_reminder.target_project`,
+`check_reminders.project`, and `list_reminders.target_project`. A display name, alias, repository name,
+or checkout basename is not that handle; unknown and foreign handles are refused, even if no rows
+are due.
+
+If you only know a basename/name, first propose resolving the project or selecting it from the owned
+project listing, using the available tool's schema. Wait for an actual successful result before using
+its handle. Do not invent a resolver result, an issued ID, or an account-management RPC. If those
+tools are unavailable, explain that an owned handle is needed. Do not silently omit a selector and
+widen a project-specific request. To set a global reminder, omit the optional target. Checking
+without a project delivers only global and eligible escalated reminders, not all project reminders.
+
+Global delivery and overdue escalation stay **within the reminder owner's account**. A valid project
+target at least `[reminders].escalation_hours` overdue may deliver in another project context of that
+same account, flagged `escalated: true`; it never transfers to another account, even with the same
+checkout basename. Held rows and unresolved historical text targets stay pending and suppressed,
+not global or escalated. There is no automatic historical mapping.
+
+The Pi companion resolves the session directory's sanitized `origin` remote with
+`mcp__alexandria__resolve_project`, then uses the returned owned project ID for recall and reminder
+checks. Userinfo, query and fragment are discarded before remote identity is sent; absent a usable
+remote and absent `ALEXANDRIA_PROJECT_ID`, the companion sends no project selector and remains
+Personal-only. The explicit override is resolved and validated too. Authentication uses the
+companion's `ALEXANDRIA_API_TOKEN`, independently of model-provider credentials; an incompatible
+server requires upgrade, never an anonymous or unscoped fallback. Automatic observation stores and
+session-end extraction were removed: when a durable fact should be retained, call
+`mcp__alexandria__store_memory` explicitly, or `mcp__alexandria__import_document` for source material.
+
+The Claude recall hook has a narrower context contract: it resolves only an explicit
+`ALEXANDRIA_PROJECT_ID` and does not inspect git remotes. Without the override it stays Personal-only.
+It authenticates with `ALEXANDRIA_API_TOKEN`; a failed project lookup never becomes unscoped recall.
+Claude hooks no longer store prompt-regex observations or extract transcripts. Use the explicit
+`store_memory`/`import_document` tools when there is durable information to retain.
 
 Delivery happens only when something calls **`mcp__alexandria__check_reminders`**, and the Claude Code
 hooks here do not call it — they only auto-recall. So under Claude Code you are that something: call
 it when the user asks "anything due?", when a reminder they expected hasn't shown up, or when you have
-just set a reminder that was already due, passing the current project so project-targeted reminders
-match. That call is the *only* thing that consumes reminders (recurring ones advance; missed fires
-coalesce rather than trickle). The `due_reminders` array on `mcp__alexandria__retrieve_memories` /
+just set a reminder that was already due, passing the actual owned issued project handle so typed
+targets match. Omit the project only when checking for global and eligible escalated reminders.
+That call is the *only* thing that consumes reminders (recurring ones advance; missed fires coalesce
+rather than trickle). The `due_reminders` array on `mcp__alexandria__retrieve_memories` /
 `mcp__alexandria__recall` responses is a read-only safety net (a small oldest-due sample) that is
-*untargeted* and consumes nothing: entries appear there with their `target` whatever project they
-belong to, so another project's entry is informational — it reaches the user through
-`mcp__alexandria__check_reminders`.
+*untargeted within your account* and consumes nothing: eligible entries carry `global` or a typed
+project handle. Another owned project's entry is informational, not consumed; delivery occurs through
+a matching or eligible escalated `mcp__alexandria__check_reminders` call. Held/unresolved targets are
+excluded from that sample but remain inspectable in your unfiltered reminder history.
+
+## Project scope and explicit writes
+
+Without an explicit project context, ordinary reads are Personal-only; they do not search every project.
+For project-specific work, call `mcp__alexandria__resolve_project` with the available project identity,
+then use the returned owned ID with the relevant tool's project/context parameter. Do not infer an ID
+from a name or checkout basename. Project writes require an explicit project target; a session ID is
+not a substitute for a scope. The Pi companion can resolve a sanitized git origin automatically, but
+an agent using the tools directly must resolve the project before issuing a project-scoped request.
+
+## Classification and quality review
+
+Unassigned is an owner review partition, not a recall mode. Use `mcp__alexandria__list_unassigned_memories` only for deliberate Unassigned review; `mcp__alexandria__propose_memory_scope` stages a revision for the owner, not a move or approval. Do not treat quality proposals as facts or grant egress consent on the owner's behalf. Use the owner UI for quality decisions and private operation history. Refinement does not look for contradictions between Personal and a project, even when both are recalled.
 
 ## Guidelines
 
-- **Bias toward storing.** Memory writes are cheap and clustering handles rough dedup; losing a
-  decision/rationale is more costly than an extra memory entry.
+- **Store durable information explicitly.** Use `store_memory` for a standalone durable fact,
+  decision, preference, correction, or resolved bug; use `import_document` for reference material.
+  Client integrations do not automatically extract or write observed conversation content.
 - **Write for a stranger.** Assume the reader has zero context from this conversation.
 - **Don't narrate it.** Store/retrieve silently as part of normal work, the same way you'd read
   a file — don't announce "let me check my memory" unless the result changes what you tell the
   user.
 - **Surface conflicts.** If a retrieved memory contradicts what you're about to do or say, flag
   it to the user rather than silently picking one.
-- **Batch queries when exploring multiple angles** — call `retrieve_memories` a few times with
+- **Batch queries when exploring multiple angles** — call `mcp__alexandria__retrieve_memories` a few times with
   varied phrasing rather than one query trying to cover everything, same principle as varying
   web-search queries.
 
 ## Availability
 
-These tools come from the `alexandria` MCP server (HTTP, `http://127.0.0.1:3000/mcp`, registered
-via `claude mcp add --transport http --scope user alexandria http://127.0.0.1:3000/mcp`). If the
-tools aren't present, the server may not be running —
-check `systemctl --user status alexandria` (if deployed as a systemd user service) before
-concluding memory isn't available for this session.
+These tools come from the `alexandria` MCP server (HTTP, `http://127.0.0.1:3000/mcp`). A Claude
+Code MCP connection must use an authorized bearer credential when the server requires authentication;
+the hook's `ALEXANDRIA_API_TOKEN` configures only the hook, not the native MCP connection. If the
+tools aren't present, the server may not be running — check `systemctl --user status alexandria` (if
+deployed as a systemd user service) before concluding memory isn't available for this session.
