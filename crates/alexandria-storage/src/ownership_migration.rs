@@ -2,9 +2,12 @@
 //! connection is the exclusive migration writer; a verified kit is opened only
 //! as a separate scratch copy, never to probe the live store's lock.
 
+#[cfg(all(test, target_os = "linux"))]
+mod checkpoint_tests;
 mod snapshot;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -17,7 +20,7 @@ use uuid::Uuid;
 use crate::access::SystemContext;
 use crate::models::PrincipalIds;
 use crate::offline_copy::{SourceManifest, VerifiedBackupCopy, read_source_manifest};
-use crate::repos::scope::claim_system_for_workspace;
+use crate::repos::scope::{claim_system_for_workspace, is_write_conflict};
 use crate::{Database, RecordId, schema, system_config};
 
 use self::snapshot::{
@@ -279,14 +282,40 @@ impl<'db> OwnershipMigration<'db> {
     }
 
     /// Apply at most `max_rows` changes and checkpoint them in the same transaction.
+    /// A definitely rejected commit may retry twice, with a fresh transaction each time.
     pub async fn step(&self, id: &MigrationId, max_rows: usize) -> Result<Progress> {
+        self.step_with_commit(id, max_rows, async |tx| tx.commit().await.map(|_| ()))
+            .await
+    }
+
+    async fn step_with_commit(
+        &self,
+        id: &MigrationId,
+        max_rows: usize,
+        mut commit: impl AsyncFnMut(Transaction<Any>) -> Result<(), surrealdb::Error>,
+    ) -> Result<Progress> {
         ensure!(
             max_rows != 0,
             "Ownership migration requires a nonzero page size"
         );
-        let tx = self.db.inner().clone().begin().await?;
-        let result = step_run(&tx, id, i64::try_from(max_rows).unwrap_or(i64::MAX)).await;
-        finish(tx, result).await
+        let max_rows = i64::try_from(max_rows).unwrap_or(i64::MAX);
+        let mut backoffs_ms = [10, 20].into_iter();
+        loop {
+            let tx = self.db.inner().clone().begin().await?;
+            let progress = match step_run(&tx, id, max_rows).await {
+                Ok(progress) => progress,
+                Err(error) => return finish(tx, Err(error)).await,
+            };
+            let Err(error) = commit(tx).await else {
+                return Ok(progress);
+            };
+            // At explicit commit, SurrealKV's typed conflict is a definite abort.
+            // Do not replay on an ambiguous outcome or a preparation error.
+            let Some(delay_ms) = backoffs_ms.next().filter(|_| is_write_conflict(&error)) else {
+                return Err(error).context("Commit ownership migration transaction");
+            };
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
     }
 
     /// Compare the live corpus to the frozen postimage before publishing Complete.
